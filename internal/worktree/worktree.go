@@ -3,9 +3,8 @@
 // worktree (resetting tracked files but keeping untracked build/dependency caches)
 // is far faster than cloning per task.
 //
-// The pool design follows treehouse (MIT) — see THIRD_PARTY.md. orcha's own state
-// (active task records) is the source of truth for which slots are in use, so the
-// pool needs no separate reservation/liveness bookkeeping.
+// orcha's own task records are the source of truth for which slots are in use, so
+// the pool needs no separate reservation or liveness bookkeeping.
 package worktree
 
 import (

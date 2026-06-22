@@ -82,5 +82,4 @@ enforces this in CI.
 
 ## License
 
-MIT — see `LICENSE`. Later milestones vendor code from upstream MIT projects; see
-`THIRD_PARTY.md`.
+MIT — see `LICENSE`.

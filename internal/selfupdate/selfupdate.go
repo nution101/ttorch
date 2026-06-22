@@ -1,7 +1,7 @@
 // Package selfupdate implements `orcha update`: check the latest GitHub release,
 // download + checksum-verify the asset, and atomically replace the running
-// binary. The atomic-replace + macOS-quarantine approach follows prior art
-// credited in THIRD_PARTY.md.
+// binary — following the PATH symlink so the real file is rewritten, and clearing
+// the macOS quarantine xattr so Gatekeeper does not block the updated binary.
 package selfupdate
 
 import (
