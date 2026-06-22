@@ -4,15 +4,19 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	orchaembed "github.com/nution101/orcha"
 	"github.com/nution101/orcha/internal/buildinfo"
@@ -23,6 +27,8 @@ import (
 	"github.com/nution101/orcha/internal/paths"
 	"github.com/nution101/orcha/internal/projectinit"
 	"github.com/nution101/orcha/internal/selfupdate"
+	"github.com/nution101/orcha/internal/supervisor"
+	"github.com/nution101/orcha/internal/wake"
 )
 
 // repo is the GitHub slug releases are fetched from. Update when publishing.
@@ -70,7 +76,13 @@ func Main(args []string) int {
 		return run(cmdSend(rest))
 	case "teardown":
 		return run(cmdTeardown(rest))
-	case "worker", "supervise", "daemon", "skill", "review-diff", "merge-local":
+	case "daemon":
+		return run(cmdDaemon(rest))
+	case "supervise":
+		return run(cmdSupervise())
+	case "wake":
+		return run(cmdWake(rest))
+	case "worker", "skill", "review-diff", "merge-local":
 		fmt.Fprintf(os.Stderr, "orcha %s: not available yet — arrives in a later milestone.\n", cmd)
 		return 3
 	default:
@@ -301,6 +313,122 @@ func cmdCC(args []string) error {
 	return mgr().OpenCC(*isolated)
 }
 
+func cmdDaemon(args []string) error {
+	sub := "status"
+	if len(args) > 0 {
+		sub = args[0]
+	}
+	switch sub {
+	case "run":
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return supervisor.New(paths.Default()).Run(ctx)
+	case "start":
+		return daemonStart()
+	case "stop":
+		return daemonStop()
+	case "status":
+		return daemonStatus()
+	default:
+		return errors.New("usage: orcha daemon run|start|stop|status")
+	}
+}
+
+func cmdSupervise() error {
+	if pid, ok := supervisor.Running(paths.Default()); ok {
+		fmt.Printf("supervisor already running (pid %d)\n", pid)
+		return nil
+	}
+	return daemonStart()
+}
+
+func cmdWake(args []string) error {
+	if len(args) == 0 || args[0] != "drain" {
+		return errors.New("usage: orcha wake drain")
+	}
+	ws, err := (wake.Queue{Path: paths.Default().WakeQueue()}).Drain()
+	if err != nil {
+		return err
+	}
+	if len(ws) == 0 {
+		fmt.Println("no pending wakes")
+		return nil
+	}
+	fmt.Printf("%d wake(s):\n", len(ws))
+	for _, w := range ws {
+		key := w.Key
+		if key == "" {
+			key = "-"
+		}
+		fmt.Printf("  %-9s %-14s %s\n", w.Kind, key, w.Payload)
+	}
+	return nil
+}
+
+func daemonStart() error {
+	p := paths.Default()
+	if pid, ok := supervisor.Running(p); ok {
+		fmt.Printf("supervisor already running (pid %d)\n", pid)
+		return nil
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(p.Home, 0o755); err != nil {
+		return err
+	}
+	logf, err := os.OpenFile(p.DaemonLog(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	c := exec.Command(exe, "daemon", "run")
+	c.Env = append(os.Environ(), "ORCHA_DAEMON=1")
+	c.Stdout = logf
+	c.Stderr = logf
+	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := c.Start(); err != nil {
+		return err
+	}
+	pid := c.Process.Pid
+	_ = c.Process.Release()
+	fmt.Printf("supervisor started (pid %d); logging to %s\n", pid, p.DaemonLog())
+	return nil
+}
+
+func daemonStop() error {
+	p := paths.Default()
+	pid, ok := supervisor.PID(p)
+	if !ok || !supervisor.Alive(pid) {
+		fmt.Println("supervisor not running")
+		_ = os.Remove(p.PIDFile())
+		return nil
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	if err := proc.Signal(syscall.SIGTERM); err != nil {
+		return err
+	}
+	fmt.Printf("sent stop to supervisor (pid %d)\n", pid)
+	return nil
+}
+
+func daemonStatus() error {
+	p := paths.Default()
+	pid, ok := supervisor.Running(p)
+	if !ok {
+		fmt.Println("supervisor not running")
+		return nil
+	}
+	fmt.Printf("supervisor running (pid %d)\n", pid)
+	if fi, err := os.Stat(p.Beacon()); err == nil {
+		fmt.Printf("  last beat: %s ago\n", time.Since(fi.ModTime()).Round(time.Second))
+	}
+	return nil
+}
+
 func reapplyContent(p paths.Paths) error {
 	res, err := installer.Apply(orchaembed.Content, p, buildinfo.CurrentVersion())
 	if err != nil {
@@ -343,6 +471,11 @@ Team:
   send <id> <text...>     type a message into a worker
   teardown <id> [--force] finish a worker (refuses to discard unlanded work)
 
+Supervision:
+  supervise               ensure the background supervisor is running
+  daemon run|start|stop|status   manage the supervisor process
+  wake drain              print and clear pending supervision events
+
 Setup:
   install                 install/update managed skills, agents, and guidance
   update [--content-only] self-update the binary, then re-apply content
@@ -351,6 +484,6 @@ Setup:
   init [--mode m]         set up a repo's AGENTS.md + CLAUDE.md + delivery mode
   version | help          version / this message
 
-Coming later: supervise, daemon, skill, review-diff, merge-local
+Coming later: skill, review-diff, merge-local
 `)
 }

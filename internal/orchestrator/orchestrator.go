@@ -74,6 +74,8 @@ func (m *Manager) Spawn(taskID, projectPath string, scout bool, rawCmd string) (
 		kind = "scout"
 	}
 	h := harness.Resolve()
+	// Install the turn-end hook so the supervisor can detect this worker's turns.
+	_ = harness.InstallTurnEndHook(h, wt, m.P.TurnEndMarker(taskID))
 	cmd := rawCmd
 	if cmd == "" {
 		brief := m.P.BriefPath(taskID)
