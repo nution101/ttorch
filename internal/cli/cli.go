@@ -18,6 +18,7 @@ import (
 	"github.com/nution101/orcha/internal/installer"
 	"github.com/nution101/orcha/internal/manifest"
 	"github.com/nution101/orcha/internal/paths"
+	"github.com/nution101/orcha/internal/projectinit"
 	"github.com/nution101/orcha/internal/selfupdate"
 )
 
@@ -50,9 +51,11 @@ func Main(args []string) int {
 		return run(cmdUpdate(rest))
 	case "uninstall":
 		return run(cmdUninstall(rest))
+	case "init":
+		return run(cmdInit(rest))
 	case "manager", "status", "spawn", "worker", "cc", "teardown", "send", "peek",
-		"supervise", "daemon", "init", "skill", "review-diff", "merge-local":
-		fmt.Fprintf(os.Stderr, "orcha %s: not available yet — arrives in a later milestone (M1–M5).\n", cmd)
+		"supervise", "daemon", "skill", "review-diff", "merge-local":
+		fmt.Fprintf(os.Stderr, "orcha %s: not available yet — arrives in a later milestone.\n", cmd)
 		return 3
 	default:
 		fmt.Fprintf(os.Stderr, "orcha: unknown command %q\n\n", cmd)
@@ -159,6 +162,26 @@ func cmdUninstall(args []string) error {
 	return nil
 }
 
+func cmdInit(args []string) error {
+	fs := flag.NewFlagSet("init", flag.ContinueOnError)
+	mode := fs.String("mode", "pr", "delivery mode for this repo: pr | local | validated")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	dir := "."
+	if fs.NArg() > 0 {
+		dir = fs.Arg(0)
+	}
+	notes, err := projectinit.Init(dir, *mode)
+	if err != nil {
+		return err
+	}
+	for _, n := range notes {
+		fmt.Println("  " + n)
+	}
+	return nil
+}
+
 func reapplyContent(p paths.Paths) error {
 	res, err := installer.Apply(orchaembed.Content, p, buildinfo.CurrentVersion())
 	if err != nil {
@@ -197,12 +220,13 @@ Available now (M0 — distribution):
   uninstall          remove managed files (keeps files you edited)
     --purge          also remove ~/.orcha state and data
   doctor [--yes]     check for tmux/git/gh/claude and install what's missing
+  init [--mode m]    set up a repo's AGENTS.md + CLAUDE.md symlink + delivery mode
   version            print version
   help               this message
 
 Coming in later milestones:
   (bare) orcha       launch the manager session
   cc                 open a Claude session attached to the team
-  status spawn teardown send peek supervise daemon init skill ...
+  status spawn teardown send peek supervise daemon skill ...
 `)
 }
