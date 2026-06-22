@@ -108,8 +108,10 @@ func (m *Manager) Spawn(taskID, projectPath string, scout bool, rawCmd string) (
 		kind = "scout"
 	}
 	h := harness.Resolve()
-	// Install the turn-end hook so the supervisor can detect this worker's turns.
+	// Install the turn-end hook so the supervisor can detect this worker's turns,
+	// and pre-accept the harness's folder-trust prompt so the worker runs autonomously.
 	_ = harness.InstallTurnEndHook(h, wt, m.P.TurnEndMarker(taskID))
+	harness.TrustWorktree(h, repo, wt)
 	cmd := rawCmd
 	if cmd == "" {
 		brief := m.P.BriefPath(taskID)
@@ -226,9 +228,15 @@ func (m *Manager) OpenCC(isolated bool) error {
 	if err := tmux.NewWindow(m.Session, window, dir); err != nil {
 		return err
 	}
-	_ = tmux.SendLine(m.Session, window, harness.InteractiveCommand(harness.Resolve()))
+	h := harness.Resolve()
+	if repo, err := worktree.RepoRoot(dir); err == nil {
+		harness.TrustWorktree(h, repo, dir)
+	} else {
+		harness.TrustWorktree(h, dir)
+	}
+	_ = tmux.SendLine(m.Session, window, harness.InteractiveCommand(h))
 	_ = m.Store.Save(state.Task{
-		ID: id, Window: window, Worktree: dir, Harness: harness.Resolve(),
+		ID: id, Window: window, Worktree: dir, Harness: h,
 		Kind: "cc", Created: time.Now(),
 	})
 	return tmux.Attach(m.Session, window)

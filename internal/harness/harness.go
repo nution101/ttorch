@@ -5,6 +5,7 @@ package harness
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -120,4 +121,99 @@ func excludeInWorktree(worktree, pattern string) error {
 // quote single-quotes a path for safe interpolation in a shell command.
 func quote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// TrustWorktree pre-accepts Claude Code's one-time folder-trust prompt for a
+// worker's repo and worktree, so a spawned worker runs without an interactive
+// prompt blocking it. It sets hasTrustDialogAccepted in Claude's config
+// (~/.claude.json) for the given paths. Best-effort and idempotent: it never fails
+// a spawn, never overwrites an unparseable config, and is a no-op when the harness
+// is not claude or ORCHA_NO_AUTOTRUST is set.
+func TrustWorktree(kind string, paths ...string) {
+	if kind != "claude" || os.Getenv("ORCHA_NO_AUTOTRUST") != "" {
+		return
+	}
+	var resolved []string
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		if rp, err := filepath.EvalSymlinks(p); err == nil {
+			p = rp // match how Claude keys projects (resolved real path)
+		}
+		resolved = append(resolved, p)
+	}
+	_ = ensureTrusted(claudeConfigPath(), resolved)
+}
+
+func claudeConfigPath() string {
+	if v := os.Getenv("ORCHA_CLAUDE_JSON"); v != "" { // test/override hook
+		return v
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".claude.json")
+}
+
+// ensureTrusted marks each path trusted in the Claude config at cfgPath, preserving
+// all other content. It returns an error (without writing) if the config exists but
+// is not valid JSON, so a malformed config is never clobbered.
+func ensureTrusted(cfgPath string, paths []string) error {
+	if cfgPath == "" || len(paths) == 0 {
+		return nil
+	}
+	cfg := map[string]any{}
+	if b, err := os.ReadFile(cfgPath); err == nil {
+		if err := json.Unmarshal(b, &cfg); err != nil {
+			return fmt.Errorf("claude config %s is not valid JSON; leaving it untouched: %w", cfgPath, err)
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	projects, ok := cfg["projects"].(map[string]any)
+	if !ok {
+		projects = map[string]any{}
+		cfg["projects"] = projects
+	}
+	changed := false
+	for _, p := range paths {
+		entry, _ := projects[p].(map[string]any)
+		if entry == nil {
+			entry = map[string]any{}
+			projects[p] = entry
+		}
+		if v, _ := entry["hasTrustDialogAccepted"].(bool); !v {
+			entry["hasTrustDialogAccepted"] = true
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	b, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicWrite(cfgPath, b)
+}
+
+func atomicWrite(path string, b []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".orcha-claude-*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer os.Remove(name)
+	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(name, path)
 }
