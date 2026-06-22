@@ -73,11 +73,17 @@ func InstallTurnEndHook(kind, worktree, markerPath string) error {
 		Hooks []hookCmd `json:"hooks"`
 	}
 	type settings struct {
-		Hooks map[string][]hookEntry `json:"hooks"`
+		// IncludeCoAuthoredBy=false stops the agent from adding an AI co-author
+		// trailer to commits — work is authored as the repo's git user, not the agent.
+		IncludeCoAuthoredBy bool                   `json:"includeCoAuthoredBy"`
+		Hooks               map[string][]hookEntry `json:"hooks"`
 	}
-	cfg := settings{Hooks: map[string][]hookEntry{
-		"Stop": {{Hooks: []hookCmd{{Type: "command", Command: "touch " + quote(markerPath)}}}},
-	}}
+	cfg := settings{
+		IncludeCoAuthoredBy: false,
+		Hooks: map[string][]hookEntry{
+			"Stop": {{Hooks: []hookCmd{{Type: "command", Command: "touch " + quote(markerPath)}}}},
+		},
+	}
 	dir := filepath.Join(worktree, ".claude")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
