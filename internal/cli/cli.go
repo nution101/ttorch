@@ -27,6 +27,7 @@ import (
 	"github.com/nution101/orcha/internal/paths"
 	"github.com/nution101/orcha/internal/projectinit"
 	"github.com/nution101/orcha/internal/selfupdate"
+	"github.com/nution101/orcha/internal/skills"
 	"github.com/nution101/orcha/internal/supervisor"
 	"github.com/nution101/orcha/internal/wake"
 )
@@ -62,6 +63,8 @@ func Main(args []string) int {
 		return run(cmdUninstall(rest))
 	case "init":
 		return run(cmdInit(rest))
+	case "skills":
+		return run(cmdSkills(rest))
 	case "manager":
 		return run(mgr().StartManager())
 	case "cc":
@@ -203,6 +206,19 @@ func cmdUninstall(args []string) error {
 			fmt.Println("  " + n)
 		}
 	}
+	return nil
+}
+
+func cmdSkills(args []string) error {
+	if len(args) > 0 && args[0] == "install" {
+		fs := flag.NewFlagSet("skills", flag.ContinueOnError)
+		yes := fs.Bool("yes", false, "install without prompting")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		return skills.Install(os.Stdout, os.Stdin, *yes)
+	}
+	skills.List(os.Stdout)
 	return nil
 }
 
@@ -649,6 +665,7 @@ Setup:
   update [--content-only] self-update the binary, then re-apply content
   uninstall [--purge]     remove managed files (keeps files you edited)
   doctor [--yes]          check/install tmux, git, gh, claude
+  skills [install]        list / install recommended agent skills (e.g. axi)
   init [--mode m]         set up a repo's AGENTS.md + CLAUDE.md + delivery mode
   version | help          version / this message
 

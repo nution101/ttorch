@@ -457,6 +457,9 @@ func writeBriefStub(path, id, kind string) error {
 	}
 	body := fmt.Sprintf(`# Task %s (%s)
 
+Ramp up first: read this repo's AGENTS.md / CLAUDE.md for project context and
+conventions, and use any relevant skills available to you, before changing code.
+
 The manager has not written a detailed brief yet. Wait for instructions, or ask
 the manager via your window. Work only within this worktree; commit on a feature
 branch. Do not address the lead directly.

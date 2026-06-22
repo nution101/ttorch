@@ -46,6 +46,7 @@ orcha doctor      # check/installs tmux, git, gh, claude
 | `orcha wake drain` | Print and clear pending supervision events |
 | `orcha install` / `update` / `uninstall` | Manage the installed content |
 | `orcha doctor [--yes]` | Detect and install missing dependencies |
+| `orcha skills [install]` | List/install recommended agent skills (e.g. axi) |
 | `orcha init [--mode m]` | Set up a repo's AGENTS.md + CLAUDE.md + delivery mode |
 | `orcha version` / `help` | Version / usage |
 

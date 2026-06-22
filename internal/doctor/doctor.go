@@ -101,6 +101,8 @@ func Run(out io.Writer, in io.Reader, autoYes bool) error {
 		}
 	}
 
+	fmt.Fprintln(out, "  tip: 'orcha skills' adds recommended agent skills (e.g. axi)")
+
 	if len(installable) == 0 {
 		fmt.Fprintln(out, "Nothing to auto-install.")
 		return nil

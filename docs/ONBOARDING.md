@@ -7,7 +7,7 @@ of writing and reviewing every line yourself.
 ## 1. Requirements
 
 - **macOS, Linux, or Windows with WSL2.** (orcha is Linux/macOS-native; on Windows it
-  runs inside WSL2 — see §9.)
+  runs inside WSL2 — see §10.)
 - `tmux`, `git`, `gh`, and `claude` (Claude Code). `orcha doctor` installs the missing
   ones for you.
 
@@ -86,7 +86,21 @@ means at least one check failed, so the manager can gate on it.
 > **Trust:** validation runs the repository's own commands on your machine with your
 > credentials. Only run it against repositories and worker output you trust.
 
-## 7. Approvals & safety
+## 7. Skills & memory (ramp up the crew)
+
+Workers get more effective when they start informed:
+
+- **Skills.** A worker is a normal Claude Code session, so it inherits every Agent Skill
+  in `~/.claude/skills` — orcha adds its own on top. `orcha skills` lists recommended
+  skills and `orcha skills install` adds them (e.g. the `axi` guidelines for
+  agent-ergonomic CLIs; needs `npx`/Node). A team can also ship its own skills through
+  orcha's managed content so `orcha update` distributes them to everyone.
+- **Memory.** A repo's committed `AGENTS.md` (with `CLAUDE.md` symlinked to it by
+  `orcha init`) is durable project memory — conventions, gotchas, where things live.
+  Workers read it automatically, and the manager records new durable learnings back into
+  it on delivery, so each task makes the next one faster.
+
+## 8. Approvals & safety
 
 - The manager is **read-only** over your real checkouts; all changes happen in
   disposable worktrees.
@@ -95,7 +109,7 @@ means at least one check failed, so the manager can gate on it.
 - Approvals are time-boxed (`--ttl`, default 10m), single-use, and recorded in
   `~/.orcha/audit.log`.
 
-## 8. Updating
+## 9. Updating
 
 ```sh
 orcha update                 # self-update the binary, then re-apply managed content
@@ -105,14 +119,14 @@ Updates **add** new capabilities and upgrade files you haven't touched, but **ne
 overwrite a file you edited** — your version is kept and the new one is parked beside it
 as `<file>.orcha-new` and reported. Your task state under `~/.orcha` is never touched.
 
-## 9. Windows / WSL2
+## 10. Windows / WSL2
 
 Run orcha **inside WSL2**, not on the Windows host. The PowerShell installer bootstraps
 into your default WSL distribution. WSL1 is not supported (its process/cwd semantics are
 unreliable); `orcha doctor` warns if it detects WSL1. Install your dependencies inside
 the WSL distribution (`orcha doctor` will).
 
-## 10. Configuration
+## 11. Configuration
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -125,7 +139,7 @@ the WSL distribution (`orcha doctor` will).
 | `ORCHA_VALIDATE_TIMEOUT` | `10m` | per-check timeout for `orcha validate` |
 | `ORCHA_REPO` | `nution101/orcha` | release source for install/update |
 
-## 11. Troubleshooting
+## 12. Troubleshooting
 
 - `orcha doctor` — missing dependencies, package manager, WSL status.
 - `orcha daemon status` — is the supervisor running? `orcha supervise` (re)starts it;
@@ -134,7 +148,7 @@ the WSL distribution (`orcha doctor` will).
   tasks against live tmux windows after a crash or restart.
 - `orcha wake drain` — pending supervision events (the manager drains these each turn).
 
-## 12. Uninstall
+## 13. Uninstall
 
 ```sh
 orcha uninstall            # remove managed files (keeps anything you edited)

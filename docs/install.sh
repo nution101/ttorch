@@ -78,3 +78,4 @@ echo "Installed orcha ${VERSION} -> ${BIN_PATH}"
 echo "Laying down managed content..."
 "$BIN_PATH" install
 echo "Done. Run 'orcha doctor' to check dependencies (tmux, git, gh, claude)."
+echo "Optional: 'orcha skills install' adds recommended agent skills (e.g. axi)."

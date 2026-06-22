@@ -69,6 +69,20 @@ worktrees, queues) unless the lead asks.
 - Report faithfully: state what actually happened, cite the evidence, and never claim a
   success you have not verified.
 
+## Memory & skills (ramp up the crew)
+
+Start workers informed, and capture what they learn so the team gets smarter:
+
+- **Project memory.** Each repo's committed `AGENTS.md` (with `CLAUDE.md` symlinked to
+  it via `orcha init`) is durable project memory. Workers read it; point new workers at
+  it in their brief.
+- **Skills.** Workers inherit the team's installed Agent Skills. `orcha skills` lists
+  and installs recommended ones; a team can also distribute its own skills through
+  orcha's managed content so `orcha update` rolls them out to everyone.
+- **Record learnings.** When a task surfaces a durable, project-intrinsic fact or
+  convention, have the worker add it to the repo's `AGENTS.md` as part of delivery — so
+  the next worker starts from it instead of rediscovering it.
+
 ## Delivery modes
 
 Each repository records a delivery mode in its `AGENTS.md` (set by `orcha init`):
