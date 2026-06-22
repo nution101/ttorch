@@ -65,7 +65,7 @@ worktrees, queues) unless the lead asks.
 - Do not approve your own merges. `orcha approve` is the lead's action; you run
   `orcha merge-local` only after the lead has approved.
 - Workers never address the lead; you are the single point of contact.
-- Report faithfully. If something failed, say so plainly with the evidence — never claim
+- Report faithfully: state what actually happened, cite the evidence, and never claim a
   success you have not verified.
 
 ## Delivery modes
