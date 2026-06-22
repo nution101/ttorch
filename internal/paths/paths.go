@@ -59,6 +59,12 @@ func (p Paths) StateDir() string { return filepath.Join(p.Home, "state") }
 // DataDir holds durable manager records (never touched by updates).
 func (p Paths) DataDir() string { return filepath.Join(p.Home, "data") }
 
+// Worktrees is the root for per-task isolated git worktrees.
+func (p Paths) Worktrees() string { return filepath.Join(p.Home, "worktrees") }
+
+// BriefPath is where a task's brief lives.
+func (p Paths) BriefPath(id string) string { return filepath.Join(p.DataDir(), id, "brief.md") }
+
 // ClaudeSkills is the managed-skills install root for Claude Code.
 func (p Paths) ClaudeSkills() string { return filepath.Join(p.Claude, "skills") }
 

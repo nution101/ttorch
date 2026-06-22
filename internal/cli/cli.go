@@ -11,12 +11,15 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
+	"strings"
 
 	orchaembed "github.com/nution101/orcha"
 	"github.com/nution101/orcha/internal/buildinfo"
 	"github.com/nution101/orcha/internal/doctor"
 	"github.com/nution101/orcha/internal/installer"
 	"github.com/nution101/orcha/internal/manifest"
+	"github.com/nution101/orcha/internal/orchestrator"
 	"github.com/nution101/orcha/internal/paths"
 	"github.com/nution101/orcha/internal/projectinit"
 	"github.com/nution101/orcha/internal/selfupdate"
@@ -32,8 +35,8 @@ func assetName(tag string) string {
 // Main runs orcha and returns a process exit code.
 func Main(args []string) int {
 	if len(args) == 0 {
-		usage(os.Stdout)
-		return 0
+		// Bare `orcha` launches the manager session.
+		return run(mgr().StartManager())
 	}
 	cmd, rest := args[0], args[1:]
 	switch cmd {
@@ -53,8 +56,21 @@ func Main(args []string) int {
 		return run(cmdUninstall(rest))
 	case "init":
 		return run(cmdInit(rest))
-	case "manager", "status", "spawn", "worker", "cc", "teardown", "send", "peek",
-		"supervise", "daemon", "skill", "review-diff", "merge-local":
+	case "manager":
+		return run(mgr().StartManager())
+	case "cc":
+		return run(cmdCC(rest))
+	case "spawn":
+		return run(cmdSpawn(rest))
+	case "status":
+		return run(cmdStatus())
+	case "peek":
+		return run(cmdPeek(rest))
+	case "send":
+		return run(cmdSend(rest))
+	case "teardown":
+		return run(cmdTeardown(rest))
+	case "worker", "supervise", "daemon", "skill", "review-diff", "merge-local":
 		fmt.Fprintf(os.Stderr, "orcha %s: not available yet — arrives in a later milestone.\n", cmd)
 		return 3
 	default:
@@ -182,6 +198,109 @@ func cmdInit(args []string) error {
 	return nil
 }
 
+func mgr() *orchestrator.Manager { return orchestrator.New(paths.Default()) }
+
+func cmdSpawn(args []string) error {
+	// Task id and repo are the first two positionals; flags follow (the stdlib
+	// flag parser stops at the first positional, so parse the remainder).
+	if len(args) < 2 {
+		return errors.New(`usage: orcha spawn <task-id> <repo-path> [--scout] [--cmd "..."]`)
+	}
+	id, repo := args[0], args[1]
+	fs := flag.NewFlagSet("spawn", flag.ContinueOnError)
+	scout := fs.Bool("scout", false, "investigation task: report only, no code changes")
+	raw := fs.String("cmd", "", "raw command to run instead of the default harness launch")
+	if err := fs.Parse(args[2:]); err != nil {
+		return err
+	}
+	t, err := mgr().Spawn(id, repo, *scout, *raw)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("spawned %s (%s) in window %s\n  worktree: %s\n", t.ID, t.Kind, t.Window, t.Worktree)
+	return nil
+}
+
+func cmdStatus() error {
+	m := mgr()
+	tasks, err := m.Status()
+	if err != nil {
+		return err
+	}
+	if len(tasks) == 0 {
+		fmt.Println("no active workers. dispatch with: orcha spawn <task-id> <repo-path>")
+		return nil
+	}
+	fmt.Printf("%-16s %-6s %-8s %-12s %s\n", "TASK", "KIND", "STATE", "WINDOW", "PROJECT")
+	for _, t := range tasks {
+		st := "gone"
+		if m.Live(t) {
+			st = "running"
+		}
+		fmt.Printf("%-16s %-6s %-8s %-12s %s\n", t.ID, t.Kind, st, t.Window, t.Project)
+	}
+	return nil
+}
+
+func cmdPeek(args []string) error {
+	if len(args) < 1 {
+		return errors.New("usage: orcha peek <task-id> [lines]")
+	}
+	lines := 40
+	if len(args) > 1 {
+		if n, err := strconv.Atoi(args[1]); err == nil {
+			lines = n
+		}
+	}
+	out, err := mgr().Peek(args[0], lines)
+	if err != nil {
+		return err
+	}
+	fmt.Println(out)
+	return nil
+}
+
+func cmdSend(args []string) error {
+	if len(args) < 2 {
+		return errors.New("usage: orcha send <task-id> <text...>")
+	}
+	if err := mgr().Send(args[0], strings.Join(args[1:], " ")); err != nil {
+		return err
+	}
+	fmt.Printf("sent to %s\n", args[0])
+	return nil
+}
+
+func cmdTeardown(args []string) error {
+	if len(args) < 1 {
+		return errors.New("usage: orcha teardown <task-id> [--force]")
+	}
+	id := args[0]
+	fs := flag.NewFlagSet("teardown", flag.ContinueOnError)
+	force := fs.Bool("force", false, "discard unlanded work")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	notes, err := mgr().Teardown(id, *force)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("tore down %s\n", id)
+	for _, n := range notes {
+		fmt.Println("  " + n)
+	}
+	return nil
+}
+
+func cmdCC(args []string) error {
+	fs := flag.NewFlagSet("cc", flag.ContinueOnError)
+	isolated := fs.Bool("isolated", false, "open in its own isolated worktree")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	return mgr().OpenCC(*isolated)
+}
+
 func reapplyContent(p paths.Paths) error {
 	res, err := installer.Apply(orchaembed.Content, p, buildinfo.CurrentVersion())
 	if err != nil {
@@ -209,24 +328,29 @@ func printResult(w io.Writer, res *installer.Result) {
 }
 
 func usage(w io.Writer) {
-	fmt.Fprint(w, `orcha — manage an always-on team of Claude Code agents
+	fmt.Fprint(w, `orcha — manage a team of Claude Code agents
 
-Usage: orcha <command> [flags]
+Usage: orcha [command] [flags]   (bare 'orcha' launches the manager session)
 
-Available now (M0 — distribution):
-  install            install/update the managed skills, agents, and guidance
-  update             self-update the binary, then re-apply content
-    --content-only   re-apply embedded content without replacing the binary
-  uninstall          remove managed files (keeps files you edited)
-    --purge          also remove ~/.orcha state and data
-  doctor [--yes]     check for tmux/git/gh/claude and install what's missing
-  init [--mode m]    set up a repo's AGENTS.md + CLAUDE.md symlink + delivery mode
-  version            print version
-  help               this message
+Team:
+  (bare) orcha            launch the manager session and attach
+  cc [--isolated]         open a Claude session attached to the team
+  spawn <id> <repo>       start a worker on a task in an isolated worktree
+    --scout                 investigation only (report, no code changes)
+    --cmd "..."             run a raw command instead of the default harness
+  status                  list active workers
+  peek <id> [lines]       read recent output from a worker
+  send <id> <text...>     type a message into a worker
+  teardown <id> [--force] finish a worker (refuses to discard unlanded work)
 
-Coming in later milestones:
-  (bare) orcha       launch the manager session
-  cc                 open a Claude session attached to the team
-  status spawn teardown send peek supervise daemon skill ...
+Setup:
+  install                 install/update managed skills, agents, and guidance
+  update [--content-only] self-update the binary, then re-apply content
+  uninstall [--purge]     remove managed files (keeps files you edited)
+  doctor [--yes]          check/install tmux, git, gh, claude
+  init [--mode m]         set up a repo's AGENTS.md + CLAUDE.md + delivery mode
+  version | help          version / this message
+
+Coming later: supervise, daemon, skill, review-diff, merge-local
 `)
 }
