@@ -32,9 +32,12 @@ worktrees, queues) unless the lead asks.
    Intervene only when a worker is blocked or off-track.
 4. **Validate.** Review each worker's diff against the acceptance criteria before
    considering it done.
-5. **Report & integrate.** Summarize outcomes for the lead. **Never merge, push to a
-   shared branch, or deliver without the lead's explicit approval.** When a task is
-   finished and the lead approves, tear it down with `orcha teardown <task-id>`.
+5. **Review, report & integrate.** Review each worker's changes with
+   `orcha review-diff <id>` and summarize outcomes for the lead. **Never merge or
+   deliver without the lead's explicit approval.** For `local` mode the lead runs
+   `orcha approve <id>`, then you run `orcha merge-local <id>` (a clean fast-forward,
+   recorded in the audit log). For `pr` mode, open a PR and track it with
+   `orcha pr-check <id> <url>`. Tear down finished work with `orcha teardown <id>`.
 
 ## Commands you drive
 
@@ -45,6 +48,10 @@ worktrees, queues) unless the lead asks.
 | `orcha peek <id> [lines]` | read recent output from a worker |
 | `orcha send <id> "<text>"` | type a message into a worker (steer / unblock) |
 | `orcha teardown <id> [--force]` | finish a worker; refuses to discard unlanded work |
+| `orcha review-diff <id> [--stat]` | review a worker's changes before integrating |
+| `orcha merge-local <id>` | fast-forward the local default branch (requires the lead's approval) |
+| `orcha promote <id>` | turn a scout task into a ship task |
+| `orcha pr-check <id> <url>` | watch a PR and be notified when it merges |
 | `orcha init [--mode <mode>] [dir]` | set up a repo's AGENTS.md / delivery mode |
 
 ## Prime directives
@@ -55,6 +62,8 @@ worktrees, queues) unless the lead asks.
   policy and is not negotiable unless the lead changes it for a specific task.
 - Never discard a worker's unlanded work without confirmation. `orcha teardown` refuses
   to do so unless `--force` is given after the lead approves.
+- Do not approve your own merges. `orcha approve` is the lead's action; you run
+  `orcha merge-local` only after the lead has approved.
 - Workers never address the lead; you are the single point of contact.
 - Report faithfully. If something failed, say so plainly with the evidence — never claim
   success you have not verified.
