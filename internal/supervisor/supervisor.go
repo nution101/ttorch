@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
+
 	"github.com/nution101/orcha/internal/paths"
 	"github.com/nution101/orcha/internal/state"
 	"github.com/nution101/orcha/internal/tmux"
@@ -73,6 +75,21 @@ func (s *Supervisor) Run(ctx context.Context) error {
 
 	t := time.NewTicker(s.Cfg.Poll)
 	defer t.Stop()
+
+	// Watch the state dir so turn-end/status writes wake the supervisor instantly,
+	// on top of the periodic sweep. If the watcher can't start, we degrade to
+	// polling only (the channels stay nil and never fire).
+	var events chan fsnotify.Event
+	var errsCh chan error
+	if w, err := fsnotify.NewWatcher(); err == nil {
+		defer w.Close()
+		_ = os.MkdirAll(s.P.StateDir(), 0o755)
+		if err := w.Add(s.P.StateDir()); err == nil {
+			events = w.Events
+			errsCh = w.Errors
+		}
+	}
+
 	s.beat()
 	for {
 		select {
@@ -81,13 +98,32 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		case <-t.C:
 			s.beat()
 			s.tick()
+		case ev, ok := <-events:
+			if !ok {
+				events = nil
+				continue
+			}
+			if ev.Op&(fsnotify.Create|fsnotify.Write) != 0 {
+				s.scanSignals()
+			}
+		case _, ok := <-errsCh:
+			if !ok {
+				errsCh = nil
+			}
 		}
 	}
 }
 
-// tick performs one supervision cycle: detect turn-end/status signals, stalled
-// panes, and a due heartbeat, appending each to the wake-queue.
+// tick performs one full supervision cycle.
 func (s *Supervisor) tick() {
+	s.scanSignals()
+	s.scanStale()
+	s.heartbeat()
+}
+
+// scanSignals turns new turn-end/status writes into signal wakes (idempotent:
+// each file fires once per modification).
+func (s *Supervisor) scanSignals() {
 	entries, _ := os.ReadDir(s.P.StateDir())
 	for _, e := range entries {
 		name := e.Name()
@@ -105,35 +141,43 @@ func (s *Supervisor) tick() {
 			_ = s.Q.Append("signal", id, name)
 		}
 	}
+}
 
-	if tmux.Available() {
-		tasks, _ := s.Store.List()
-		for _, task := range tasks {
-			if task.Kind == "cc" {
-				continue
+// scanStale emits a wake when a worker's pane stops changing and shows no busy
+// indicator for two consecutive sweeps.
+func (s *Supervisor) scanStale() {
+	if !tmux.Available() {
+		return
+	}
+	tasks, _ := s.Store.List()
+	for _, task := range tasks {
+		if task.Kind == "cc" {
+			continue
+		}
+		out, err := tmux.CapturePane(s.Session, task.Window, 6)
+		if err != nil {
+			continue
+		}
+		if busy(out) {
+			s.staleCount[task.ID] = 0
+			s.paneHash[task.ID] = hash(out)
+			continue
+		}
+		h := hash(out)
+		if s.paneHash[task.ID] == h {
+			s.staleCount[task.ID]++
+			if s.staleCount[task.ID] == 2 {
+				_ = s.Q.Append("stale", task.ID, task.Window)
 			}
-			out, err := tmux.CapturePane(s.Session, task.Window, 6)
-			if err != nil {
-				continue
-			}
-			if busy(out) {
-				s.staleCount[task.ID] = 0
-				s.paneHash[task.ID] = hash(out)
-				continue
-			}
-			h := hash(out)
-			if s.paneHash[task.ID] == h {
-				s.staleCount[task.ID]++
-				if s.staleCount[task.ID] == 2 {
-					_ = s.Q.Append("stale", task.ID, task.Window)
-				}
-			} else {
-				s.paneHash[task.ID] = h
-				s.staleCount[task.ID] = 0
-			}
+		} else {
+			s.paneHash[task.ID] = h
+			s.staleCount[task.ID] = 0
 		}
 	}
+}
 
+// heartbeat emits a periodic review wake.
+func (s *Supervisor) heartbeat() {
 	if s.now().Sub(s.lastHeartbeat) >= s.Cfg.Heartbeat {
 		_ = s.Q.Append("heartbeat", "", "")
 		s.lastHeartbeat = s.now()

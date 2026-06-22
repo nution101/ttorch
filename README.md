@@ -4,10 +4,11 @@ Run a team of Claude Code agents. You act as the **manager**: plan the work, del
 isolated **worker** sessions, review the results, and approve delivery — instead of
 writing and reviewing every line by hand.
 
-> **Status: M0 (foundation/distribution).** This milestone ships the install/update
-> machinery, the global Claude Code surface, and dependency setup. The orchestration
-> runtime (tmux sessions, the supervisor daemon, worker dispatch) lands in later
-> milestones. See `ORCHA_PLAN.md` for the full architecture and roadmap.
+> **Status: M0–M3 + hardening.** Installs and updates safely, ships the global Claude
+> Code surface, dispatches workers into isolated tmux sessions on a reusable worktree
+> pool, and runs a zero-token supervisor daemon. Still to come: the full delivery
+> lifecycle (review/merge/PR), the validation gate, and Windows-native polish. See
+> `ORCHA_PLAN.md` for the architecture and roadmap.
 
 ## Install
 
@@ -29,15 +30,23 @@ make install      # builds into ~/.orcha/bin, links into ~/.local/bin, lays cont
 orcha doctor      # check/installs tmux, git, gh, claude
 ```
 
-## Commands (M0)
+## Commands
 
 | Command | Description |
 | --- | --- |
-| `orcha install` | Install/update managed skills, agents, and global guidance |
-| `orcha update [--content-only]` | Self-update the binary, then re-apply content |
-| `orcha uninstall [--purge]` | Remove managed files (keeps files you edited) |
+| `orcha` | Launch the manager session and attach |
+| `orcha cc [--isolated]` | Open a Claude session attached to the team |
+| `orcha spawn <id> <repo> [--scout]` | Start a worker on a task in an isolated worktree |
+| `orcha status` | List active workers |
+| `orcha peek <id> [lines]` | Read recent output from a worker |
+| `orcha send <id> <text>` | Type a message into a worker |
+| `orcha teardown <id> [--force]` | Finish a worker (returns its worktree to the pool) |
+| `orcha supervise` / `orcha daemon …` | Run the background supervisor |
+| `orcha wake drain` | Print and clear pending supervision events |
+| `orcha install` / `update` / `uninstall` | Manage the installed content |
 | `orcha doctor [--yes]` | Detect and install missing dependencies |
-| `orcha version` | Print version |
+| `orcha init [--mode m]` | Set up a repo's AGENTS.md + CLAUDE.md + delivery mode |
+| `orcha version` / `help` | Version / usage |
 
 ## How updates stay safe
 

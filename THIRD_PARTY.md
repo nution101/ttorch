@@ -1,16 +1,24 @@
-# Third-party code
+# Third-party
 
-orcha's design reuses logic from these MIT-licensed upstream projects. Later milestones
-vendor portions of their Go packages into `internal/` with attribution; as of M0, no
-third-party source has been vendored yet.
+## Runtime dependencies
 
-When code is vendored, record it here with the source repository, the commit/version, the
-files taken, and the original MIT copyright. Keep upstream copyright notices intact in the
-vendored files. Do not let upstream project names or identifiers leak into orcha's package
-names, environment variables, on-disk state, or user-facing text.
+- `github.com/fsnotify/fsnotify` (BSD-3-Clause) — filesystem notifications; the
+  supervisor watches the state directory for instant signal detection.
+- `golang.org/x/sys` (BSD-3-Clause) — transitive (fsnotify).
 
-Planned reuse:
+## Design credit
 
-- **treehouse** (MIT) — worktree pool, process termination, git helpers.
-- **no-mistakes** (MIT) — self-update engine, global skill install, daemon + IPC,
-  harness adapters.
+orcha's design draws on these MIT-licensed projects. Where their approach is
+reimplemented (not copied), they are credited here:
+
+- **treehouse** (MIT) — the reusable worktree-pool model in `internal/worktree`
+  (reuse idle clean slots, reset tracked files while keeping untracked caches,
+  reap pane process groups on return).
+- **no-mistakes** (MIT) — the self-managing single-binary substrate: self-update
+  with atomic replace + macOS quarantine handling (`internal/selfupdate`), global
+  skill install, and the long-lived supervisor model (`internal/supervisor`).
+
+If upstream source is ever copied verbatim, record it here with the source repo,
+commit/version, files taken, and original MIT copyright, and keep the upstream
+notice intact in the vendored files. Do not let upstream project names leak into
+orcha's package names, environment variables, on-disk state, or user-facing text.

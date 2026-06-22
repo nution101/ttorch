@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/nution101/orcha/internal/harness"
@@ -22,11 +23,41 @@ type Manager struct {
 	P       paths.Paths
 	Session string
 	Store   state.Store
+	Pool    worktree.Pool
 }
 
 // New builds a Manager from the standard paths.
 func New(p paths.Paths) *Manager {
-	return &Manager{P: p, Session: tmux.SessionName(), Store: state.Store{Dir: p.StateDir()}}
+	return &Manager{
+		P:       p,
+		Session: tmux.SessionName(),
+		Store:   state.Store{Dir: p.StateDir()},
+		Pool:    worktree.Pool{Root: p.Worktrees(), Max: worktree.MaxFromEnv()},
+	}
+}
+
+// inUseWorktrees returns the worktree paths held by active tasks for a repo.
+func (m *Manager) inUseWorktrees(repo string) []string {
+	tasks, _ := m.Store.List()
+	var out []string
+	for _, t := range tasks {
+		if t.Project == repo && t.Worktree != "" {
+			out = append(out, t.Worktree)
+		}
+	}
+	return out
+}
+
+// killPaneProcesses reaps a window's pane process group so a returned worktree is
+// not held by lingering children.
+func (m *Manager) killPaneProcesses(window string) {
+	pid := tmux.PanePID(m.Session, window)
+	if pid <= 0 {
+		return
+	}
+	_ = syscall.Kill(-pid, syscall.SIGTERM)
+	time.Sleep(150 * time.Millisecond)
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
 }
 
 func (m *Manager) requireTmux() error {
@@ -58,7 +89,7 @@ func (m *Manager) Spawn(taskID, projectPath string, scout bool, rawCmd string) (
 		return zero, fmt.Errorf("task %q already has a window; tear it down first", taskID)
 	}
 
-	wt, err := worktree.Acquire(m.P.Worktrees(), repo, taskID)
+	wt, err := m.Pool.Acquire(repo, m.inUseWorktrees(repo))
 	if err != nil {
 		return zero, err
 	}
@@ -137,10 +168,13 @@ func (m *Manager) Teardown(taskID string, force bool) ([]string, error) {
 			return nil, fmt.Errorf("task %q has uncommitted changes; review it, then 'orcha teardown %s --force'", taskID, taskID)
 		}
 	}
+	m.killPaneProcesses(t.Window)
 	_ = tmux.KillWindow(m.Session, t.Window)
-	if t.Project != "" {
-		if err := worktree.Remove(t.Project, t.Worktree); err != nil {
+	if t.Project != "" && t.Worktree != "" {
+		if err := m.Pool.Release(t.Project, t.Worktree); err != nil {
 			notes = append(notes, "worktree: "+err.Error())
+		} else {
+			notes = append(notes, "worktree returned to pool for reuse")
 		}
 	}
 	if err := m.Store.Remove(taskID); err != nil {
@@ -178,7 +212,7 @@ func (m *Manager) OpenCC(isolated bool) error {
 	window := id
 	if isolated {
 		if repo, err := worktree.RepoRoot(dir); err == nil {
-			if wt, err := worktree.Acquire(m.P.Worktrees(), repo, id); err == nil {
+			if wt, err := m.Pool.Acquire(repo, m.inUseWorktrees(repo)); err == nil {
 				dir = wt
 			}
 		}

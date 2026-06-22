@@ -129,6 +129,20 @@ func CapturePane(session, window string, n int) (string, error) {
 	return run("capture-pane", "-p", "-t", target(session, window), "-S", "-"+strconv.Itoa(n))
 }
 
+// PanePID returns the PID of the process running in a window's pane, or 0.
+func PanePID(session, window string) int {
+	out, err := run("list-panes", "-t", target(session, window), "-F", "#{pane_pid}")
+	if err != nil {
+		return 0
+	}
+	line := strings.TrimSpace(strings.SplitN(out, "\n", 2)[0])
+	pid, err := strconv.Atoi(line)
+	if err != nil {
+		return 0
+	}
+	return pid
+}
+
 // KillWindow removes a window (best effort).
 func KillWindow(session, window string) error {
 	_, err := run("kill-window", "-t", target(session, window))

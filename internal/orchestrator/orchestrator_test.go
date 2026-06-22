@@ -84,12 +84,22 @@ func TestSpawnPeekTeardown(t *testing.T) {
 	if m.Live(task) {
 		t.Fatal("window still alive after teardown")
 	}
-	if _, err := os.Stat(task.Worktree); !os.IsNotExist(err) {
-		t.Fatal("worktree not removed")
+	if _, err := os.Stat(task.Worktree); err != nil {
+		t.Fatal("worktree should be kept in the pool for reuse after teardown")
 	}
 	if tasks, _ := m.Status(); len(tasks) != 0 {
 		t.Fatalf("status returned %d tasks after teardown, want 0", len(tasks))
 	}
+
+	// A new task reuses the now-idle pooled worktree.
+	task2, err := m.Spawn("t2", repo, false, "sleep 30")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task2.Worktree != task.Worktree {
+		t.Fatalf("expected worktree reuse: %q vs %q", task2.Worktree, task.Worktree)
+	}
+	_, _ = m.Teardown("t2", true)
 }
 
 func TestTeardownRefusesDirtyWorktree(t *testing.T) {
