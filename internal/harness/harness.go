@@ -37,11 +37,42 @@ func Available(kind string) bool {
 	return err == nil
 }
 
+// EffortArgs returns the extra `claude` arguments that set the reasoning effort
+// for a spawned session. The level is read from TTORCH_EFFORT (default
+// "ultracode"); set TTORCH_EFFORT=off to leave Claude's own default untouched.
+//
+// "ultracode" is not an --effort level: it is a session feature (xhigh reasoning
+// plus dynamic workflow orchestration) enabled via --settings. The discrete
+// levels (low|medium|high|xhigh|max) go through the --effort flag. An
+// unrecognized value falls back to ultracode rather than passing something
+// claude would reject.
+func EffortArgs(kind string) string {
+	if kind != "claude" {
+		return ""
+	}
+	switch level := effortLevel(); level {
+	case "off", "none", "default":
+		return ""
+	case "low", "medium", "high", "xhigh", "max":
+		return " --effort " + level
+	default: // "ultracode" and anything unrecognized
+		return ` --settings '{"ultracode":true}'`
+	}
+}
+
+func effortLevel() string {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("TTORCH_EFFORT")))
+	if v == "" {
+		return "ultracode"
+	}
+	return v
+}
+
 // InteractiveCommand is the shell command to start an interactive session.
 func InteractiveCommand(kind string) string {
 	switch kind {
 	case "claude":
-		return "claude --dangerously-skip-permissions"
+		return "claude --dangerously-skip-permissions" + EffortArgs(kind)
 	default:
 		return kind
 	}
@@ -51,7 +82,7 @@ func InteractiveCommand(kind string) string {
 func BriefCommand(kind, briefPath string) string {
 	switch kind {
 	case "claude":
-		return "claude --dangerously-skip-permissions \"$(cat " + quote(briefPath) + ")\""
+		return "claude --dangerously-skip-permissions" + EffortArgs(kind) + " \"$(cat " + quote(briefPath) + ")\""
 	default:
 		return kind
 	}

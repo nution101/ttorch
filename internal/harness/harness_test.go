@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -28,6 +29,54 @@ func trusted(projects map[string]any, path string) bool {
 	}
 	v, _ := e["hasTrustDialogAccepted"].(bool)
 	return v
+}
+
+func TestEffortArgs(t *testing.T) {
+	cases := []struct {
+		env  string
+		want string
+	}{
+		{"", ` --settings '{"ultracode":true}'`}, // default
+		{"ultracode", ` --settings '{"ultracode":true}'`},
+		{"MAX", " --effort max"}, // case-insensitive
+		{"xhigh", " --effort xhigh"},
+		{"high", " --effort high"},
+		{"off", ""},
+		{"none", ""},
+		{"default", ""},
+		{"bogus", ` --settings '{"ultracode":true}'`}, // unrecognized -> ultracode
+	}
+	for _, c := range cases {
+		t.Setenv("TTORCH_EFFORT", c.env)
+		if got := EffortArgs("claude"); got != c.want {
+			t.Errorf("TTORCH_EFFORT=%q: got %q, want %q", c.env, got, c.want)
+		}
+	}
+	// Non-claude harnesses never get effort args.
+	t.Setenv("TTORCH_EFFORT", "ultracode")
+	if got := EffortArgs("other"); got != "" {
+		t.Errorf("non-claude harness should get no effort args, got %q", got)
+	}
+}
+
+func TestLaunchCommandsCarryEffort(t *testing.T) {
+	t.Setenv("TTORCH_EFFORT", "") // default: ultracode
+	want := `claude --dangerously-skip-permissions --settings '{"ultracode":true}'`
+	if got := InteractiveCommand("claude"); got != want {
+		t.Errorf("interactive: got %q, want %q", got, want)
+	}
+	brief := BriefCommand("claude", "/tmp/b.md")
+	if !strings.Contains(brief, `--settings '{"ultracode":true}'`) {
+		t.Errorf("brief command missing ultracode setting: %q", brief)
+	}
+	if !strings.HasSuffix(brief, `"$(cat '/tmp/b.md')"`) {
+		t.Errorf("brief command should end with the brief prompt: %q", brief)
+	}
+
+	t.Setenv("TTORCH_EFFORT", "off")
+	if got := InteractiveCommand("claude"); got != "claude --dangerously-skip-permissions" {
+		t.Errorf("off should drop effort args, got %q", got)
+	}
 }
 
 func TestEnsureTrusted_CreatesAndPreserves(t *testing.T) {

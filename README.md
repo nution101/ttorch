@@ -73,6 +73,22 @@ additionally confirm those checksums came from this repo's release workflow.
 | `ttorch profile [dir]` | Derive the repo's stack/commands/conventions into AGENTS.md |
 | `ttorch version` / `help` | Version / usage |
 
+## Session effort
+
+Every Claude session ttorch spawns — the manager, `ttorch cc`, and each worker — runs in
+**ultracode** mode by default (the highest-capability mode: `xhigh` reasoning plus dynamic
+workflow orchestration). Tune it with `TTORCH_EFFORT`:
+
+| `TTORCH_EFFORT` | Effect |
+| --- | --- |
+| `ultracode` (default) | `xhigh` reasoning + workflow orchestration |
+| `max` / `xhigh` / `high` / `medium` / `low` | Set a fixed `--effort` level (`max` is the highest raw reasoning tier) |
+| `off` | Leave Claude's own default effort untouched |
+
+```sh
+TTORCH_EFFORT=max ttorch        # e.g. highest reasoning, no nested orchestration
+```
+
 ## Updating
 
 ```sh
