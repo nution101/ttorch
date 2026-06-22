@@ -32,6 +32,10 @@ make install          # builds into ~/.ttorch/bin, links into ~/.local/bin, lays
 The binary lives in the user-owned `~/.ttorch/bin/ttorch` with a PATH symlink at
 `~/.local/bin/ttorch`. Make sure `~/.local/bin` is on your `PATH`.
 
+Release downloads are sha256-checked against the release's `checksums.txt` during
+install; the checksums are also cosign-signed — see **Verifying a release** in the
+README to confirm a download independently.
+
 ## 3. First run
 
 ```sh

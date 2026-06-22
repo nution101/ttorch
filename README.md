@@ -4,9 +4,13 @@ Run a team of Claude Code agents. You act as the **manager**: plan the work, del
 isolated **worker** sessions, review the results, and approve delivery — instead of
 writing and reviewing every line by hand.
 
-> **Status: M0–M5.** Installs/updates safely, ships the global Claude Code surface,
-> dispatches workers into isolated tmux worktrees, runs a zero-token supervisor, and
-> gates delivery behind review + validation + your explicit approval.
+[![CI](https://github.com/nution101/ttorch/actions/workflows/ci.yml/badge.svg)](https://github.com/nution101/ttorch/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/nution101/ttorch?sort=semver)](https://github.com/nution101/ttorch/releases/latest)
+
+> ttorch installs/updates safely, ships a global Claude Code surface, dispatches workers
+> into isolated tmux worktrees, runs a zero-token supervisor, gates delivery behind
+> review + validation + your explicit approval, and learns each repo's conventions over
+> time.
 >
 > **New here? Start with [`docs/ONBOARDING.md`](docs/ONBOARDING.md).** Architecture and
 > roadmap live in `TTORCH_PLAN.md`.
@@ -68,13 +72,18 @@ additionally confirm those checksums came from this repo's release workflow.
 | `ttorch profile [dir]` | Derive the repo's stack/commands/conventions into AGENTS.md |
 | `ttorch version` / `help` | Version / usage |
 
-## How updates stay safe
+## Updating
 
-`ttorch update` adds newly shipped skills and upgrades files you have not touched, but it
-**never overwrites a file you edited**. Your version is kept; the new one is parked beside
-it as `<name>.ttorch-new` and reported. A per-file sha256 manifest (`~/.ttorch/manifest.json`)
-distinguishes "ttorch wrote this and it's unchanged" from "the developer changed it". Your
-task state under `~/.ttorch/state` and `~/.ttorch/data` is never touched by updates.
+```sh
+ttorch update                 # self-update the binary, then re-apply managed content
+ttorch update --content-only  # re-apply content only (no binary change)
+```
+
+Updates add newly shipped skills and upgrade files you have not touched, but **never
+overwrite a file you edited** — your version is kept and the new one is parked beside it
+as `<name>.ttorch-new` and reported. A per-file sha256 manifest (`~/.ttorch/manifest.json`)
+distinguishes "ttorch wrote this and it's unchanged" from "you changed it". Your task
+state under `~/.ttorch/state` and `~/.ttorch/data` is never touched.
 
 ## What gets installed
 
@@ -93,11 +102,25 @@ task state under `~/.ttorch/state` and `~/.ttorch/data` is never touched by upda
 ```sh
 make build    # build ./bin/ttorch
 make test     # go test ./...
-make lint     # go vet + gofmt check + vocabulary lint
-make dist     # cross-compile + checksums into ./dist
+make lint     # go vet + gofmt check
+make dist     # cross-compile all targets + checksums into ./dist
 ```
 
 Contributions keep a professional, neutral tone — no themed personas or role-play vocabulary.
+
+## Releases & CI
+
+- **CI** (`.github/workflows/ci.yml`) runs `go vet`, the `gofmt` check, and `go test` on
+  macOS and Linux for every push and pull request.
+- **Releases are automated** by [release-please](https://github.com/googleapis/release-please):
+  as `feat:` / `fix:` commits land on `main` it maintains a release pull request; merging
+  that PR tags the version, then the workflow cross-compiles the binaries, generates
+  `checksums.txt`, **signs it with cosign (keyless)**, and attaches everything to the
+  GitHub release.
+- **Manual release** (fallback): `git tag vX.Y.Z && git push origin vX.Y.Z` runs the same
+  build → sign → publish via `.github/workflows/release.yml`.
+- Artifacts are named `ttorch-<version>-<os>-<arch>.tar.gz`; `install.sh`/`install.ps1`
+  and `ttorch update` resolve the latest release automatically.
 
 ## License
 
