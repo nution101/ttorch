@@ -13,6 +13,11 @@ user-invocable: true
 
 Gate a task's work on the repository's own checks before it is delivered.
 
+> **Trust:** `orcha validate` runs the repository's own build/test/lint commands —
+> including any `.orcha/validate.sh` — on your machine with your credentials. Only run
+> it against repositories and worker output you trust. Each check runs under a timeout
+> (`ORCHA_VALIDATE_TIMEOUT`, default 10m).
+
 ## How to run
 
 `orcha validate <task-id>` runs the detected checks in the worker's worktree and prints
@@ -20,7 +25,7 @@ Gate a task's work on the repository's own checks before it is delivered.
 
 - Go repos: `go build`, `go vet`, `gofmt`, `go test`.
 - Node repos: the `build`/`lint`/`test` scripts present in `package.json`.
-- Any repo can override detection with an executable `.orcha/validate.sh`.
+- Any repo can override detection with a `.orcha/validate.sh` script (run via `sh`).
 
 ## What to do with the result
 

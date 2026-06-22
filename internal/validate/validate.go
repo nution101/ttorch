@@ -1,14 +1,23 @@
 // Package validate runs a repository's own checks (build / vet / lint / test) against
 // a worker's worktree before delivery. Checks are auto-detected per ecosystem, or
 // overridden by a repo-provided .orcha/validate.sh.
+//
+// Trust: these are the repository's OWN commands (and any .orcha/validate.sh),
+// executed on the host with the operator's credentials. Run validation only against
+// repositories and worker output you trust. Each step runs under a timeout
+// (ORCHA_VALIDATE_TIMEOUT, default 10m) so a hung command cannot block indefinitely.
 package validate
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
+	"time"
 )
 
 // Step is one named check to run in the worktree.
@@ -34,7 +43,7 @@ func Detect(dir string) []Step {
 		return []Step{
 			{Name: "build", Cmd: []string{"go", "build", "./..."}},
 			{Name: "vet", Cmd: []string{"go", "vet", "./..."}},
-			{Name: "fmt", Cmd: []string{"sh", "-c", `test -z "$(gofmt -l .)"`}},
+			{Name: "fmt", Cmd: []string{"sh", "-c", `o=$(gofmt -l .); test -z "$o" || { echo "unformatted:"; echo "$o"; exit 1; }`}},
 			{Name: "test", Cmd: []string{"go", "test", "./..."}},
 		}
 	}
@@ -54,21 +63,53 @@ func Detect(dir string) []Step {
 	return nil
 }
 
-// Run executes each step in dir, capturing combined output, and continues through all
-// steps (so every failure is reported, not just the first).
+// DefaultTimeout bounds each check; override with ORCHA_VALIDATE_TIMEOUT.
+const DefaultTimeout = 10 * time.Minute
+
+func stepTimeout() time.Duration {
+	if v := os.Getenv("ORCHA_VALIDATE_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return DefaultTimeout
+}
+
+// Run executes each step in dir under a per-step timeout, capturing combined output,
+// and continues through all steps (so every failure is reported, not just the first).
 func Run(dir string, steps []Step) []Result {
+	to := stepTimeout()
 	results := make([]Result, 0, len(steps))
 	for _, s := range steps {
-		c := exec.Command(s.Cmd[0], s.Cmd[1:]...)
-		c.Dir = dir
-		out, err := c.CombinedOutput()
-		results = append(results, Result{
-			Name:   s.Name,
-			Passed: err == nil,
-			Output: strings.TrimRight(string(out), "\n"),
-		})
+		results = append(results, runStep(dir, s, to))
 	}
 	return results
+}
+
+func runStep(dir string, s Step, to time.Duration) Result {
+	ctx, cancel := context.WithTimeout(context.Background(), to)
+	defer cancel()
+	c := exec.CommandContext(ctx, s.Cmd[0], s.Cmd[1:]...)
+	c.Dir = dir
+	// Run the command in its own process group and kill the whole group on timeout,
+	// so a hung command's children (servers, watchers) are reaped too.
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	c.Cancel = func() error {
+		if c.Process != nil {
+			return syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
+		}
+		return nil
+	}
+	c.WaitDelay = 2 * time.Second
+	out, err := c.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return Result{Name: s.Name, Passed: false, Output: fmt.Sprintf("timed out after %s", to)}
+	}
+	return Result{
+		Name:   s.Name,
+		Passed: err == nil,
+		Output: strings.TrimRight(string(out), "\n"),
+	}
 }
 
 // Failures returns the results that did not pass.

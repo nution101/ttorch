@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nution101/orcha/internal/approval"
 	"github.com/nution101/orcha/internal/paths"
 	"github.com/nution101/orcha/internal/tmux"
 )
@@ -246,4 +247,61 @@ func TestDeliveryLifecycle(t *testing.T) {
 		t.Fatalf("promote did not flip kind: %q", reloaded.Kind)
 	}
 	_, _ = m.Teardown("s9", true)
+}
+
+func TestMergeLocal_ApprovalBinding(t *testing.T) {
+	if !tmux.Available() {
+		t.Skip("tmux not installed")
+	}
+	repo := newRepoMain(t)
+	session := fmt.Sprintf("orcha-bind-%d", os.Getpid())
+	t.Setenv("ORCHA_HOME", t.TempDir())
+	t.Setenv("ORCHA_TMUX_SESSION", session)
+	defer exec.Command("tmux", "kill-session", "-t", session).Run()
+
+	m := New(paths.Default())
+	task, err := m.Spawn("b1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := task.Worktree
+	os.WriteFile(filepath.Join(wt, "a.txt"), []byte("1\n"), 0o644)
+	gitIn(t, wt, "add", "-A")
+	gitIn(t, wt, "commit", "-q", "-m", "work1")
+
+	// A recoverable refusal (dirty repo) must NOT consume the approval.
+	os.WriteFile(filepath.Join(repo, "dirty.txt"), []byte("x\n"), 0o644)
+	if err := m.Approve("b1", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.MergeLocal("b1"); err == nil {
+		t.Fatal("merge should refuse while the repo is dirty")
+	}
+	if !approval.Valid(m.P.ApprovalFile("b1")) {
+		t.Fatal("a recoverable refusal must leave the approval intact")
+	}
+	os.Remove(filepath.Join(repo, "dirty.txt"))
+
+	// The worker changes after approval -> merge must reject (and consume the stale token).
+	os.WriteFile(filepath.Join(wt, "b.txt"), []byte("2\n"), 0o644)
+	gitIn(t, wt, "add", "-A")
+	gitIn(t, wt, "commit", "-q", "-m", "work2")
+	if _, err := m.MergeLocal("b1"); err == nil {
+		t.Fatal("merge should reject work that changed since approval")
+	}
+	if approval.Valid(m.P.ApprovalFile("b1")) {
+		t.Fatal("a stale (commit-mismatched) approval should be consumed")
+	}
+
+	// Re-approve the current commit, then merge succeeds.
+	if err := m.Approve("b1", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.MergeLocal("b1"); err != nil {
+		t.Fatalf("merge after re-approval: %v", err)
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") != gitIn(t, wt, "rev-parse", "HEAD") {
+		t.Fatal("default branch was not fast-forwarded after re-approval")
+	}
+	_, _ = m.Teardown("b1", true)
 }

@@ -3,6 +3,7 @@ package validate
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -72,6 +73,40 @@ func TestDetect_Override(t *testing.T) {
 func TestDetect_Empty(t *testing.T) {
 	if steps := Detect(t.TempDir()); steps != nil {
 		t.Fatalf("expected no steps for an unrecognized repo, got %+v", steps)
+	}
+}
+
+func TestRun_Timeout(t *testing.T) {
+	t.Setenv("ORCHA_VALIDATE_TIMEOUT", "300ms")
+	results := Run(t.TempDir(), []Step{{Name: "slow", Cmd: []string{"sh", "-c", "sleep 5"}}})
+	if len(results) != 1 || results[0].Passed {
+		t.Fatalf("slow step should fail by timeout, got %+v", results)
+	}
+	if !strings.Contains(results[0].Output, "timed out") {
+		t.Fatalf("expected a timeout message, got %q", results[0].Output)
+	}
+}
+
+func TestRun_FmtFailureNamesFiles(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module x\n\ngo 1.22\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "bad.go"), []byte("package x\nfunc  F( ){}\n"), 0o644)
+
+	var fmtStep Step
+	for _, s := range Detect(dir) {
+		if s.Name == "fmt" {
+			fmtStep = s
+		}
+	}
+	if fmtStep.Name == "" {
+		t.Fatal("no fmt step detected for a go.mod repo")
+	}
+	res := Run(dir, []Step{fmtStep})
+	if res[0].Passed {
+		t.Fatal("fmt should fail on a mis-formatted file")
+	}
+	if !strings.Contains(res[0].Output, "unformatted") || !strings.Contains(res[0].Output, "bad.go") {
+		t.Fatalf("fmt failure should name the unformatted file; got %q", res[0].Output)
 	}
 }
 

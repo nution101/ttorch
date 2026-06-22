@@ -263,10 +263,22 @@ func (m *Manager) Validate(taskID string) ([]validate.Result, error) {
 // Approve grants a short-lived approval token authorizing a merge for taskID.
 // This is intended for the lead to run, not the manager.
 func (m *Manager) Approve(taskID string, ttl time.Duration) error {
-	if _, err := m.Store.Load(taskID); err != nil {
+	t, err := m.Store.Load(taskID)
+	if err != nil {
 		return fmt.Errorf("unknown task %q", taskID)
 	}
-	return approval.Grant(m.P.ApprovalFile(taskID), ttl)
+	if ttl <= 0 {
+		return fmt.Errorf("--ttl must be positive (got %s)", ttl)
+	}
+	head, err := worktree.Head(t.Worktree)
+	if err != nil {
+		return err
+	}
+	if err := approval.Grant(m.P.ApprovalFile(taskID), ttl, head); err != nil {
+		return err
+	}
+	m.audit(fmt.Sprintf("approve task=%s commit=%s ttl=%s", taskID, short(head), ttl))
+	return nil
 }
 
 // MergeLocal fast-forwards the repo's local default branch to the worker's HEAD —
@@ -278,7 +290,7 @@ func (m *Manager) MergeLocal(taskID string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("unknown task %q", taskID)
 	}
-	if !approval.Consume(m.P.ApprovalFile(taskID)) {
+	if !approval.Valid(m.P.ApprovalFile(taskID)) {
 		return "", fmt.Errorf("no valid approval for %q; the lead must run 'orcha approve %s' first", taskID, taskID)
 	}
 	repo := t.Project
@@ -300,6 +312,16 @@ func (m *Manager) MergeLocal(taskID string) (string, error) {
 	}
 	if !worktree.IsAncestor(repo, defHead, workerHead) {
 		return "", fmt.Errorf("worker %q is not a fast-forward of %q; have the worker rebase first", taskID, def)
+	}
+	// Consume the approval only now — immediately before the state change — so a
+	// recoverable refusal above leaves it intact for a retry, and require it to
+	// authorize exactly the commit being merged (no changes since the lead reviewed).
+	approvedHead, ok := approval.Consume(m.P.ApprovalFile(taskID))
+	if !ok {
+		return "", fmt.Errorf("approval for %q expired before merge; run 'orcha approve %s' again", taskID, taskID)
+	}
+	if approvedHead != workerHead {
+		return "", fmt.Errorf("worker %q changed since approval (approved %s, now %s); re-review with 'orcha review-diff %s' and approve again", taskID, short(approvedHead), short(workerHead), taskID)
 	}
 	if err := worktree.MergeFastForward(repo, workerHead); err != nil {
 		return "", err
