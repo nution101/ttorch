@@ -39,12 +39,12 @@ type Diagnosis struct {
 	Found   map[string]string // tool name -> path
 	Missing []Tool
 	Manager string // detected package manager (empty if none)
-	WSL     bool
+	WSL     string // "", "wsl1", or "wsl2"
 }
 
 // Diagnose inspects the environment without changing anything.
 func Diagnose() Diagnosis {
-	d := Diagnosis{Found: map[string]string{}, Manager: detectManager(), WSL: isWSL()}
+	d := Diagnosis{Found: map[string]string{}, Manager: detectManager(), WSL: detectWSL()}
 	for _, t := range Tools() {
 		if p, err := exec.LookPath(t.Bin); err == nil {
 			d.Found[t.Name] = p
@@ -72,8 +72,11 @@ func Run(out io.Writer, in io.Reader, autoYes bool) error {
 			fmt.Fprintf(out, "  [%s] %-7s — %s\n", tag, t.Name, t.Why)
 		}
 	}
-	if d.WSL {
-		fmt.Fprintln(out, "  runtime: WSL detected (Linux paths)")
+	switch d.WSL {
+	case "wsl2":
+		fmt.Fprintln(out, "  runtime: WSL2 (supported)")
+	case "wsl1":
+		fmt.Fprintln(out, "  runtime: WSL1 detected — upgrade to WSL2 (process/cwd semantics are unreliable on WSL1)")
 	}
 	if d.Manager == "" {
 		fmt.Fprintln(out, "  package manager: none detected")
@@ -166,13 +169,28 @@ func installSpec(manager, tool string) ([]string, bool) {
 	return nil, false
 }
 
-func isWSL() bool {
+// wslKind classifies a /proc/version string as "wsl2", "wsl1", or "" (not WSL).
+// WSL2 kernels carry "WSL2" in the version string; older/WSL1 kernels carry
+// "Microsoft" without it.
+func wslKind(procVersion string) string {
+	v := strings.ToLower(procVersion)
+	switch {
+	case strings.Contains(v, "wsl2"):
+		return "wsl2"
+	case strings.Contains(v, "microsoft"), strings.Contains(v, "wsl"):
+		return "wsl1"
+	default:
+		return ""
+	}
+}
+
+func detectWSL() string {
 	if runtime.GOOS != "linux" {
-		return false
+		return ""
 	}
 	b, err := os.ReadFile("/proc/version")
 	if err != nil {
-		return false
+		return ""
 	}
-	return strings.Contains(strings.ToLower(string(b)), "microsoft")
+	return wslKind(string(b))
 }

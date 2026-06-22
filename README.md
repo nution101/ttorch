@@ -4,11 +4,12 @@ Run a team of Claude Code agents. You act as the **manager**: plan the work, del
 isolated **worker** sessions, review the results, and approve delivery — instead of
 writing and reviewing every line by hand.
 
-> **Status: M0–M3 + hardening.** Installs and updates safely, ships the global Claude
-> Code surface, dispatches workers into isolated tmux sessions on a reusable worktree
-> pool, and runs a zero-token supervisor daemon. Still to come: the full delivery
-> lifecycle (review/merge/PR), the validation gate, and Windows-native polish. See
-> `ORCHA_PLAN.md` for the architecture and roadmap.
+> **Status: M0–M5.** Installs/updates safely, ships the global Claude Code surface,
+> dispatches workers into isolated tmux worktrees, runs a zero-token supervisor, and
+> gates delivery behind review + validation + your explicit approval.
+>
+> **New here? Start with [`docs/ONBOARDING.md`](docs/ONBOARDING.md).** Architecture and
+> roadmap live in `ORCHA_PLAN.md`.
 
 ## Install
 

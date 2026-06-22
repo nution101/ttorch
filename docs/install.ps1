@@ -1,39 +1,28 @@
-# orcha installer (Windows). For the full parallel experience, run orcha inside WSL2
-# and use docs/install.sh there. This installs a native Windows build for basic use.
+# orcha installer for Windows.
+#
+# orcha is a Linux-native tool; on Windows it runs inside WSL2. This script bootstraps
+# the install into your default WSL distribution.
 #   irm https://nution101.github.io/orcha/install.ps1 | iex
 $ErrorActionPreference = "Stop"
 
 $repo = if ($env:ORCHA_REPO) { $env:ORCHA_REPO } else { "nution101/orcha" }
-$installDir = "$env:LOCALAPPDATA\orcha\bin"
-$arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "amd64" }
+$parts = $repo.Split('/')
+$url = "https://$($parts[0]).github.io/$($parts[1])/install.sh"
 
-$release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest"
-$version = $release.tag_name
-if (-not $version) { throw "Could not determine latest release for $repo." }
-
-$asset = "orcha-$version-windows-$arch.zip"
-$base = "https://github.com/$repo/releases/download/$version"
-$tmp = New-TemporaryFile | ForEach-Object { Remove-Item $_; New-Item -ItemType Directory -Path $_ }
-
-Write-Host "Downloading orcha $version for windows/$arch..."
-Invoke-WebRequest -Uri "$base/$asset" -OutFile "$tmp\$asset"
-Invoke-WebRequest -Uri "$base/checksums.txt" -OutFile "$tmp\checksums.txt"
-
-$expected = (Select-String -Path "$tmp\checksums.txt" -Pattern ([regex]::Escape($asset))).Line.Split(" ")[0]
-$actual = (Get-FileHash -Algorithm SHA256 "$tmp\$asset").Hash.ToLower()
-if ($expected -ne $actual) { throw "Checksum mismatch for $asset; refusing to install." }
-
-Expand-Archive -Path "$tmp\$asset" -DestinationPath $tmp -Force
-New-Item -ItemType Directory -Path $installDir -Force | Out-Null
-Move-Item -Path "$tmp\orcha.exe" -Destination "$installDir\orcha.exe" -Force
-Remove-Item -Recurse -Force $tmp
-
-$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if ($userPath -notlike "*$installDir*") {
-  [Environment]::SetEnvironmentVariable("Path", "$userPath;$installDir", "User")
-  Write-Host "Added $installDir to user PATH (restart your terminal)."
+function Test-Wsl {
+    try { wsl.exe --status *> $null; return ($LASTEXITCODE -eq 0) } catch { return $false }
 }
 
-Write-Host "Installed orcha $version -> $installDir\orcha.exe"
-& "$installDir\orcha.exe" install
-Write-Host "Note: parallel tmux orchestration requires WSL2. See the README."
+if (-not (Test-Wsl)) {
+    Write-Host "orcha runs inside WSL2, which was not found."
+    Write-Host ""
+    Write-Host "1. Install WSL2 (in an admin PowerShell):  wsl --install"
+    Write-Host "2. Reboot, then open your WSL distribution and run:"
+    Write-Host "     curl -fsSL $url | sh"
+    exit 1
+}
+
+Write-Host "Installing orcha inside WSL2..."
+wsl.exe -e bash -lc "curl -fsSL $url | sh"
+Write-Host ""
+Write-Host "Done. Use orcha from inside WSL (open your distribution, or 'wsl')."
