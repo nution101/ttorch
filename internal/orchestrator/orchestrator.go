@@ -17,6 +17,7 @@ import (
 	"github.com/nution101/orcha/internal/paths"
 	"github.com/nution101/orcha/internal/state"
 	"github.com/nution101/orcha/internal/tmux"
+	"github.com/nution101/orcha/internal/validate"
 	"github.com/nution101/orcha/internal/worktree"
 )
 
@@ -243,6 +244,20 @@ func (m *Manager) ReviewDiff(taskID string, stat bool) (string, error) {
 	}
 	base := worktree.DefaultBranch(t.Project)
 	return worktree.Diff(t.Worktree, base, stat)
+}
+
+// Validate runs the worktree's detected checks for a task. It returns nil results
+// when no checks are detected (the caller reports that distinctly from a pass).
+func (m *Manager) Validate(taskID string) ([]validate.Result, error) {
+	t, err := m.Store.Load(taskID)
+	if err != nil {
+		return nil, fmt.Errorf("unknown task %q", taskID)
+	}
+	steps := validate.Detect(t.Worktree)
+	if len(steps) == 0 {
+		return nil, nil
+	}
+	return validate.Run(t.Worktree, steps), nil
 }
 
 // Approve grants a short-lived approval token authorizing a merge for taskID.

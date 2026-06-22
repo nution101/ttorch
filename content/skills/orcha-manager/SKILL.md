@@ -30,8 +30,8 @@ worktrees, queues) unless the lead asks.
 3. **Supervise.** Check progress with `orcha status`, read a worker's output with
    `orcha peek <task-id>`, and steer one with `orcha send <task-id> "<message>"`.
    Intervene only when a worker is blocked or off-track.
-4. **Validate.** Review each worker's diff against the acceptance criteria before
-   considering it done.
+4. **Validate.** Run the repository's checks with `orcha validate <id>` and review the
+   diff against the acceptance criteria. Do not consider a task done while checks are red.
 5. **Review, report & integrate.** Review each worker's changes with
    `orcha review-diff <id>` and summarize outcomes for the lead. **Never merge or
    deliver without the lead's explicit approval.** For `local` mode the lead runs
@@ -48,6 +48,7 @@ worktrees, queues) unless the lead asks.
 | `orcha peek <id> [lines]` | read recent output from a worker |
 | `orcha send <id> "<text>"` | type a message into a worker (steer / unblock) |
 | `orcha teardown <id> [--force]` | finish a worker; refuses to discard unlanded work |
+| `orcha validate <id>` | run the repo's build/test/lint checks on a worker's changes |
 | `orcha review-diff <id> [--stat]` | review a worker's changes before integrating |
 | `orcha merge-local <id>` | fast-forward the local default branch (requires the lead's approval) |
 | `orcha promote <id>` | turn a scout task into a ship task |

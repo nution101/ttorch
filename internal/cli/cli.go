@@ -82,6 +82,8 @@ func Main(args []string) int {
 		return run(cmdSupervise())
 	case "wake":
 		return run(cmdWake(rest))
+	case "validate":
+		return run(cmdValidate(rest))
 	case "review-diff":
 		return run(cmdReviewDiff(rest))
 	case "approve":
@@ -379,6 +381,49 @@ func cmdWake(args []string) error {
 	return nil
 }
 
+func cmdValidate(args []string) error {
+	if len(args) < 1 {
+		return errors.New("usage: orcha validate <task-id>")
+	}
+	results, err := mgr().Validate(args[0])
+	if err != nil {
+		return err
+	}
+	if len(results) == 0 {
+		fmt.Println("no checks detected for this worktree (add .orcha/validate.sh to define them)")
+		return nil
+	}
+	failed := 0
+	for _, r := range results {
+		status := "PASS"
+		if !r.Passed {
+			status = "FAIL"
+			failed++
+		}
+		fmt.Printf("  [%s] %s\n", status, r.Name)
+		if !r.Passed && r.Output != "" {
+			fmt.Println(indentTail(r.Output, 15))
+		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d of %d checks failed", failed, len(results))
+	}
+	fmt.Printf("all %d checks passed\n", len(results))
+	return nil
+}
+
+// indentTail returns the last n lines of s, each indented for readability.
+func indentTail(s string, n int) string {
+	lines := strings.Split(s, "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	for i, l := range lines {
+		lines[i] = "      " + l
+	}
+	return strings.Join(lines, "\n")
+}
+
 func cmdReviewDiff(args []string) error {
 	if len(args) < 1 {
 		return errors.New("usage: orcha review-diff <task-id> [--stat]")
@@ -590,6 +635,7 @@ Supervision:
   wake drain              print and clear pending supervision events
 
 Delivery:
+  validate <id>               run the repo's build/test/lint checks on a worker
   review-diff <id> [--stat]   show a worker's changes vs the default branch
   approve <id> [--ttl 10m]    grant a time-boxed approval (run by the lead)
   merge-local <id>            fast-forward the local default branch (needs approval)
@@ -606,6 +652,6 @@ Setup:
   init [--mode m]         set up a repo's AGENTS.md + CLAUDE.md + delivery mode
   version | help          version / this message
 
-Coming later: skill, the validation gate
+Coming later: native-Windows polish
 `)
 }
