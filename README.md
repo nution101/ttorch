@@ -73,6 +73,15 @@ additionally confirm those checksums came from this repo's release workflow.
 | `ttorch profile [dir]` | Derive the repo's stack/commands/conventions into AGENTS.md |
 | `ttorch version` / `help` | Version / usage |
 
+## Project setup (automatic)
+
+You don't have to remember to run `ttorch init`. The first time ttorch touches a git repo —
+when you start the manager in it, or when the manager dispatches a worker to it — ttorch
+sets it up automatically: it writes the AGENTS.md managed block (+ the `CLAUDE.md` symlink)
+and the project profile, so workers always have project memory to read. It's clobber-safe
+(your AGENTS.md content is preserved), idempotent, and a no-op outside a git repo. Set
+`TTORCH_NO_AUTOINIT=1` to turn it off and run `ttorch init` yourself.
+
 ## Session effort
 
 The **manager** is a lean orchestrator: it launches at `--effort high` and carries a charter

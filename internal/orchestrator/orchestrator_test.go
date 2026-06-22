@@ -11,6 +11,7 @@ import (
 
 	"github.com/nution101/ttorch/internal/approval"
 	"github.com/nution101/ttorch/internal/paths"
+	"github.com/nution101/ttorch/internal/projectinit"
 	"github.com/nution101/ttorch/internal/tmux"
 )
 
@@ -316,6 +317,41 @@ func TestMergeLocal_ApprovalBinding(t *testing.T) {
 		t.Fatal("default branch was not fast-forwarded after re-approval")
 	}
 	_, _ = m.Teardown("b1", true)
+}
+
+func TestAutoInit(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	repo := t.TempDir()
+	exec.Command("git", "-C", repo, "init").Run()
+
+	if projectinit.Initialized(repo) {
+		t.Fatal("fresh repo should not be initialized")
+	}
+	autoInit(repo)
+	if !projectinit.Initialized(repo) {
+		t.Fatal("autoInit should have set up the repo")
+	}
+
+	// Idempotent: a second call leaves it initialized and does not error.
+	autoInit(repo)
+	if !projectinit.Initialized(repo) {
+		t.Fatal("repo should stay initialized after a second autoInit")
+	}
+
+	// Opt-out: a fresh repo with TTORCH_NO_AUTOINIT set is left untouched.
+	other := t.TempDir()
+	exec.Command("git", "-C", other, "init").Run()
+	t.Setenv("TTORCH_NO_AUTOINIT", "1")
+	autoInit(other)
+	if projectinit.Initialized(other) {
+		t.Fatal("TTORCH_NO_AUTOINIT should skip auto-init")
+	}
+
+	// Non-git directory is a no-op (and never panics).
+	t.Setenv("TTORCH_NO_AUTOINIT", "")
+	autoInit(t.TempDir())
 }
 
 func TestStopSession(t *testing.T) {

@@ -7,6 +7,26 @@ import (
 	"testing"
 )
 
+func TestInitialized(t *testing.T) {
+	dir := t.TempDir()
+	if Initialized(dir) {
+		t.Fatal("empty dir should not be initialized")
+	}
+	// An AGENTS.md without the managed marker is not "initialized".
+	if err := os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte("# hand-written\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if Initialized(dir) {
+		t.Fatal("AGENTS.md without the ttorch marker should not count as initialized")
+	}
+	if _, err := Init(dir, "pr"); err != nil {
+		t.Fatal(err)
+	}
+	if !Initialized(dir) {
+		t.Fatal("after Init the dir should be initialized")
+	}
+}
+
 func TestInit_CreatesAgentsAndSymlink(t *testing.T) {
 	dir := t.TempDir()
 	if _, err := Init(dir, "pr"); err != nil {

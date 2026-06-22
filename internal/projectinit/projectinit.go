@@ -24,6 +24,16 @@ func ValidMode(mode string) bool {
 	return false
 }
 
+// Initialized reports whether dir already carries the ttorch-managed block in its
+// AGENTS.md, i.e. `ttorch init` has been run there.
+func Initialized(dir string) bool {
+	b, err := os.ReadFile(filepath.Join(dir, "AGENTS.md"))
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(b), markerBegin)
+}
+
 // Init sets up dir: ensures AGENTS.md carries the ttorch-managed delivery-mode block
 // and that CLAUDE.md symlinks to AGENTS.md. It returns human-readable notes.
 func Init(dir, mode string) ([]string, error) {

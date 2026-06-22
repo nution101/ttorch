@@ -15,6 +15,8 @@ import (
 	"github.com/nution101/ttorch/internal/approval"
 	"github.com/nution101/ttorch/internal/harness"
 	"github.com/nution101/ttorch/internal/paths"
+	"github.com/nution101/ttorch/internal/profile"
+	"github.com/nution101/ttorch/internal/projectinit"
 	"github.com/nution101/ttorch/internal/state"
 	"github.com/nution101/ttorch/internal/termtab"
 	"github.com/nution101/ttorch/internal/tmux"
@@ -87,6 +89,7 @@ func (m *Manager) Spawn(taskID, projectPath string, scout bool, rawCmd string) (
 	if err != nil {
 		return zero, fmt.Errorf("%s is not inside a git repository", projectPath)
 	}
+	autoInit(repo) // first-use setup so workers always have AGENTS.md to read
 
 	window := "wk-" + taskID
 	if tmux.WindowExists(m.Session, window) {
@@ -194,6 +197,36 @@ func (m *Manager) Teardown(taskID string, force bool) ([]string, error) {
 	return notes, nil
 }
 
+// autoInit sets a repository up for ttorch on first use, so the lead never has to
+// remember to run `ttorch init`. If path is inside a git repo that has not been
+// initialized yet, it writes the AGENTS.md managed block (+ CLAUDE.md symlink) and
+// the project profile, printing what it did. It is best-effort and opt-out via
+// TTORCH_NO_AUTOINIT; it no-ops on non-git dirs and already-initialized repos.
+func autoInit(path string) {
+	if os.Getenv("TTORCH_NO_AUTOINIT") != "" {
+		return
+	}
+	repo, err := worktree.RepoRoot(path)
+	if err != nil || projectinit.Initialized(repo) {
+		return
+	}
+	notes, err := projectinit.Init(repo, "pr")
+	if err != nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "ttorch: set up %s for ttorch (set TTORCH_NO_AUTOINIT=1 to skip)\n", repo)
+	for _, n := range notes {
+		fmt.Fprintln(os.Stderr, "  "+n)
+	}
+	if p, err := profile.Apply(repo); err == nil {
+		stack := p.Stack
+		if stack == "" {
+			stack = "unknown"
+		}
+		fmt.Fprintf(os.Stderr, "  wrote project profile (stack: %s)\n", stack)
+	}
+}
+
 // StartManager ensures the manager window exists (running the harness) and attaches
 // the lead to it.
 func (m *Manager) StartManager() error {
@@ -205,6 +238,7 @@ func (m *Manager) StartManager() error {
 	}
 	if !tmux.WindowExists(m.Session, "manager") {
 		dir := cwd()
+		autoInit(dir) // first-use setup of the default project (the launch dir)
 		if err := tmux.NewWindow(m.Session, "manager", dir); err != nil {
 			return err
 		}
