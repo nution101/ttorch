@@ -4,6 +4,7 @@
 package harness
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -104,25 +105,82 @@ func InteractiveCommand(kind string) string {
 // ManagerCommand starts the manager session. It runs lighter than workers
 // (managerEffortLevel, default "high") and carries the manager charter as an
 // appended system prompt so the session plans and delegates via `ttorch spawn`
-// rather than doing the work itself.
-func ManagerCommand(kind string) string {
+// rather than doing the work itself. The session is launched with a stable
+// session id so a later restore can resume this exact conversation.
+func ManagerCommand(kind, sessionID string) string {
 	switch kind {
 	case "claude":
 		return "claude --dangerously-skip-permissions" + effortArgsForLevel(managerEffortLevel()) +
-			" --append-system-prompt " + shq(managerCharter)
+			" --append-system-prompt " + shq(managerCharter) +
+			" --session-id " + shq(sessionID)
 	default:
 		return kind
 	}
 }
 
-// BriefCommand starts the harness with a task brief as its initial prompt.
-func BriefCommand(kind, briefPath string) string {
+// ManagerResumeCommand resumes the manager conversation after a stop/reboot/
+// upgrade. It keeps the manager's effort and charter but resumes the prior
+// conversation rather than starting a new one: it uses --resume <sessionID>, or
+// --continue (most recent conversation in the launch directory) when no id is
+// known (legacy state).
+func ManagerResumeCommand(kind, sessionID string) string {
 	switch kind {
 	case "claude":
-		return "claude --dangerously-skip-permissions" + EffortArgs(kind) + " \"$(cat " + quote(briefPath) + ")\""
+		base := "claude --dangerously-skip-permissions" + effortArgsForLevel(managerEffortLevel()) +
+			" --append-system-prompt " + shq(managerCharter)
+		if sessionID == "" {
+			return base + " --continue"
+		}
+		return base + " --resume " + shq(sessionID)
 	default:
 		return kind
 	}
+}
+
+// BriefCommand starts the harness with a task brief as its initial prompt. It is
+// launched with a stable session id so a later restore can resume this exact
+// worker conversation.
+func BriefCommand(kind, briefPath, sessionID string) string {
+	switch kind {
+	case "claude":
+		return "claude --dangerously-skip-permissions" + EffortArgs(kind) +
+			" --session-id " + shq(sessionID) +
+			" \"$(cat " + quote(briefPath) + ")\""
+	default:
+		return kind
+	}
+}
+
+// ResumeCommand resumes a worker conversation after a stop/reboot/upgrade with no
+// brief: it continues the exact conversation via --resume <sessionID>, or
+// --continue (most recent conversation in the worktree) when no id is known
+// (legacy state).
+func ResumeCommand(kind, sessionID string) string {
+	switch kind {
+	case "claude":
+		base := "claude --dangerously-skip-permissions" + EffortArgs(kind)
+		if sessionID == "" {
+			return base + " --continue"
+		}
+		return base + " --resume " + shq(sessionID)
+	default:
+		return kind
+	}
+}
+
+// NewSessionID returns a random RFC-4122 version-4 UUID, used as a stable Claude
+// Code session id so a session can be resumed later. It uses crypto/rand and no
+// external dependency.
+func NewSessionID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand should never fail; if it does, panic rather than emit a
+		// predictable id that could collide with a real conversation.
+		panic("harness: crypto/rand: " + err.Error())
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant 10
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 // shq single-quotes s into one shell word, neutralizing shell metacharacters

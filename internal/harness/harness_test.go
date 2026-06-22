@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -65,7 +66,7 @@ func TestLaunchCommandsCarryEffort(t *testing.T) {
 	if got := InteractiveCommand("claude"); got != want {
 		t.Errorf("interactive: got %q, want %q", got, want)
 	}
-	brief := BriefCommand("claude", "/tmp/b.md")
+	brief := BriefCommand("claude", "/tmp/b.md", "sid-123")
 	if !strings.Contains(brief, `--settings '{"ultracode":true}'`) {
 		t.Errorf("brief command missing ultracode setting: %q", brief)
 	}
@@ -81,7 +82,7 @@ func TestLaunchCommandsCarryEffort(t *testing.T) {
 
 func TestManagerCommand(t *testing.T) {
 	t.Setenv("TTORCH_MANAGER_EFFORT", "") // default: high (NOT ultracode)
-	cmd := ManagerCommand("claude")
+	cmd := ManagerCommand("claude", "mgr-sid")
 	if !strings.Contains(cmd, " --effort high") {
 		t.Errorf("manager should default to --effort high, got %q", cmd)
 	}
@@ -101,16 +102,82 @@ func TestManagerCommand(t *testing.T) {
 	if !strings.Contains(cmd, `lead'\''s`) {
 		t.Errorf("charter apostrophe not shell-escaped, got %q", cmd)
 	}
+	if !strings.Contains(cmd, " --session-id 'mgr-sid'") {
+		t.Errorf("manager should launch with the session id, got %q", cmd)
+	}
 }
 
 func TestManagerEffortOverride(t *testing.T) {
 	t.Setenv("TTORCH_MANAGER_EFFORT", "ultracode")
-	if got := ManagerCommand("claude"); !strings.Contains(got, `--settings '{"ultracode":true}'`) {
+	if got := ManagerCommand("claude", "x"); !strings.Contains(got, `--settings '{"ultracode":true}'`) {
 		t.Errorf("override to ultracode should add --settings, got %q", got)
 	}
 	t.Setenv("TTORCH_MANAGER_EFFORT", "max")
-	if got := ManagerCommand("claude"); !strings.Contains(got, " --effort max") {
+	if got := ManagerCommand("claude", "x"); !strings.Contains(got, " --effort max") {
 		t.Errorf("override to max should add --effort max, got %q", got)
+	}
+}
+
+func TestManagerResumeCommand(t *testing.T) {
+	t.Setenv("TTORCH_MANAGER_EFFORT", "")
+	cmd := ManagerResumeCommand("claude", "mgr-sid")
+	if !strings.Contains(cmd, " --resume 'mgr-sid'") {
+		t.Errorf("resume should carry --resume <id>, got %q", cmd)
+	}
+	if strings.Contains(cmd, "--session-id") {
+		t.Errorf("resume must not use --session-id, got %q", cmd)
+	}
+	if !strings.Contains(cmd, " --effort high") || !strings.Contains(cmd, "--append-system-prompt") {
+		t.Errorf("resume should keep effort + charter, got %q", cmd)
+	}
+	// No id -> --continue, no --resume.
+	cont := ManagerResumeCommand("claude", "")
+	if !strings.Contains(cont, " --continue") || strings.Contains(cont, "--resume") {
+		t.Errorf("empty id should use --continue, got %q", cont)
+	}
+}
+
+func TestBriefCommandCarriesSessionID(t *testing.T) {
+	t.Setenv("TTORCH_EFFORT", "off")
+	cmd := BriefCommand("claude", "/tmp/b.md", "wk-sid")
+	if !strings.Contains(cmd, " --session-id 'wk-sid'") {
+		t.Errorf("brief should carry --session-id, got %q", cmd)
+	}
+	// The session id flag must come before the positional brief prompt.
+	si := strings.Index(cmd, "--session-id")
+	bp := strings.Index(cmd, "$(cat")
+	if si < 0 || bp < 0 || si > bp {
+		t.Errorf("session id must precede the brief prompt, got %q", cmd)
+	}
+}
+
+func TestResumeCommand(t *testing.T) {
+	t.Setenv("TTORCH_EFFORT", "off")
+	cmd := ResumeCommand("claude", "wk-sid")
+	if !strings.Contains(cmd, " --resume 'wk-sid'") {
+		t.Errorf("worker resume should carry --resume <id>, got %q", cmd)
+	}
+	if strings.Contains(cmd, "$(cat") || strings.Contains(cmd, "--session-id") {
+		t.Errorf("worker resume must not carry a brief or --session-id, got %q", cmd)
+	}
+	cont := ResumeCommand("claude", "")
+	if !strings.Contains(cont, " --continue") || strings.Contains(cont, "--resume") {
+		t.Errorf("empty id should use --continue, got %q", cont)
+	}
+}
+
+func TestNewSessionID(t *testing.T) {
+	re := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	a := NewSessionID()
+	b := NewSessionID()
+	if !re.MatchString(a) {
+		t.Errorf("session id %q is not a v4 UUID", a)
+	}
+	if !re.MatchString(b) {
+		t.Errorf("session id %q is not a v4 UUID", b)
+	}
+	if a == b {
+		t.Errorf("two session ids should differ, both = %q", a)
 	}
 }
 

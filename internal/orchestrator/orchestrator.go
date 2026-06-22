@@ -112,6 +112,8 @@ func (m *Manager) Spawn(taskID, projectPath string, scout bool, rawCmd string) (
 		kind = "scout"
 	}
 	h := harness.Resolve()
+	// Assign a stable session id so a later restore resumes this exact conversation.
+	sid := harness.NewSessionID()
 	// Install the turn-end hook so the supervisor can detect this worker's turns,
 	// and pre-accept the harness's folder-trust prompt so the worker runs autonomously.
 	_ = harness.InstallTurnEndHook(h, wt, m.P.TurnEndMarker(taskID))
@@ -122,7 +124,7 @@ func (m *Manager) Spawn(taskID, projectPath string, scout bool, rawCmd string) (
 		if _, err := os.Stat(brief); os.IsNotExist(err) {
 			_ = writeBriefStub(brief, taskID, kind)
 		}
-		cmd = harness.BriefCommand(h, brief)
+		cmd = harness.BriefCommand(h, brief, sid)
 	}
 	if err := tmux.SendLine(m.Session, window, cmd); err != nil {
 		return zero, err
@@ -134,7 +136,7 @@ func (m *Manager) Spawn(taskID, projectPath string, scout bool, rawCmd string) (
 
 	t := state.Task{
 		ID: taskID, Window: window, Worktree: wt, Project: repo,
-		Harness: h, Kind: kind, Created: time.Now(),
+		Harness: h, Kind: kind, Created: time.Now(), SessionID: sid,
 	}
 	if err := m.Store.Save(t); err != nil {
 		return zero, err
@@ -227,8 +229,12 @@ func autoInit(path string) {
 	}
 }
 
-// StartManager ensures the manager window exists (running the harness) and attaches
-// the lead to it.
+// StartManager attaches the lead to the manager. If the manager window is already
+// live it just attaches; otherwise it rebuilds. When saved state exists (a manager
+// record or any task), it restores the whole team — the manager window plus every
+// worker tab, each resumed to its prior conversation — so a stop, reboot, crash, or
+// `ttorch update` is recoverable by simply running `ttorch`. With no saved state it
+// starts a fresh manager in the current directory.
 func (m *Manager) StartManager() error {
 	if err := m.requireTmux(); err != nil {
 		return err
@@ -236,17 +242,40 @@ func (m *Manager) StartManager() error {
 	if err := tmux.EnsureSession(m.Session); err != nil {
 		return err
 	}
-	if !tmux.WindowExists(m.Session, "manager") {
-		dir := cwd()
-		autoInit(dir) // first-use setup of the default project (the launch dir)
-		if err := tmux.NewWindow(m.Session, "manager", dir); err != nil {
-			return err
-		}
-		_ = tmux.SendLine(m.Session, "manager", harness.ManagerCommand(harness.Resolve()))
-		fmt.Fprintf(os.Stderr, "ttorch: manager started in %s — tell it the repo to work on; 'ttorch stop' to end.\n", dir)
-	} else {
+	if tmux.WindowExists(m.Session, "manager") {
 		fmt.Fprintln(os.Stderr, "ttorch: attaching to your running manager — 'ttorch stop' to end it (then 'ttorch' in another folder to restart there).")
+		return m.attachManager()
 	}
+
+	_, ok, _ := m.Store.LoadManager()
+	tasks, _ := m.Store.List()
+	if ok || len(tasks) > 0 {
+		notes := m.restore()
+		fmt.Fprintln(os.Stderr, "ttorch: restoring your saved session — manager and workers resume where they left off.")
+		for _, n := range notes {
+			fmt.Fprintln(os.Stderr, "  "+n)
+		}
+		return m.attachManager()
+	}
+
+	// Fresh start: no saved session.
+	dir := cwd()
+	sid := harness.NewSessionID()
+	if err := m.Store.SaveManager(state.Manager{Dir: dir, SessionID: sid}); err != nil {
+		return err
+	}
+	autoInit(dir) // first-use setup of the default project (the launch dir)
+	if err := tmux.NewWindow(m.Session, "manager", dir); err != nil {
+		return err
+	}
+	_ = tmux.SendLine(m.Session, "manager", harness.ManagerCommand(harness.Resolve(), sid))
+	fmt.Fprintf(os.Stderr, "ttorch: manager started in %s — tell it the repo to work on; 'ttorch stop' to end.\n", dir)
+	return m.attachManager()
+}
+
+// attachManager opens the manager window for the lead: it prefers a native iTerm2
+// window on macOS, falling back to a plain tmux attach.
+func (m *Manager) attachManager() error {
 	if termtab.OpenManagerSession(m.Session, "manager") {
 		fmt.Fprintln(os.Stderr, "ttorch: opened the manager in a new iTerm2 window (now in front) — workers open as tabs there; this terminal is free.")
 		return nil
@@ -254,8 +283,107 @@ func (m *Manager) StartManager() error {
 	return tmux.Attach(m.Session, "manager")
 }
 
+// restore rebuilds any missing windows from saved state, resuming each session to
+// its prior conversation. It is best-effort: a single window that fails to rebuild
+// is noted but never aborts the rest. It returns human-readable notes.
+func (m *Manager) restore() []string {
+	var notes []string
+	if err := tmux.EnsureSession(m.Session); err != nil {
+		return []string{"could not ensure tmux session: " + err.Error()}
+	}
+	h := harness.Resolve()
+
+	// Manager window first, so there is always a manager to talk to.
+	if !tmux.WindowExists(m.Session, "manager") {
+		mgr, ok, _ := m.Store.LoadManager()
+		if ok {
+			if err := tmux.NewWindow(m.Session, "manager", mgr.Dir); err != nil {
+				notes = append(notes, "skipped manager ("+err.Error()+")")
+			} else {
+				_ = tmux.SendLine(m.Session, "manager", harness.ManagerResumeCommand(h, mgr.SessionID))
+				notes = append(notes, "restored manager")
+			}
+		} else {
+			// No manager record (legacy state): start a fresh manager so the lead
+			// always has one, and persist it for next time.
+			dir := cwd()
+			sid := harness.NewSessionID()
+			if err := m.Store.SaveManager(state.Manager{Dir: dir, SessionID: sid}); err != nil {
+				notes = append(notes, "could not persist new manager record: "+err.Error())
+			}
+			if err := tmux.NewWindow(m.Session, "manager", dir); err != nil {
+				notes = append(notes, "skipped manager ("+err.Error()+")")
+			} else {
+				_ = tmux.SendLine(m.Session, "manager", harness.ManagerCommand(h, sid))
+				notes = append(notes, "started a fresh manager (no saved manager record)")
+			}
+		}
+	}
+
+	// Workers: rebuild each task window whose worktree still exists.
+	tasks, _ := m.Store.List()
+	for _, t := range tasks {
+		if t.Kind == "cc" {
+			continue // ad-hoc, lead-driven sessions are not auto-restored
+		}
+		if tmux.WindowExists(m.Session, t.Window) {
+			continue
+		}
+		if _, err := os.Stat(t.Worktree); err != nil {
+			notes = append(notes, fmt.Sprintf("skipped %s (worktree gone)", t.ID))
+			continue
+		}
+		if err := tmux.NewWindow(m.Session, t.Window, t.Worktree); err != nil {
+			notes = append(notes, fmt.Sprintf("skipped %s (%s)", t.ID, err.Error()))
+			continue
+		}
+		_ = tmux.SendLine(m.Session, t.Window, harness.ResumeCommand(h, t.SessionID))
+		_ = termtab.Open(m.Session, t.Window)
+		notes = append(notes, "restored "+t.ID)
+	}
+	return notes
+}
+
+// Resume rebuilds the manager and every worker tab from saved state, resuming each
+// to its prior conversation. The caller attaches afterwards.
+func (m *Manager) Resume() ([]string, error) {
+	if err := m.requireTmux(); err != nil {
+		return nil, err
+	}
+	if err := tmux.EnsureSession(m.Session); err != nil {
+		return nil, err
+	}
+	return m.restore(), nil
+}
+
+// Reset discards the saved session for a clean start: it kills the tmux session
+// (if present) and removes the manager record and every task record. It never
+// deletes worktrees or branches.
+func (m *Manager) Reset() ([]string, error) {
+	var notes []string
+	if tmux.Available() && tmux.HasSession(m.Session) {
+		if err := tmux.KillSession(m.Session); err != nil {
+			notes = append(notes, "tmux: "+err.Error())
+		} else {
+			notes = append(notes, "killed the ttorch tmux session")
+		}
+	}
+	if err := m.Store.RemoveManager(); err != nil {
+		notes = append(notes, "manager record: "+err.Error())
+	}
+	tasks, _ := m.Store.List()
+	for _, t := range tasks {
+		if err := m.Store.Remove(t.ID); err != nil {
+			notes = append(notes, fmt.Sprintf("%s: %s", t.ID, err.Error()))
+		}
+	}
+	notes = append(notes, fmt.Sprintf("discarded the saved session (%d task record(s)); worktrees and branches were kept", len(tasks)))
+	return notes, nil
+}
+
 // StopSession tears down the ttorch tmux session (and all its windows). The
-// supervisor is stopped separately by the caller.
+// supervisor is stopped separately by the caller. It does NOT clear state, so the
+// session can be resumed later with `ttorch` or `ttorch resume`.
 func (m *Manager) StopSession() ([]string, error) {
 	if !tmux.Available() || !tmux.HasSession(m.Session) {
 		return []string{"no ttorch session was running"}, nil
@@ -272,8 +400,9 @@ func (m *Manager) StopSession() ([]string, error) {
 	}
 	notes := []string{fmt.Sprintf("stopped the ttorch session %q (%d window(s))", m.Session, len(windows))}
 	if workers > 0 {
-		notes = append(notes, fmt.Sprintf("%d worker(s) were running; their worktrees remain in the pool (run 'ttorch status' next time)", workers))
+		notes = append(notes, fmt.Sprintf("%d worker(s) were running; their worktrees remain in the pool", workers))
 	}
+	notes = append(notes, "run 'ttorch' to resume where you left off, or 'ttorch reset' to discard the saved session")
 	return notes, nil
 }
 

@@ -51,8 +51,14 @@ re-attaches to the same one. To work on other repos, just tell the manager their
 one manager tracks them all. When you're done (or want to move it to a different folder):
 
 ```sh
-ttorch stop            # stop the manager session + supervisor
+ttorch stop            # stop the manager session + supervisor (resumable)
 ```
+
+`ttorch stop` is a *resumable pause*, not a teardown: your team state, worktrees, and
+Claude conversations stay on disk. After a stop, a reboot, a crash, or a `ttorch update`,
+running `ttorch` again rebuilds the manager **and every worker tab**, each resumed to the
+exact conversation it had. Use `ttorch resume` to force that rebuild, or `ttorch reset` to
+discard the saved session for a clean start (worktrees and branches are always kept).
 
 ## 4. The daily loop
 

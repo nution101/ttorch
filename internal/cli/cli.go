@@ -4,6 +4,7 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -45,7 +46,7 @@ func assetName(tag string) string {
 // Main runs ttorch and returns a process exit code.
 func Main(args []string) int {
 	if len(args) == 0 {
-		// Bare `ttorch` launches the manager session.
+		// Bare `ttorch` launches the manager session (auto-restoring saved state).
 		return run(mgr().StartManager())
 	}
 	cmd, rest := args[0], args[1:]
@@ -72,6 +73,10 @@ func Main(args []string) int {
 		return run(cmdSkills(rest))
 	case "manager":
 		return run(mgr().StartManager())
+	case "resume":
+		return run(cmdResume())
+	case "reset":
+		return run(cmdReset(rest))
 	case "stop":
 		return run(cmdStop())
 	case "cc":
@@ -412,6 +417,55 @@ func cmdStop() error {
 		fmt.Println("  " + n)
 	}
 	return err
+}
+
+// cmdResume forces a rebuild of the manager window and every worker tab from
+// saved state, then attaches the lead to the manager.
+func cmdResume() error {
+	m := mgr()
+	notes, err := m.Resume()
+	if err != nil {
+		return err
+	}
+	for _, n := range notes {
+		fmt.Println("  " + n)
+	}
+	return m.StartManager()
+}
+
+// cmdReset discards the saved session (manager record + task records) for a clean
+// start. It confirms first unless --yes is given. Worktrees and branches are kept.
+func cmdReset(args []string) error {
+	fs := flag.NewFlagSet("reset", flag.ContinueOnError)
+	yes := fs.Bool("yes", false, "skip the confirmation prompt")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if !*yes && !confirm(os.Stdout, os.Stdin, "Discard the saved ttorch session (manager + task records)? Worktrees and branches are kept.") {
+		fmt.Println("aborted")
+		return nil
+	}
+	notes, err := mgr().Reset()
+	if err != nil {
+		return err
+	}
+	for _, n := range notes {
+		fmt.Println("  " + n)
+	}
+	return nil
+}
+
+// confirm prompts the user for a yes/no answer, defaulting to no.
+func confirm(out io.Writer, in io.Reader, prompt string) bool {
+	fmt.Fprintf(out, "%s [y/N] ", prompt)
+	r := bufio.NewReader(in)
+	line, _ := r.ReadString('\n')
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return true
+	default:
+		return false
+	}
 }
 
 func cmdSupervise() error {
@@ -759,12 +813,16 @@ func printResult(w io.Writer, res *installer.Result) {
 func usage(w io.Writer) {
 	fmt.Fprint(w, `ttorch — manage a team of Claude Code agents
 
-Usage: ttorch [command] [flags]   (bare 'ttorch' launches the manager session)
+Usage: ttorch [command] [flags]   (bare 'ttorch' launches/restores the manager session)
 
 Team:
-  (bare) ttorch           start/attach the manager (one persistent session; a new
-                          manager starts in the current folder — tell it the repo)
-  stop                    stop the manager session and the supervisor
+  (bare) ttorch           start/attach the manager (one persistent session). If a
+                          saved session exists (after stop/reboot/upgrade) it rebuilds
+                          the manager + all worker tabs, each resumed to its prior
+                          conversation; otherwise a new manager starts in this folder
+  resume                  force a rebuild of the manager + all worker tabs, then attach
+  reset [--yes]           discard the saved session for a clean start (keeps worktrees)
+  stop                    stop the manager session + supervisor (resumable: run 'ttorch')
   cc [--isolated]         open a Claude session attached to the team
   spawn <id> <repo>       start a worker on a task in an isolated worktree
     --scout                 investigation only (report, no code changes)

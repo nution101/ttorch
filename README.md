@@ -57,7 +57,9 @@ additionally confirm those checksums came from this repo's release workflow.
 | Command | Description |
 | --- | --- |
 | `ttorch` | Start/attach the manager (persistent; a new one starts in the current folder) |
-| `ttorch stop` | Stop the manager session and the supervisor |
+| `ttorch resume` | Force a rebuild of the manager + all worker tabs from saved state, then attach |
+| `ttorch reset [--yes]` | Discard the saved session for a clean start (worktrees/branches are kept) |
+| `ttorch stop` | Stop the manager session + supervisor (resumable: run `ttorch` to come back) |
 | `ttorch cc [--isolated]` | Open a Claude session attached to the team |
 | `ttorch spawn <id> <repo> [--scout]` | Start a worker on a task in an isolated worktree |
 | `ttorch status` | List active workers |
@@ -72,6 +74,29 @@ additionally confirm those checksums came from this repo's release workflow.
 | `ttorch init [--mode m]` | Set up a repo's AGENTS.md + CLAUDE.md + delivery mode |
 | `ttorch profile [dir]` | Derive the repo's stack/commands/conventions into AGENTS.md |
 | `ttorch version` / `help` | Version / usage |
+
+## Resuming after a reboot or upgrade
+
+Your team survives a stop, a reboot, a crash, or a `ttorch update`. Three things
+persist on disk independently of the running tmux session: ttorch's task state
+(`~/.ttorch/state`), the git worktrees, and Claude Code's conversation transcripts
+(`~/.claude/projects/<dir>/<id>.jsonl`). At launch each session is given a stable
+session id, so it can later be resumed to the exact conversation it had.
+
+- **`ttorch`** — bare `ttorch` is all you normally need. If a saved session exists,
+  it rebuilds the **manager window** and **every worker tab**, each resumed to its
+  prior Claude conversation (`--resume`), then attaches you. If there's no saved
+  session, it starts a fresh manager in the current folder.
+- **`ttorch stop`** — a *resumable pause*. It ends the tmux session and the
+  supervisor but keeps your saved session, so `ttorch` brings everything back.
+- **`ttorch resume`** — force a rebuild of the manager + all worker tabs from saved
+  state (useful if a window was closed), then attach.
+- **`ttorch reset [--yes]`** — discard the saved session for a clean start. It kills
+  the tmux session and removes the manager and task records. It **never** deletes
+  worktrees or branches — your work is safe.
+
+Restore is best-effort: if a worker's worktree is gone its tab is skipped (noted),
+and one window that fails to rebuild never aborts the rest.
 
 ## Project setup (automatic)
 

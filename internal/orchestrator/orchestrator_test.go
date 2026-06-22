@@ -12,6 +12,7 @@ import (
 	"github.com/nution101/ttorch/internal/approval"
 	"github.com/nution101/ttorch/internal/paths"
 	"github.com/nution101/ttorch/internal/projectinit"
+	"github.com/nution101/ttorch/internal/state"
 	"github.com/nution101/ttorch/internal/tmux"
 )
 
@@ -380,5 +381,74 @@ func TestStopSession(t *testing.T) {
 	notes, err := m.StopSession()
 	if err != nil || len(notes) == 0 {
 		t.Fatalf("stop with no session: notes=%v err=%v", notes, err)
+	}
+}
+
+// TestRestoreAndReset spawns a worker, kills the tmux session (simulating a stop/
+// reboot), then asserts restore() rebuilds the manager and worker windows from
+// saved state, and that Reset() clears the saved session.
+func TestRestoreAndReset(t *testing.T) {
+	if !tmux.Available() {
+		t.Skip("tmux not installed")
+	}
+	repo := newRepoMain(t)
+	session := fmt.Sprintf("ttorch-restore-%d", os.Getpid())
+	t.Setenv("TTORCH_HOME", t.TempDir())
+	t.Setenv("TTORCH_TMUX_SESSION", session)
+	defer exec.Command("tmux", "kill-session", "-t", session).Run()
+
+	m := New(paths.Default())
+
+	// Save a manager record so restore rebuilds the manager window too.
+	if err := m.Store.SaveManager(state.Manager{Dir: repo, SessionID: "mgr-sid"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tmux.EnsureSession(m.Session); err != nil {
+		t.Fatal(err)
+	}
+	if err := tmux.NewWindow(m.Session, "manager", repo); err != nil {
+		t.Fatal(err)
+	}
+
+	task, err := m.Spawn("r1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.SessionID == "" {
+		t.Fatal("spawn should assign a session id")
+	}
+	if task.Window != "wk-r1" {
+		t.Fatalf("window = %q, want wk-r1", task.Window)
+	}
+
+	// Simulate a stop / reboot: the tmux session is gone but state persists.
+	if err := tmux.KillSession(m.Session); err != nil {
+		t.Fatal(err)
+	}
+	if tmux.HasSession(session) {
+		t.Fatal("session should be gone after kill")
+	}
+
+	notes := m.restore()
+	t.Logf("restore notes: %v", notes)
+	if !tmux.WindowExists(m.Session, "manager") {
+		t.Fatal("restore should rebuild the manager window")
+	}
+	if !tmux.WindowExists(m.Session, "wk-r1") {
+		t.Fatal("restore should rebuild the worker window")
+	}
+
+	// Reset clears the saved session (manager record + task records).
+	if _, err := m.Reset(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := m.Store.LoadManager(); ok {
+		t.Fatal("Reset should remove the manager record")
+	}
+	if tasks, _ := m.Store.List(); len(tasks) != 0 {
+		t.Fatalf("Reset should clear task records, got %d", len(tasks))
+	}
+	if tmux.HasSession(session) {
+		t.Fatal("Reset should kill the tmux session")
 	}
 }
