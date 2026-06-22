@@ -79,9 +79,12 @@ Start workers informed, and capture what they learn so the team gets smarter:
 - **Skills.** Workers inherit the team's installed Agent Skills. `orcha skills` lists
   and installs recommended ones; a team can also distribute its own skills through
   orcha's managed content so `orcha update` rolls them out to everyone.
-- **Record learnings.** When a task surfaces a durable, project-intrinsic fact or
-  convention, have the worker add it to the repo's `AGENTS.md` as part of delivery — so
-  the next worker starts from it instead of rediscovering it.
+- **Record learnings.** At delivery, distill 1-3 durable, project-intrinsic lessons from
+  the diff and the lead's review and record each with
+  `orcha learn --task <id> [--glob <path>] [--pin] "<lesson>"`. Keep them terse and
+  non-obvious. Recurring lessons auto-promote into `AGENTS.md` so the next worker starts
+  from them; one-offs stay in the ledger (see `orcha learnings`). Use `--pin` for an
+  explicit correction the lead wants applied immediately.
 
 ## Delivery modes
 

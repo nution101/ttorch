@@ -100,8 +100,11 @@ Workers get more effective when they start informed:
   orcha's managed content so `orcha update` distributes them to everyone.
 - **Memory.** A repo's committed `AGENTS.md` (with `CLAUDE.md` symlinked to it by
   `orcha init`) is durable project memory — conventions, gotchas, where things live.
-  Workers read it automatically, and the manager records new durable learnings back into
-  it on delivery, so each task makes the next one faster.
+  Workers read it automatically. At delivery the manager records lessons with
+  `orcha learn` into `.orcha/learnings.jsonl`; **recurring** lessons auto-promote into a
+  capped `AGENTS.md` "Learnings" block, so the repo gets smarter over time without that
+  block ever bloating. Commit `AGENTS.md` and `.orcha/learnings.jsonl` so the whole team
+  benefits. (`orcha learnings` lists them.)
 
 ## 8. Approvals & safety
 

@@ -22,6 +22,7 @@ import (
 	"github.com/nution101/orcha/internal/buildinfo"
 	"github.com/nution101/orcha/internal/doctor"
 	"github.com/nution101/orcha/internal/installer"
+	"github.com/nution101/orcha/internal/learnings"
 	"github.com/nution101/orcha/internal/manifest"
 	"github.com/nution101/orcha/internal/orchestrator"
 	"github.com/nution101/orcha/internal/paths"
@@ -31,6 +32,7 @@ import (
 	"github.com/nution101/orcha/internal/skills"
 	"github.com/nution101/orcha/internal/supervisor"
 	"github.com/nution101/orcha/internal/wake"
+	"github.com/nution101/orcha/internal/worktree"
 )
 
 // repo is the GitHub slug releases are fetched from. Update when publishing.
@@ -104,6 +106,10 @@ func Main(args []string) int {
 		return run(cmdFleetSync(rest))
 	case "recovery":
 		return run(cmdRecovery())
+	case "learn":
+		return run(cmdLearn(rest))
+	case "learnings":
+		return run(cmdLearnings(rest))
 	case "worker", "skill":
 		fmt.Fprintf(os.Stderr, "orcha %s: not available yet — arrives in a later milestone.\n", cmd)
 		return 3
@@ -570,6 +576,85 @@ func cmdRecovery() error {
 	return nil
 }
 
+// resolveRepo picks the repo root for a learnings command: an explicit --repo, else
+// the --task's project, else the repo containing the current directory.
+func resolveRepo(repoFlag, taskFlag string) (string, error) {
+	if repoFlag != "" {
+		return worktree.RepoRoot(repoFlag)
+	}
+	if taskFlag != "" {
+		t, err := mgr().Store.Load(taskFlag)
+		if err != nil {
+			return "", fmt.Errorf("unknown task %q", taskFlag)
+		}
+		if t.Project != "" {
+			return t.Project, nil
+		}
+	}
+	return worktree.RepoRoot(".")
+}
+
+func cmdLearn(args []string) error {
+	fs := flag.NewFlagSet("learn", flag.ContinueOnError)
+	repo := fs.String("repo", "", "repository (default: current repo, or --task's repo)")
+	task := fs.String("task", "", "attribute the lesson to a task (resolves its repo)")
+	glob := fs.String("glob", "", "path scope, e.g. internal/api/**")
+	pin := fs.Bool("pin", false, "always include this lesson (don't wait for recurrence)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	text := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	if text == "" {
+		return errors.New(`usage: orcha learn [--task id] [--glob pat] [--pin] "<lesson>"`)
+	}
+	dir, err := resolveRepo(*repo, *task)
+	if err != nil {
+		return err
+	}
+	e, err := learnings.Apply(dir, text, *glob, *task, *pin)
+	if err != nil {
+		return err
+	}
+	status := "recorded"
+	if e.Pinned || e.Count >= learnings.PromoteThreshold {
+		status = "recorded + promoted to AGENTS.md"
+	}
+	fmt.Printf("%s (seen %dx): %s\n", status, e.Count, e.Text)
+	return nil
+}
+
+func cmdLearnings(args []string) error {
+	fs := flag.NewFlagSet("learnings", flag.ContinueOnError)
+	repo := fs.String("repo", "", "repository")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	dir, err := resolveRepo(*repo, "")
+	if err != nil {
+		return err
+	}
+	entries, err := (learnings.Store{Dir: dir}).Load()
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		fmt.Println("no learnings recorded yet")
+		return nil
+	}
+	promoted := map[string]bool{}
+	for _, e := range learnings.Promoted(entries) {
+		promoted[e.Text] = true
+	}
+	for _, e := range entries {
+		tag := "ledger"
+		if promoted[e.Text] {
+			tag = "in AGENTS.md"
+		}
+		fmt.Printf("  [%dx · %s] %s\n", e.Count, tag, e.Text)
+	}
+	return nil
+}
+
 func daemonStart() error {
 	p := paths.Default()
 	if pid, ok := supervisor.Running(p); ok {
@@ -690,6 +775,8 @@ Delivery:
   pr-check <id> <url>         watch a PR and wake when it merges
   fleet-sync [dir]            refresh local default from origin; prune gone branches
   recovery                    reconcile tracked tasks against live windows
+  learn [--task id] "<msg>"   record a durable repo lesson (auto-promotes when recurring)
+  learnings                   list recorded lessons
 
 Setup:
   install                 install/update managed skills, agents, and guidance
