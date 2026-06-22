@@ -35,3 +35,16 @@ Always run `make lint && make test` before committing.
 ## Roadmap
 
 See `ORCHA_PLAN.md` (one level up in the workspace, or the design doc) for milestones M0–M6.
+
+<!-- BEGIN orcha-profile -->
+Maintained by orcha (`orcha profile`). The repo's stack, commands, and
+conventions — match these when changing code here.
+
+- Stack: Go
+- Build: `go build ./...`
+- Test: `go test ./...`
+- Lint/format: `gofmt -l .`, `go vet ./...`
+- Tests: standard `testing` package; tests in *_test.go beside sources
+- Layout: cmd/, content/, docs/, internal/
+- Match the style of: internal/paths/paths.go, internal/tmux/tmux.go, internal/validate/validate.go
+<!-- END orcha-profile -->

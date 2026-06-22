@@ -71,6 +71,9 @@ orcha init --mode local     # fast-forward the local default branch after approv
 orcha init --mode validated # run the validation gate before opening a PR
 ```
 This writes an `AGENTS.md` block and symlinks `CLAUDE.md → AGENTS.md` in the repo.
+`orcha init` also derives a **project profile** (stack, exact build/test/lint commands,
+layout, and a few exemplar files) into `AGENTS.md` so workers match the repo's style;
+refresh it anytime with `orcha profile`. Commit `AGENTS.md` so workers pick it up.
 
 ## 6. Validation gate
 

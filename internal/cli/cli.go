@@ -25,6 +25,7 @@ import (
 	"github.com/nution101/orcha/internal/manifest"
 	"github.com/nution101/orcha/internal/orchestrator"
 	"github.com/nution101/orcha/internal/paths"
+	"github.com/nution101/orcha/internal/profile"
 	"github.com/nution101/orcha/internal/projectinit"
 	"github.com/nution101/orcha/internal/selfupdate"
 	"github.com/nution101/orcha/internal/skills"
@@ -63,6 +64,8 @@ func Main(args []string) int {
 		return run(cmdUninstall(rest))
 	case "init":
 		return run(cmdInit(rest))
+	case "profile":
+		return run(cmdProfile(rest))
 	case "skills":
 		return run(cmdSkills(rest))
 	case "manager":
@@ -239,6 +242,34 @@ func cmdInit(args []string) error {
 	for _, n := range notes {
 		fmt.Println("  " + n)
 	}
+	if p, err := profile.Apply(dir); err == nil {
+		stack := p.Stack
+		if stack == "" {
+			stack = "unknown"
+		}
+		fmt.Printf("  wrote project profile (stack: %s) — commit AGENTS.md so workers pick it up\n", stack)
+	}
+	return nil
+}
+
+func cmdProfile(args []string) error {
+	dir := "."
+	if len(args) > 0 {
+		dir = args[0]
+	}
+	p, err := profile.Apply(dir)
+	if err != nil {
+		return err
+	}
+	stack := p.Stack
+	if stack == "" {
+		stack = "unknown"
+	}
+	fmt.Printf("Updated the project profile in %s/AGENTS.md (stack: %s).\n", dir, stack)
+	if len(p.Exemplars) > 0 {
+		fmt.Printf("  exemplars: %s\n", strings.Join(p.Exemplars, ", "))
+	}
+	fmt.Println("  Commit AGENTS.md so workers pick it up.")
 	return nil
 }
 
@@ -667,6 +698,7 @@ Setup:
   doctor [--yes]          check/install tmux, git, gh, claude
   skills [install]        list / install recommended agent skills (e.g. axi)
   init [--mode m]         set up a repo's AGENTS.md + CLAUDE.md + delivery mode
+  profile [dir]           derive the repo's stack/commands/conventions into AGENTS.md
   version | help          version / this message
 
 Coming later: native-Windows polish

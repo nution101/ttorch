@@ -48,6 +48,7 @@ orcha doctor      # check/installs tmux, git, gh, claude
 | `orcha doctor [--yes]` | Detect and install missing dependencies |
 | `orcha skills [install]` | List/install recommended agent skills (e.g. axi) |
 | `orcha init [--mode m]` | Set up a repo's AGENTS.md + CLAUDE.md + delivery mode |
+| `orcha profile [dir]` | Derive the repo's stack/commands/conventions into AGENTS.md |
 | `orcha version` / `help` | Version / usage |
 
 ## How updates stay safe
