@@ -269,18 +269,21 @@ func TestMergeLocal_ApprovalBinding(t *testing.T) {
 	gitIn(t, wt, "add", "-A")
 	gitIn(t, wt, "commit", "-q", "-m", "work1")
 
-	// A recoverable refusal (dirty repo) must NOT consume the approval.
-	os.WriteFile(filepath.Join(repo, "dirty.txt"), []byte("x\n"), 0o644)
+	// A recoverable refusal (uncommitted tracked changes) must NOT consume the approval.
+	os.WriteFile(filepath.Join(repo, "f.txt"), []byte("locally changed\n"), 0o644) // f.txt is tracked
 	if err := m.Approve("b1", time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.MergeLocal("b1"); err == nil {
-		t.Fatal("merge should refuse while the repo is dirty")
+		t.Fatal("merge should refuse with uncommitted tracked changes")
 	}
 	if !approval.Valid(m.P.ApprovalFile("b1")) {
 		t.Fatal("a recoverable refusal must leave the approval intact")
 	}
-	os.Remove(filepath.Join(repo, "dirty.txt"))
+	gitIn(t, repo, "checkout", "--", "f.txt") // restore the tracked file
+
+	// An UNTRACKED file (e.g. an `orcha init` AGENTS.md) must NOT block the merge.
+	os.WriteFile(filepath.Join(repo, "AGENTS.md"), []byte("notes\n"), 0o644)
 
 	// The worker changes after approval -> merge must reject (and consume the stale token).
 	os.WriteFile(filepath.Join(wt, "b.txt"), []byte("2\n"), 0o644)
@@ -298,7 +301,7 @@ func TestMergeLocal_ApprovalBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := m.MergeLocal("b1"); err != nil {
-		t.Fatalf("merge after re-approval: %v", err)
+		t.Fatalf("merge after re-approval (untracked files present): %v", err)
 	}
 	if gitIn(t, repo, "rev-parse", "HEAD") != gitIn(t, wt, "rev-parse", "HEAD") {
 		t.Fatal("default branch was not fast-forwarded after re-approval")

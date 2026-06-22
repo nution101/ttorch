@@ -92,7 +92,7 @@ func (p Pool) Acquire(repo string, inUse []string) (string, error) {
 		if busy[abs] {
 			continue
 		}
-		tracked, err := hasTrackedChanges(s)
+		tracked, err := HasTrackedChanges(s)
 		if err != nil || tracked {
 			continue // skip slots with orphaned uncommitted work or unreadable state
 		}
@@ -135,8 +135,11 @@ func IsDirty(slot string) (bool, error) {
 	return strings.TrimSpace(out) != "", nil
 }
 
-func hasTrackedChanges(slot string) (bool, error) {
-	out, err := git("-C", slot, "status", "--porcelain", "--untracked-files=no")
+// HasTrackedChanges reports uncommitted changes to tracked files (ignoring
+// untracked files). A fast-forward merge is safe with untracked files present, so
+// this is the right cleanliness gate for merge-local.
+func HasTrackedChanges(path string) (bool, error) {
+	out, err := git("-C", path, "status", "--porcelain", "--untracked-files=no")
 	if err != nil {
 		return false, err
 	}

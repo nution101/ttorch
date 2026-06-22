@@ -299,8 +299,11 @@ func (m *Manager) MergeLocal(taskID string) (string, error) {
 	if cur != def {
 		return "", fmt.Errorf("repo is on %q, not the default branch %q", cur, def)
 	}
-	if dirty, _ := worktree.IsDirty(repo); dirty {
-		return "", fmt.Errorf("repo has uncommitted changes; commit or stash before merging")
+	// Only tracked changes block a fast-forward; untracked files (e.g. an `orcha init`
+	// AGENTS.md the developer hasn't committed) are fine, and git's own --ff-only
+	// guards the rare untracked-collision case.
+	if changed, _ := worktree.HasTrackedChanges(repo); changed {
+		return "", fmt.Errorf("repo has uncommitted changes to tracked files; commit or stash before merging")
 	}
 	workerHead, err := worktree.Head(t.Worktree)
 	if err != nil {
