@@ -1,4 +1,4 @@
-// Package paths centralizes orcha's on-disk layout. Every location is overridable
+// Package paths centralizes ttorch's on-disk layout. Every location is overridable
 // via an environment variable so tests can redirect into a temp directory.
 package paths
 
@@ -7,13 +7,13 @@ import (
 	"path/filepath"
 )
 
-// Paths describes where orcha keeps its own state and where it installs the
+// Paths describes where ttorch keeps its own state and where it installs the
 // managed Claude Code / agent content.
 type Paths struct {
-	Home     string // ~/.orcha (ORCHA_HOME)
-	Claude   string // ~/.claude (ORCHA_CLAUDE_DIR)
-	Agents   string // ~/.agents (ORCHA_AGENTS_DIR)
-	LocalBin string // ~/.local/bin (ORCHA_BIN_DIR) — where the PATH symlink lives
+	Home     string // ~/.ttorch (TTORCH_HOME)
+	Claude   string // ~/.claude (TTORCH_CLAUDE_DIR)
+	Agents   string // ~/.agents (TTORCH_AGENTS_DIR)
+	LocalBin string // ~/.local/bin (TTORCH_BIN_DIR) — where the PATH symlink lives
 }
 
 func envOr(key, fallback string) string {
@@ -30,19 +30,19 @@ func Default() Paths {
 		home = "."
 	}
 	return Paths{
-		Home:     envOr("ORCHA_HOME", filepath.Join(home, ".orcha")),
-		Claude:   envOr("ORCHA_CLAUDE_DIR", filepath.Join(home, ".claude")),
-		Agents:   envOr("ORCHA_AGENTS_DIR", filepath.Join(home, ".agents")),
-		LocalBin: envOr("ORCHA_BIN_DIR", filepath.Join(home, ".local", "bin")),
+		Home:     envOr("TTORCH_HOME", filepath.Join(home, ".ttorch")),
+		Claude:   envOr("TTORCH_CLAUDE_DIR", filepath.Join(home, ".claude")),
+		Agents:   envOr("TTORCH_AGENTS_DIR", filepath.Join(home, ".agents")),
+		LocalBin: envOr("TTORCH_BIN_DIR", filepath.Join(home, ".local", "bin")),
 	}
 }
 
-// BinDir is the user-owned directory holding the real orcha binary.
+// BinDir is the user-owned directory holding the real ttorch binary.
 // It is intentionally user-owned so macOS can atomically self-replace it.
 func (p Paths) BinDir() string { return filepath.Join(p.Home, "bin") }
 
-// Binary is the path to the installed orcha executable.
-func (p Paths) Binary() string { return filepath.Join(p.BinDir(), "orcha") }
+// Binary is the path to the installed ttorch executable.
+func (p Paths) Binary() string { return filepath.Join(p.BinDir(), "ttorch") }
 
 // ManifestFile is the ledger of every managed file and its sha256.
 func (p Paths) ManifestFile() string { return filepath.Join(p.Home, "manifest.json") }

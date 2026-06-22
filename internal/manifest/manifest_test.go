@@ -103,7 +103,7 @@ func TestReconcile_NeverClobbersUserEdits(t *testing.T) {
 		t.Fatal("user edits were clobbered!")
 	}
 	if read(t, dest+Suffix) != "v2" {
-		t.Fatal("new version not parked as .orcha-new")
+		t.Fatal("new version not parked as .ttorch-new")
 	}
 }
 

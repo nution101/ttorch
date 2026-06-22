@@ -13,12 +13,12 @@ import (
 	"time"
 )
 
-// SessionName is the tmux session orcha uses (override with ORCHA_TMUX_SESSION).
+// SessionName is the tmux session ttorch uses (override with TTORCH_TMUX_SESSION).
 func SessionName() string {
-	if s := os.Getenv("ORCHA_TMUX_SESSION"); s != "" {
+	if s := os.Getenv("TTORCH_TMUX_SESSION"); s != "" {
 		return s
 	}
-	return "orcha"
+	return "ttorch"
 }
 
 // Available reports whether tmux is installed.
@@ -33,7 +33,7 @@ func InsideTmux() bool { return os.Getenv("TMUX") != "" }
 func bin() (string, error) {
 	p, err := exec.LookPath("tmux")
 	if err != nil {
-		return "", errors.New("tmux not found (run 'orcha doctor')")
+		return "", errors.New("tmux not found (run 'ttorch doctor')")
 	}
 	return p, nil
 }

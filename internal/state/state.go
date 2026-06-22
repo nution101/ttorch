@@ -1,4 +1,4 @@
-// Package state persists task records as JSON under ~/.orcha/state, so the manager
+// Package state persists task records as JSON under ~/.ttorch/state, so the manager
 // is restart-proof: any session can read the current team from disk.
 package state
 
@@ -39,7 +39,7 @@ func (s Store) Save(t Task) error {
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(s.Dir, ".orcha-tmp-*")
+	tmp, err := os.CreateTemp(s.Dir, ".ttorch-tmp-*")
 	if err != nil {
 		return err
 	}

@@ -8,7 +8,7 @@ import (
 
 // These are overridden at build time, e.g.:
 //
-//	go build -ldflags "-X github.com/nution101/orcha/internal/buildinfo.Version=v0.1.0"
+//	go build -ldflags "-X github.com/nution101/ttorch/internal/buildinfo.Version=v0.1.0"
 var (
 	Version = "dev"
 	Commit  = "none"
@@ -37,5 +37,5 @@ func CurrentVersion() string {
 
 // String returns a human-readable one-line build summary.
 func String() string {
-	return fmt.Sprintf("orcha %s (commit %s, built %s)", CurrentVersion(), Commit, Date)
+	return fmt.Sprintf("ttorch %s (commit %s, built %s)", CurrentVersion(), Commit, Date)
 }

@@ -15,8 +15,8 @@ import (
 )
 
 const (
-	markerBegin = "<!-- BEGIN orcha-profile -->"
-	markerEnd   = "<!-- END orcha-profile -->"
+	markerBegin = "<!-- BEGIN ttorch-profile -->"
+	markerEnd   = "<!-- END ttorch-profile -->"
 )
 
 // Profile is the derived, render-ready summary of a repository.
@@ -33,7 +33,7 @@ type Profile struct {
 
 var noiseDirs = map[string]bool{
 	".git": true, "node_modules": true, "vendor": true, "dist": true,
-	"build": true, "target": true, ".orcha": true, ".idea": true,
+	"build": true, "target": true, ".ttorch": true, ".idea": true,
 	".vscode": true, ".next": true, "out": true,
 }
 
@@ -88,7 +88,7 @@ func Detect(repoDir string) Profile {
 // Render produces the AGENTS.md block body for a profile (only populated lines).
 func Render(p Profile) string {
 	var b strings.Builder
-	b.WriteString("Maintained by orcha (`orcha profile`). The repo's stack, commands, and\n")
+	b.WriteString("Maintained by ttorch (`ttorch profile`). The repo's stack, commands, and\n")
 	b.WriteString("conventions — match these when changing code here.\n\n")
 	line := func(label string, v string) {
 		if v != "" {
@@ -312,7 +312,7 @@ func atomicWrite(path string, content []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".orcha-tmp-*")
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".ttorch-tmp-*")
 	if err != nil {
 		return err
 	}

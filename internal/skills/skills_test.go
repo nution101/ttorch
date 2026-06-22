@@ -37,7 +37,7 @@ func TestListMentionsInstall(t *testing.T) {
 	var buf bytes.Buffer
 	List(&buf)
 	out := buf.String()
-	if !strings.Contains(out, "kunchenguid/axi") || !strings.Contains(out, "orcha skills install") {
+	if !strings.Contains(out, "kunchenguid/axi") || !strings.Contains(out, "ttorch skills install") {
 		t.Fatalf("List output missing expected content:\n%s", out)
 	}
 }

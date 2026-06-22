@@ -1,6 +1,6 @@
-// Package projectinit implements `orcha init`: set up a repository to follow the
+// Package projectinit implements `ttorch init`: set up a repository to follow the
 // AGENTS.md-as-source + CLAUDE.md-symlink convention and record its delivery mode
-// in an orcha-managed block, without clobbering existing developer content.
+// in an ttorch-managed block, without clobbering existing developer content.
 package projectinit
 
 import (
@@ -11,8 +11,8 @@ import (
 )
 
 const (
-	markerBegin = "<!-- BEGIN orcha-managed -->"
-	markerEnd   = "<!-- END orcha-managed -->"
+	markerBegin = "<!-- BEGIN ttorch-managed -->"
+	markerEnd   = "<!-- END ttorch-managed -->"
 )
 
 // ValidMode reports whether mode is a recognized delivery mode.
@@ -24,7 +24,7 @@ func ValidMode(mode string) bool {
 	return false
 }
 
-// Init sets up dir: ensures AGENTS.md carries the orcha-managed delivery-mode block
+// Init sets up dir: ensures AGENTS.md carries the ttorch-managed delivery-mode block
 // and that CLAUDE.md symlinks to AGENTS.md. It returns human-readable notes.
 func Init(dir, mode string) ([]string, error) {
 	if mode == "" {
@@ -64,12 +64,12 @@ func Init(dir, mode string) ([]string, error) {
 
 func managedBlock(mode string) string {
 	return markerBegin + "\n" +
-		"This repository is managed by orcha. The manager reads the delivery mode below.\n\n" +
+		"This repository is managed by ttorch. The manager reads the delivery mode below.\n\n" +
 		"- delivery-mode: " + mode + "\n" +
 		markerEnd
 }
 
-// upsertBlock replaces the orcha-managed block in an existing AGENTS.md, or appends
+// upsertBlock replaces the ttorch-managed block in an existing AGENTS.md, or appends
 // it, preserving all developer content outside the markers.
 func upsertBlock(path, block, mode string) (string, error) {
 	existing, err := os.ReadFile(path)
@@ -93,7 +93,7 @@ func upsertBlock(path, block, mode string) (string, error) {
 	if err := atomicWrite(path, []byte(text+sep+block+"\n")); err != nil {
 		return "", err
 	}
-	return "added orcha block to AGENTS.md (delivery-mode: " + mode + ")", nil
+	return "added ttorch block to AGENTS.md (delivery-mode: " + mode + ")", nil
 }
 
 // ensureSymlink makes dst -> linkTarget, with a copy fallback; never clobbers an
@@ -121,7 +121,7 @@ func atomicWrite(path string, content []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".orcha-tmp-*")
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".ttorch-tmp-*")
 	if err != nil {
 		return err
 	}

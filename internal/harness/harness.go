@@ -134,9 +134,9 @@ func quote(s string) string {
 // prompt blocking it. It sets hasTrustDialogAccepted in Claude's config
 // (~/.claude.json) for the given paths. Best-effort and idempotent: it never fails
 // a spawn, never overwrites an unparseable config, and is a no-op when the harness
-// is not claude or ORCHA_NO_AUTOTRUST is set.
+// is not claude or TTORCH_NO_AUTOTRUST is set.
 func TrustWorktree(kind string, paths ...string) {
-	if kind != "claude" || os.Getenv("ORCHA_NO_AUTOTRUST") != "" {
+	if kind != "claude" || os.Getenv("TTORCH_NO_AUTOTRUST") != "" {
 		return
 	}
 	var resolved []string
@@ -153,7 +153,7 @@ func TrustWorktree(kind string, paths ...string) {
 }
 
 func claudeConfigPath() string {
-	if v := os.Getenv("ORCHA_CLAUDE_JSON"); v != "" { // test/override hook
+	if v := os.Getenv("TTORCH_CLAUDE_JSON"); v != "" { // test/override hook
 		return v
 	}
 	home, err := os.UserHomeDir()
@@ -208,7 +208,7 @@ func ensureTrusted(cfgPath string, paths []string) error {
 
 func atomicWrite(path string, b []byte) error {
 	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".orcha-claude-*")
+	tmp, err := os.CreateTemp(dir, ".ttorch-claude-*")
 	if err != nil {
 		return err
 	}

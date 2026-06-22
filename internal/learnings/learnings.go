@@ -1,6 +1,6 @@
-// Package learnings is orcha's capture-on-delivery memory loop. The manager records
+// Package learnings is ttorch's capture-on-delivery memory loop. The manager records
 // durable, project-intrinsic lessons at the approval gate; they accumulate in a
-// per-repo ledger (.orcha/learnings.jsonl), and recurring (or pinned) lessons are
+// per-repo ledger (.ttorch/learnings.jsonl), and recurring (or pinned) lessons are
 // promoted into a capped, always-loaded "Learnings" block in AGENTS.md. Deterministic
 // and file-based — no embeddings, no RAG.
 package learnings
@@ -24,8 +24,8 @@ const (
 	// MaxLessonLen truncates an individual lesson (hygiene).
 	MaxLessonLen = 240
 
-	markerBegin = "<!-- BEGIN orcha-learnings -->"
-	markerEnd   = "<!-- END orcha-learnings -->"
+	markerBegin = "<!-- BEGIN ttorch-learnings -->"
+	markerEnd   = "<!-- END ttorch-learnings -->"
 )
 
 // Entry is one accumulated lesson.
@@ -41,7 +41,7 @@ type Entry struct {
 // Store is the per-repo ledger.
 type Store struct{ Dir string } // Dir is the repository root
 
-func (s Store) path() string { return filepath.Join(s.Dir, ".orcha", "learnings.jsonl") }
+func (s Store) path() string { return filepath.Join(s.Dir, ".ttorch", "learnings.jsonl") }
 
 // Load returns the ledger entries (empty if none yet).
 func (s Store) Load() ([]Entry, error) {
@@ -133,10 +133,10 @@ func (s Store) Prune(maxAge time.Duration) (int, error) {
 	return removed, err
 }
 
-// withLock serializes ledger read-modify-write across concurrent orcha processes
+// withLock serializes ledger read-modify-write across concurrent ttorch processes
 // (parallel workers/manager) using a mkdir-based lock, so updates can't clobber.
 func (s Store) withLock(fn func() error) error {
-	dir := filepath.Join(s.Dir, ".orcha")
+	dir := filepath.Join(s.Dir, ".ttorch")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
@@ -179,7 +179,7 @@ func Promoted(entries []Entry) []Entry {
 func Render(entries []Entry) string {
 	promoted := Promoted(entries)
 	var b strings.Builder
-	b.WriteString("Maintained by orcha — recurring lessons learned in this repo. Apply them.\n\n")
+	b.WriteString("Maintained by ttorch — recurring lessons learned in this repo. Apply them.\n\n")
 	if len(promoted) == 0 {
 		b.WriteString("_No recurring lessons recorded yet._\n")
 		return b.String()
@@ -251,7 +251,7 @@ func atomicWrite(path string, content []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".orcha-tmp-*")
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".ttorch-tmp-*")
 	if err != nil {
 		return err
 	}

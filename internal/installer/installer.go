@@ -10,16 +10,16 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/nution101/orcha/internal/manifest"
-	"github.com/nution101/orcha/internal/paths"
+	"github.com/nution101/ttorch/internal/manifest"
+	"github.com/nution101/ttorch/internal/paths"
 )
 
 const (
 	embedRoot    = "content"
 	agentsGlobal = "assets/AGENTS.global.md"
 
-	markerBegin = "<!-- BEGIN orcha-managed -->"
-	markerEnd   = "<!-- END orcha-managed -->"
+	markerBegin = "<!-- BEGIN ttorch-managed -->"
+	markerEnd   = "<!-- END ttorch-managed -->"
 )
 
 // Result bundles the manifest report with the side-effects on AGENTS.md/CLAUDE.md.
@@ -102,10 +102,10 @@ func desiredFiles(content fs.FS, p paths.Paths) (map[string][]byte, []byte, erro
 	return desired, global, nil
 }
 
-// Uninstall removes managed files orcha still owns (sha matches the ledger),
+// Uninstall removes managed files ttorch still owns (sha matches the ledger),
 // leaves anything the developer modified, strips the AGENTS managed block, and
 // removes the CLAUDE.md symlink if it points at our AGENTS.md. State/data under
-// ~/.orcha is preserved unless purge is set.
+// ~/.ttorch is preserved unless purge is set.
 func Uninstall(p paths.Paths, purge bool) (*Result, error) {
 	prev := manifest.Load(p.ManifestFile())
 	rep := &manifest.Report{}
@@ -144,7 +144,7 @@ func Uninstall(p paths.Paths, purge bool) (*Result, error) {
 	return res, nil
 }
 
-// applyAgentsBlock replaces only the orcha-managed block in the target file,
+// applyAgentsBlock replaces only the ttorch-managed block in the target file,
 // preserving any developer-authored content outside the markers.
 func applyAgentsBlock(target string, block []byte) (string, error) {
 	managed := markerBegin + "\n" + strings.TrimRight(string(block), "\n") + "\n" + markerEnd + "\n"
@@ -238,7 +238,7 @@ func atomicWrite(p string, content []byte) error {
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(p), ".orcha-tmp-*")
+	tmp, err := os.CreateTemp(filepath.Dir(p), ".ttorch-tmp-*")
 	if err != nil {
 		return err
 	}

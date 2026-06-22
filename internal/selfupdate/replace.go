@@ -9,8 +9,8 @@ import (
 
 // ReplaceExecutable atomically replaces the binary at target with newBytes.
 //
-// It resolves symlinks first so a PATH symlink (e.g. ~/.local/bin/orcha ->
-// ~/.orcha/bin/orcha) is followed and the REAL binary is rewritten. The new
+// It resolves symlinks first so a PATH symlink (e.g. ~/.local/bin/ttorch ->
+// ~/.ttorch/bin/ttorch) is followed and the REAL binary is rewritten. The new
 // bytes are written to a temp file in the same directory (so os.Rename is an
 // atomic same-filesystem swap) with the original permissions preserved.
 //
@@ -29,7 +29,7 @@ func ReplaceExecutable(target string, newBytes []byte) error {
 		perm = fi.Mode().Perm()
 	}
 
-	tmp, err := os.CreateTemp(dir, ".orcha-update-*")
+	tmp, err := os.CreateTemp(dir, ".ttorch-update-*")
 	if err != nil {
 		return fmt.Errorf("create temp in %s: %w", dir, err)
 	}
@@ -51,7 +51,7 @@ func ReplaceExecutable(target string, newBytes []byte) error {
 	if err := os.Rename(tmpName, real); err != nil {
 		os.Remove(tmpName)
 		if runtime.GOOS == "darwin" {
-			return fmt.Errorf("cannot atomically replace %s: %w; reinstall orcha into a user-owned dir (e.g. ~/.orcha/bin)", real, err)
+			return fmt.Errorf("cannot atomically replace %s: %w; reinstall ttorch into a user-owned dir (e.g. ~/.ttorch/bin)", real, err)
 		}
 		if werr := os.WriteFile(real, newBytes, perm); werr != nil {
 			return werr

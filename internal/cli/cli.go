@@ -1,4 +1,4 @@
-// Package cli implements orcha's command dispatch. Milestone M0 ships the
+// Package cli implements ttorch's command dispatch. Milestone M0 ships the
 // distribution surface (install / update / uninstall / doctor / version);
 // orchestration verbs are stubbed with a clear "coming soon" message.
 package cli
@@ -18,34 +18,34 @@ import (
 	"syscall"
 	"time"
 
-	orchaembed "github.com/nution101/orcha"
-	"github.com/nution101/orcha/internal/buildinfo"
-	"github.com/nution101/orcha/internal/doctor"
-	"github.com/nution101/orcha/internal/installer"
-	"github.com/nution101/orcha/internal/learnings"
-	"github.com/nution101/orcha/internal/manifest"
-	"github.com/nution101/orcha/internal/orchestrator"
-	"github.com/nution101/orcha/internal/paths"
-	"github.com/nution101/orcha/internal/profile"
-	"github.com/nution101/orcha/internal/projectinit"
-	"github.com/nution101/orcha/internal/selfupdate"
-	"github.com/nution101/orcha/internal/skills"
-	"github.com/nution101/orcha/internal/supervisor"
-	"github.com/nution101/orcha/internal/wake"
-	"github.com/nution101/orcha/internal/worktree"
+	ttorchembed "github.com/nution101/ttorch"
+	"github.com/nution101/ttorch/internal/buildinfo"
+	"github.com/nution101/ttorch/internal/doctor"
+	"github.com/nution101/ttorch/internal/installer"
+	"github.com/nution101/ttorch/internal/learnings"
+	"github.com/nution101/ttorch/internal/manifest"
+	"github.com/nution101/ttorch/internal/orchestrator"
+	"github.com/nution101/ttorch/internal/paths"
+	"github.com/nution101/ttorch/internal/profile"
+	"github.com/nution101/ttorch/internal/projectinit"
+	"github.com/nution101/ttorch/internal/selfupdate"
+	"github.com/nution101/ttorch/internal/skills"
+	"github.com/nution101/ttorch/internal/supervisor"
+	"github.com/nution101/ttorch/internal/wake"
+	"github.com/nution101/ttorch/internal/worktree"
 )
 
 // repo is the GitHub slug releases are fetched from. Update when publishing.
-const repo = "nution101/orcha"
+const repo = "nution101/ttorch"
 
 func assetName(tag string) string {
-	return fmt.Sprintf("orcha-%s-%s-%s.tar.gz", tag, runtime.GOOS, runtime.GOARCH)
+	return fmt.Sprintf("ttorch-%s-%s-%s.tar.gz", tag, runtime.GOOS, runtime.GOARCH)
 }
 
-// Main runs orcha and returns a process exit code.
+// Main runs ttorch and returns a process exit code.
 func Main(args []string) int {
 	if len(args) == 0 {
-		// Bare `orcha` launches the manager session.
+		// Bare `ttorch` launches the manager session.
 		return run(mgr().StartManager())
 	}
 	cmd, rest := args[0], args[1:]
@@ -111,10 +111,10 @@ func Main(args []string) int {
 	case "learnings":
 		return run(cmdLearnings(rest))
 	case "worker", "skill":
-		fmt.Fprintf(os.Stderr, "orcha %s: not available yet — arrives in a later milestone.\n", cmd)
+		fmt.Fprintf(os.Stderr, "ttorch %s: not available yet — arrives in a later milestone.\n", cmd)
 		return 3
 	default:
-		fmt.Fprintf(os.Stderr, "orcha: unknown command %q\n\n", cmd)
+		fmt.Fprintf(os.Stderr, "ttorch: unknown command %q\n\n", cmd)
 		usage(os.Stderr)
 		return 2
 	}
@@ -139,7 +139,7 @@ func cmdDoctor(args []string) error {
 
 func cmdInstall() error {
 	p := paths.Default()
-	res, err := installer.Apply(orchaembed.Content, p, buildinfo.CurrentVersion())
+	res, err := installer.Apply(ttorchembed.Content, p, buildinfo.CurrentVersion())
 	if err != nil {
 		return err
 	}
@@ -198,7 +198,7 @@ func cmdUpdate(args []string) error {
 
 func cmdUninstall(args []string) error {
 	fs := flag.NewFlagSet("uninstall", flag.ContinueOnError)
-	purge := fs.Bool("purge", false, "also remove ~/.orcha state and data")
+	purge := fs.Bool("purge", false, "also remove ~/.ttorch state and data")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -285,7 +285,7 @@ func cmdSpawn(args []string) error {
 	// Task id and repo are the first two positionals; flags follow (the stdlib
 	// flag parser stops at the first positional, so parse the remainder).
 	if len(args) < 2 {
-		return errors.New(`usage: orcha spawn <task-id> <repo-path> [--scout] [--cmd "..."]`)
+		return errors.New(`usage: ttorch spawn <task-id> <repo-path> [--scout] [--cmd "..."]`)
 	}
 	id, repo := args[0], args[1]
 	fs := flag.NewFlagSet("spawn", flag.ContinueOnError)
@@ -309,7 +309,7 @@ func cmdStatus() error {
 		return err
 	}
 	if len(tasks) == 0 {
-		fmt.Println("no active workers. dispatch with: orcha spawn <task-id> <repo-path>")
+		fmt.Println("no active workers. dispatch with: ttorch spawn <task-id> <repo-path>")
 		return nil
 	}
 	fmt.Printf("%-16s %-6s %-8s %-12s %s\n", "TASK", "KIND", "STATE", "WINDOW", "PROJECT")
@@ -325,7 +325,7 @@ func cmdStatus() error {
 
 func cmdPeek(args []string) error {
 	if len(args) < 1 {
-		return errors.New("usage: orcha peek <task-id> [lines]")
+		return errors.New("usage: ttorch peek <task-id> [lines]")
 	}
 	lines := 40
 	if len(args) > 1 {
@@ -343,7 +343,7 @@ func cmdPeek(args []string) error {
 
 func cmdSend(args []string) error {
 	if len(args) < 2 {
-		return errors.New("usage: orcha send <task-id> <text...>")
+		return errors.New("usage: ttorch send <task-id> <text...>")
 	}
 	if err := mgr().Send(args[0], strings.Join(args[1:], " ")); err != nil {
 		return err
@@ -354,7 +354,7 @@ func cmdSend(args []string) error {
 
 func cmdTeardown(args []string) error {
 	if len(args) < 1 {
-		return errors.New("usage: orcha teardown <task-id> [--force]")
+		return errors.New("usage: ttorch teardown <task-id> [--force]")
 	}
 	id := args[0]
 	fs := flag.NewFlagSet("teardown", flag.ContinueOnError)
@@ -399,7 +399,7 @@ func cmdDaemon(args []string) error {
 	case "status":
 		return daemonStatus()
 	default:
-		return errors.New("usage: orcha daemon run|start|stop|status")
+		return errors.New("usage: ttorch daemon run|start|stop|status")
 	}
 }
 
@@ -413,7 +413,7 @@ func cmdSupervise() error {
 
 func cmdWake(args []string) error {
 	if len(args) == 0 || args[0] != "drain" {
-		return errors.New("usage: orcha wake drain")
+		return errors.New("usage: ttorch wake drain")
 	}
 	ws, err := (wake.Queue{Path: paths.Default().WakeQueue()}).Drain()
 	if err != nil {
@@ -436,14 +436,14 @@ func cmdWake(args []string) error {
 
 func cmdValidate(args []string) error {
 	if len(args) < 1 {
-		return errors.New("usage: orcha validate <task-id>")
+		return errors.New("usage: ttorch validate <task-id>")
 	}
 	results, err := mgr().Validate(args[0])
 	if err != nil {
 		return err
 	}
 	if len(results) == 0 {
-		fmt.Println("no checks detected for this worktree (add .orcha/validate.sh to define them)")
+		fmt.Println("no checks detected for this worktree (add .ttorch/validate.sh to define them)")
 		return nil
 	}
 	failed := 0
@@ -479,7 +479,7 @@ func indentTail(s string, n int) string {
 
 func cmdReviewDiff(args []string) error {
 	if len(args) < 1 {
-		return errors.New("usage: orcha review-diff <task-id> [--stat]")
+		return errors.New("usage: ttorch review-diff <task-id> [--stat]")
 	}
 	id := args[0]
 	fs := flag.NewFlagSet("review-diff", flag.ContinueOnError)
@@ -501,7 +501,7 @@ func cmdReviewDiff(args []string) error {
 
 func cmdApprove(args []string) error {
 	if len(args) < 1 {
-		return errors.New("usage: orcha approve <task-id> [--ttl 10m]")
+		return errors.New("usage: ttorch approve <task-id> [--ttl 10m]")
 	}
 	id := args[0]
 	fs := flag.NewFlagSet("approve", flag.ContinueOnError)
@@ -512,13 +512,13 @@ func cmdApprove(args []string) error {
 	if err := mgr().Approve(id, *ttl); err != nil {
 		return err
 	}
-	fmt.Printf("approved %s for %s — now run: orcha merge-local %s\n", id, *ttl, id)
+	fmt.Printf("approved %s for %s — now run: ttorch merge-local %s\n", id, *ttl, id)
 	return nil
 }
 
 func cmdMergeLocal(args []string) error {
 	if len(args) < 1 {
-		return errors.New("usage: orcha merge-local <task-id>")
+		return errors.New("usage: ttorch merge-local <task-id>")
 	}
 	out, err := mgr().MergeLocal(args[0])
 	if err != nil {
@@ -530,7 +530,7 @@ func cmdMergeLocal(args []string) error {
 
 func cmdPromote(args []string) error {
 	if len(args) < 1 {
-		return errors.New("usage: orcha promote <task-id>")
+		return errors.New("usage: ttorch promote <task-id>")
 	}
 	if err := mgr().Promote(args[0]); err != nil {
 		return err
@@ -541,7 +541,7 @@ func cmdPromote(args []string) error {
 
 func cmdPRCheck(args []string) error {
 	if len(args) < 2 {
-		return errors.New("usage: orcha pr-check <task-id> <pr-url>")
+		return errors.New("usage: ttorch pr-check <task-id> <pr-url>")
 	}
 	if err := mgr().ArmPRCheck(args[0], args[1]); err != nil {
 		return err
@@ -605,7 +605,7 @@ func cmdLearn(args []string) error {
 	}
 	text := strings.TrimSpace(strings.Join(fs.Args(), " "))
 	if text == "" {
-		return errors.New(`usage: orcha learn [--task id] [--glob pat] [--pin] "<lesson>"`)
+		return errors.New(`usage: ttorch learn [--task id] [--glob pat] [--pin] "<lesson>"`)
 	}
 	dir, err := resolveRepo(*repo, *task)
 	if err != nil {
@@ -673,7 +673,7 @@ func daemonStart() error {
 		return err
 	}
 	c := exec.Command(exe, "daemon", "run")
-	c.Env = append(os.Environ(), "ORCHA_DAEMON=1")
+	c.Env = append(os.Environ(), "TTORCH_DAEMON=1")
 	c.Stdout = logf
 	c.Stderr = logf
 	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
@@ -720,7 +720,7 @@ func daemonStatus() error {
 }
 
 func reapplyContent(p paths.Paths) error {
-	res, err := installer.Apply(orchaembed.Content, p, buildinfo.CurrentVersion())
+	res, err := installer.Apply(ttorchembed.Content, p, buildinfo.CurrentVersion())
 	if err != nil {
 		return err
 	}
@@ -746,12 +746,12 @@ func printResult(w io.Writer, res *installer.Result) {
 }
 
 func usage(w io.Writer) {
-	fmt.Fprint(w, `orcha — manage a team of Claude Code agents
+	fmt.Fprint(w, `ttorch — manage a team of Claude Code agents
 
-Usage: orcha [command] [flags]   (bare 'orcha' launches the manager session)
+Usage: ttorch [command] [flags]   (bare 'ttorch' launches the manager session)
 
 Team:
-  (bare) orcha            launch the manager session and attach
+  (bare) ttorch            launch the manager session and attach
   cc [--isolated]         open a Claude session attached to the team
   spawn <id> <repo>       start a worker on a task in an isolated worktree
     --scout                 investigation only (report, no code changes)

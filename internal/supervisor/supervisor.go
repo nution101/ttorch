@@ -1,4 +1,4 @@
-// Package supervisor is orcha's long-lived, zero-token watcher. It polls worker
+// Package supervisor is ttorch's long-lived, zero-token watcher. It polls worker
 // state and panes, and appends supervision events to the durable wake-queue that
 // the manager drains. Running as a daemon (vs a one-shot) lets it hold cadence in
 // memory and react quickly; durability lives in the wake-queue file, so a restart
@@ -19,10 +19,10 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 
-	"github.com/nution101/orcha/internal/paths"
-	"github.com/nution101/orcha/internal/state"
-	"github.com/nution101/orcha/internal/tmux"
-	"github.com/nution101/orcha/internal/wake"
+	"github.com/nution101/ttorch/internal/paths"
+	"github.com/nution101/ttorch/internal/state"
+	"github.com/nution101/ttorch/internal/tmux"
+	"github.com/nution101/ttorch/internal/wake"
 )
 
 // Config tunes the polling cadence.

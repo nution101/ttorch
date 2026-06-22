@@ -1,4 +1,4 @@
-// Package doctor detects the tools orcha needs (tmux, git, gh, claude) and,
+// Package doctor detects the tools ttorch needs (tmux, git, gh, claude) and,
 // with consent, installs the missing ones via the platform package manager.
 package doctor
 
@@ -12,7 +12,7 @@ import (
 	"strings"
 )
 
-// Tool is an external dependency orcha relies on.
+// Tool is an external dependency ttorch relies on.
 type Tool struct {
 	Name     string
 	Bin      string
@@ -29,7 +29,7 @@ func Tools() []Tool {
 		{Name: "tmux", Bin: "tmux", Why: "runs each agent in its own visible session", Required: true},
 		{Name: "git", Bin: "git", Why: "worktrees, branches, and delivery", Required: true},
 		{Name: "gh", Bin: "gh", Why: "PR creation and merge-status checks", Required: false},
-		{Name: "claude", Bin: "claude", Why: "the coding agent orcha orchestrates", Required: true,
+		{Name: "claude", Bin: "claude", Why: "the coding agent ttorch orchestrates", Required: true,
 			Manual: "install Claude Code, e.g.  npm install -g @anthropic-ai/claude-code"},
 	}
 }
@@ -60,7 +60,7 @@ func Diagnose() Diagnosis {
 func Run(out io.Writer, in io.Reader, autoYes bool) error {
 	d := Diagnose()
 
-	fmt.Fprintln(out, "orcha doctor")
+	fmt.Fprintln(out, "ttorch doctor")
 	for _, t := range Tools() {
 		if p, ok := d.Found[t.Name]; ok {
 			fmt.Fprintf(out, "  [ok]      %-7s %s\n", t.Name, p)
@@ -101,7 +101,7 @@ func Run(out io.Writer, in io.Reader, autoYes bool) error {
 		}
 	}
 
-	fmt.Fprintln(out, "  tip: 'orcha skills' adds recommended agent skills (e.g. axi)")
+	fmt.Fprintln(out, "  tip: 'ttorch skills' adds recommended agent skills (e.g. axi)")
 
 	if len(installable) == 0 {
 		fmt.Fprintln(out, "Nothing to auto-install.")

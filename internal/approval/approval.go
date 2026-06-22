@@ -1,7 +1,7 @@
 // Package approval implements the human-approval token that gates merges.
 //
-// `orcha approve <id>` grants a short-lived token bound to the reviewed commit;
-// `orcha merge-local <id>` consumes it and refuses if the worker's HEAD has moved
+// `ttorch approve <id>` grants a short-lived token bound to the reviewed commit;
+// `ttorch merge-local <id>` consumes it and refuses if the worker's HEAD has moved
 // since approval. This makes approval a distinct, time-boxed, commit-bound step
 // rather than an implicit side effect of the manager running a command. (It is
 // defense in depth + an audit trail, not an unbreakable barrier against a fully

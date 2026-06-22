@@ -5,12 +5,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nution101/orcha/internal/paths"
-	"github.com/nution101/orcha/internal/wake"
+	"github.com/nution101/ttorch/internal/paths"
+	"github.com/nution101/ttorch/internal/wake"
 )
 
 func TestTick_SignalsHeartbeatAndDedup(t *testing.T) {
-	t.Setenv("ORCHA_HOME", t.TempDir())
+	t.Setenv("TTORCH_HOME", t.TempDir())
 	p := paths.Default()
 	if err := os.MkdirAll(p.StateDir(), 0o755); err != nil {
 		t.Fatal(err)
@@ -54,7 +54,7 @@ func hasWake(ws []wake.Wake, kind, key string) bool {
 }
 
 func TestRunningFalseWhenNoPID(t *testing.T) {
-	t.Setenv("ORCHA_HOME", t.TempDir())
+	t.Setenv("TTORCH_HOME", t.TempDir())
 	if _, ok := Running(paths.Default()); ok {
 		t.Fatal("Running should be false with no pid file")
 	}

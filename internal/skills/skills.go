@@ -1,6 +1,6 @@
-// Package skills manages recommended external Agent Skills that orcha suggests
+// Package skills manages recommended external Agent Skills that ttorch suggests
 // installing alongside its own. These are installed on demand via the `skills` npm
-// tool (`npx skills add <ref>`); they are not vendored into orcha.
+// tool (`npx skills add <ref>`); they are not vendored into ttorch.
 package skills
 
 import (
@@ -12,13 +12,13 @@ import (
 	"strings"
 )
 
-// Skill is an externally-distributed Agent Skill orcha recommends.
+// Skill is an externally-distributed Agent Skill ttorch recommends.
 type Skill struct {
 	Ref string // "owner/repo" passed to `npx skills add`
 	Why string
 }
 
-// Recommended returns the skills orcha suggests for any team.
+// Recommended returns the skills ttorch suggests for any team.
 func Recommended() []Skill {
 	return []Skill{
 		{Ref: "kunchenguid/axi", Why: "guidelines for building token-efficient, agent-native CLI tools"},
@@ -38,7 +38,7 @@ func NpxAvailable() bool {
 
 // List prints the recommended skills and how to install them.
 func List(out io.Writer) {
-	fmt.Fprintln(out, "Recommended agent skills (install: orcha skills install):")
+	fmt.Fprintln(out, "Recommended agent skills (install: ttorch skills install):")
 	for _, s := range Recommended() {
 		fmt.Fprintf(out, "  %-18s %s\n", s.Ref, s.Why)
 	}
@@ -52,7 +52,7 @@ func List(out io.Writer) {
 func Install(out io.Writer, in io.Reader, autoYes bool) error {
 	recs := Recommended()
 	if !NpxAvailable() {
-		return errors.New("npx not found — install Node.js, or run the commands from 'orcha skills' manually")
+		return errors.New("npx not found — install Node.js, or run the commands from 'ttorch skills' manually")
 	}
 	fmt.Fprintln(out, "Will install via npx:")
 	for _, s := range recs {

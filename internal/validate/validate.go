@@ -1,11 +1,11 @@
 // Package validate runs a repository's own checks (build / vet / lint / test) against
 // a worker's worktree before delivery. Checks are auto-detected per ecosystem, or
-// overridden by a repo-provided .orcha/validate.sh.
+// overridden by a repo-provided .ttorch/validate.sh.
 //
-// Trust: these are the repository's OWN commands (and any .orcha/validate.sh),
+// Trust: these are the repository's OWN commands (and any .ttorch/validate.sh),
 // executed on the host with the operator's credentials. Run validation only against
 // repositories and worker output you trust. Each step runs under a timeout
-// (ORCHA_VALIDATE_TIMEOUT, default 10m) so a hung command cannot block indefinitely.
+// (TTORCH_VALIDATE_TIMEOUT, default 10m) so a hung command cannot block indefinitely.
 package validate
 
 import (
@@ -33,11 +33,11 @@ type Result struct {
 	Output string
 }
 
-// Detect returns the checks for a worktree: an explicit .orcha/validate.sh override if
+// Detect returns the checks for a worktree: an explicit .ttorch/validate.sh override if
 // present, else an ecosystem-appropriate default set, else nil (no checks detected).
 func Detect(dir string) []Step {
-	if fileExists(filepath.Join(dir, ".orcha", "validate.sh")) {
-		return []Step{{Name: "custom", Cmd: []string{"sh", ".orcha/validate.sh"}}}
+	if fileExists(filepath.Join(dir, ".ttorch", "validate.sh")) {
+		return []Step{{Name: "custom", Cmd: []string{"sh", ".ttorch/validate.sh"}}}
 	}
 	if fileExists(filepath.Join(dir, "go.mod")) {
 		return []Step{
@@ -63,11 +63,11 @@ func Detect(dir string) []Step {
 	return nil
 }
 
-// DefaultTimeout bounds each check; override with ORCHA_VALIDATE_TIMEOUT.
+// DefaultTimeout bounds each check; override with TTORCH_VALIDATE_TIMEOUT.
 const DefaultTimeout = 10 * time.Minute
 
 func stepTimeout() time.Duration {
-	if v := os.Getenv("ORCHA_VALIDATE_TIMEOUT"); v != "" {
+	if v := os.Getenv("TTORCH_VALIDATE_TIMEOUT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			return d
 		}

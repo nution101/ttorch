@@ -1,4 +1,4 @@
-module github.com/nution101/orcha
+module github.com/nution101/ttorch
 
 go 1.23
 

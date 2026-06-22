@@ -1,22 +1,22 @@
 #!/bin/sh
-# orcha installer (macOS / Linux / WSL).
-#   curl -fsSL https://nution101.github.io/orcha/install.sh | sh
+# ttorch installer (macOS / Linux / WSL).
+#   curl -fsSL https://raw.githubusercontent.com/nution101/ttorch/main/docs/install.sh | sh
 set -eu
 
-REPO="${ORCHA_REPO:-nution101/orcha}"
-INSTALL_DIR="${ORCHA_HOME:-$HOME/.orcha}/bin"
-BIN_PATH="$INSTALL_DIR/orcha"
+REPO="${TTORCH_REPO:-nution101/ttorch}"
+INSTALL_DIR="${TTORCH_HOME:-$HOME/.ttorch}/bin"
+BIN_PATH="$INSTALL_DIR/ttorch"
 
 # Choose a PATH dir we can link into.
-if [ -n "${ORCHA_BIN_DIR:-}" ]; then
-  LINK_DIR="$ORCHA_BIN_DIR"
+if [ -n "${TTORCH_BIN_DIR:-}" ]; then
+  LINK_DIR="$TTORCH_BIN_DIR"
 else
   case ":$PATH:" in
     *":$HOME/.local/bin:"*) LINK_DIR="$HOME/.local/bin" ;;
     *) LINK_DIR="/usr/local/bin" ;;
   esac
 fi
-LINK_PATH="$LINK_DIR/orcha"
+LINK_PATH="$LINK_DIR/ttorch"
 
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"
@@ -38,12 +38,12 @@ if [ -z "$VERSION" ]; then
   exit 1
 fi
 
-ASSET="orcha-${VERSION}-${OS}-${ARCH}.tar.gz"
+ASSET="ttorch-${VERSION}-${OS}-${ARCH}.tar.gz"
 BASE="https://github.com/${REPO}/releases/download/${VERSION}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-echo "Downloading orcha ${VERSION} for ${OS}/${ARCH}..."
+echo "Downloading ttorch ${VERSION} for ${OS}/${ARCH}..."
 curl -fsSL "${BASE}/${ASSET}" -o "${TMP}/${ASSET}"
 curl -fsSL "${BASE}/checksums.txt" -o "${TMP}/checksums.txt"
 
@@ -63,7 +63,7 @@ fi
 
 tar xzf "${TMP}/${ASSET}" -C "$TMP"
 mkdir -p "$INSTALL_DIR"
-mv "${TMP}/orcha" "$BIN_PATH"
+mv "${TMP}/ttorch" "$BIN_PATH"
 chmod 755 "$BIN_PATH"
 
 # Link into PATH (the real binary stays user-owned for safe self-update).
@@ -74,8 +74,8 @@ else
   sudo mkdir -p "$LINK_DIR"; sudo rm -f "$LINK_PATH"; sudo ln -s "$BIN_PATH" "$LINK_PATH"
 fi
 
-echo "Installed orcha ${VERSION} -> ${BIN_PATH}"
+echo "Installed ttorch ${VERSION} -> ${BIN_PATH}"
 echo "Laying down managed content..."
 "$BIN_PATH" install
-echo "Done. Run 'orcha doctor' to check dependencies (tmux, git, gh, claude)."
-echo "Optional: 'orcha skills install' adds recommended agent skills (e.g. axi)."
+echo "Done. Run 'ttorch doctor' to check dependencies (tmux, git, gh, claude)."
+echo "Optional: 'ttorch skills install' adds recommended agent skills (e.g. axi)."

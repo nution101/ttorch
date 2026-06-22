@@ -1,9 +1,9 @@
-// Package manifest implements orcha's clobber-safe content reconciliation.
+// Package manifest implements ttorch's clobber-safe content reconciliation.
 //
-// The core guarantee: `orcha install` / `orcha update` lay down managed files,
+// The core guarantee: `ttorch install` / `ttorch update` lay down managed files,
 // ADD newly shipped ones, UPGRADE files the user hasn't touched — and NEVER
 // overwrite a file the developer edited. Edited/conflicting files are parked
-// beside the target as "<name>.orcha-new" and reported, so no local work is lost.
+// beside the target as "<name>.ttorch-new" and reported, so no local work is lost.
 //
 // A per-file sha256 ledger (the manifest) distinguishes "we wrote this and it's
 // unchanged" (safe to upgrade) from "the user changed it" (must not clobber).
@@ -20,9 +20,9 @@ import (
 	"sort"
 )
 
-// Suffix is appended to a target when orcha must surface a new version without
+// Suffix is appended to a target when ttorch must surface a new version without
 // overwriting local content.
-const Suffix = ".orcha-new"
+const Suffix = ".ttorch-new"
 
 // Action describes what happened to a single file during reconciliation.
 type Action string
@@ -31,8 +31,8 @@ const (
 	Added     Action = "added"     // file was newly shipped and did not exist
 	Updated   Action = "updated"   // managed file unchanged since we wrote it; upgraded in place
 	Unchanged Action = "unchanged" // already byte-identical to the shipped version
-	Conflict  Action = "conflict"  // user edited a managed file; new version parked as .orcha-new
-	UserFile  Action = "userfile"  // a file we don't manage already sat here; shipped copy parked as .orcha-new
+	Conflict  Action = "conflict"  // user edited a managed file; new version parked as .ttorch-new
+	UserFile  Action = "userfile"  // a file we don't manage already sat here; shipped copy parked as .ttorch-new
 	Retired   Action = "retired"   // removed upstream and untouched locally; deleted
 	Kept      Action = "kept"      // removed upstream but modified locally (or unverifiable); left in place
 )
@@ -82,7 +82,7 @@ func (r *Report) Conflicts() []FileResult {
 }
 
 // Manifest is the on-disk ledger: absolute target path -> sha256 of the bytes
-// orcha last wrote there.
+// ttorch last wrote there.
 type Manifest struct {
 	Version string            `json:"version"`
 	Files   map[string]string `json:"files"`
@@ -177,7 +177,7 @@ func Reconcile(desired map[string][]byte, prev *Manifest, version string) (*Mani
 			}
 			rep.add(dest, UserFile, "your file kept; shipped version at "+filepath.Base(dest)+Suffix)
 		case curSha == prevSha:
-			// Unchanged since orcha wrote it -> safe to upgrade.
+			// Unchanged since ttorch wrote it -> safe to upgrade.
 			if err := writeManaged(dest, content); err != nil {
 				return nil, nil, err
 			}
@@ -248,7 +248,7 @@ func atomicWrite(path string, content []byte, perm os.FileMode) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".orcha-tmp-*")
+	tmp, err := os.CreateTemp(dir, ".ttorch-tmp-*")
 	if err != nil {
 		return err
 	}

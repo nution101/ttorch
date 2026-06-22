@@ -7,15 +7,15 @@ import (
 	"testing"
 	"testing/fstest"
 
-	"github.com/nution101/orcha/internal/manifest"
-	"github.com/nution101/orcha/internal/paths"
+	"github.com/nution101/ttorch/internal/manifest"
+	"github.com/nution101/ttorch/internal/paths"
 )
 
 func sandbox(t *testing.T) paths.Paths {
 	t.Helper()
 	root := t.TempDir()
 	return paths.Paths{
-		Home:     filepath.Join(root, "orcha"),
+		Home:     filepath.Join(root, "ttorch"),
 		Claude:   filepath.Join(root, "claude"),
 		Agents:   filepath.Join(root, "agents"),
 		LocalBin: filepath.Join(root, "bin"),
@@ -24,10 +24,10 @@ func sandbox(t *testing.T) paths.Paths {
 
 func content(skill string) fstest.MapFS {
 	return fstest.MapFS{
-		"content/skills/orcha-manager/SKILL.md": {Data: []byte(skill)},
-		"content/agents/orcha-worker.md":        {Data: []byte("worker")},
-		"content/commands/orcha.md":             {Data: []byte("cmd")},
-		"content/assets/AGENTS.global.md":       {Data: []byte("GLOBAL GUIDANCE")},
+		"content/skills/ttorch-manager/SKILL.md": {Data: []byte(skill)},
+		"content/agents/ttorch-worker.md":        {Data: []byte("worker")},
+		"content/commands/ttorch.md":             {Data: []byte("cmd")},
+		"content/assets/AGENTS.global.md":        {Data: []byte("GLOBAL GUIDANCE")},
 	}
 }
 
@@ -47,15 +47,15 @@ func TestApply_LaysDownDualMirrorAndGuidance(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	claudeSkill := filepath.Join(p.ClaudeSkills(), "orcha-manager", "SKILL.md")
-	agentsSkill := filepath.Join(p.AgentsSkills(), "orcha-manager", "SKILL.md")
+	claudeSkill := filepath.Join(p.ClaudeSkills(), "ttorch-manager", "SKILL.md")
+	agentsSkill := filepath.Join(p.AgentsSkills(), "ttorch-manager", "SKILL.md")
 	if read(t, claudeSkill) != "skill-v1" {
 		t.Fatal("skill not installed into ~/.claude")
 	}
 	if read(t, agentsSkill) != "skill-v1" {
 		t.Fatal("skill not mirrored into ~/.agents")
 	}
-	if read(t, filepath.Join(p.ClaudeAgents(), "orcha-worker.md")) != "worker" {
+	if read(t, filepath.Join(p.ClaudeAgents(), "ttorch-worker.md")) != "worker" {
 		t.Fatal("worker agent not installed")
 	}
 
@@ -85,7 +85,7 @@ func TestApply_PreservesUserEditsAcrossUpdate(t *testing.T) {
 	if _, err := Apply(content("skill-v1"), p, "0.1.0"); err != nil {
 		t.Fatal(err)
 	}
-	claudeSkill := filepath.Join(p.ClaudeSkills(), "orcha-manager", "SKILL.md")
+	claudeSkill := filepath.Join(p.ClaudeSkills(), "ttorch-manager", "SKILL.md")
 
 	// Developer tunes the skill.
 	if err := os.WriteFile(claudeSkill, []byte("my-custom-skill"), 0o644); err != nil {
@@ -101,7 +101,7 @@ func TestApply_PreservesUserEditsAcrossUpdate(t *testing.T) {
 		t.Fatal("user edit was clobbered on update")
 	}
 	if read(t, claudeSkill+manifest.Suffix) != "skill-v2" {
-		t.Fatal("new version not parked as .orcha-new")
+		t.Fatal("new version not parked as .ttorch-new")
 	}
 	if len(res.Report.Conflicts()) == 0 {
 		t.Fatal("expected a reported conflict")

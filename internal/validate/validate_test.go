@@ -60,8 +60,8 @@ func TestDetect_Node(t *testing.T) {
 
 func TestDetect_Override(t *testing.T) {
 	dir := t.TempDir()
-	os.MkdirAll(filepath.Join(dir, ".orcha"), 0o755)
-	os.WriteFile(filepath.Join(dir, ".orcha", "validate.sh"), []byte("#!/bin/sh\n"), 0o755)
+	os.MkdirAll(filepath.Join(dir, ".ttorch"), 0o755)
+	os.WriteFile(filepath.Join(dir, ".ttorch", "validate.sh"), []byte("#!/bin/sh\n"), 0o755)
 	// Even with a go.mod, the explicit override wins.
 	os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module x\n"), 0o644)
 	steps := Detect(dir)
@@ -77,7 +77,7 @@ func TestDetect_Empty(t *testing.T) {
 }
 
 func TestRun_Timeout(t *testing.T) {
-	t.Setenv("ORCHA_VALIDATE_TIMEOUT", "300ms")
+	t.Setenv("TTORCH_VALIDATE_TIMEOUT", "300ms")
 	results := Run(t.TempDir(), []Step{{Name: "slow", Cmd: []string{"sh", "-c", "sleep 5"}}})
 	if len(results) != 1 || results[0].Passed {
 		t.Fatalf("slow step should fail by timeout, got %+v", results)

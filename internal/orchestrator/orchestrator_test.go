@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nution101/orcha/internal/approval"
-	"github.com/nution101/orcha/internal/paths"
-	"github.com/nution101/orcha/internal/tmux"
+	"github.com/nution101/ttorch/internal/approval"
+	"github.com/nution101/ttorch/internal/paths"
+	"github.com/nution101/ttorch/internal/tmux"
 )
 
 // TestSpawnPeekTeardown exercises the real runtime against tmux + git. It is
@@ -41,14 +41,14 @@ func TestSpawnPeekTeardown(t *testing.T) {
 	runGit("add", "-A")
 	runGit("commit", "-q", "-m", "init")
 
-	session := fmt.Sprintf("orcha-test-%d", os.Getpid())
-	t.Setenv("ORCHA_HOME", t.TempDir())
-	t.Setenv("ORCHA_TMUX_SESSION", session)
+	session := fmt.Sprintf("ttorch-test-%d", os.Getpid())
+	t.Setenv("TTORCH_HOME", t.TempDir())
+	t.Setenv("TTORCH_TMUX_SESSION", session)
 	defer exec.Command("tmux", "kill-session", "-t", session).Run()
 
 	m := New(paths.Default())
 
-	task, err := m.Spawn("t1", repo, false, "printf 'ORCHA_MARKER\\n'; sleep 30")
+	task, err := m.Spawn("t1", repo, false, "printf 'TTORCH_MARKER\\n'; sleep 30")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,12 +69,12 @@ func TestSpawnPeekTeardown(t *testing.T) {
 	var out string
 	for i := 0; i < 20; i++ {
 		out, _ = m.Peek("t1", 50)
-		if strings.Contains(out, "ORCHA_MARKER") {
+		if strings.Contains(out, "TTORCH_MARKER") {
 			break
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	if !strings.Contains(out, "ORCHA_MARKER") {
+	if !strings.Contains(out, "TTORCH_MARKER") {
 		t.Fatalf("marker not found in pane output: %q", out)
 	}
 
@@ -125,9 +125,9 @@ func TestTeardownRefusesDirtyWorktree(t *testing.T) {
 	runGit("add", "-A")
 	runGit("commit", "-q", "-m", "init")
 
-	session := fmt.Sprintf("orcha-test-dirty-%d", os.Getpid())
-	t.Setenv("ORCHA_HOME", t.TempDir())
-	t.Setenv("ORCHA_TMUX_SESSION", session)
+	session := fmt.Sprintf("ttorch-test-dirty-%d", os.Getpid())
+	t.Setenv("TTORCH_HOME", t.TempDir())
+	t.Setenv("TTORCH_TMUX_SESSION", session)
 	defer exec.Command("tmux", "kill-session", "-t", session).Run()
 
 	m := New(paths.Default())
@@ -182,9 +182,9 @@ func TestDeliveryLifecycle(t *testing.T) {
 	}
 	repo := newRepoMain(t)
 
-	session := fmt.Sprintf("orcha-deliver-%d", os.Getpid())
-	t.Setenv("ORCHA_HOME", t.TempDir())
-	t.Setenv("ORCHA_TMUX_SESSION", session)
+	session := fmt.Sprintf("ttorch-deliver-%d", os.Getpid())
+	t.Setenv("TTORCH_HOME", t.TempDir())
+	t.Setenv("TTORCH_TMUX_SESSION", session)
 	defer exec.Command("tmux", "kill-session", "-t", session).Run()
 
 	m := New(paths.Default())
@@ -254,9 +254,9 @@ func TestMergeLocal_ApprovalBinding(t *testing.T) {
 		t.Skip("tmux not installed")
 	}
 	repo := newRepoMain(t)
-	session := fmt.Sprintf("orcha-bind-%d", os.Getpid())
-	t.Setenv("ORCHA_HOME", t.TempDir())
-	t.Setenv("ORCHA_TMUX_SESSION", session)
+	session := fmt.Sprintf("ttorch-bind-%d", os.Getpid())
+	t.Setenv("TTORCH_HOME", t.TempDir())
+	t.Setenv("TTORCH_TMUX_SESSION", session)
 	defer exec.Command("tmux", "kill-session", "-t", session).Run()
 
 	m := New(paths.Default())
@@ -282,7 +282,7 @@ func TestMergeLocal_ApprovalBinding(t *testing.T) {
 	}
 	gitIn(t, repo, "checkout", "--", "f.txt") // restore the tracked file
 
-	// An UNTRACKED file (e.g. an `orcha init` AGENTS.md) must NOT block the merge.
+	// An UNTRACKED file (e.g. an `ttorch init` AGENTS.md) must NOT block the merge.
 	os.WriteFile(filepath.Join(repo, "AGENTS.md"), []byte("notes\n"), 0o644)
 
 	// The worker changes after approval -> merge must reject (and consume the stale token).

@@ -1,11 +1,11 @@
 ---
-name: orcha-worker
-description: Brief contract for a worker session spawned by the orcha manager.
+name: ttorch-worker
+description: Brief contract for a worker session spawned by the ttorch manager.
 metadata:
-  managed-by: orcha
+  managed-by: ttorch
 ---
 
-# Orcha Worker
+# Ttorch Worker
 
 You are a **worker** executing one task assigned by the manager, inside an isolated
 workspace. Scope and conduct:

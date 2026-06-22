@@ -12,13 +12,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/nution101/orcha/internal/approval"
-	"github.com/nution101/orcha/internal/harness"
-	"github.com/nution101/orcha/internal/paths"
-	"github.com/nution101/orcha/internal/state"
-	"github.com/nution101/orcha/internal/tmux"
-	"github.com/nution101/orcha/internal/validate"
-	"github.com/nution101/orcha/internal/worktree"
+	"github.com/nution101/ttorch/internal/approval"
+	"github.com/nution101/ttorch/internal/harness"
+	"github.com/nution101/ttorch/internal/paths"
+	"github.com/nution101/ttorch/internal/state"
+	"github.com/nution101/ttorch/internal/tmux"
+	"github.com/nution101/ttorch/internal/validate"
+	"github.com/nution101/ttorch/internal/worktree"
 )
 
 // Manager performs runtime operations against a tmux session and the state store.
@@ -65,7 +65,7 @@ func (m *Manager) killPaneProcesses(window string) {
 
 func (m *Manager) requireTmux() error {
 	if !tmux.Available() {
-		return errors.New("tmux is required (run 'orcha doctor' to install it)")
+		return errors.New("tmux is required (run 'ttorch doctor' to install it)")
 	}
 	return nil
 }
@@ -170,7 +170,7 @@ func (m *Manager) Teardown(taskID string, force bool) ([]string, error) {
 	var notes []string
 	if !force {
 		if dirty, _ := worktree.IsDirty(t.Worktree); dirty {
-			return nil, fmt.Errorf("task %q has uncommitted changes; review it, then 'orcha teardown %s --force'", taskID, taskID)
+			return nil, fmt.Errorf("task %q has uncommitted changes; review it, then 'ttorch teardown %s --force'", taskID, taskID)
 		}
 	}
 	m.killPaneProcesses(t.Window)
@@ -206,7 +206,7 @@ func (m *Manager) StartManager() error {
 	return tmux.Attach(m.Session, "manager")
 }
 
-// OpenCC opens an interactive harness session inside the orcha session as a tracked
+// OpenCC opens an interactive harness session inside the ttorch session as a tracked
 // window, so the manager is aware of it. With isolated, it gets its own worktree.
 func (m *Manager) OpenCC(isolated bool) error {
 	if err := m.requireTmux(); err != nil {
@@ -299,7 +299,7 @@ func (m *Manager) MergeLocal(taskID string) (string, error) {
 		return "", fmt.Errorf("unknown task %q", taskID)
 	}
 	if !approval.Valid(m.P.ApprovalFile(taskID)) {
-		return "", fmt.Errorf("no valid approval for %q; the lead must run 'orcha approve %s' first", taskID, taskID)
+		return "", fmt.Errorf("no valid approval for %q; the lead must run 'ttorch approve %s' first", taskID, taskID)
 	}
 	repo := t.Project
 	def := worktree.DefaultBranch(repo)
@@ -307,7 +307,7 @@ func (m *Manager) MergeLocal(taskID string) (string, error) {
 	if cur != def {
 		return "", fmt.Errorf("repo is on %q, not the default branch %q", cur, def)
 	}
-	// Only tracked changes block a fast-forward; untracked files (e.g. an `orcha init`
+	// Only tracked changes block a fast-forward; untracked files (e.g. an `ttorch init`
 	// AGENTS.md the developer hasn't committed) are fine, and git's own --ff-only
 	// guards the rare untracked-collision case.
 	if changed, _ := worktree.HasTrackedChanges(repo); changed {
@@ -329,10 +329,10 @@ func (m *Manager) MergeLocal(taskID string) (string, error) {
 	// authorize exactly the commit being merged (no changes since the lead reviewed).
 	approvedHead, ok := approval.Consume(m.P.ApprovalFile(taskID))
 	if !ok {
-		return "", fmt.Errorf("approval for %q expired before merge; run 'orcha approve %s' again", taskID, taskID)
+		return "", fmt.Errorf("approval for %q expired before merge; run 'ttorch approve %s' again", taskID, taskID)
 	}
 	if approvedHead != workerHead {
-		return "", fmt.Errorf("worker %q changed since approval (approved %s, now %s); re-review with 'orcha review-diff %s' and approve again", taskID, short(approvedHead), short(workerHead), taskID)
+		return "", fmt.Errorf("worker %q changed since approval (approved %s, now %s); re-review with 'ttorch review-diff %s' and approve again", taskID, short(approvedHead), short(workerHead), taskID)
 	}
 	if err := worktree.MergeFastForward(repo, workerHead); err != nil {
 		return "", err

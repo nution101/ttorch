@@ -29,7 +29,7 @@ func TestCompareVersions(t *testing.T) {
 
 func TestReplaceExecutable_PreservesPermAndFollowsSymlink(t *testing.T) {
 	dir := t.TempDir()
-	real := filepath.Join(dir, "bin", "orcha")
+	real := filepath.Join(dir, "bin", "ttorch")
 	if err := os.MkdirAll(filepath.Dir(real), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +37,7 @@ func TestReplaceExecutable_PreservesPermAndFollowsSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	// PATH symlink pointing at the real binary.
-	link := filepath.Join(dir, "orcha")
+	link := filepath.Join(dir, "ttorch")
 	if err := os.Symlink(real, link); err != nil {
 		t.Fatal(err)
 	}
@@ -70,17 +70,17 @@ func TestReplaceExecutable_PreservesPermAndFollowsSymlink(t *testing.T) {
 }
 
 func TestExtractBinary_UnsupportedFormat(t *testing.T) {
-	if _, err := extractBinary("orcha.zip", []byte("x")); err == nil {
+	if _, err := extractBinary("ttorch.zip", []byte("x")); err == nil {
 		t.Fatal("expected error for unsupported format")
 	}
 }
 
 func TestChecksumFor(t *testing.T) {
-	sums := "abc123  orcha-v1-darwin-arm64.tar.gz\ndef456 *orcha-v1-linux-amd64.tar.gz\n"
-	if got, ok := checksumFor(sums, "orcha-v1-darwin-arm64.tar.gz"); !ok || got != "abc123" {
+	sums := "abc123  ttorch-v1-darwin-arm64.tar.gz\ndef456 *ttorch-v1-linux-amd64.tar.gz\n"
+	if got, ok := checksumFor(sums, "ttorch-v1-darwin-arm64.tar.gz"); !ok || got != "abc123" {
 		t.Fatalf("got %q ok=%v", got, ok)
 	}
-	if got, ok := checksumFor(sums, "orcha-v1-linux-amd64.tar.gz"); !ok || got != "def456" {
+	if got, ok := checksumFor(sums, "ttorch-v1-linux-amd64.tar.gz"); !ok || got != "def456" {
 		t.Fatalf("star-prefixed name: got %q ok=%v", got, ok)
 	}
 	if _, ok := checksumFor(sums, "missing"); ok {

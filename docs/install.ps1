@@ -1,20 +1,20 @@
-# orcha installer for Windows.
+# ttorch installer for Windows.
 #
-# orcha is a Linux-native tool; on Windows it runs inside WSL2. This script bootstraps
+# ttorch is a Linux-native tool; on Windows it runs inside WSL2. This script bootstraps
 # the install into your default WSL distribution.
-#   irm https://nution101.github.io/orcha/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/nution101/ttorch/main/docs/install.ps1 | iex
 $ErrorActionPreference = "Stop"
 
-$repo = if ($env:ORCHA_REPO) { $env:ORCHA_REPO } else { "nution101/orcha" }
+$repo = if ($env:TTORCH_REPO) { $env:TTORCH_REPO } else { "nution101/ttorch" }
 $parts = $repo.Split('/')
-$url = "https://$($parts[0]).github.io/$($parts[1])/install.sh"
+$url = "https://raw.githubusercontent.com/$($parts[0])/$($parts[1])/main/docs/install.sh"
 
 function Test-Wsl {
     try { wsl.exe --status *> $null; return ($LASTEXITCODE -eq 0) } catch { return $false }
 }
 
 if (-not (Test-Wsl)) {
-    Write-Host "orcha runs inside WSL2, which was not found."
+    Write-Host "ttorch runs inside WSL2, which was not found."
     Write-Host ""
     Write-Host "1. Install WSL2 (in an admin PowerShell):  wsl --install"
     Write-Host "2. Reboot, then open your WSL distribution and run:"
@@ -22,7 +22,7 @@ if (-not (Test-Wsl)) {
     exit 1
 }
 
-Write-Host "Installing orcha inside WSL2..."
+Write-Host "Installing ttorch inside WSL2..."
 wsl.exe -e bash -lc "curl -fsSL $url | sh"
 Write-Host ""
-Write-Host "Done. Use orcha from inside WSL (open your distribution, or 'wsl')."
+Write-Host "Done. Use ttorch from inside WSL (open your distribution, or 'wsl')."

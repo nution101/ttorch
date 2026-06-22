@@ -3,7 +3,7 @@
 // worktree (resetting tracked files but keeping untracked build/dependency caches)
 // is far faster than cloning per task.
 //
-// orcha's own task records are the source of truth for which slots are in use, so
+// ttorch's own task records are the source of truth for which slots are in use, so
 // the pool needs no separate reservation or liveness bookkeeping.
 package worktree
 
@@ -47,9 +47,9 @@ func poolName(repo string) string {
 // DefaultMax bounds the number of worktrees per repository.
 const DefaultMax = 16
 
-// MaxFromEnv returns the configured pool size (ORCHA_MAX_WORKTREES) or the default.
+// MaxFromEnv returns the configured pool size (TTORCH_MAX_WORKTREES) or the default.
 func MaxFromEnv() int {
-	if v := os.Getenv("ORCHA_MAX_WORKTREES"); v != "" {
+	if v := os.Getenv("TTORCH_MAX_WORKTREES"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			return n
 		}

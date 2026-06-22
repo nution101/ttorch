@@ -1,4 +1,4 @@
-// Package selfupdate implements `orcha update`: check the latest GitHub release,
+// Package selfupdate implements `ttorch update`: check the latest GitHub release,
 // download + checksum-verify the asset, and atomically replace the running
 // binary — following the PATH symlink so the real file is rewritten, and clearing
 // the macOS quarantine xattr so Gatekeeper does not block the updated binary.
@@ -25,12 +25,12 @@ var ErrNoReleases = errors.New("no releases published yet")
 
 const maxDownload = 256 << 20 // 256 MiB cap
 
-// Config parameterizes the updater for orcha's repo + asset naming.
+// Config parameterizes the updater for ttorch's repo + asset naming.
 type Config struct {
-	Repo           string // "owner/orcha"
+	Repo           string // "owner/ttorch"
 	CurrentVersion string
 	ExecutablePath string
-	AssetName      string // e.g. orcha-v0.1.0-darwin-arm64.tar.gz
+	AssetName      string // e.g. ttorch-v0.1.0-darwin-arm64.tar.gz
 	Client         *http.Client
 }
 
@@ -76,7 +76,7 @@ func Latest(repo string, client *http.Client) (string, error) {
 }
 
 // Apply downloads the release asset for tag, verifies its sha256 against the
-// release's checksums.txt, extracts the orcha binary, and atomically replaces
+// release's checksums.txt, extracts the ttorch binary, and atomically replaces
 // the running executable.
 func (c Config) Apply(tag string) error {
 	base := "https://github.com/" + c.Repo + "/releases/download/" + tag + "/"
@@ -149,11 +149,11 @@ func extractBinary(asset string, data []byte) ([]byte, error) {
 			if i := strings.LastIndexByte(name, '/'); i >= 0 {
 				name = name[i+1:]
 			}
-			if name == "orcha" || name == "orcha.exe" {
+			if name == "ttorch" || name == "ttorch.exe" {
 				return io.ReadAll(io.LimitReader(tr, maxDownload))
 			}
 		}
-		return nil, errors.New("orcha binary not found in archive")
+		return nil, errors.New("ttorch binary not found in archive")
 	default:
 		return nil, fmt.Errorf("unsupported asset format: %s", asset)
 	}
