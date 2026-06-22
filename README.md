@@ -75,18 +75,24 @@ additionally confirm those checksums came from this repo's release workflow.
 
 ## Session effort
 
-Every Claude session ttorch spawns — the manager, `ttorch cc`, and each worker — runs in
-**ultracode** mode by default (the highest-capability mode: `xhigh` reasoning plus dynamic
-workflow orchestration). Tune it with `TTORCH_EFFORT`:
+The **manager** is a lean orchestrator: it launches at `--effort high` and carries a charter
+that makes it *plan and delegate* (via `ttorch spawn`) rather than write code itself. The
+deep work happens in **workers**, which run in **ultracode** by default (`xhigh` reasoning +
+dynamic workflow orchestration). `ttorch cc` also defaults to ultracode.
 
-| `TTORCH_EFFORT` | Effect |
-| --- | --- |
-| `ultracode` (default) | `xhigh` reasoning + workflow orchestration |
-| `max` / `xhigh` / `high` / `medium` / `low` | Set a fixed `--effort` level (`max` is the highest raw reasoning tier) |
-| `off` | Leave Claude's own default effort untouched |
+| Env | Applies to | Default | Effect |
+| --- | --- | --- | --- |
+| `TTORCH_MANAGER_EFFORT` | the manager | `high` | `low`…`max`, or `ultracode`/`off` |
+| `TTORCH_EFFORT` | workers + `ttorch cc` | `ultracode` | `ultracode`, a fixed `--effort` level (`max`…`low`), or `off` |
+
+`ultracode` is not an `--effort` level — it is `xhigh` plus workflow orchestration (set via
+`--settings`); the discrete levels go through `--effort`. The manager is deliberately *not*
+ultracode by default, because that pushes a session to do deep work (and spawn its own
+internal sub-agents) instead of delegating.
 
 ```sh
-TTORCH_EFFORT=max ttorch        # e.g. highest reasoning, no nested orchestration
+TTORCH_EFFORT=max ttorch              # workers at highest raw reasoning, no nested orchestration
+TTORCH_MANAGER_EFFORT=ultracode ttorch # opt the manager back into ultracode
 ```
 
 ## Worker visibility

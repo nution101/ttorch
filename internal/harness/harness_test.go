@@ -79,6 +79,41 @@ func TestLaunchCommandsCarryEffort(t *testing.T) {
 	}
 }
 
+func TestManagerCommand(t *testing.T) {
+	t.Setenv("TTORCH_MANAGER_EFFORT", "") // default: high (NOT ultracode)
+	cmd := ManagerCommand("claude")
+	if !strings.Contains(cmd, " --effort high") {
+		t.Errorf("manager should default to --effort high, got %q", cmd)
+	}
+	if strings.Contains(cmd, "ultracode") {
+		t.Errorf("manager must not default to ultracode, got %q", cmd)
+	}
+	if !strings.Contains(cmd, " --append-system-prompt '") {
+		t.Errorf("manager should append the charter as a quoted system prompt, got %q", cmd)
+	}
+	if !strings.Contains(cmd, "You are the ttorch MANAGER") {
+		t.Errorf("manager charter missing, got %q", cmd)
+	}
+	if !strings.Contains(cmd, "ttorch spawn") {
+		t.Errorf("charter should instruct delegation via ttorch spawn, got %q", cmd)
+	}
+	// The charter's apostrophe (lead's) must be shell-escaped, not break the quote.
+	if !strings.Contains(cmd, `lead'\''s`) {
+		t.Errorf("charter apostrophe not shell-escaped, got %q", cmd)
+	}
+}
+
+func TestManagerEffortOverride(t *testing.T) {
+	t.Setenv("TTORCH_MANAGER_EFFORT", "ultracode")
+	if got := ManagerCommand("claude"); !strings.Contains(got, `--settings '{"ultracode":true}'`) {
+		t.Errorf("override to ultracode should add --settings, got %q", got)
+	}
+	t.Setenv("TTORCH_MANAGER_EFFORT", "max")
+	if got := ManagerCommand("claude"); !strings.Contains(got, " --effort max") {
+		t.Errorf("override to max should add --effort max, got %q", got)
+	}
+}
+
 func TestEnsureTrusted_CreatesAndPreserves(t *testing.T) {
 	cfg := filepath.Join(t.TempDir(), ".claude.json")
 	// Pre-existing config with unrelated content + an existing project.

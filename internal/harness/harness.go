@@ -38,24 +38,29 @@ func Available(kind string) bool {
 }
 
 // EffortArgs returns the extra `claude` arguments that set the reasoning effort
-// for a spawned session. The level is read from TTORCH_EFFORT (default
-// "ultracode"); set TTORCH_EFFORT=off to leave Claude's own default untouched.
-//
-// "ultracode" is not an --effort level: it is a session feature (xhigh reasoning
-// plus dynamic workflow orchestration) enabled via --settings. The discrete
-// levels (low|medium|high|xhigh|max) go through the --effort flag. An
-// unrecognized value falls back to ultracode rather than passing something
-// claude would reject.
+// for a spawned worker (and the `ttorch cc` session). The level is read from
+// TTORCH_EFFORT (default "ultracode"); set TTORCH_EFFORT=off to leave Claude's
+// own default untouched.
 func EffortArgs(kind string) string {
 	if kind != "claude" {
 		return ""
 	}
-	switch level := effortLevel(); level {
+	return effortArgsForLevel(effortLevel())
+}
+
+// effortArgsForLevel maps an effort level to claude flags. "ultracode" is not an
+// --effort level: it is a session feature (xhigh reasoning plus dynamic workflow
+// orchestration) enabled via --settings. The discrete levels (low|medium|high|
+// xhigh|max) go through the --effort flag; off/none/default add nothing; an
+// unrecognized value falls back to ultracode rather than passing something claude
+// would reject.
+func effortArgsForLevel(level string) string {
+	switch level {
 	case "off", "none", "default":
 		return ""
 	case "low", "medium", "high", "xhigh", "max":
 		return " --effort " + level
-	default: // "ultracode" and anything unrecognized
+	default:
 		return ` --settings '{"ultracode":true}'`
 	}
 }
@@ -68,11 +73,43 @@ func effortLevel() string {
 	return v
 }
 
-// InteractiveCommand is the shell command to start an interactive session.
+// managerEffortLevel is the manager's effort, from TTORCH_MANAGER_EFFORT (default
+// "high"). The manager only plans and delegates, so it runs lighter than workers
+// and is deliberately NOT ultracode by default: ultracode pushes a session to do
+// deep work itself (and spawn its own internal sub-agents), which fights the
+// manager's delegate-only role.
+func managerEffortLevel() string {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("TTORCH_MANAGER_EFFORT")))
+	if v == "" {
+		return "high"
+	}
+	return v
+}
+
+// managerCharter is appended to the manager session's system prompt so the
+// session always acts as the orchestrator regardless of how the lead phrases a
+// request. It is one line (it is sent through tmux).
+const managerCharter = "You are the ttorch MANAGER for this tmux session; the person you talk to is the lead. PLAN and DELEGATE — do not write code, edit files, or run a project's build/test/lint commands in this window yourself. For each task, dispatch a worker into its own isolated workspace with: ttorch spawn <task-id> <repo-path> (add --scout for investigation-only). Then supervise with ttorch status, ttorch peek <id>, and ttorch send <id> <text>; validate with ttorch validate <id>; review with ttorch review-diff <id>; and report plain outcomes (ready, blocked, or needs-your-decision). The only commands you run in this window are ttorch orchestration commands. Never merge or deliver without the lead's explicit approval. Follow the ttorch-manager skill for the full protocol."
+
+// InteractiveCommand starts an interactive session (used by `ttorch cc`).
 func InteractiveCommand(kind string) string {
 	switch kind {
 	case "claude":
 		return "claude --dangerously-skip-permissions" + EffortArgs(kind)
+	default:
+		return kind
+	}
+}
+
+// ManagerCommand starts the manager session. It runs lighter than workers
+// (managerEffortLevel, default "high") and carries the manager charter as an
+// appended system prompt so the session plans and delegates via `ttorch spawn`
+// rather than doing the work itself.
+func ManagerCommand(kind string) string {
+	switch kind {
+	case "claude":
+		return "claude --dangerously-skip-permissions" + effortArgsForLevel(managerEffortLevel()) +
+			" --append-system-prompt " + shq(managerCharter)
 	default:
 		return kind
 	}
@@ -86,6 +123,12 @@ func BriefCommand(kind, briefPath string) string {
 	default:
 		return kind
 	}
+}
+
+// shq single-quotes s into one shell word, neutralizing shell metacharacters
+// (an embedded single quote is closed, escaped as \', and reopened).
+func shq(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // InstallTurnEndHook arranges for the harness to touch markerPath at each turn

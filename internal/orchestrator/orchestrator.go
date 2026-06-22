@@ -208,7 +208,7 @@ func (m *Manager) StartManager() error {
 		if err := tmux.NewWindow(m.Session, "manager", dir); err != nil {
 			return err
 		}
-		_ = tmux.SendLine(m.Session, "manager", harness.InteractiveCommand(harness.Resolve()))
+		_ = tmux.SendLine(m.Session, "manager", harness.ManagerCommand(harness.Resolve()))
 		fmt.Fprintf(os.Stderr, "ttorch: manager started in %s — tell it the repo to work on; 'ttorch stop' to end.\n", dir)
 	} else {
 		fmt.Fprintln(os.Stderr, "ttorch: attaching to your running manager — 'ttorch stop' to end it (then 'ttorch' in another folder to restart there).")
