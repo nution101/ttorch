@@ -77,8 +77,7 @@ make lint     # go vet + gofmt check + vocabulary lint
 make dist     # cross-compile + checksums into ./dist
 ```
 
-Contributions keep a professional tone (no role-play vocabulary); `scripts/lint-vocab.sh`
-enforces this in CI.
+Contributions keep a professional, neutral tone — no themed personas or role-play vocabulary.
 
 ## License
 

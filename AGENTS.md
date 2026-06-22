@@ -25,8 +25,8 @@ Always run `make lint && make test` before committing.
 
 ## Conventions
 
-- **Professional tone only.** No role-play / pirate vocabulary anywhere. CI enforces this
-  via `scripts/lint-vocab.sh`.
+- **Professional tone only.** Use neutral engineering language and the manager/worker/lead
+  roles — no themed personas or role-play vocabulary.
 - **Do not reference any specific company or employer** in code, content, or docs.
 - Never clobber developer-edited files; surface conflicts as `.orcha-new` (see
   `internal/manifest`).

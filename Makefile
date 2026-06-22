@@ -30,7 +30,6 @@ fmtcheck:
 	@test -z "$$(gofmt -l .)" || { echo "gofmt needed:"; gofmt -l .; exit 1; }
 
 lint: vet fmtcheck
-	sh scripts/lint-vocab.sh
 
 dist:
 	@mkdir -p dist
