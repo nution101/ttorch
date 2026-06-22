@@ -72,6 +72,8 @@ func Main(args []string) int {
 		return run(cmdSkills(rest))
 	case "manager":
 		return run(mgr().StartManager())
+	case "stop":
+		return run(cmdStop())
 	case "cc":
 		return run(cmdCC(rest))
 	case "spawn":
@@ -401,6 +403,15 @@ func cmdDaemon(args []string) error {
 	default:
 		return errors.New("usage: ttorch daemon run|start|stop|status")
 	}
+}
+
+func cmdStop() error {
+	_ = daemonStop() // stop the supervisor (prints its own line)
+	notes, err := mgr().StopSession()
+	for _, n := range notes {
+		fmt.Println("  " + n)
+	}
+	return err
 }
 
 func cmdSupervise() error {
@@ -751,7 +762,9 @@ func usage(w io.Writer) {
 Usage: ttorch [command] [flags]   (bare 'ttorch' launches the manager session)
 
 Team:
-  (bare) ttorch            launch the manager session and attach
+  (bare) ttorch           start/attach the manager (one persistent session; a new
+                          manager starts in the current folder — tell it the repo)
+  stop                    stop the manager session and the supervisor
   cc [--isolated]         open a Claude session attached to the team
   spawn <id> <repo>       start a worker on a task in an isolated worktree
     --scout                 investigation only (report, no code changes)

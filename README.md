@@ -56,7 +56,8 @@ additionally confirm those checksums came from this repo's release workflow.
 
 | Command | Description |
 | --- | --- |
-| `ttorch` | Launch the manager session and attach |
+| `ttorch` | Start/attach the manager (persistent; a new one starts in the current folder) |
+| `ttorch stop` | Stop the manager session and the supervisor |
 | `ttorch cc [--isolated]` | Open a Claude session attached to the team |
 | `ttorch spawn <id> <repo> [--scout]` | Start a worker on a task in an isolated worktree |
 | `ttorch status` | List active workers |

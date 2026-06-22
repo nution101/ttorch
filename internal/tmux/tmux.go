@@ -149,6 +149,12 @@ func KillWindow(session, window string) error {
 	return err
 }
 
+// KillSession tears down an entire session and all its windows.
+func KillSession(session string) error {
+	_, err := run("kill-session", "-t", session)
+	return err
+}
+
 // SelectWindow makes a window active.
 func SelectWindow(session, window string) error {
 	_, err := run("select-window", "-t", target(session, window))

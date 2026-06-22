@@ -308,3 +308,32 @@ func TestMergeLocal_ApprovalBinding(t *testing.T) {
 	}
 	_, _ = m.Teardown("b1", true)
 }
+
+func TestStopSession(t *testing.T) {
+	if !tmux.Available() {
+		t.Skip("tmux not installed")
+	}
+	session := fmt.Sprintf("ttorch-stop-%d", os.Getpid())
+	t.Setenv("TTORCH_HOME", t.TempDir())
+	t.Setenv("TTORCH_TMUX_SESSION", session)
+	defer exec.Command("tmux", "kill-session", "-t", session).Run()
+
+	m := New(paths.Default())
+	if err := tmux.EnsureSession(m.Session); err != nil {
+		t.Fatal(err)
+	}
+	if !tmux.HasSession(session) {
+		t.Fatal("session should exist before stop")
+	}
+	if _, err := m.StopSession(); err != nil {
+		t.Fatal(err)
+	}
+	if tmux.HasSession(session) {
+		t.Fatal("session should be gone after StopSession")
+	}
+	// Stopping when nothing is running is a clean no-op.
+	notes, err := m.StopSession()
+	if err != nil || len(notes) == 0 {
+		t.Fatalf("stop with no session: notes=%v err=%v", notes, err)
+	}
+}

@@ -40,12 +40,19 @@ README to confirm a download independently.
 
 ```sh
 ttorch doctor          # check (and offer to install) tmux/git/gh/claude; reports WSL status
-ttorch                 # launch the manager session and attach
+cd ~/code/my-project   # start in the project you want to work on
+ttorch                 # open the manager here and attach
 ```
 
-`ttorch` with no arguments ensures your dependencies, the tmux session, and the
-background supervisor, then opens the manager and attaches you to it. Talk to the
-manager in plain language; it runs the team.
+`ttorch` with no arguments opens the manager in your **current directory** (its default
+project) and attaches you. Talk to it in plain language; it runs the team. The manager
+session is **persistent** — closing the tab only detaches it, and running `ttorch` again
+re-attaches to the same one. To work on other repos, just tell the manager their path;
+one manager tracks them all. When you're done (or want to move it to a different folder):
+
+```sh
+ttorch stop            # stop the manager session + supervisor
+```
 
 ## 4. The daily loop
 

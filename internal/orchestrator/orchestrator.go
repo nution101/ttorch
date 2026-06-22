@@ -198,12 +198,39 @@ func (m *Manager) StartManager() error {
 		return err
 	}
 	if !tmux.WindowExists(m.Session, "manager") {
-		if err := tmux.NewWindow(m.Session, "manager", cwd()); err != nil {
+		dir := cwd()
+		if err := tmux.NewWindow(m.Session, "manager", dir); err != nil {
 			return err
 		}
 		_ = tmux.SendLine(m.Session, "manager", harness.InteractiveCommand(harness.Resolve()))
+		fmt.Fprintf(os.Stderr, "ttorch: manager started in %s — tell it the repo to work on; 'ttorch stop' to end.\n", dir)
+	} else {
+		fmt.Fprintln(os.Stderr, "ttorch: attaching to your running manager — 'ttorch stop' to end it (then 'ttorch' in another folder to restart there).")
 	}
 	return tmux.Attach(m.Session, "manager")
+}
+
+// StopSession tears down the ttorch tmux session (and all its windows). The
+// supervisor is stopped separately by the caller.
+func (m *Manager) StopSession() ([]string, error) {
+	if !tmux.Available() || !tmux.HasSession(m.Session) {
+		return []string{"no ttorch session was running"}, nil
+	}
+	windows, _ := tmux.ListWindows(m.Session)
+	workers := 0
+	for _, w := range windows {
+		if strings.HasPrefix(w, "wk-") {
+			workers++
+		}
+	}
+	if err := tmux.KillSession(m.Session); err != nil {
+		return nil, err
+	}
+	notes := []string{fmt.Sprintf("stopped the ttorch session %q (%d window(s))", m.Session, len(windows))}
+	if workers > 0 {
+		notes = append(notes, fmt.Sprintf("%d worker(s) were running; their worktrees remain in the pool (run 'ttorch status' next time)", workers))
+	}
+	return notes, nil
 }
 
 // OpenCC opens an interactive harness session inside the ttorch session as a tracked
