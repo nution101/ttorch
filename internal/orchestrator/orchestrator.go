@@ -16,6 +16,7 @@ import (
 	"github.com/nution101/ttorch/internal/harness"
 	"github.com/nution101/ttorch/internal/paths"
 	"github.com/nution101/ttorch/internal/state"
+	"github.com/nution101/ttorch/internal/termtab"
 	"github.com/nution101/ttorch/internal/tmux"
 	"github.com/nution101/ttorch/internal/validate"
 	"github.com/nution101/ttorch/internal/worktree"
@@ -123,6 +124,10 @@ func (m *Manager) Spawn(taskID, projectPath string, scout bool, rawCmd string) (
 	if err := tmux.SendLine(m.Session, window, cmd); err != nil {
 		return zero, err
 	}
+	// Best-effort: open a native terminal tab/window that attaches a view onto
+	// this worker's tmux window so the lead can watch it. The worker stays in
+	// tmux regardless; never fail the spawn on this.
+	_ = termtab.Open(m.Session, window)
 
 	t := state.Task{
 		ID: taskID, Window: window, Worktree: wt, Project: repo,
@@ -175,6 +180,7 @@ func (m *Manager) Teardown(taskID string, force bool) ([]string, error) {
 	}
 	m.killPaneProcesses(t.Window)
 	_ = tmux.KillWindow(m.Session, t.Window)
+	termtab.Close(t.Window)
 	if t.Project != "" && t.Worktree != "" {
 		if err := m.Pool.Release(t.Project, t.Worktree); err != nil {
 			notes = append(notes, "worktree: "+err.Error())
@@ -206,6 +212,10 @@ func (m *Manager) StartManager() error {
 		fmt.Fprintf(os.Stderr, "ttorch: manager started in %s — tell it the repo to work on; 'ttorch stop' to end.\n", dir)
 	} else {
 		fmt.Fprintln(os.Stderr, "ttorch: attaching to your running manager — 'ttorch stop' to end it (then 'ttorch' in another folder to restart there).")
+	}
+	if termtab.OpenManagerSession(m.Session, "manager") {
+		fmt.Fprintln(os.Stderr, "ttorch: opened the manager in a new iTerm2 window (now in front) — workers open as tabs there; this terminal is free.")
+		return nil
 	}
 	return tmux.Attach(m.Session, "manager")
 }

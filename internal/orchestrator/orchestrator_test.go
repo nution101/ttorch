@@ -14,6 +14,15 @@ import (
 	"github.com/nution101/ttorch/internal/tmux"
 )
 
+// TestMain disables native worker terminal views for the whole package. The
+// integration tests below exercise Spawn, which best-effort opens a terminal tab
+// or window on macOS; without this, running these tests would spawn real GUI
+// windows on a developer's Mac.
+func TestMain(m *testing.M) {
+	os.Setenv("TTORCH_WORKER_TABS", "off")
+	os.Exit(m.Run())
+}
+
 // TestSpawnPeekTeardown exercises the real runtime against tmux + git. It is
 // skipped where tmux is unavailable (e.g. CI without tmux installed).
 func TestSpawnPeekTeardown(t *testing.T) {

@@ -29,3 +29,15 @@ func TestInstallSpec(t *testing.T) {
 		t.Fatal("unknown manager should not be installable")
 	}
 }
+
+func TestITermInstallCmd(t *testing.T) {
+	if cmd, ok := itermInstallCmd("brew"); !ok || len(cmd) != 4 ||
+		cmd[0] != "brew" || cmd[1] != "install" || cmd[2] != "--cask" || cmd[3] != "iterm2" {
+		t.Fatalf("brew iterm cmd wrong: %v ok=%v", cmd, ok)
+	}
+	for _, m := range []string{"apt-get", "dnf", "pacman", ""} {
+		if _, ok := itermInstallCmd(m); ok {
+			t.Errorf("iterm should not be installable via %q", m)
+		}
+	}
+}

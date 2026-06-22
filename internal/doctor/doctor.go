@@ -72,6 +72,21 @@ func Run(out io.Writer, in io.Reader, autoYes bool) error {
 			fmt.Fprintf(out, "  [%s] %-7s — %s\n", tag, t.Name, t.Why)
 		}
 	}
+
+	// iTerm2 is an optional macOS convenience: with it present, 'ttorch' opens the
+	// team in a single iTerm2 window with clean per-worker tabs. Never required.
+	wantITerm := false
+	if runtime.GOOS == "darwin" {
+		if itermInstalled() {
+			fmt.Fprintf(out, "  [ok]      %-7s %s\n", "iTerm2", "/Applications/iTerm.app")
+		} else {
+			fmt.Fprintln(out, "  [absent] iTerm2  — clean per-worker tabs; 'ttorch' will open the team in iTerm2 when present")
+			if _, ok := itermInstallCmd(d.Manager); ok {
+				wantITerm = true
+			}
+		}
+	}
+
 	switch d.WSL {
 	case "wsl2":
 		fmt.Fprintln(out, "  runtime: WSL2 (supported)")
@@ -103,7 +118,7 @@ func Run(out io.Writer, in io.Reader, autoYes bool) error {
 
 	fmt.Fprintln(out, "  tip: 'ttorch skills' adds recommended agent skills (e.g. axi)")
 
-	if len(installable) == 0 {
+	if len(installable) == 0 && !wantITerm {
 		fmt.Fprintln(out, "Nothing to auto-install.")
 		return nil
 	}
@@ -112,6 +127,10 @@ func Run(out io.Writer, in io.Reader, autoYes bool) error {
 	for _, t := range installable {
 		cmd, _ := installSpec(d.Manager, t.Name)
 		fmt.Fprintf(out, "  %s  (%s)\n", strings.Join(cmd, " "), t.Name)
+	}
+	if wantITerm {
+		cmd, _ := itermInstallCmd(d.Manager)
+		fmt.Fprintf(out, "  %s  (%s)\n", strings.Join(cmd, " "), "iTerm2")
 	}
 
 	if !autoYes && !confirm(out, in, "Install these now? [Y/n] ") {
@@ -128,6 +147,18 @@ func Run(out io.Writer, in io.Reader, autoYes bool) error {
 		c.Stdin = os.Stdin
 		if err := c.Run(); err != nil {
 			return fmt.Errorf("install %s failed: %w", t.Name, err)
+		}
+	}
+	if wantITerm {
+		cmd, _ := itermInstallCmd(d.Manager)
+		fmt.Fprintf(out, "+ %s\n", strings.Join(cmd, " "))
+		c := exec.Command(cmd[0], cmd[1:]...)
+		c.Stdout = out
+		c.Stderr = out
+		c.Stdin = os.Stdin
+		if err := c.Run(); err != nil {
+			// iTerm2 is optional: a failed install is a note, not a hard error.
+			fmt.Fprintf(out, "  iTerm2 install failed (optional): %v\n", err)
 		}
 	}
 	fmt.Fprintln(out, "Done.")
@@ -167,6 +198,25 @@ func installSpec(manager, tool string) ([]string, bool) {
 		return []string{"sudo", "zypper", "install", "-y", tool}, true
 	case "apk":
 		return []string{"sudo", "apk", "add", tool}, true
+	}
+	return nil, false
+}
+
+// itermInstalled reports whether iTerm2 is present (macOS app bundle). iTerm2
+// has no CLI on PATH, so its presence is the existence of the bundle.
+func itermInstalled() bool {
+	if runtime.GOOS != "darwin" {
+		return false
+	}
+	_, err := os.Stat("/Applications/iTerm.app")
+	return err == nil
+}
+
+// itermInstallCmd returns the command to install iTerm2 via the given manager.
+// iTerm2 is a Homebrew cask, so it is only installable when manager is "brew".
+func itermInstallCmd(manager string) ([]string, bool) {
+	if manager == "brew" {
+		return []string{"brew", "install", "--cask", "iterm2"}, true
 	}
 	return nil, false
 }

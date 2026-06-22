@@ -89,6 +89,34 @@ workflow orchestration). Tune it with `TTORCH_EFFORT`:
 TTORCH_EFFORT=max ttorch        # e.g. highest reasoning, no nested orchestration
 ```
 
+## Worker visibility
+
+Every worker runs as a window in a shared tmux session (default name `ttorch`). The
+zero-token supervisor, `ttorch status`, `ttorch peek`, `ttorch send`, and `ttorch teardown`
+all drive those windows, and you can navigate between them inside tmux with `Ctrl-b w`.
+
+On macOS, ttorch additionally opens a **native terminal tab or window** that *attaches a
+view* onto each new worker's tmux window, so you can watch a worker without leaving tmux.
+The native tab only views the worker — the worker process keeps running inside its tmux
+window, and closing the tab tears down only that view (the worker and its window stay
+alive). iTerm gets a new tab; Terminal.app gets a new window.
+
+**iTerm2 is recommended** for the cleanest experience: it gives one window with a tab per
+worker. When iTerm2 is installed, running bare `ttorch` opens the **manager itself in a new
+iTerm2 window**, so the manager tab and the per-worker view tabs all live together in one
+window. ttorch brings that iTerm2 window to the front, so your invoking terminal returns to
+a prompt and you drive the team from the new window. With Terminal.app (the always-present
+fallback) each worker still opens its own separate window instead, and the manager attaches
+in place. `ttorch doctor` can install iTerm2 for you on macOS (via Homebrew).
+
+| Env | Effect |
+| --- | --- |
+| `TTORCH_WORKER_TABS` | Native-terminal behavior (worker views **and** the manager-in-iTerm2 launch) is on by default; set `0`/`off`/`false`/`no` to disable (workers still run as tmux windows). |
+| `TTORCH_TERMINAL` | `auto` (default) detects iTerm then falls back to Terminal.app; force with `iterm` or `terminal`. |
+
+This is a macOS-only convenience and best-effort: on other platforms, or if it can't open
+a tab, workers run in tmux exactly as before.
+
 ## Updating
 
 ```sh

@@ -7,7 +7,7 @@ ttorch is a single Go binary that installs and orchestrates a team of Claude Cod
 ```sh
 make build    # ./bin/ttorch
 make test     # go test ./...
-make lint     # go vet + gofmt check + vocabulary lint
+make lint     # go vet + gofmt check
 make dist     # cross-compiled artifacts + checksums
 ```
 

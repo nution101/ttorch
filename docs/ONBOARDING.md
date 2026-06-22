@@ -63,7 +63,11 @@ You direct; the manager dispatches and supervises:
    worktree (add `--scout` for investigation-only tasks that produce a report, not code).
 3. **Supervise** — `ttorch status` lists workers; `ttorch peek <id>` reads a worker's
    output; `ttorch send <id> "<message>"` steers one. The background supervisor wakes the
-   manager on real events, so an idle team costs nothing.
+   manager on real events, so an idle team costs nothing. On macOS, each spawned worker
+   also opens a native terminal tab/window viewing its tmux window (see §11); inside tmux,
+   `Ctrl-b w` still navigates between worker windows. With iTerm2 installed (recommended;
+   `ttorch doctor` can install it), bare `ttorch` opens the manager in a new iTerm2 window
+   so the manager and all worker tabs share one window.
 4. **Review & validate** — `ttorch review-diff <id>` shows the changes;
    `ttorch validate <id>` runs the repo's build/test/lint checks (§6).
 5. **Approve & integrate** — you run `ttorch approve <id>`, then the manager runs
@@ -154,6 +158,8 @@ the WSL distribution (`ttorch doctor` will).
 | `TTORCH_TMUX_SESSION` | `ttorch` | tmux session name |
 | `TTORCH_MAX_WORKTREES` | `16` | worktree pool size per repository |
 | `TTORCH_VALIDATE_TIMEOUT` | `10m` | per-check timeout for `ttorch validate` |
+| `TTORCH_WORKER_TABS` | enabled | macOS-only: native-terminal behavior — open a native terminal tab/window viewing each new worker, and (with iTerm2) open the manager in a new iTerm2 window; set `0`/`off`/`false`/`no` to disable all of it (workers still run as tmux windows) |
+| `TTORCH_TERMINAL` | `auto` | which terminal to use for worker views: `auto` (iTerm then Terminal.app), `iterm`, or `terminal` |
 | `TTORCH_REPO` | `nution101/ttorch` | release source for install/update |
 
 ## 12. Troubleshooting
