@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/nution101/orcha/internal/approval"
 	"github.com/nution101/orcha/internal/harness"
 	"github.com/nution101/orcha/internal/paths"
 	"github.com/nution101/orcha/internal/state"
@@ -229,6 +231,169 @@ func (m *Manager) OpenCC(isolated bool) error {
 		Kind: "cc", Created: time.Now(),
 	})
 	return tmux.Attach(m.Session, window)
+}
+
+// --- delivery lifecycle (M4) ---
+
+// ReviewDiff returns a worker's changes against the repo's default branch.
+func (m *Manager) ReviewDiff(taskID string, stat bool) (string, error) {
+	t, err := m.Store.Load(taskID)
+	if err != nil {
+		return "", fmt.Errorf("unknown task %q", taskID)
+	}
+	base := worktree.DefaultBranch(t.Project)
+	return worktree.Diff(t.Worktree, base, stat)
+}
+
+// Approve grants a short-lived approval token authorizing a merge for taskID.
+// This is intended for the lead to run, not the manager.
+func (m *Manager) Approve(taskID string, ttl time.Duration) error {
+	if _, err := m.Store.Load(taskID); err != nil {
+		return fmt.Errorf("unknown task %q", taskID)
+	}
+	return approval.Grant(m.P.ApprovalFile(taskID), ttl)
+}
+
+// MergeLocal fast-forwards the repo's local default branch to the worker's HEAD —
+// the sole sanctioned state-changing write to a real checkout. It requires a valid
+// approval token, the default branch checked out and clean, and a clean
+// fast-forward. Every merge is recorded in the audit log.
+func (m *Manager) MergeLocal(taskID string) (string, error) {
+	t, err := m.Store.Load(taskID)
+	if err != nil {
+		return "", fmt.Errorf("unknown task %q", taskID)
+	}
+	if !approval.Consume(m.P.ApprovalFile(taskID)) {
+		return "", fmt.Errorf("no valid approval for %q; the lead must run 'orcha approve %s' first", taskID, taskID)
+	}
+	repo := t.Project
+	def := worktree.DefaultBranch(repo)
+	cur, _ := worktree.CurrentBranch(repo)
+	if cur != def {
+		return "", fmt.Errorf("repo is on %q, not the default branch %q", cur, def)
+	}
+	if dirty, _ := worktree.IsDirty(repo); dirty {
+		return "", fmt.Errorf("repo has uncommitted changes; commit or stash before merging")
+	}
+	workerHead, err := worktree.Head(t.Worktree)
+	if err != nil {
+		return "", err
+	}
+	defHead, err := worktree.Head(repo)
+	if err != nil {
+		return "", err
+	}
+	if !worktree.IsAncestor(repo, defHead, workerHead) {
+		return "", fmt.Errorf("worker %q is not a fast-forward of %q; have the worker rebase first", taskID, def)
+	}
+	if err := worktree.MergeFastForward(repo, workerHead); err != nil {
+		return "", err
+	}
+	m.audit(fmt.Sprintf("merge-local task=%s repo=%s %s -> %s", taskID, repo, def, short(workerHead)))
+	return fmt.Sprintf("fast-forwarded %s to %s for task %s", def, short(workerHead), taskID), nil
+}
+
+// Promote turns a scout task into a ship task (restoring teardown protection).
+func (m *Manager) Promote(taskID string) error {
+	t, err := m.Store.Load(taskID)
+	if err != nil {
+		return fmt.Errorf("unknown task %q", taskID)
+	}
+	if t.Kind != "scout" {
+		return fmt.Errorf("task %q is not a scout task", taskID)
+	}
+	t.Kind = "ship"
+	return m.Store.Save(t)
+}
+
+// ArmPRCheck records a PR URL on a task so the supervisor polls for its merge.
+func (m *Manager) ArmPRCheck(taskID, url string) error {
+	t, err := m.Store.Load(taskID)
+	if err != nil {
+		return fmt.Errorf("unknown task %q", taskID)
+	}
+	t.PR = url
+	return m.Store.Save(t)
+}
+
+// FleetSync refreshes a repo's local default branch from origin when safe and
+// prunes local branches whose upstream is gone.
+func (m *Manager) FleetSync(repoPath string) ([]string, error) {
+	repo, err := worktree.RepoRoot(repoPath)
+	if err != nil {
+		return nil, fmt.Errorf("%s is not inside a git repository", repoPath)
+	}
+	var notes []string
+	if err := worktree.Fetch(repo); err != nil {
+		notes = append(notes, "fetch skipped (offline?)")
+	}
+	if gone, err := worktree.GoneBranches(repo); err == nil {
+		cur, _ := worktree.CurrentBranch(repo)
+		for _, b := range gone {
+			if b == cur {
+				continue
+			}
+			if err := worktree.DeleteBranch(repo, b); err == nil {
+				notes = append(notes, "pruned branch "+b)
+			}
+		}
+	}
+	def := worktree.DefaultBranch(repo)
+	if cur, _ := worktree.CurrentBranch(repo); cur == def {
+		if dirty, _ := worktree.IsDirty(repo); !dirty {
+			if err := worktree.MergeFastForward(repo, "origin/"+def); err == nil {
+				notes = append(notes, def+" fast-forwarded to origin/"+def)
+			}
+		}
+	}
+	if len(notes) == 0 {
+		notes = append(notes, "already up to date")
+	}
+	return notes, nil
+}
+
+// Recovery reconciles tracked tasks against live tmux windows and reports drift.
+func (m *Manager) Recovery() ([]string, error) {
+	var notes []string
+	windows, _ := tmux.ListWindows(m.Session)
+	winSet := map[string]bool{}
+	for _, w := range windows {
+		winSet[w] = true
+	}
+	tasks, _ := m.Store.List()
+	hasMeta := map[string]bool{}
+	for _, t := range tasks {
+		hasMeta[t.Window] = true
+		if t.Kind != "cc" && !winSet[t.Window] {
+			notes = append(notes, "dead worker (window gone): "+t.ID)
+		}
+	}
+	for _, w := range windows {
+		if strings.HasPrefix(w, "wk-") && !hasMeta[w] {
+			notes = append(notes, "orphan window (no task record): "+w)
+		}
+	}
+	if len(notes) == 0 {
+		notes = append(notes, "reconciled; nothing to recover")
+	}
+	return notes, nil
+}
+
+func (m *Manager) audit(line string) {
+	_ = os.MkdirAll(m.P.Home, 0o755)
+	f, err := os.OpenFile(m.P.AuditLog(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = fmt.Fprintf(f, "%s %s\n", time.Now().Format(time.RFC3339), line)
+}
+
+func short(sha string) string {
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
 }
 
 func cwd() string {

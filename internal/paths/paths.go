@@ -83,6 +83,14 @@ func (p Paths) TurnEndMarker(id string) string {
 	return filepath.Join(p.StateDir(), id+".turn-ended")
 }
 
+// ApprovalFile holds a short-lived approval token authorizing a merge for a task.
+func (p Paths) ApprovalFile(id string) string {
+	return filepath.Join(p.StateDir(), id+".approve")
+}
+
+// AuditLog records state-changing delivery actions (merges).
+func (p Paths) AuditLog() string { return filepath.Join(p.Home, "audit.log") }
+
 // ClaudeSkills is the managed-skills install root for Claude Code.
 func (p Paths) ClaudeSkills() string { return filepath.Join(p.Claude, "skills") }
 

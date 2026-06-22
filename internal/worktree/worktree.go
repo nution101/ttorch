@@ -194,6 +194,86 @@ func nextIndex(slots []string) int {
 	return max + 1
 }
 
+// --- repo/branch helpers for the delivery lifecycle ---
+
+// DefaultBranch returns the repo's default branch name (origin/HEAD, else
+// main/master, else the current branch).
+func DefaultBranch(repo string) string {
+	if out, err := git("-C", repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"); err == nil {
+		return strings.TrimPrefix(strings.TrimSpace(out), "origin/")
+	}
+	for _, b := range []string{"main", "master"} {
+		if _, err := git("-C", repo, "rev-parse", "--verify", "--quiet", "refs/heads/"+b); err == nil {
+			return b
+		}
+	}
+	if out, err := git("-C", repo, "rev-parse", "--abbrev-ref", "HEAD"); err == nil {
+		return strings.TrimSpace(out)
+	}
+	return "main"
+}
+
+// Head returns the HEAD commit of a repo or worktree.
+func Head(path string) (string, error) { return git("-C", path, "rev-parse", "HEAD") }
+
+// CurrentBranch returns the checked-out branch name (or "HEAD" if detached).
+func CurrentBranch(repo string) (string, error) {
+	return git("-C", repo, "rev-parse", "--abbrev-ref", "HEAD")
+}
+
+// IsAncestor reports whether commit a is an ancestor of commit b (so b can
+// fast-forward from a).
+func IsAncestor(repo, a, b string) bool {
+	_, err := git("-C", repo, "merge-base", "--is-ancestor", a, b)
+	return err == nil
+}
+
+// Diff returns the diff of a worktree against base (working tree vs base ref).
+func Diff(path, base string, stat bool) (string, error) {
+	args := []string{"-C", path, "diff"}
+	if stat {
+		args = append(args, "--stat")
+	}
+	if base != "" {
+		args = append(args, base)
+	}
+	return git(args...)
+}
+
+// MergeFastForward fast-forwards the repo's current branch to commit (refusing a
+// non-fast-forward merge).
+func MergeFastForward(repo, commit string) error {
+	_, err := git("-C", repo, "merge", "--ff-only", commit)
+	return err
+}
+
+// Fetch updates remotes and prunes deleted remote branches.
+func Fetch(repo string) error {
+	_, err := git("-C", repo, "fetch", "--prune", "--quiet")
+	return err
+}
+
+// GoneBranches lists local branches whose upstream is gone.
+func GoneBranches(repo string) ([]string, error) {
+	out, err := git("-C", repo, "for-each-ref", "--format=%(refname:short) %(upstream:track)", "refs/heads")
+	if err != nil {
+		return nil, err
+	}
+	var gone []string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "[gone]") {
+			gone = append(gone, strings.Fields(line)[0])
+		}
+	}
+	return gone, nil
+}
+
+// DeleteBranch force-deletes a local branch.
+func DeleteBranch(repo, branch string) error {
+	_, err := git("-C", repo, "branch", "-D", branch)
+	return err
+}
+
 func lock(poolDir string) (func(), error) {
 	lp := filepath.Join(poolDir, ".lock")
 	for i := 0; i < 50; i++ {

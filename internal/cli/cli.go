@@ -82,7 +82,21 @@ func Main(args []string) int {
 		return run(cmdSupervise())
 	case "wake":
 		return run(cmdWake(rest))
-	case "worker", "skill", "review-diff", "merge-local":
+	case "review-diff":
+		return run(cmdReviewDiff(rest))
+	case "approve":
+		return run(cmdApprove(rest))
+	case "merge-local":
+		return run(cmdMergeLocal(rest))
+	case "promote":
+		return run(cmdPromote(rest))
+	case "pr-check":
+		return run(cmdPRCheck(rest))
+	case "fleet-sync":
+		return run(cmdFleetSync(rest))
+	case "recovery":
+		return run(cmdRecovery())
+	case "worker", "skill":
 		fmt.Fprintf(os.Stderr, "orcha %s: not available yet — arrives in a later milestone.\n", cmd)
 		return 3
 	default:
@@ -365,6 +379,105 @@ func cmdWake(args []string) error {
 	return nil
 }
 
+func cmdReviewDiff(args []string) error {
+	if len(args) < 1 {
+		return errors.New("usage: orcha review-diff <task-id> [--stat]")
+	}
+	id := args[0]
+	fs := flag.NewFlagSet("review-diff", flag.ContinueOnError)
+	stat := fs.Bool("stat", false, "summary (diffstat) only")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	out, err := mgr().ReviewDiff(id, *stat)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(out) == "" {
+		fmt.Println("(no changes against the default branch)")
+		return nil
+	}
+	fmt.Println(out)
+	return nil
+}
+
+func cmdApprove(args []string) error {
+	if len(args) < 1 {
+		return errors.New("usage: orcha approve <task-id> [--ttl 10m]")
+	}
+	id := args[0]
+	fs := flag.NewFlagSet("approve", flag.ContinueOnError)
+	ttl := fs.Duration("ttl", 10*time.Minute, "how long the approval stays valid")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if err := mgr().Approve(id, *ttl); err != nil {
+		return err
+	}
+	fmt.Printf("approved %s for %s — now run: orcha merge-local %s\n", id, *ttl, id)
+	return nil
+}
+
+func cmdMergeLocal(args []string) error {
+	if len(args) < 1 {
+		return errors.New("usage: orcha merge-local <task-id>")
+	}
+	out, err := mgr().MergeLocal(args[0])
+	if err != nil {
+		return err
+	}
+	fmt.Println(out)
+	return nil
+}
+
+func cmdPromote(args []string) error {
+	if len(args) < 1 {
+		return errors.New("usage: orcha promote <task-id>")
+	}
+	if err := mgr().Promote(args[0]); err != nil {
+		return err
+	}
+	fmt.Printf("promoted %s to a ship task\n", args[0])
+	return nil
+}
+
+func cmdPRCheck(args []string) error {
+	if len(args) < 2 {
+		return errors.New("usage: orcha pr-check <task-id> <pr-url>")
+	}
+	if err := mgr().ArmPRCheck(args[0], args[1]); err != nil {
+		return err
+	}
+	fmt.Printf("watching %s for merge of %s\n", args[0], args[1])
+	return nil
+}
+
+func cmdFleetSync(args []string) error {
+	dir := "."
+	if len(args) > 0 {
+		dir = args[0]
+	}
+	notes, err := mgr().FleetSync(dir)
+	if err != nil {
+		return err
+	}
+	for _, n := range notes {
+		fmt.Println("  " + n)
+	}
+	return nil
+}
+
+func cmdRecovery() error {
+	notes, err := mgr().Recovery()
+	if err != nil {
+		return err
+	}
+	for _, n := range notes {
+		fmt.Println("  " + n)
+	}
+	return nil
+}
+
 func daemonStart() error {
 	p := paths.Default()
 	if pid, ok := supervisor.Running(p); ok {
@@ -476,6 +589,15 @@ Supervision:
   daemon run|start|stop|status   manage the supervisor process
   wake drain              print and clear pending supervision events
 
+Delivery:
+  review-diff <id> [--stat]   show a worker's changes vs the default branch
+  approve <id> [--ttl 10m]    grant a time-boxed approval (run by the lead)
+  merge-local <id>            fast-forward the local default branch (needs approval)
+  promote <id>                turn a scout task into a ship task
+  pr-check <id> <url>         watch a PR and wake when it merges
+  fleet-sync [dir]            refresh local default from origin; prune gone branches
+  recovery                    reconcile tracked tasks against live windows
+
 Setup:
   install                 install/update managed skills, agents, and guidance
   update [--content-only] self-update the binary, then re-apply content
@@ -484,6 +606,6 @@ Setup:
   init [--mode m]         set up a repo's AGENTS.md + CLAUDE.md + delivery mode
   version | help          version / this message
 
-Coming later: skill, review-diff, merge-local
+Coming later: skill, the validation gate
 `)
 }

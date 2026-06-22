@@ -146,3 +146,104 @@ func TestTeardownRefusesDirtyWorktree(t *testing.T) {
 		t.Fatalf("forced teardown failed: %v", err)
 	}
 }
+
+func gitIn(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	c := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	c.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=w", "GIT_AUTHOR_EMAIL=w@example.com",
+		"GIT_COMMITTER_NAME=w", "GIT_COMMITTER_EMAIL=w@example.com")
+	out, err := c.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func newRepoMain(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	repo := t.TempDir()
+	gitIn(t, repo, "init", "-b", "main", "-q")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("hi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "-A")
+	gitIn(t, repo, "commit", "-q", "-m", "init")
+	return repo
+}
+
+func TestDeliveryLifecycle(t *testing.T) {
+	if !tmux.Available() {
+		t.Skip("tmux not installed")
+	}
+	repo := newRepoMain(t)
+
+	session := fmt.Sprintf("orcha-deliver-%d", os.Getpid())
+	t.Setenv("ORCHA_HOME", t.TempDir())
+	t.Setenv("ORCHA_TMUX_SESSION", session)
+	defer exec.Command("tmux", "kill-session", "-t", session).Run()
+
+	m := New(paths.Default())
+	task, err := m.Spawn("d1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := task.Worktree
+
+	// Simulate the worker committing a change in its worktree.
+	if err := os.WriteFile(filepath.Join(wt, "feature.txt"), []byte("new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, wt, "add", "-A")
+	gitIn(t, wt, "commit", "-q", "-m", "add feature")
+
+	// review-diff surfaces the change.
+	diff, err := m.ReviewDiff("d1", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(diff, "feature.txt") {
+		t.Fatalf("review-diff missing the change: %q", diff)
+	}
+
+	// merge-local refuses without an approval token.
+	if _, err := m.MergeLocal("d1"); err == nil {
+		t.Fatal("merge-local must refuse without approval")
+	}
+
+	// Approve, then merge: the default branch fast-forwards to the worker's HEAD.
+	if err := m.Approve("d1", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.MergeLocal("d1"); err != nil {
+		t.Fatalf("merge-local: %v", err)
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") != gitIn(t, wt, "rev-parse", "HEAD") {
+		t.Fatal("default branch was not fast-forwarded to the worker HEAD")
+	}
+	// Approval is single-use.
+	if _, err := m.MergeLocal("d1"); err == nil {
+		t.Fatal("approval should be consumed after one merge")
+	}
+	_, _ = m.Teardown("d1", true)
+
+	// promote: a scout task becomes a ship task.
+	scout, err := m.Spawn("s9", repo, true, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scout.Kind != "scout" {
+		t.Fatalf("expected scout kind, got %q", scout.Kind)
+	}
+	if err := m.Promote("s9"); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, _ := m.Store.Load("s9")
+	if reloaded.Kind != "ship" {
+		t.Fatalf("promote did not flip kind: %q", reloaded.Kind)
+	}
+	_, _ = m.Teardown("s9", true)
+}

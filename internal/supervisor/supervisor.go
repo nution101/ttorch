@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -47,6 +48,9 @@ type Supervisor struct {
 	paneHash      map[string]string // task id -> last pane hash
 	staleCount    map[string]int    // task id -> consecutive unchanged ticks
 	lastHeartbeat time.Time
+	lastCheck     time.Time
+	checked       map[string]bool // task id -> PR-merge already reported
+	checkEvery    time.Duration
 	now           func() time.Time
 }
 
@@ -62,6 +66,9 @@ func New(p paths.Paths) *Supervisor {
 		paneHash:      map[string]string{},
 		staleCount:    map[string]int{},
 		lastHeartbeat: time.Now(),
+		lastCheck:     time.Now(),
+		checked:       map[string]bool{},
+		checkEvery:    60 * time.Second,
 		now:           time.Now,
 	}
 }
@@ -118,7 +125,34 @@ func (s *Supervisor) Run(ctx context.Context) error {
 func (s *Supervisor) tick() {
 	s.scanSignals()
 	s.scanStale()
+	s.scanChecks()
 	s.heartbeat()
+}
+
+// scanChecks polls armed PR checks (rate-limited) and emits a wake when a task's
+// PR is merged. Requires the gh CLI.
+func (s *Supervisor) scanChecks() {
+	if _, err := exec.LookPath("gh"); err != nil {
+		return
+	}
+	if s.now().Sub(s.lastCheck) < s.checkEvery {
+		return
+	}
+	s.lastCheck = s.now()
+	tasks, _ := s.Store.List()
+	for _, t := range tasks {
+		if t.PR == "" || s.checked[t.ID] {
+			continue
+		}
+		out, err := exec.Command("gh", "pr", "view", t.PR, "--json", "state", "-q", ".state").Output()
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(string(out)) == "MERGED" {
+			_ = s.Q.Append("check", t.ID, "PR merged: "+t.PR)
+			s.checked[t.ID] = true
+		}
+	}
 }
 
 // scanSignals turns new turn-end/status writes into signal wakes (idempotent:
