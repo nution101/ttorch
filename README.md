@@ -31,6 +31,23 @@ make install      # builds into ~/.ttorch/bin, links into ~/.local/bin, lays con
 ttorch doctor      # check/installs tmux, git, gh, claude
 ```
 
+## Verifying a release
+
+Each release's `checksums.txt` is signed with [cosign](https://github.com/sigstore/cosign)
+(keyless / Sigstore — no shared keys):
+
+```sh
+cosign verify-blob \
+  --bundle checksums.txt.cosign.bundle \
+  --certificate-identity-regexp '^https://github.com/nution101/ttorch/\.github/workflows/.+' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  checksums.txt
+shasum -a 256 -c checksums.txt --ignore-missing   # then verify your tarball
+```
+
+The installer already checks the sha256 against `checksums.txt`; the signature lets you
+additionally confirm those checksums came from this repo's release workflow.
+
 ## Commands
 
 | Command | Description |
