@@ -17,6 +17,8 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+
+	"github.com/nution101/ttorch/internal/tmux"
 )
 
 // Open opens a native terminal tab (iTerm) or window (Terminal.app) that
@@ -187,9 +189,11 @@ func viewName(window string) string {
 // viewCommand builds the tmux command the native tab runs. It creates (or
 // attaches to) a grouped view session sharing the source session's windows,
 // sets destroy-unattached (scoped explicitly to the view session) so closing the
-// tab tears down only the view, and selects the worker's window. new-session
-// WITHOUT -d attaches immediately, so destroy-unattached only fires when the user
-// closes the tab.
+// tab tears down only the view, turns on title reporting for the view session so
+// the tab shows the worker's friendly label (tmux.TitleFormat reads the shared
+// window's @ttorch_label; set-titles is a per-session option, so the grouped view
+// needs its own), and selects the worker's window. new-session WITHOUT -d attaches
+// immediately, so destroy-unattached only fires when the user closes the tab.
 //
 // This command is executed by the terminal's interactive shell (via osascript
 // `do script` / `write text`), so every interpolated operand is single-quoted
@@ -198,8 +202,8 @@ func viewName(window string) string {
 func viewCommand(session, window string) string {
 	view := viewName(window)
 	return fmt.Sprintf(
-		"tmux new-session -A -s %s -t %s \\; set-option -t %s destroy-unattached on \\; select-window -t %s:%s",
-		shq(view), shq(session), shq(view), shq(view), shq(window),
+		"tmux new-session -A -s %s -t %s \\; set-option -t %s destroy-unattached on \\; set-option -t %s set-titles on \\; set-option -t %s set-titles-string %s \\; select-window -t %s:%s",
+		shq(view), shq(session), shq(view), shq(view), shq(view), shq(tmux.TitleFormat), shq(view), shq(window),
 	)
 }
 

@@ -74,6 +74,27 @@ func (m *Manager) requireTmux() error {
 	return nil
 }
 
+// windowLabel returns the friendly tab title for a task window: scouts are tagged
+// so they stand out; ship and cc tasks read as just the task id. The window's tmux
+// name (e.g. "wk-<id>") is unaffected — it stays the stable target.
+func windowLabel(kind, id string) string {
+	if kind == "scout" {
+		return "scout · " + id
+	}
+	return id
+}
+
+// newWindow creates a ttorch window and gives it a friendly display title (the
+// terminal tab name) while keeping its tmux name as the stable target. Labeling is
+// best-effort, so only the window creation can fail the caller.
+func (m *Manager) newWindow(window, cwd, label string) error {
+	if err := tmux.NewWindow(m.Session, window, cwd); err != nil {
+		return err
+	}
+	_ = tmux.LabelWindow(m.Session, window, label)
+	return nil
+}
+
 // Spawn starts a worker for taskID against the repo containing projectPath. If
 // rawCmd is empty, it launches the detected harness with the task brief; otherwise
 // it runs rawCmd (used for testing and escape hatches).
@@ -96,6 +117,10 @@ func (m *Manager) Spawn(taskID, projectPath string, scout bool, rawCmd string) (
 	if tmux.WindowExists(m.Session, window) {
 		return zero, fmt.Errorf("task %q already has a window; tear it down first", taskID)
 	}
+	kind := "ship"
+	if scout {
+		kind = "scout"
+	}
 
 	wt, err := m.Pool.Acquire(repo, m.inUseWorktrees(repo))
 	if err != nil {
@@ -104,14 +129,10 @@ func (m *Manager) Spawn(taskID, projectPath string, scout bool, rawCmd string) (
 	if err := tmux.EnsureSession(m.Session); err != nil {
 		return zero, err
 	}
-	if err := tmux.NewWindow(m.Session, window, wt); err != nil {
+	if err := m.newWindow(window, wt, windowLabel(kind, taskID)); err != nil {
 		return zero, err
 	}
 
-	kind := "ship"
-	if scout {
-		kind = "scout"
-	}
 	h := harness.Resolve()
 	// Assign a stable session id so a later restore resumes this exact conversation.
 	sid := harness.NewSessionID()
@@ -318,7 +339,7 @@ func (m *Manager) StartManager() error {
 		return err
 	}
 	autoInit(dir) // first-use setup of the default project (the launch dir)
-	if err := tmux.NewWindow(m.Session, "manager", dir); err != nil {
+	if err := m.newWindow("manager", dir, "manager"); err != nil {
 		return err
 	}
 	_ = tmux.SendLine(m.Session, "manager", harness.ManagerCommand(harness.Resolve(), sid, m.charterFile()))
@@ -360,7 +381,7 @@ func (m *Manager) restore() []string {
 	if !tmux.WindowExists(m.Session, "manager") {
 		mgr, ok, _ := m.Store.LoadManager()
 		if ok {
-			if err := tmux.NewWindow(m.Session, "manager", mgr.Dir); err != nil {
+			if err := m.newWindow("manager", mgr.Dir, "manager"); err != nil {
 				notes = append(notes, "skipped manager ("+err.Error()+")")
 			} else {
 				_ = tmux.SendLine(m.Session, "manager", harness.ManagerResumeOrFresh(h, mgr.SessionID, m.charterFile()))
@@ -374,7 +395,7 @@ func (m *Manager) restore() []string {
 			if err := m.Store.SaveManager(state.Manager{Dir: dir, SessionID: sid}); err != nil {
 				notes = append(notes, "could not persist new manager record: "+err.Error())
 			}
-			if err := tmux.NewWindow(m.Session, "manager", dir); err != nil {
+			if err := m.newWindow("manager", dir, "manager"); err != nil {
 				notes = append(notes, "skipped manager ("+err.Error()+")")
 			} else {
 				_ = tmux.SendLine(m.Session, "manager", harness.ManagerCommand(h, sid, m.charterFile()))
@@ -396,7 +417,7 @@ func (m *Manager) restore() []string {
 			notes = append(notes, fmt.Sprintf("skipped %s (worktree gone)", t.ID))
 			continue
 		}
-		if err := tmux.NewWindow(m.Session, t.Window, t.Worktree); err != nil {
+		if err := m.newWindow(t.Window, t.Worktree, windowLabel(t.Kind, t.ID)); err != nil {
 			notes = append(notes, fmt.Sprintf("skipped %s (%s)", t.ID, err.Error()))
 			continue
 		}
@@ -488,7 +509,7 @@ func (m *Manager) OpenCC(isolated bool) error {
 	if err := tmux.EnsureSession(m.Session); err != nil {
 		return err
 	}
-	if err := tmux.NewWindow(m.Session, window, dir); err != nil {
+	if err := m.newWindow(window, dir, windowLabel("cc", id)); err != nil {
 		return err
 	}
 	h := harness.Resolve()

@@ -48,6 +48,27 @@ func TestDeriveState(t *testing.T) {
 	}
 }
 
+// TestWindowLabel pins the friendly tab titles: scouts are tagged, ship and cc
+// tasks read as just the id, and no internal "wk-"/"ttv-" prefix leaks through.
+func TestWindowLabel(t *testing.T) {
+	cases := []struct {
+		kind, id, want string
+	}{
+		{"scout", "tab-names", "scout · tab-names"},
+		{"ship", "tab-names", "tab-names"},
+		{"cc", "cc-184205", "cc-184205"},
+		{"", "x", "x"}, // unknown kind defaults to the plain id
+	}
+	for _, c := range cases {
+		if got := windowLabel(c.kind, c.id); got != c.want {
+			t.Errorf("windowLabel(%q, %q) = %q, want %q", c.kind, c.id, got, c.want)
+		}
+		if strings.Contains(windowLabel(c.kind, c.id), "wk-") {
+			t.Errorf("windowLabel(%q, %q) leaked a wk- prefix", c.kind, c.id)
+		}
+	}
+}
+
 // TestSpawnPeekTeardown exercises the real runtime against tmux + git. It is
 // skipped where tmux is unavailable (e.g. CI without tmux installed).
 func TestSpawnPeekTeardown(t *testing.T) {
