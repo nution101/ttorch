@@ -69,9 +69,17 @@ func managerCommand(session, window string) string {
 	)
 }
 
+// itermRunning reports whether iTerm2 is already running. Reading the `running`
+// property does NOT launch the app (unlike most other commands).
+func itermRunning() bool {
+	out, err := exec.Command("osascript", "-e", `application "iTerm" is running`).Output()
+	return err == nil && strings.TrimSpace(string(out)) == "true"
+}
+
 // itermNewWindowScript returns the AppleScript that opens a NEW iTerm window and
-// runs cmd in it. The command is embedded as an AppleScript string literal, so
-// backslashes and double-quotes are escaped.
+// runs cmd in it. Use this only when iTerm is ALREADY running, so we don't disturb
+// the lead's existing windows. The command is embedded as an AppleScript string
+// literal, so backslashes and double-quotes are escaped.
 func itermNewWindowScript(cmd string) string {
 	lit := escapeAppleScript(cmd)
 	return `tell application "iTerm"
@@ -81,10 +89,30 @@ func itermNewWindowScript(cmd string) string {
 end tell`
 }
 
-// OpenManagerSession opens the manager in a NEW iTerm2 window on macOS so the
-// manager tab and the per-worker view tabs share one iTerm window. It returns
-// true only when it actually launched iTerm; otherwise it returns false and the
-// caller falls back to tmux.Attach.
+// itermLaunchScript returns the AppleScript for the case where iTerm is NOT yet
+// running. Activating iTerm makes it open its own window, so we reuse that window
+// (waiting briefly for it to appear) instead of creating a second one and leaving
+// a blank window behind. Falls back to creating a window if the user configured
+// iTerm to open none on launch.
+func itermLaunchScript(cmd string) string {
+	lit := escapeAppleScript(cmd)
+	return `tell application "iTerm"
+	activate
+	repeat 50 times
+		if (count of windows) > 0 then exit repeat
+		delay 0.1
+	end repeat
+	if (count of windows) is 0 then create window with default profile
+	tell current session of current window to write text "` + lit + `"
+end tell`
+}
+
+// OpenManagerSession opens the manager in an iTerm2 window on macOS so the manager
+// and the per-worker view tabs share one iTerm window. If iTerm is not yet running
+// it reuses the window iTerm opens on launch (avoiding a stray second window);
+// if iTerm is already running it opens a dedicated new window. It returns true only
+// when it actually launched iTerm; otherwise it returns false and the caller falls
+// back to tmux.Attach.
 //
 // It is a no-op (returns false) unless every gate holds: the feature is enabled;
 // the OS is macOS; the user did not force Terminal.app; iTerm is installed; we
@@ -99,7 +127,11 @@ func OpenManagerSession(session, window string) bool {
 		os.Getenv("TMUX") != "" {
 		return false
 	}
-	script := itermNewWindowScript(managerCommand(session, window))
+	cmd := managerCommand(session, window)
+	script := itermLaunchScript(cmd) // cold launch: reuse iTerm's own launch window
+	if itermRunning() {
+		script = itermNewWindowScript(cmd) // already running: a dedicated new window
+	}
 	if err := exec.Command("osascript", "-e", script).Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "ttorch: could not open the manager in iTerm2 (attaching in tmux instead): %v\n", err)
 		return false

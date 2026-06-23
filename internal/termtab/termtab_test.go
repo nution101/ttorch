@@ -235,6 +235,27 @@ func TestITermNewWindowScriptEscapes(t *testing.T) {
 	}
 }
 
+func TestITermLaunchScript(t *testing.T) {
+	s := itermLaunchScript(`tmux attach-session -t ttorch`)
+	// Cold launch must reuse the window iTerm opens, not unconditionally create one.
+	checks := []string{
+		`tell application "iTerm"`,
+		"activate",
+		"count of windows", // waits for / checks the launch window
+		"tell current session of current window to write text", // reuses the current window
+		"tmux attach-session -t ttorch",
+	}
+	for _, c := range checks {
+		if !strings.Contains(s, c) {
+			t.Errorf("itermLaunchScript missing %q in %q", c, s)
+		}
+	}
+	// It must escape the command for the AppleScript literal, same as the other path.
+	if !strings.Contains(itermLaunchScript(`a "b" \c`), `a \"b\" \\c`) {
+		t.Error("itermLaunchScript should escape quotes/backslashes")
+	}
+}
+
 // TestOpenManagerSessionGatedOff confirms the launcher is a no-op (never calls
 // osascript) when the feature is disabled, when Terminal.app is forced, when
 // inside tmux, or when inside iTerm. These are the GUI-free gates.
