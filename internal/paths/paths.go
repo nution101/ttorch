@@ -50,6 +50,10 @@ func (p Paths) ManifestFile() string { return filepath.Join(p.Home, "manifest.js
 // VersionFile records the installed content/binary version.
 func (p Paths) VersionFile() string { return filepath.Join(p.Home, "version") }
 
+// ManagerCharterFile holds the manager's system-prompt charter, passed to claude
+// via --append-system-prompt-file so the launched command stays short.
+func (p Paths) ManagerCharterFile() string { return filepath.Join(p.Home, "manager-charter.md") }
+
 // UpdateCheckFile caches the 24h "new version available" check.
 func (p Paths) UpdateCheckFile() string { return filepath.Join(p.Home, "update-check.json") }
 

@@ -82,58 +82,75 @@ func TestLaunchCommandsCarryEffort(t *testing.T) {
 
 func TestManagerCommand(t *testing.T) {
 	t.Setenv("TTORCH_MANAGER_EFFORT", "") // default: high (NOT ultracode)
-	cmd := ManagerCommand("claude", "mgr-sid")
+	// With a charter file the charter is referenced (short command), not inlined.
+	cmd := ManagerCommand("claude", "mgr-sid", "/tmp/charter.md")
 	if !strings.Contains(cmd, " --effort high") {
 		t.Errorf("manager should default to --effort high, got %q", cmd)
 	}
 	if strings.Contains(cmd, "ultracode") {
 		t.Errorf("manager must not default to ultracode, got %q", cmd)
 	}
-	if !strings.Contains(cmd, " --append-system-prompt '") {
-		t.Errorf("manager should append the charter as a quoted system prompt, got %q", cmd)
+	if !strings.Contains(cmd, " --append-system-prompt-file '/tmp/charter.md'") {
+		t.Errorf("manager should reference the charter file, got %q", cmd)
 	}
-	if !strings.Contains(cmd, "You are the ttorch MANAGER") {
-		t.Errorf("manager charter missing, got %q", cmd)
-	}
-	if !strings.Contains(cmd, "ttorch spawn") {
-		t.Errorf("charter should instruct delegation via ttorch spawn, got %q", cmd)
-	}
-	// The charter's apostrophe (lead's) must be shell-escaped, not break the quote.
-	if !strings.Contains(cmd, `lead'\''s`) {
-		t.Errorf("charter apostrophe not shell-escaped, got %q", cmd)
+	if strings.Contains(cmd, "You are the ttorch MANAGER") {
+		t.Errorf("charter should live in the file, not be inlined, got %q", cmd)
 	}
 	if !strings.Contains(cmd, " --session-id 'mgr-sid'") {
 		t.Errorf("manager should launch with the session id, got %q", cmd)
+	}
+
+	// With no charter file it falls back to inlining the charter (shell-escaped).
+	inline := ManagerCommand("claude", "mgr-sid", "")
+	if !strings.Contains(inline, " --append-system-prompt '") ||
+		!strings.Contains(inline, "You are the ttorch MANAGER") ||
+		!strings.Contains(inline, "ttorch spawn") ||
+		!strings.Contains(inline, `lead'\''s`) {
+		t.Errorf("inline fallback charter wrong: %q", inline)
 	}
 }
 
 func TestManagerEffortOverride(t *testing.T) {
 	t.Setenv("TTORCH_MANAGER_EFFORT", "ultracode")
-	if got := ManagerCommand("claude", "x"); !strings.Contains(got, `--settings '{"ultracode":true}'`) {
+	if got := ManagerCommand("claude", "x", ""); !strings.Contains(got, `--settings '{"ultracode":true}'`) {
 		t.Errorf("override to ultracode should add --settings, got %q", got)
 	}
 	t.Setenv("TTORCH_MANAGER_EFFORT", "max")
-	if got := ManagerCommand("claude", "x"); !strings.Contains(got, " --effort max") {
+	if got := ManagerCommand("claude", "x", ""); !strings.Contains(got, " --effort max") {
 		t.Errorf("override to max should add --effort max, got %q", got)
 	}
 }
 
 func TestManagerResumeCommand(t *testing.T) {
 	t.Setenv("TTORCH_MANAGER_EFFORT", "")
-	cmd := ManagerResumeCommand("claude", "mgr-sid")
+	cmd := ManagerResumeCommand("claude", "mgr-sid", "/tmp/charter.md")
 	if !strings.Contains(cmd, " --resume 'mgr-sid'") {
 		t.Errorf("resume should carry --resume <id>, got %q", cmd)
 	}
 	if strings.Contains(cmd, "--session-id") {
 		t.Errorf("resume must not use --session-id, got %q", cmd)
 	}
-	if !strings.Contains(cmd, " --effort high") || !strings.Contains(cmd, "--append-system-prompt") {
-		t.Errorf("resume should keep effort + charter, got %q", cmd)
+	if !strings.Contains(cmd, " --effort high") || !strings.Contains(cmd, "--append-system-prompt-file '/tmp/charter.md'") {
+		t.Errorf("resume should keep effort + charter file, got %q", cmd)
 	}
 	// No id -> --continue, no --resume.
-	cont := ManagerResumeCommand("claude", "")
+	cont := ManagerResumeCommand("claude", "", "")
 	if !strings.Contains(cont, " --continue") || strings.Contains(cont, "--resume") {
 		t.Errorf("empty id should use --continue, got %q", cont)
+	}
+}
+
+func TestWriteManagerCharter(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "manager-charter.md")
+	if err := WriteManagerCharter(p); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "You are the ttorch MANAGER") || !strings.Contains(string(b), "ttorch spawn") {
+		t.Errorf("charter file content wrong: %q", b)
 	}
 }
 
@@ -168,7 +185,7 @@ func TestResumeCommand(t *testing.T) {
 
 func TestManagerResumeOrFresh(t *testing.T) {
 	t.Setenv("TTORCH_MANAGER_EFFORT", "")
-	cmd := ManagerResumeOrFresh("claude", "mgr-sid")
+	cmd := ManagerResumeOrFresh("claude", "mgr-sid", "/tmp/charter.md")
 	if !strings.Contains(cmd, " --resume 'mgr-sid'") {
 		t.Errorf("should attempt resume, got %q", cmd)
 	}

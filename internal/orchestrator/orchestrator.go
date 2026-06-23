@@ -268,9 +268,19 @@ func (m *Manager) StartManager() error {
 	if err := tmux.NewWindow(m.Session, "manager", dir); err != nil {
 		return err
 	}
-	_ = tmux.SendLine(m.Session, "manager", harness.ManagerCommand(harness.Resolve(), sid))
+	_ = tmux.SendLine(m.Session, "manager", harness.ManagerCommand(harness.Resolve(), sid, m.charterFile()))
 	fmt.Fprintf(os.Stderr, "ttorch: manager started in %s — tell it the repo to work on; 'ttorch stop' to end.\n", dir)
 	return m.attachManager()
+}
+
+// charterFile ensures the manager charter file exists and returns its path; on a
+// write failure it returns "" so the launch falls back to an inline charter.
+func (m *Manager) charterFile() string {
+	p := m.P.ManagerCharterFile()
+	if err := harness.WriteManagerCharter(p); err != nil {
+		return ""
+	}
+	return p
 }
 
 // attachManager opens the manager window for the lead: it prefers a native iTerm2
@@ -300,7 +310,7 @@ func (m *Manager) restore() []string {
 			if err := tmux.NewWindow(m.Session, "manager", mgr.Dir); err != nil {
 				notes = append(notes, "skipped manager ("+err.Error()+")")
 			} else {
-				_ = tmux.SendLine(m.Session, "manager", harness.ManagerResumeOrFresh(h, mgr.SessionID))
+				_ = tmux.SendLine(m.Session, "manager", harness.ManagerResumeOrFresh(h, mgr.SessionID, m.charterFile()))
 				notes = append(notes, "restored manager")
 			}
 		} else {
@@ -314,7 +324,7 @@ func (m *Manager) restore() []string {
 			if err := tmux.NewWindow(m.Session, "manager", dir); err != nil {
 				notes = append(notes, "skipped manager ("+err.Error()+")")
 			} else {
-				_ = tmux.SendLine(m.Session, "manager", harness.ManagerCommand(h, sid))
+				_ = tmux.SendLine(m.Session, "manager", harness.ManagerCommand(h, sid, m.charterFile()))
 				notes = append(notes, "started a fresh manager (no saved manager record)")
 			}
 		}

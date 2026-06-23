@@ -103,19 +103,37 @@ func InteractiveCommand(kind string) string {
 }
 
 // ManagerCommand starts the manager session. It runs lighter than workers
-// (managerEffortLevel, default "high") and carries the manager charter as an
-// appended system prompt so the session plans and delegates via `ttorch spawn`
-// rather than doing the work itself. The session is launched with a stable
-// session id so a later restore can resume this exact conversation.
-func ManagerCommand(kind, sessionID string) string {
+// (managerEffortLevel, default "high") and carries the manager charter so the
+// session plans and delegates via `ttorch spawn` rather than doing the work
+// itself. The session is launched with a stable session id so a later restore can
+// resume this exact conversation. charterFile, when set, is passed via
+// --append-system-prompt-file so the launched command stays short instead of
+// inlining the whole charter on the command line.
+func ManagerCommand(kind, sessionID, charterFile string) string {
 	switch kind {
 	case "claude":
 		return "claude --dangerously-skip-permissions" + effortArgsForLevel(managerEffortLevel()) +
-			" --append-system-prompt " + shq(managerCharter) +
+			managerCharterArg(charterFile) +
 			" --session-id " + shq(sessionID)
 	default:
 		return kind
 	}
+}
+
+// managerCharterArg applies the manager charter: as a file reference when a path
+// is given (keeps the launched command short), otherwise inlined.
+func managerCharterArg(charterFile string) string {
+	if charterFile != "" {
+		return " --append-system-prompt-file " + shq(charterFile)
+	}
+	return " --append-system-prompt " + shq(managerCharter)
+}
+
+// WriteManagerCharter writes the manager charter to path so it can be passed via
+// --append-system-prompt-file. It overwrites any existing file (the charter is
+// ttorch-managed and may change across versions).
+func WriteManagerCharter(path string) error {
+	return os.WriteFile(path, []byte(managerCharter+"\n"), 0o644)
 }
 
 // ManagerResumeCommand resumes the manager conversation after a stop/reboot/
@@ -123,11 +141,11 @@ func ManagerCommand(kind, sessionID string) string {
 // conversation rather than starting a new one: it uses --resume <sessionID>, or
 // --continue (most recent conversation in the launch directory) when no id is
 // known (legacy state).
-func ManagerResumeCommand(kind, sessionID string) string {
+func ManagerResumeCommand(kind, sessionID, charterFile string) string {
 	switch kind {
 	case "claude":
 		base := "claude --dangerously-skip-permissions" + effortArgsForLevel(managerEffortLevel()) +
-			" --append-system-prompt " + shq(managerCharter)
+			managerCharterArg(charterFile)
 		if sessionID == "" {
 			return base + " --continue"
 		}
@@ -172,11 +190,11 @@ func ResumeCommand(kind, sessionID string) string {
 // manager (same session id) if the resume fails — e.g. the saved conversation was
 // never persisted, or its id/directory no longer resolves. Without the fallback a
 // failed `--resume` would exit and strand the lead at a shell prompt.
-func ManagerResumeOrFresh(kind, sessionID string) string {
+func ManagerResumeOrFresh(kind, sessionID, charterFile string) string {
 	if kind != "claude" {
-		return ManagerResumeCommand(kind, sessionID)
+		return ManagerResumeCommand(kind, sessionID, charterFile)
 	}
-	return ManagerResumeCommand(kind, sessionID) + " || " + ManagerCommand(kind, sessionID)
+	return ManagerResumeCommand(kind, sessionID, charterFile) + " || " + ManagerCommand(kind, sessionID, charterFile)
 }
 
 // WorkerResumeOrFresh resumes a worker conversation, falling back to relaunching
