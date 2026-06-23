@@ -18,6 +18,7 @@ import (
 	"github.com/nution101/ttorch/internal/profile"
 	"github.com/nution101/ttorch/internal/projectinit"
 	"github.com/nution101/ttorch/internal/state"
+	"github.com/nution101/ttorch/internal/supervisor"
 	"github.com/nution101/ttorch/internal/termtab"
 	"github.com/nution101/ttorch/internal/tmux"
 	"github.com/nution101/ttorch/internal/validate"
@@ -118,6 +119,10 @@ func (m *Manager) Spawn(taskID, projectPath string, scout bool, rawCmd string) (
 	// and pre-accept the harness's folder-trust prompt so the worker runs autonomously.
 	_ = harness.InstallTurnEndHook(h, wt, m.P.TurnEndMarker(taskID))
 	harness.TrustWorktree(h, repo, wt)
+	// The turn-end hook is useless without something reading it: make sure the
+	// background supervisor is up so this worker's turn boundaries and idle become
+	// wakes the manager is told about.
+	m.ensureSupervisor()
 	cmd := rawCmd
 	if cmd == "" {
 		brief := m.P.BriefPath(taskID)
@@ -144,6 +149,25 @@ func (m *Manager) Spawn(taskID, projectPath string, scout bool, rawCmd string) (
 	return t, nil
 }
 
+// ensureSupervisor starts the background supervisor if it isn't already running,
+// so the manager is told when a worker ends a turn or goes idle. It reuses the
+// shared start path (supervisor.Start) and is best-effort: a failure is reported
+// to stderr but never fails the spawn. Set TTORCH_NO_SUPERVISOR=1 to manage the
+// supervisor yourself.
+func (m *Manager) ensureSupervisor() {
+	if os.Getenv("TTORCH_NO_SUPERVISOR") != "" {
+		return
+	}
+	_, started, err := supervisor.Start(m.P)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ttorch: could not start the supervisor (run 'ttorch supervise'): %v\n", err)
+		return
+	}
+	if started {
+		fmt.Fprintln(os.Stderr, "ttorch: started the background supervisor to watch for turn-end/idle")
+	}
+}
+
 // Live reports whether a task's tmux window is still present.
 func (m *Manager) Live(t state.Task) bool {
 	return tmux.WindowExists(m.Session, t.Window)
@@ -151,6 +175,35 @@ func (m *Manager) Live(t state.Task) bool {
 
 // Status returns all tracked tasks.
 func (m *Manager) Status() ([]state.Task, error) { return m.Store.List() }
+
+// DeriveState classifies a worker from observable inputs: whether its tmux window
+// is live and a recent capture of its pane. It is the pure core of TaskState, kept
+// separate so it can be tested without tmux. The states are:
+//   - "gone":    the window is no longer present
+//   - "working": the pane shows a busy indicator (mid-turn)
+//   - "idle":    the window is live but not busy (finished / awaiting input)
+//
+// It mirrors the supervisor's stale-detection heuristic (supervisor.Busy) so
+// `ttorch status` and the wakes the manager receives never disagree.
+func DeriveState(live bool, pane string) string {
+	if !live {
+		return "gone"
+	}
+	if supervisor.Busy(pane) {
+		return "working"
+	}
+	return "idle"
+}
+
+// TaskState reports a worker's live state for `ttorch status` (see DeriveState).
+// A live pane that can't be captured falls back to "idle".
+func (m *Manager) TaskState(t state.Task) string {
+	if !tmux.WindowExists(m.Session, t.Window) {
+		return DeriveState(false, "")
+	}
+	out, _ := tmux.CapturePane(m.Session, t.Window, 6)
+	return DeriveState(true, out)
+}
 
 // Peek returns the last n lines of a worker's pane.
 func (m *Manager) Peek(taskID string, lines int) (string, error) {

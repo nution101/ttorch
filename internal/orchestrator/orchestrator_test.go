@@ -19,10 +19,33 @@ import (
 // TestMain disables native worker terminal views for the whole package. The
 // integration tests below exercise Spawn, which best-effort opens a terminal tab
 // or window on macOS; without this, running these tests would spawn real GUI
-// windows on a developer's Mac.
+// windows on a developer's Mac. It also disables the auto-ensure of the background
+// supervisor so a Spawn test never detaches a stray `daemon run` process.
 func TestMain(m *testing.M) {
 	os.Setenv("TTORCH_WORKER_TABS", "off")
+	os.Setenv("TTORCH_NO_SUPERVISOR", "1")
 	os.Exit(m.Run())
+}
+
+func TestDeriveState(t *testing.T) {
+	cases := []struct {
+		name string
+		live bool
+		pane string
+		want string
+	}{
+		{"dead window", false, "", "gone"},
+		{"dead wins over busy text", false, "esc to interrupt", "gone"},
+		{"live empty pane", true, "", "idle"},
+		{"live at a prompt", true, "all set\n> ", "idle"},
+		{"busy interrupt", true, "✻ Working… (esc to interrupt)", "working"},
+		{"busy thinking", true, "Thinking about the change", "working"},
+	}
+	for _, tc := range cases {
+		if got := DeriveState(tc.live, tc.pane); got != tc.want {
+			t.Errorf("%s: DeriveState(%v, %q) = %q, want %q", tc.name, tc.live, tc.pane, got, tc.want)
+		}
+	}
 }
 
 // TestSpawnPeekTeardown exercises the real runtime against tmux + git. It is

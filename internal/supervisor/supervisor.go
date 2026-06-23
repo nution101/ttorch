@@ -192,7 +192,7 @@ func (s *Supervisor) scanStale() {
 		if err != nil {
 			continue
 		}
-		if busy(out) {
+		if Busy(out) {
 			s.staleCount[task.ID] = 0
 			s.paneHash[task.ID] = hash(out)
 			continue
@@ -270,6 +270,40 @@ func Running(p paths.Paths) (int, bool) {
 	return pid, true
 }
 
+// Start launches the supervisor as a detached background process that runs
+// `<this-binary> daemon run`, logging to p.DaemonLog(). It is the single shared
+// start path behind `ttorch supervise`, `ttorch daemon start`, and the automatic
+// ensure-on-spawn. It is idempotent: if a supervisor already holds the singleton
+// it launches nothing and returns that pid with started=false.
+func Start(p paths.Paths) (pid int, started bool, err error) {
+	if pid, ok := Running(p); ok {
+		return pid, false, nil
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return 0, false, err
+	}
+	if err := os.MkdirAll(p.Home, 0o755); err != nil {
+		return 0, false, err
+	}
+	logf, err := os.OpenFile(p.DaemonLog(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return 0, false, err
+	}
+	defer logf.Close()
+	c := exec.Command(exe, "daemon", "run")
+	c.Env = append(os.Environ(), "TTORCH_DAEMON=1")
+	c.Stdout = logf
+	c.Stderr = logf
+	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := c.Start(); err != nil {
+		return 0, false, err
+	}
+	pid = c.Process.Pid
+	_ = c.Process.Release()
+	return pid, true, nil
+}
+
 func touch(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
@@ -290,7 +324,10 @@ func hash(s string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func busy(pane string) bool {
+// Busy reports whether a captured pane shows a harness busy indicator (the worker
+// is mid-turn). It is the shared heuristic behind both the supervisor's
+// stale-detection and `ttorch status`, so the two never disagree.
+func Busy(pane string) bool {
 	low := strings.ToLower(pane)
 	for _, m := range []string{"esc to interrupt", "working…", "working...", "thinking", "generating"} {
 		if strings.Contains(low, m) {
