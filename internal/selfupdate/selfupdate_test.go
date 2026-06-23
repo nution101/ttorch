@@ -1,10 +1,61 @@
 package selfupdate
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestTagFromLocation(t *testing.T) {
+	cases := []struct {
+		loc     string
+		wantTag string
+		wantOK  bool
+	}{
+		{"https://github.com/o/r/releases/tag/v0.1.7", "v0.1.7", true},
+		{"/o/r/releases/tag/v1.2.3", "v1.2.3", true},
+		{"https://github.com/o/r/releases/tag/v0.1.7/", "v0.1.7", true},
+		{"https://github.com/o/r/releases", "", false}, // no releases
+		{"https://github.com/o/r/releases/tag/", "", false},
+		{"", "", false},
+	}
+	for _, c := range cases {
+		tag, ok := tagFromLocation(c.loc)
+		if tag != c.wantTag || ok != c.wantOK {
+			t.Errorf("tagFromLocation(%q) = (%q,%v), want (%q,%v)", c.loc, tag, ok, c.wantTag, c.wantOK)
+		}
+	}
+}
+
+func TestLatest(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/has/rel/releases/latest":
+			http.Redirect(w, r, "https://github.com/has/rel/releases/tag/v9.9.9", http.StatusFound)
+		case "/no/rel/releases/latest":
+			http.Redirect(w, r, "https://github.com/no/rel/releases", http.StatusFound)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	old := githubWeb
+	githubWeb = srv.URL
+	defer func() { githubWeb = old }()
+
+	if tag, err := Latest("has/rel", nil); err != nil || tag != "v9.9.9" {
+		t.Fatalf("Latest(has/rel) = (%q,%v), want (v9.9.9,nil)", tag, err)
+	}
+	if _, err := Latest("no/rel", nil); err != ErrNoReleases {
+		t.Fatalf("Latest(no/rel) err = %v, want ErrNoReleases", err)
+	}
+	if _, err := Latest("missing/repo", nil); err != ErrNoReleases {
+		t.Fatalf("Latest(missing) err = %v, want ErrNoReleases (404)", err)
+	}
+}
 
 func TestCompareVersions(t *testing.T) {
 	cases := []struct {

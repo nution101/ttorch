@@ -10,7 +10,6 @@ import (
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +21,11 @@ import (
 
 // ErrNoReleases indicates the repo has no published release yet.
 var ErrNoReleases = errors.New("no releases published yet")
+
+// githubWeb is the github.com base (overridable in tests). The release "latest"
+// lookup uses the web redirect here, NOT api.github.com, to avoid the
+// unauthenticated API rate limit (60 requests/hour/IP).
+var githubWeb = "https://github.com"
 
 const maxDownload = 256 << 20 // 256 MiB cap
 
@@ -41,38 +45,50 @@ func (c Config) client() *http.Client {
 	return &http.Client{Timeout: 30 * time.Second}
 }
 
-// Latest returns the newest release tag, or ErrNoReleases.
+// Latest returns the newest release tag, or ErrNoReleases. It reads the tag from
+// the github.com /releases/latest redirect — the Location header points at
+// /releases/tag/<tag> — instead of api.github.com, which is rate-limited to 60
+// unauthenticated requests/hour/IP and would 403 after a few `ttorch update`s.
 func Latest(repo string, client *http.Client) (string, error) {
 	if client == nil {
 		client = &http.Client{Timeout: 15 * time.Second}
 	}
-	url := "https://api.github.com/repos/" + repo + "/releases/latest"
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	resp, err := client.Do(req)
+	// Capture the redirect instead of following it.
+	c := *client
+	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+	resp, err := c.Head(githubWeb + "/" + repo + "/releases/latest")
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
+	switch resp.StatusCode {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
+		http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		if tag, ok := tagFromLocation(resp.Header.Get("Location")); ok {
+			return tag, nil
+		}
+		// A repo with no releases redirects to /releases (no /tag/ segment).
 		return "", ErrNoReleases
-	}
-	if resp.StatusCode != http.StatusOK {
+	case http.StatusNotFound:
+		return "", ErrNoReleases
+	default:
 		return "", fmt.Errorf("github returned %s", resp.Status)
 	}
-	var out struct {
-		TagName string `json:"tag_name"`
+}
+
+// tagFromLocation extracts the release tag from a /releases/latest redirect
+// Location (e.g. https://github.com/owner/repo/releases/tag/v1.2.3 -> v1.2.3).
+func tagFromLocation(loc string) (string, bool) {
+	const marker = "/releases/tag/"
+	i := strings.LastIndex(loc, marker)
+	if i < 0 {
+		return "", false
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil {
-		return "", err
+	if tag := strings.Trim(loc[i+len(marker):], "/"); tag != "" {
+		return tag, true
 	}
-	if out.TagName == "" {
-		return "", ErrNoReleases
-	}
-	return out.TagName, nil
+	return "", false
 }
 
 // Apply downloads the release asset for tag, verifies its sha256 against the
