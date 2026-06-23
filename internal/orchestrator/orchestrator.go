@@ -300,7 +300,7 @@ func (m *Manager) restore() []string {
 			if err := tmux.NewWindow(m.Session, "manager", mgr.Dir); err != nil {
 				notes = append(notes, "skipped manager ("+err.Error()+")")
 			} else {
-				_ = tmux.SendLine(m.Session, "manager", harness.ManagerResumeCommand(h, mgr.SessionID))
+				_ = tmux.SendLine(m.Session, "manager", harness.ManagerResumeOrFresh(h, mgr.SessionID))
 				notes = append(notes, "restored manager")
 			}
 		} else {
@@ -337,7 +337,7 @@ func (m *Manager) restore() []string {
 			notes = append(notes, fmt.Sprintf("skipped %s (%s)", t.ID, err.Error()))
 			continue
 		}
-		_ = tmux.SendLine(m.Session, t.Window, harness.ResumeCommand(h, t.SessionID))
+		_ = tmux.SendLine(m.Session, t.Window, harness.WorkerResumeOrFresh(h, t.SessionID, m.P.BriefPath(t.ID)))
 		_ = termtab.Open(m.Session, t.Window)
 		notes = append(notes, "restored "+t.ID)
 	}

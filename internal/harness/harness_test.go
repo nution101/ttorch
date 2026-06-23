@@ -166,6 +166,33 @@ func TestResumeCommand(t *testing.T) {
 	}
 }
 
+func TestManagerResumeOrFresh(t *testing.T) {
+	t.Setenv("TTORCH_MANAGER_EFFORT", "")
+	cmd := ManagerResumeOrFresh("claude", "mgr-sid")
+	if !strings.Contains(cmd, " --resume 'mgr-sid'") {
+		t.Errorf("should attempt resume, got %q", cmd)
+	}
+	if !strings.Contains(cmd, " || ") {
+		t.Errorf("should fall back with ||, got %q", cmd)
+	}
+	// The fallback is a fresh manager with the SAME id (self-healing).
+	if !strings.Contains(cmd, " --session-id 'mgr-sid'") {
+		t.Errorf("fallback should start a fresh manager with the same id, got %q", cmd)
+	}
+}
+
+func TestWorkerResumeOrFresh(t *testing.T) {
+	t.Setenv("TTORCH_EFFORT", "off")
+	cmd := WorkerResumeOrFresh("claude", "wk-sid", "/tmp/b.md")
+	if !strings.Contains(cmd, " --resume 'wk-sid'") || !strings.Contains(cmd, " || ") {
+		t.Errorf("should attempt resume then fall back, got %q", cmd)
+	}
+	// Fallback relaunches from the brief with the same id.
+	if !strings.Contains(cmd, " --session-id 'wk-sid'") || !strings.Contains(cmd, `"$(cat '/tmp/b.md')"`) {
+		t.Errorf("fallback should re-brief with the same id, got %q", cmd)
+	}
+}
+
 func TestNewSessionID(t *testing.T) {
 	re := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 	a := NewSessionID()

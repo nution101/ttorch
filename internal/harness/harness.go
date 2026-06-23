@@ -168,6 +168,27 @@ func ResumeCommand(kind, sessionID string) string {
 	}
 }
 
+// ManagerResumeOrFresh resumes the manager conversation, falling back to a fresh
+// manager (same session id) if the resume fails — e.g. the saved conversation was
+// never persisted, or its id/directory no longer resolves. Without the fallback a
+// failed `--resume` would exit and strand the lead at a shell prompt.
+func ManagerResumeOrFresh(kind, sessionID string) string {
+	if kind != "claude" {
+		return ManagerResumeCommand(kind, sessionID)
+	}
+	return ManagerResumeCommand(kind, sessionID) + " || " + ManagerCommand(kind, sessionID)
+}
+
+// WorkerResumeOrFresh resumes a worker conversation, falling back to relaunching
+// it from its brief (same session id) if the resume fails, so a worker is never
+// left at a dead shell after a stop/reboot/upgrade.
+func WorkerResumeOrFresh(kind, sessionID, briefPath string) string {
+	if kind != "claude" {
+		return ResumeCommand(kind, sessionID)
+	}
+	return ResumeCommand(kind, sessionID) + " || " + BriefCommand(kind, briefPath, sessionID)
+}
+
 // NewSessionID returns a random RFC-4122 version-4 UUID, used as a stable Claude
 // Code session id so a session can be resumed later. It uses crypto/rand and no
 // external dependency.
