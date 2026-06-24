@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -52,6 +53,7 @@ type Supervisor struct {
 	checked       map[string]bool // task id -> PR-merge already reported
 	checkEvery    time.Duration
 	now           func() time.Time
+	lock          *os.File // held while this process owns the singleton (nil otherwise)
 }
 
 // New builds a Supervisor using the standard layout.
@@ -76,6 +78,13 @@ func New(p paths.Paths) *Supervisor {
 // Run owns the supervisor process until ctx is cancelled.
 func (s *Supervisor) Run(ctx context.Context) error {
 	if err := s.acquire(); err != nil {
+		// Losing the singleton race to a live supervisor is not an error: this
+		// duplicate daemon simply has no work to do, so it exits quietly (the
+		// winner runs). Any other failure is real and surfaces to the caller.
+		var running *AlreadyRunningError
+		if errors.As(err, &running) {
+			return nil
+		}
 		return err
 	}
 	defer s.release()
@@ -220,17 +229,107 @@ func (s *Supervisor) heartbeat() {
 
 func (s *Supervisor) beat() { _ = touch(s.P.Beacon()) }
 
+// maxAcquireAttempts bounds the retry that handles the pid file being unlinked or
+// replaced between our open and our lock (a departing supervisor's release racing
+// our start). A handful of attempts is far more than any real start/stop overlap
+// needs.
+const maxAcquireAttempts = 5
+
+// acquire claims the supervisor singleton with an exclusive advisory lock (flock)
+// on the PID file, held for the lifetime of this process. The kernel arbitrates the
+// lock, so at most one process can hold it at a time, and — crucially — it is
+// released automatically when the holder exits, even on a crash. That makes the
+// claim immune to the races a bare PID file suffers: there is no check-then-write
+// window for a second daemon to slip through (the old Running()-then-WriteFile, the
+// double-start race), no stale file to reclaim by hand (a dead holder's lock is
+// already gone), and no need to second-guess a recorded pid against liveness or
+// worry about pid reuse — the lock, not the file contents, is the source of truth.
+//
+// flock binds to the inode, not the path, so after winning the lock we confirm our
+// descriptor still names the file at the path. If a departing supervisor's release()
+// unlinked it between our open and our lock, we would otherwise be holding a live
+// lock on an orphaned inode that daemon.pid no longer points at — invisible to
+// Running()/stop/status, and free for the next start to claim a fresh file and run a
+// second supervisor. On that mismatch we drop the orphan and retry against the live
+// file.
+//
+// The pid is written into the file purely for observability, so Running(),
+// `ttorch daemon status`, and `ttorch daemon stop` can find and signal the live
+// supervisor exactly as before.
 func (s *Supervisor) acquire() error {
-	if pid, ok := Running(s.P); ok && pid != os.Getpid() {
-		return &AlreadyRunningError{PID: pid}
+	if s.lock != nil {
+		return nil // this process already holds the singleton
 	}
-	if err := os.MkdirAll(filepath.Dir(s.P.PIDFile()), 0o755); err != nil {
+	path := s.P.PIDFile()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(s.P.PIDFile(), []byte(strconv.Itoa(os.Getpid())), 0o644)
+	for attempt := 0; attempt < maxAcquireAttempts; attempt++ {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			return err
+		}
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			_ = f.Close()
+			if errors.Is(err, syscall.EWOULDBLOCK) {
+				pid, _ := PID(s.P) // best-effort: name the live holder if it recorded its pid
+				return &AlreadyRunningError{PID: pid}
+			}
+			return err
+		}
+		if !lockedLiveFile(f, path) {
+			// We locked an inode that is no longer the file at the path (a departing
+			// supervisor unlinked it). Drop the orphan and retry against the live file.
+			_ = f.Close()
+			continue
+		}
+		// We hold the lock on the live pid file. Record our pid, truncating any dead
+		// predecessor's, so the rest of ttorch can find and signal us.
+		if err := f.Truncate(0); err != nil {
+			_ = f.Close()
+			return err
+		}
+		if _, err := f.WriteAt([]byte(strconv.Itoa(os.Getpid())), 0); err != nil {
+			_ = f.Close()
+			return err
+		}
+		s.lock = f // keep the fd open to hold the lock for our lifetime
+		return nil
+	}
+	return errors.New("supervisor: could not acquire the lock (pid file kept being replaced)")
 }
 
-func (s *Supervisor) release() { _ = os.Remove(s.P.PIDFile()) }
+// lockedLiveFile reports whether f still refers to the file currently at path. flock
+// is held on the inode, not the path, so a descriptor whose path was unlinked between
+// open and lock points at an orphaned inode; this also catches a path replaced by a
+// different inode. acquire uses it so it never writes its pid to a file that
+// daemon.pid no longer names.
+func lockedLiveFile(f *os.File, path string) bool {
+	onDisk, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	held, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return os.SameFile(held, onDisk)
+}
+
+// release relinquishes the singleton: it drops the PID file (only while it still
+// names this process, so a successor that has already taken over is left untouched)
+// and closes the locked descriptor, which releases the advisory lock. With no
+// contention the file names us and is removed, exactly as before.
+func (s *Supervisor) release() {
+	if s.lock == nil {
+		return
+	}
+	if pid, ok := PID(s.P); !ok || pid == os.Getpid() {
+		_ = os.Remove(s.P.PIDFile())
+	}
+	_ = s.lock.Close() // releases the flock
+	s.lock = nil
+}
 
 // AlreadyRunningError reports a live supervisor holding the singleton.
 type AlreadyRunningError struct{ PID int }
