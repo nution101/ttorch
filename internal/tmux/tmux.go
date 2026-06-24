@@ -21,6 +21,13 @@ func SessionName() string {
 	return "ttorch"
 }
 
+// TitleFormat is the set-titles-string ttorch applies to the sessions it creates
+// so the terminal tab shows a window's friendly display label (the @ttorch_label
+// window option set by LabelWindow), falling back to the window's tmux name when
+// no label is set. Without set-titles the terminal shows its own fallback (e.g.
+// iTerm's "tmux N"). The view sessions in package termtab set the same string.
+const TitleFormat = "#{?#{@ttorch_label},#{@ttorch_label},#W}"
+
 // Available reports whether tmux is installed.
 func Available() bool {
 	_, err := exec.LookPath("tmux")
@@ -59,13 +66,27 @@ func HasSession(session string) bool {
 	return err == nil
 }
 
-// EnsureSession creates the session detached if it does not exist.
+// applyTitleOptions turns on terminal-title reporting for a session ttorch owns
+// and points it at TitleFormat. set-titles/-string are per-session options, so
+// they are applied to every session ttorch attaches (this shared session, and the
+// view sessions in package termtab). Best-effort: a failure never blocks a spawn.
+func applyTitleOptions(session string) {
+	_, _ = run("set-option", "-t", session, "set-titles", "on")
+	_, _ = run("set-option", "-t", session, "set-titles-string", TitleFormat)
+}
+
+// EnsureSession creates the session detached if it does not exist. It (re)applies
+// ttorch's title options each call so a pre-existing session also reports titles.
 func EnsureSession(session string) error {
 	if HasSession(session) {
+		applyTitleOptions(session)
 		return nil
 	}
-	_, err := run("new-session", "-d", "-s", session)
-	return err
+	if _, err := run("new-session", "-d", "-s", session); err != nil {
+		return err
+	}
+	applyTitleOptions(session)
+	return nil
 }
 
 // ListWindows returns the window names in a session.
@@ -94,9 +115,27 @@ func WindowExists(session, window string) bool {
 	return false
 }
 
-// NewWindow creates a detached window with the given working directory.
+// NewWindow creates a detached window with the given working directory. The
+// window's name is pinned (automatic-rename and allow-rename off) so the running
+// command cannot overwrite it: ttorch uses the name as a stable tmux target and as
+// a discovery key, while the friendly tab title is carried separately via the
+// @ttorch_label window option (see LabelWindow and TitleFormat). Pinning is
+// best-effort; only the window creation can fail the caller.
 func NewWindow(session, window, cwd string) error {
-	_, err := run("new-window", "-d", "-t", session, "-n", window, "-c", cwd)
+	if _, err := run("new-window", "-d", "-t", session, "-n", window, "-c", cwd); err != nil {
+		return err
+	}
+	t := target(session, window)
+	_, _ = run("set-option", "-w", "-t", t, "automatic-rename", "off")
+	_, _ = run("set-option", "-w", "-t", t, "allow-rename", "off")
+	return nil
+}
+
+// LabelWindow sets a window's friendly display title — the terminal tab name
+// rendered by TitleFormat — via the @ttorch_label window option. It does not touch
+// the window's tmux name, which stays the stable target. Best-effort.
+func LabelWindow(session, window, label string) error {
+	_, err := run("set-option", "-w", "-t", target(session, window), "@ttorch_label", label)
 	return err
 }
 

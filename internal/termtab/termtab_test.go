@@ -3,6 +3,8 @@ package termtab
 import (
 	"strings"
 	"testing"
+
+	"github.com/nution101/ttorch/internal/tmux"
 )
 
 func TestViewNameSanitizes(t *testing.T) {
@@ -37,6 +39,10 @@ func TestViewCommand(t *testing.T) {
 		"-s 'ttv-wk-42'",
 		"-t 'ttorch'",
 		"set-option -t 'ttv-wk-42' destroy-unattached on",
+		// the grouped view session reports the worker's friendly label as its tab
+		// title (set-titles is per-session, so the view needs its own).
+		"set-option -t 'ttv-wk-42' set-titles on",
+		"set-option -t 'ttv-wk-42' set-titles-string '" + tmux.TitleFormat + "'",
 		"select-window -t 'ttv-wk-42':'wk-42'",
 	}
 	for _, c := range checks {
