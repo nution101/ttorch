@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -86,6 +87,107 @@ func TestPool_SkipsSlotWithTrackedChanges(t *testing.T) {
 	}
 	if b == a {
 		t.Fatal("must not reuse a slot with uncommitted tracked changes")
+	}
+}
+
+func gitT(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	c := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	c.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com",
+		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com")
+	out, err := c.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func TestRefRemoteResolveHelpers(t *testing.T) {
+	repo := makeRepo(t)
+	if RemoteExists(repo, "origin") {
+		t.Fatal("a fresh repo has no origin remote")
+	}
+	bare := t.TempDir()
+	gitT(t, bare, "init", "--bare", "-q")
+	gitT(t, repo, "remote", "add", "origin", bare)
+	if !RemoteExists(repo, "origin") {
+		t.Fatal("origin should exist after adding it")
+	}
+
+	head, err := ResolveRef(repo, "HEAD")
+	if err != nil || head != gitT(t, repo, "rev-parse", "HEAD") {
+		t.Fatalf("ResolveRef HEAD = %q err %v", head, err)
+	}
+	if !RefExists(repo, "HEAD") {
+		t.Fatal("HEAD should resolve")
+	}
+	if RefExists(repo, "refs/heads/does-not-exist") {
+		t.Fatal("a bogus ref must not resolve")
+	}
+
+	// Push publishes the current commit as a branch on the bare remote.
+	if err := Push(repo, "origin", "HEAD:refs/heads/pushed"); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	if gitT(t, bare, "rev-parse", "refs/heads/pushed") != head {
+		t.Fatal("the pushed branch tip does not match the local HEAD")
+	}
+}
+
+func TestRebaseCleanAndConflictAbort(t *testing.T) {
+	repo := makeRepo(t)
+	def := DefaultBranch(repo)
+	start := gitT(t, repo, "rev-parse", "HEAD")
+	// The default branch advances with a conflicting edit to f.txt.
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("default\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, repo, "add", "-A")
+	gitT(t, repo, "commit", "-q", "-m", "default advance")
+	defTip := gitT(t, repo, "rev-parse", "HEAD")
+
+	// A clean rebase: a feature on a DIFFERENT file replays on top of the new default.
+	wtClean := filepath.Join(t.TempDir(), "clean")
+	if err := AddDetached(repo, wtClean, start); err != nil {
+		t.Fatal(err)
+	}
+	defer RemoveWorktree(repo, wtClean)
+	if err := os.WriteFile(filepath.Join(wtClean, "feature.txt"), []byte("f\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, wtClean, "add", "-A")
+	gitT(t, wtClean, "commit", "-q", "-m", "feature")
+	if err := Rebase(wtClean, def); err != nil {
+		t.Fatalf("a non-overlapping rebase should succeed: %v", err)
+	}
+	if !IsAncestor(repo, defTip, gitT(t, wtClean, "rev-parse", "HEAD")) {
+		t.Fatal("after a clean rebase the feature must sit on top of the new default")
+	}
+
+	// A conflicting rebase: a feature touching the SAME file aborts and restores HEAD.
+	wtConflict := filepath.Join(t.TempDir(), "conflict")
+	if err := AddDetached(repo, wtConflict, start); err != nil {
+		t.Fatal(err)
+	}
+	defer RemoveWorktree(repo, wtConflict)
+	if err := os.WriteFile(filepath.Join(wtConflict, "f.txt"), []byte("feature\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, wtConflict, "add", "-A")
+	gitT(t, wtConflict, "commit", "-q", "-m", "feature edits f.txt")
+	conflictHead := gitT(t, wtConflict, "rev-parse", "HEAD")
+	if err := Rebase(wtConflict, def); err == nil {
+		t.Fatal("a conflicting rebase must return an error")
+	}
+	if err := RebaseAbort(wtConflict); err != nil {
+		t.Fatalf("RebaseAbort: %v", err)
+	}
+	if gitT(t, wtConflict, "rev-parse", "HEAD") != conflictHead {
+		t.Fatal("RebaseAbort must restore the pre-rebase HEAD")
+	}
+	if d, _ := IsDirty(wtConflict); d {
+		t.Fatal("the worktree must be clean after the rebase abort")
 	}
 }
 

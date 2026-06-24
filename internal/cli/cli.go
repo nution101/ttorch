@@ -113,6 +113,8 @@ func Main(args []string) int {
 		return run(cmdTrust(rest))
 	case "merge-local":
 		return run(cmdMergeLocal(rest))
+	case "land":
+		return run(cmdLand(rest))
 	case "promote":
 		return run(cmdPromote(rest))
 	case "pr-check":
@@ -741,6 +743,25 @@ func cmdMergeLocal(args []string) error {
 	return nil
 }
 
+func cmdLand(args []string) error {
+	if len(args) < 1 {
+		return errors.New("usage: ttorch land <task-id> [--require-verdict]")
+	}
+	id := args[0]
+	fs := flag.NewFlagSet("land", flag.ContinueOnError)
+	requireVerdict := fs.Bool("require-verdict", false,
+		"also require a passing adversarial-review verdict + a fresh green validate (implied by trusted mode)")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	out, err := mgr().Land(id, *requireVerdict)
+	if err != nil {
+		return err
+	}
+	fmt.Println(out)
+	return nil
+}
+
 func cmdPromote(args []string) error {
 	if len(args) < 1 {
 		return errors.New("usage: ttorch promote <task-id>")
@@ -981,6 +1002,12 @@ Delivery:
   merge-local <id> [--require-verdict]
                               fast-forward the local default branch (needs approval;
                               --require-verdict also gates on a passing verdict + validate)
+  land <id> [--require-verdict]
+                              one safe atomic delivery: fetch, rebase onto the current
+                              default (abort on conflict), re-validate, integrate per the
+                              repo's delivery mode honoring the existing gates, verify the
+                              landed tip matches the validated commit, and fast-forward
+                              the local default
   promote <id>                turn a scout task into a ship task
   pr-check <id> <url>         watch a PR and wake when it merges
   fleet-sync [dir]            refresh local default from origin; prune gone branches

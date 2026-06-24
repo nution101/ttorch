@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -1024,6 +1025,319 @@ func splitApprovalPayload(data string) (by, sha string) {
 		return data[:i], data[i+1:]
 	}
 	return "", data
+}
+
+// --- one-command land (safe atomic delivery) ---
+
+// landIntegrate performs the mode-appropriate integration step of Land and returns the
+// commit now on the local default branch's tip. It is a package-level seam so a test can
+// substitute a faulty integrator and exercise Land's post-merge verification abort path
+// (a clean local fast-forward can never land a tree different from the validated commit,
+// so the only way to drive the mismatch alarm in-process is to inject one).
+var landIntegrate = func(m *Manager, t state.Task, mode string, requireVerdict bool, rebasedHead string) (string, error) {
+	return m.integrate(t, mode, requireVerdict, rebasedHead)
+}
+
+// Land turns the manual push/PR/merge/fetch/ff/verify dance into one safe, atomic command
+// for taskID, closing the near-misses of doing it by hand:
+//
+//  1. fetch origin so the rebase targets the current default-branch tip, not a stale local
+//     copy (the "forgot-fetch stale sync" near-miss);
+//  2. rebase the worker's committed work onto that tip — on conflict it ABORTS the rebase
+//     and reports the real overlap rather than blind-merging a far-behind branch whose diff
+//     reads as a huge phantom deletion;
+//  3. re-run the validation gate on the REBASED tree (the immutable committed sha, gate
+//     definition from the default branch) and require it green — no checks detected is a
+//     hard block, exactly like the merge gate;
+//  4. integrate honoring the repo's delivery mode and the EXISTING merge gates — pr mode
+//     pushes + opens + merges a PR (GitHub's review/branch-protection is the gate); every
+//     other mode does an approval-gated local fast-forward via MergeLocal, whose approval
+//     and (trusted / --require-verdict) verdict checks are never bypassed;
+//  5. POST-MERGE VERIFY that the worker's reviewed changes landed intact — byte-identity to
+//     the validated commit for the pinned local fast-forward, or every worker-touched file
+//     landing verbatim for a PR merge (where the base may legitimately have advanced) —
+//     else abort and alarm;
+//  6. leave the local default branch fast-forwarded to the landed commit.
+//
+// The rebase preserves the gate's bright line that "what merges is what was reviewed": if
+// the rebase moves the worker onto an advanced default, the lead's approval of the pre-rebase
+// commit no longer covers what would merge, so Land refuses (consuming nothing) and asks for
+// a fresh approval of the rebased commit rather than carrying a stale one forward. The common
+// case — the worker already current with the default — rebases to a no-op and lands in one
+// command. Every failure is loud; Land never silently no-ops.
+func (m *Manager) Land(taskID string, requireVerdict bool) (string, error) {
+	t, err := m.Store.Load(taskID)
+	if err != nil {
+		return "", fmt.Errorf("unknown task %q", taskID)
+	}
+	repo, wt := t.Project, t.Worktree
+	if repo == "" || wt == "" {
+		return "", fmt.Errorf("land: task %q has no repo/worktree to land", taskID)
+	}
+	// Land must resolve the delivery mode authoritatively before routing the integration:
+	// refuse a repo with no recorded mode rather than silently defaulting to pr (a degraded
+	// or absent AGENTS.md would otherwise reroute a local/trusted repo onto the ungated PR
+	// path, sidestepping the merge gate). projectinit.Initialized is the authority that
+	// `ttorch init` writes.
+	if !projectinit.Initialized(repo) {
+		return "", fmt.Errorf("land: repo %s has no ttorch delivery mode configured; run 'ttorch init --mode <pr|local|validated|trusted>' first", repo)
+	}
+	mode := projectinit.ReadMode(repo)
+	def := worktree.DefaultBranch(repo)
+	gated := requireVerdict || mode == "trusted"
+
+	// --require-verdict layers the adversarial-review verdict onto a LOCAL merge gate; pr
+	// mode has no local merge to gate (GitHub review/branch-protection is its gate), so
+	// honor the flag loudly rather than silently dropping it.
+	if mode == "pr" && requireVerdict {
+		return "", fmt.Errorf("land: --require-verdict applies to local/validated/trusted modes; repo %s is in pr mode, where GitHub review/branch-protection is the gate", repo)
+	}
+
+	// The rebased + validated commit must be exactly what merges: refuse a dirty worktree
+	// up front (a worker mid-edit), the same contract trust prep enforces.
+	if clean, err := worktree.IsClean(wt); err != nil || !clean {
+		return "", fmt.Errorf("land: the worktree for %q is not clean; commit or discard changes first so the rebased, validated commit is exactly what lands", taskID)
+	}
+
+	// (1) Fetch origin. pr mode REQUIRES an origin to push to; other modes can land a
+	// purely local repo (no remote), so a missing origin there is fine.
+	hasOrigin := worktree.RemoteExists(repo, "origin")
+	if mode == "pr" && !hasOrigin {
+		return "", fmt.Errorf("land: repo %s is in pr delivery mode but has no 'origin' remote to push to", repo)
+	}
+	if hasOrigin {
+		if err := worktree.Fetch(repo); err != nil {
+			return "", fmt.Errorf("land: 'git fetch origin' failed for %s: %w; refusing to land against a stale origin", repo, err)
+		}
+	}
+
+	// (2) Rebase the worker onto the current default tip — origin/<def> when a remote
+	// default exists (the authoritative tip), else the local <def>.
+	base := def
+	if hasOrigin && worktree.RefExists(repo, "origin/"+def) {
+		base = "origin/" + def
+	}
+	baseSha, err := worktree.ResolveRef(repo, base)
+	if err != nil {
+		return "", fmt.Errorf("land: could not resolve the rebase base %s: %w", base, err)
+	}
+	preRebase, err := worktree.Head(wt)
+	if err != nil {
+		return "", err
+	}
+	if err := worktree.Rebase(wt, base); err != nil {
+		if abErr := worktree.RebaseAbort(wt); abErr != nil {
+			return "", fmt.Errorf("land: rebasing %q onto %s hit conflicts AND the abort failed (%v); the worktree %s is left mid-rebase — run 'git -C %s rebase --abort' by hand, resolve the overlap in the worker, then re-run land: %w", taskID, base, abErr, wt, wt, err)
+		}
+		return "", fmt.Errorf("land: rebasing %q onto %s hit conflicts (real overlap with changes already on %s); aborted the rebase and restored the worktree — resolve the overlap in the worker, then re-run land: %w", taskID, base, def, err)
+	}
+	rebasedHead, err := worktree.Head(wt)
+	if err != nil {
+		return "", err
+	}
+
+	// (3) Validate the REBASED tree. Must be green; no checks detected is a hard block.
+	green, results, err := validateCommitted(repo, rebasedHead)
+	if err != nil {
+		return "", fmt.Errorf("land: could not validate the rebased tree for %q: %w", taskID, err)
+	}
+	if !green {
+		if len(results) == 0 {
+			return "", fmt.Errorf("land: no checks detected for %q after rebasing onto %s; the gate requires a build/test/lint suite (add .ttorch/validate.sh on the default branch)", taskID, base)
+		}
+		return "", fmt.Errorf("land: %d of %d checks failed on the rebased tree for %q; fix them in the worker and re-run land", len(validate.Failures(results)), len(results), taskID)
+	}
+
+	// The approval (and, when gated, the verdict) authorize a SPECIFIC commit. If the rebase
+	// moved the worker onto an advanced default, the prior approval of the pre-rebase commit
+	// no longer covers what would merge — so require a fresh approval of the rebased commit
+	// rather than carry a stale one forward. This pre-check consumes nothing (MergeLocal
+	// remains the consuming authority), so the lead reviews the rebased diff, re-approves,
+	// and re-runs land; a no-op rebase keeps the existing approval valid and lands at once.
+	if mode != "pr" {
+		if err := m.gateCoversRebased(t, rebasedHead, gated); err != nil {
+			return "", err
+		}
+	}
+
+	// (4) Integrate, honoring the delivery mode and the existing merge gates.
+	landed, err := landIntegrate(m, t, mode, requireVerdict, rebasedHead)
+	if err != nil {
+		return "", err
+	}
+
+	// (5) POST-MERGE VERIFY that the worker's reviewed changes landed intact. The local
+	// fast-forward is byte-identical to the validated commit (strict); a PR merge may sit on
+	// a base that legitimately advanced, so there we require only the worker's own files to
+	// have landed verbatim.
+	defAfter, err := verifyLanded(repo, def, baseSha, rebasedHead, mode != "pr")
+	if err != nil {
+		return "", fmt.Errorf("land: %q: %w", taskID, err)
+	}
+
+	// (6) The local default branch is now fast-forwarded to the landed commit.
+	rebaseNote := "worker already current"
+	if rebasedHead != preRebase {
+		rebaseNote = fmt.Sprintf("rebased %s→%s onto %s", short(preRebase), short(rebasedHead), base)
+	}
+	m.audit(fmt.Sprintf("land task=%s repo=%s mode=%s %s -> %s verified", taskID, repo, mode, def, short(landed)))
+	return fmt.Sprintf("landed %s (%s mode): %s; %s fast-forwarded to %s and verified",
+		taskID, mode, rebaseNote, def, short(defAfter)), nil
+}
+
+// gateCoversRebased verifies the existing approval (and, when gated, a passing review
+// verdict) is pinned to the rebased commit that will actually merge — without consuming
+// either (MergeLocal remains the consuming authority). It lets Land tell the lead clearly to
+// approve the rebased commit when its own rebase moved the worker onto an advanced default,
+// instead of MergeLocal later consuming a now-stale token and reporting a confusing generic
+// mismatch.
+func (m *Manager) gateCoversRebased(t state.Task, rebasedHead string, gated bool) error {
+	data, ok := approval.Data(m.P.ApprovalFile(t.ID))
+	_, approvedSha := splitApprovalPayload(data)
+	if !ok || approvedSha != rebasedHead {
+		return fmt.Errorf("land: no valid approval covers the rebased commit %s for %q (land rebased the worker onto the current default, so the prior approval no longer matches); review it with 'ttorch review-diff %s' and approve with 'ttorch approve %s', then re-run 'ttorch land %s'",
+			short(rebasedHead), t.ID, t.ID, t.ID, t.ID)
+	}
+	if gated {
+		v, vok := review.Load(m.P.ReviewVerdictFile(t.ID))
+		if !vok || v.Overall != review.Pass || v.ReviewedSHA != rebasedHead {
+			return fmt.Errorf("land: no passing review verdict covers the rebased commit %s for %q; re-run 'ttorch trust prep %s', review, and 'ttorch trust record %s', then re-run 'ttorch land %s'",
+				short(rebasedHead), t.ID, t.ID, t.ID, t.ID)
+		}
+	}
+	return nil
+}
+
+// integrate performs Land's mode-appropriate merge and returns the local default tip.
+func (m *Manager) integrate(t state.Task, mode string, requireVerdict bool, rebasedHead string) (string, error) {
+	repo := t.Project
+	def := worktree.DefaultBranch(repo)
+	if mode == "pr" {
+		return m.integratePR(t, def, rebasedHead)
+	}
+	// local / validated / trusted: an approval-gated local fast-forward. MergeLocal
+	// enforces the approval token and (in trusted mode or with --require-verdict) the
+	// adversarial-review verdict + a fresh green validate; Land never bypasses those.
+	if _, err := m.MergeLocal(t.ID, requireVerdict); err != nil {
+		return "", fmt.Errorf("land: local merge gate refused %q: %w", t.ID, err)
+	}
+	return worktree.Head(repo)
+}
+
+// integratePR delivers via GitHub: it publishes EXACTLY the validated commit as a branch,
+// opens (or reuses) a PR, merges it, then fast-forwards the local default branch to the
+// merged tip. GitHub's required reviews / branch protection / status checks are the gate
+// here, and a merge they block fails loudly.
+func (m *Manager) integratePR(t state.Task, def, rebasedHead string) (string, error) {
+	repo, wt := t.Project, t.Worktree
+	// HEAD-unchanged bracket (mirrors MergeLocal): the worker must not have advanced past
+	// the validated commit between validation and publish, so an unvalidated commit can
+	// never reach the remote.
+	if cur, err := worktree.Head(wt); err != nil || cur != rebasedHead {
+		return "", fmt.Errorf("land: the worker for %q advanced past the validated commit %s before publish; re-run land", t.ID, short(rebasedHead))
+	}
+	branch := "ttorch/" + t.ID
+	if err := worktree.Push(repo, "origin", rebasedHead+":refs/heads/"+branch); err != nil {
+		return "", fmt.Errorf("land: pushing %q to origin/%s failed: %w", t.ID, branch, err)
+	}
+	if err := ghEnsurePR(repo, branch, def, t.ID); err != nil {
+		return "", err
+	}
+	if _, err := gh(repo, "pr", "merge", branch, "--merge", "--delete-branch"); err != nil {
+		return "", fmt.Errorf("land: merging the PR for %q failed (required reviews / checks / branch protection?): %w", t.ID, err)
+	}
+	// Bring the local default branch to the merged tip.
+	if err := worktree.Fetch(repo); err != nil {
+		return "", fmt.Errorf("land: fetch after the PR merge of %q failed: %w", t.ID, err)
+	}
+	if cur, _ := worktree.CurrentBranch(repo); cur != def {
+		return "", fmt.Errorf("land: repo is on %q, not the default branch %q; cannot fast-forward the local default after the PR merge", cur, def)
+	}
+	if changed, _ := worktree.HasTrackedChanges(repo); changed {
+		return "", fmt.Errorf("land: repo has uncommitted tracked changes; cannot fast-forward the local default after the PR merge")
+	}
+	if err := worktree.MergeFastForward(repo, "origin/"+def); err != nil {
+		return "", fmt.Errorf("land: fast-forwarding local %s to origin/%s after the PR merge failed: %w", def, def, err)
+	}
+	return worktree.Head(repo)
+}
+
+// verifyLanded asserts the worker's reviewed changes landed intact on the default branch and
+// returns the new tip. When strict (a local fast-forward, where the base is pinned) it
+// requires the tip to be byte-identical to the validated rebasedHead, catching any file
+// changed or reverted outside the reviewed diff. When not strict (a PR merge, where the base
+// may legitimately have advanced under a concurrent landing) it instead requires every file
+// the worker changed (baseSha..rebasedHead) to be identical between rebasedHead and the
+// landed tip — the worker's contribution landed verbatim, while concurrent changes to OTHER
+// files are allowed. Either failure is a loud, file-naming alarm (a post-merge tripwire; it
+// cannot un-merge, only refuse to bless).
+func verifyLanded(repo, def, baseSha, rebasedHead string, strict bool) (string, error) {
+	defAfter, err := worktree.ResolveRef(repo, def)
+	if err != nil {
+		return "", fmt.Errorf("post-merge verify could not resolve %s: %w", def, err)
+	}
+	if strict {
+		drift, err := worktree.ChangedFiles(repo, defAfter, rebasedHead)
+		if err != nil {
+			return "", fmt.Errorf("post-merge verify could not diff the landed tip: %w", err)
+		}
+		if len(drift) > 0 {
+			return "", fmt.Errorf("POST-MERGE VERIFY FAILED: %s now at %s is NOT identical to the validated commit %s; these files differ: %s — the integration changed or reverted files outside the reviewed diff; investigate before trusting this landing",
+				def, short(defAfter), short(rebasedHead), strings.Join(drift, ", "))
+		}
+		return defAfter, nil
+	}
+	// PR path: every file the worker changed must have landed verbatim. Files that differ
+	// between the validated commit and the landed tip but were NOT touched by the worker are
+	// concurrent landings on the base and are allowed.
+	workerFiles, err := worktree.ChangedFiles(repo, baseSha, rebasedHead)
+	if err != nil {
+		return "", fmt.Errorf("post-merge verify could not list the worker's changed files: %w", err)
+	}
+	landedDrift, err := worktree.ChangedFiles(repo, rebasedHead, defAfter)
+	if err != nil {
+		return "", fmt.Errorf("post-merge verify could not diff the landed tip: %w", err)
+	}
+	worker := make(map[string]bool, len(workerFiles))
+	for _, f := range workerFiles {
+		worker[f] = true
+	}
+	var bad []string
+	for _, f := range landedDrift {
+		if worker[f] {
+			bad = append(bad, f)
+		}
+	}
+	if len(bad) > 0 {
+		return "", fmt.Errorf("POST-MERGE VERIFY FAILED: the worker's reviewed changes did not land verbatim on %s (now %s); these worker-touched files differ from the validated commit %s: %s — the merge altered or dropped the worker's contribution; investigate before trusting this landing",
+			def, short(defAfter), short(rebasedHead), strings.Join(bad, ", "))
+	}
+	return defAfter, nil
+}
+
+// gh runs a gh CLI command in repo, returning its trimmed combined output.
+func gh(repo string, args ...string) (string, error) {
+	c := exec.Command("gh", args...)
+	c.Dir = repo
+	out, err := c.CombinedOutput()
+	s := strings.TrimSpace(string(out))
+	if err != nil {
+		return s, fmt.Errorf("gh %s: %v: %s", strings.Join(args, " "), err, s)
+	}
+	return s, nil
+}
+
+// ghEnsurePR opens a PR for branch into base, or succeeds if one is already open for it.
+func ghEnsurePR(repo, branch, base, taskID string) error {
+	if _, err := gh(repo, "pr", "view", branch, "--json", "number"); err == nil {
+		return nil // a PR is already open for this branch
+	}
+	if _, err := gh(repo, "pr", "create", "--head", branch, "--base", base,
+		"--title", "ttorch: land "+taskID,
+		"--body", "Automated landing of ttorch task "+taskID+"."); err != nil {
+		return fmt.Errorf("land: opening a PR for %q (%s -> %s) failed: %w", taskID, branch, base, err)
+	}
+	return nil
 }
 
 // Promote turns a scout task into a ship task (restoring teardown protection).
