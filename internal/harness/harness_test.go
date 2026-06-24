@@ -188,6 +188,43 @@ func TestManagerCharterTrustedCarveOut(t *testing.T) {
 	}
 }
 
+// TestManagerOperatingRulesInSync guards the two primary encodings of the manager
+// operating loop — the launch-time managerCharter const and the ttorch-manager
+// SKILL.md — against drift. The five rules that reframe the loop (board-as-source-of-
+// truth, lead↔manager-only, manager-tab-orchestration-only, keep-the-fleet-moving, and
+// the autonomy loop) must each be present in BOTH encodings, matched by stable anchor
+// phrases, so the charter a manager launches with cannot diverge from the skill it is
+// told to follow.
+func TestManagerOperatingRulesInSync(t *testing.T) {
+	skill, err := os.ReadFile(filepath.Join("..", "..", "content", "skills", "ttorch-manager", "SKILL.md"))
+	if err != nil {
+		t.Fatalf("reading SKILL.md: %v", err)
+	}
+	charter := strings.ToLower(managerCharter)
+	skillText := strings.ToLower(string(skill))
+
+	rules := []struct {
+		name    string
+		anchors []string
+	}{
+		{"board is the source of truth", []string{"source of truth"}},
+		{"lead-manager only", []string{"all worker interaction"}},
+		{"manager tab = orchestration only", []string{"orchestration only", "independent"}},
+		{"keep the fleet moving", []string{"keep the fleet moving", "disjoint", "pre-yield"}},
+		{"autonomy loop", []string{"autonomy loop", "interrupt"}},
+	}
+	for _, r := range rules {
+		for _, a := range r.anchors {
+			if !strings.Contains(charter, a) {
+				t.Errorf("managerCharter is missing rule %q anchor %q — keep it in sync with the ttorch-manager skill", r.name, a)
+			}
+			if !strings.Contains(skillText, a) {
+				t.Errorf("ttorch-manager SKILL.md is missing rule %q anchor %q — keep it in sync with the managerCharter const", r.name, a)
+			}
+		}
+	}
+}
+
 func TestBriefCommandCarriesSessionID(t *testing.T) {
 	t.Setenv("TTORCH_EFFORT", "off")
 	cmd := BriefCommand("claude", "/tmp/b.md", "wk-sid")
