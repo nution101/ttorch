@@ -600,6 +600,14 @@ func (m *Manager) Approve(taskID string, ttl time.Duration) error {
 	if err := approval.Grant(m.P.ApprovalFile(taskID), ttl, head); err != nil {
 		return err
 	}
+	// Record that THIS approval was the lead's, overwriting any prior auto-mint marker
+	// (TrustRecord) so a later gated merge attributes it correctly in the audit log. The
+	// token and this field are always written together, so the consumed token's
+	// provenance and t.ApprovedBy never drift.
+	t.ApprovedBy = "human"
+	if err := m.Store.Save(t); err != nil {
+		return err
+	}
 	m.audit(fmt.Sprintf("approve task=%s commit=%s ttl=%s", taskID, short(head), ttl))
 	return nil
 }
@@ -655,12 +663,13 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 // task. The sha it covers must still be the worker's HEAD (a record-time pin against
 // a commit landing after review).
 //
-// The verdict authorizes nothing on its own — it is advisory in every mode. Both the
-// trusted-mode auto-approve AND the merge-time enforcement (requiring + re-checking
-// this verdict inside MergeLocal, with a fresh validate that treats no-checks-detected
-// as a hard block) belong to the deferred trust-gate commit. Until then every mode —
-// pr/local/validated/trusted — behaves identically: a merge still requires the human
-// approval token.
+// In every mode except trusted the verdict authorizes nothing on its own — it is
+// advisory, and a merge still requires the human approval token. In trusted mode a
+// PASS verdict whose worktree is also fresh-validate green auto-mints the approval
+// token (ApprovedBy="auto"): this is the "merge without a human reading the diff"
+// path. A no-checks-detected repo is NOT green (an empty Failures() must never read as
+// a pass), so it never auto-approves; the same fail-closed re-check runs again at the
+// merge gate in MergeLocal.
 func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Verdict, error) {
 	var zero review.Verdict
 	t, err := m.Store.Load(taskID)
@@ -689,11 +698,28 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 	}
 	t.ReviewedSHA = sha
 	t.GatePassed = verdict.Overall == review.Pass
+	t.ApprovedBy = ""
+	// Trusted mode is the sole carve-out: a PASS verdict over a green worktree
+	// auto-mints the approval token so the lead need not read the diff. Bind it to the
+	// reviewed sha (== HEAD, asserted above) so a later commit invalidates it, exactly
+	// as a human approval would. Any other mode leaves the verdict advisory.
+	if verdict.Overall == review.Pass && projectinit.ReadMode(t.Project) == "trusted" {
+		if green, _ := validateGreen(t.Worktree); green {
+			if err := approval.Grant(m.P.ApprovalFile(taskID), ttl, sha); err != nil {
+				return zero, err
+			}
+			t.ApprovedBy = "auto"
+		}
+	}
 	if err := m.Store.Save(t); err != nil {
 		return zero, err
 	}
-	m.audit(fmt.Sprintf("trust-record task=%s commit=%s verdict=%s mode=%s",
-		taskID, short(sha), verdict.Overall, projectinit.ReadMode(t.Project)))
+	autoMinted := "no"
+	if t.ApprovedBy == "auto" {
+		autoMinted = "yes"
+	}
+	m.audit(fmt.Sprintf("trust-record task=%s commit=%s verdict=%s mode=%s auto-approved=%s",
+		taskID, short(sha), verdict.Overall, projectinit.ReadMode(t.Project), autoMinted))
 	return verdict, nil
 }
 
@@ -704,10 +730,18 @@ func (m *Manager) TrustShow(taskID string) (review.Verdict, bool) {
 }
 
 // MergeLocal fast-forwards the repo's local default branch to the worker's HEAD —
-// the sole sanctioned state-changing write to a real checkout. It requires a valid
-// approval token, the default branch checked out and clean, and a clean
-// fast-forward. Every merge is recorded in the audit log.
-func (m *Manager) MergeLocal(taskID string) (string, error) {
+// the sole sanctioned state-changing write to a real checkout. It always requires a
+// valid approval token, the default branch checked out and clean, and a clean
+// fast-forward.
+//
+// The trust gate is layered on top: when requireVerdict is set, or the repo is in
+// trusted delivery mode, the merge ADDITIONALLY requires a passing, commit-pinned
+// review.Verdict and a fresh, green validate run — and treats no-checks-detected as a
+// hard BLOCK (an empty Failures() must never read as a pass). The verdict, like the
+// approval, is consumed only immediately before the merge and pinned to the exact
+// commit being merged (verdict.ReviewedSHA==workerHead), closing the TOCTOU window
+// where a commit lands after review. Every merge is recorded in the audit log.
+func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error) {
 	t, err := m.Store.Load(taskID)
 	if err != nil {
 		return "", fmt.Errorf("unknown task %q", taskID)
@@ -715,12 +749,28 @@ func (m *Manager) MergeLocal(taskID string) (string, error) {
 	if !approval.Valid(m.P.ApprovalFile(taskID)) {
 		return "", fmt.Errorf("no valid approval for %q; the lead must run 'ttorch approve %s' first", taskID, taskID)
 	}
-	// FUTURE (trust gate, later commit): when ReadMode(repo)=="trusted" || --require-verdict,
-	// also require a passing, commit-pinned review.Verdict here AND re-run a FRESH validate,
-	// treating no-checks-detected as a hard BLOCK (Validate returns nil results when nothing
-	// is detected — an empty Failures() must NOT be read as a pass). Consume the verdict and
-	// assert verdict.ReviewedSHA==workerHead alongside approvedHead==workerHead below.
 	repo := t.Project
+	gated := requireVerdict || projectinit.ReadMode(repo) == "trusted"
+	if gated {
+		// Load (do not yet consume) the verdict so a recoverable refusal below leaves it
+		// intact for a retry. Absent/expired/blocking all fail closed.
+		v, ok := review.Load(m.P.ReviewVerdictFile(taskID))
+		if !ok {
+			return "", fmt.Errorf("trust gate: no valid review verdict for %q; run 'ttorch trust prep %s', review, then 'ttorch trust record %s'", taskID, taskID, taskID)
+		}
+		if v.Overall != review.Pass {
+			return "", fmt.Errorf("trust gate: the review verdict for %q is %q, not pass; resolve the blocking findings and re-record", taskID, v.Overall)
+		}
+		// Re-run validation fresh at the gate. No-checks-detected is a hard BLOCK: a
+		// repo with no build/test/lint cannot satisfy the gate (see validateGreen).
+		green, results := validateGreen(t.Worktree)
+		if !green {
+			if len(results) == 0 {
+				return "", fmt.Errorf("trust gate: no checks detected for %q; the gate requires a build/test/lint suite (add .ttorch/validate.sh)", taskID)
+			}
+			return "", fmt.Errorf("trust gate: %d of %d checks failed for %q; fix them, re-validate, and re-record the verdict", len(validate.Failures(results)), len(results), taskID)
+		}
+	}
 	def := worktree.DefaultBranch(repo)
 	cur, _ := worktree.CurrentBranch(repo)
 	if cur != def {
@@ -753,11 +803,46 @@ func (m *Manager) MergeLocal(taskID string) (string, error) {
 	if approvedHead != workerHead {
 		return "", fmt.Errorf("worker %q changed since approval (approved %s, now %s); re-review with 'ttorch review-diff %s' and approve again", taskID, short(approvedHead), short(workerHead), taskID)
 	}
+	approver := "human"
+	if gated {
+		// Consume the verdict beside the approval and pin it to the merged commit — the
+		// second commit-pin, parallel to approvedHead==workerHead, so a commit pushed
+		// after review can never ride in unreviewed.
+		cv, ok := review.Consume(m.P.ReviewVerdictFile(taskID))
+		if !ok {
+			return "", fmt.Errorf("trust gate: the review verdict for %q expired before merge; re-record it with 'ttorch trust record %s'", taskID, taskID)
+		}
+		if cv.ReviewedSHA != workerHead {
+			return "", fmt.Errorf("trust gate: the verdict for %q covers %s but the worker is now %s; re-review and re-record", taskID, short(cv.ReviewedSHA), short(workerHead))
+		}
+		if t.ApprovedBy == "auto" {
+			approver = "auto"
+		}
+	}
 	if err := worktree.MergeFastForward(repo, workerHead); err != nil {
 		return "", err
 	}
-	m.audit(fmt.Sprintf("merge-local task=%s repo=%s %s -> %s", taskID, repo, def, short(workerHead)))
+	if gated {
+		m.audit(fmt.Sprintf("merge-local task=%s repo=%s %s -> %s gate=verdict approver=%s", taskID, repo, def, short(workerHead), approver))
+	} else {
+		m.audit(fmt.Sprintf("merge-local task=%s repo=%s %s -> %s", taskID, repo, def, short(workerHead)))
+	}
 	return fmt.Sprintf("fast-forwarded %s to %s for task %s", def, short(workerHead), taskID), nil
+}
+
+// validateGreen reports whether worktreeDir has at least one detected check and every
+// detected check passes, returning the run's results for reporting. A repo with NO
+// detectable checks is deliberately NOT green: Manager.Validate returns nil results in
+// that case, and reading an empty Failures() as a pass would fail open (auto-merging a
+// repo with no build/test/lint). Both the trusted-mode auto-approve and the merge gate
+// rely on this fail-closed contract.
+func validateGreen(worktreeDir string) (bool, []validate.Result) {
+	steps := validate.Detect(worktreeDir)
+	if len(steps) == 0 {
+		return false, nil
+	}
+	results := validate.Run(worktreeDir, steps)
+	return len(validate.Failures(results)) == 0, results
 }
 
 // Promote turns a scout task into a ship task (restoring teardown protection).
