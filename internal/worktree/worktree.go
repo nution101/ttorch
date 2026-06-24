@@ -339,6 +339,44 @@ func DeleteBranch(repo, branch string) error {
 	return err
 }
 
+// RemoteExists reports whether the repo has a remote with the given name.
+func RemoteExists(repo, name string) bool {
+	_, err := git("-C", repo, "remote", "get-url", name)
+	return err == nil
+}
+
+// RefExists reports whether ref resolves to a commit in repo (e.g. "origin/main").
+func RefExists(repo, ref string) bool {
+	_, err := git("-C", repo, "rev-parse", "--verify", "--quiet", ref+"^{commit}")
+	return err == nil
+}
+
+// ResolveRef returns the commit sha that ref points to in repo.
+func ResolveRef(repo, ref string) (string, error) {
+	return git("-C", repo, "rev-parse", ref)
+}
+
+// Rebase replays the commits in dir's current HEAD onto onto (`git rebase onto`),
+// leaving HEAD at the rebased tip. On conflict it returns an error WITHOUT cleaning
+// up — the caller must RebaseAbort to restore the original HEAD.
+func Rebase(dir, onto string) error {
+	_, err := git("-C", dir, "rebase", onto)
+	return err
+}
+
+// RebaseAbort aborts an in-progress rebase in dir, restoring the pre-rebase HEAD.
+func RebaseAbort(dir string) error {
+	_, err := git("-C", dir, "rebase", "--abort")
+	return err
+}
+
+// Push pushes refspec to remote from repo (`git push remote refspec`), e.g.
+// "<sha>:refs/heads/<branch>" to publish a detached worktree's commit as a branch.
+func Push(repo, remote, refspec string) error {
+	_, err := git("-C", repo, "push", remote, refspec)
+	return err
+}
+
 func lock(poolDir string) (func(), error) {
 	lp := filepath.Join(poolDir, ".lock")
 	for i := 0; i < 50; i++ {

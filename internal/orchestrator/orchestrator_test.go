@@ -1500,3 +1500,382 @@ func TestRestoreAndReset(t *testing.T) {
 		t.Fatal("Reset should kill the tmux session")
 	}
 }
+
+// --- ttorch land ---
+
+// TestLand_CleanLocalMode is the happy path: a worker already current with the default
+// branch, a passing gate, and a valid approval lands in one command — the default branch
+// fast-forwards to the worker's commit and the deliverable is present in the checkout.
+func TestLand_CleanLocalMode(t *testing.T) {
+	m, repo := deliveryHarness(t, "landclean")
+	commitGateScript(t, repo, "exit 0") // passing gate on the default branch
+	if _, err := projectinit.Init(repo, "local"); err != nil {
+		t.Fatal(err)
+	}
+	task, err := m.Spawn("l1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := commitFeature(t, task.Worktree, "feature.txt", "new\n")
+	if err := m.Approve("l1", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := m.Land("l1", false)
+	if err != nil {
+		t.Fatalf("clean land should succeed: %v", err)
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") != head {
+		t.Fatal("default branch was not fast-forwarded to the worker HEAD")
+	}
+	if _, err := os.Stat(filepath.Join(repo, "feature.txt")); err != nil {
+		t.Fatalf("the deliverable did not land on the default-branch checkout: %v", err)
+	}
+	if !strings.Contains(out, "landed l1") || !strings.Contains(out, "verified") {
+		t.Fatalf("unexpected land summary: %q", out)
+	}
+	// The approval is single-use, consumed by the merge inside land.
+	if approval.Valid(m.P.ApprovalFile("l1")) {
+		t.Fatal("the approval must be consumed by the land merge")
+	}
+	if b, _ := os.ReadFile(m.P.AuditLog()); !strings.Contains(string(b), "land task=l1") {
+		t.Fatalf("audit log missing the land record: %s", b)
+	}
+	_, _ = m.Teardown("l1", true)
+}
+
+// TestLand_RebaseConflictAborts: when the worker's commit and the default branch edit the
+// same lines, land must ABORT the rebase (real overlap), restore the worktree, and never
+// touch the default branch — rather than blind-merging a conflicting/far-behind diff.
+func TestLand_RebaseConflictAborts(t *testing.T) {
+	m, repo := deliveryHarness(t, "landconflict")
+	commitGateScript(t, repo, "exit 0")
+	if _, err := projectinit.Init(repo, "local"); err != nil {
+		t.Fatal(err)
+	}
+	task, err := m.Spawn("c1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := task.Worktree
+	// Worker edits f.txt one way...
+	head := commitFeature(t, wt, "f.txt", "worker change\n")
+	// ...meanwhile the default branch makes a CONFLICTING edit to the same file.
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("default change\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "f.txt")
+	gitIn(t, repo, "commit", "-q", "-m", "default edits f.txt")
+	if err := m.Approve("c1", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	defBefore := gitIn(t, repo, "rev-parse", "HEAD")
+	if _, err := m.Land("c1", false); err == nil {
+		t.Fatal("land must abort on a rebase conflict")
+	} else if !strings.Contains(err.Error(), "conflict") {
+		t.Fatalf("expected a conflict error, got: %v", err)
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") != defBefore {
+		t.Fatal("default branch must not move on a rebase-conflict abort")
+	}
+	if gitIn(t, wt, "rev-parse", "HEAD") != head {
+		t.Fatal("the worker HEAD must be restored after the aborted rebase")
+	}
+	if dirty, _ := worktreeIsDirty(t, wt); dirty {
+		t.Fatal("the worktree must be clean after the rebase abort (no half-applied conflict)")
+	}
+	_, _ = m.Teardown("c1", true)
+}
+
+// TestLand_ValidateRedAborts: land re-runs the validation gate on the rebased tree and a
+// red result aborts BEFORE integration — the default branch never moves and the approval
+// is left intact (the merge gate was never reached).
+func TestLand_ValidateRedAborts(t *testing.T) {
+	m, repo := deliveryHarness(t, "landred")
+	commitGateScript(t, repo, "exit 1") // gate fails on the default branch
+	if _, err := projectinit.Init(repo, "local"); err != nil {
+		t.Fatal(err)
+	}
+	task, err := m.Spawn("r1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = commitFeature(t, task.Worktree, "feature.txt", "new\n")
+	if err := m.Approve("r1", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	defBefore := gitIn(t, repo, "rev-parse", "HEAD")
+	if _, err := m.Land("r1", false); err == nil {
+		t.Fatal("land must abort when validation is red")
+	} else if !strings.Contains(err.Error(), "checks failed") {
+		t.Fatalf("expected a validate failure, got: %v", err)
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") != defBefore {
+		t.Fatal("default branch must not move when validation is red")
+	}
+	if !approval.Valid(m.P.ApprovalFile("r1")) {
+		t.Fatal("a pre-merge validate abort must leave the approval intact")
+	}
+	_, _ = m.Teardown("r1", true)
+}
+
+// TestLand_PostMergeVerifyMismatchAborts: a clean local fast-forward can never land a tree
+// different from the validated commit, so we inject a faulty integrator (as a botched
+// squash or a concurrent base move would behave) and assert land's post-merge verify
+// catches the drift and raises a loud, file-naming alarm.
+func TestLand_PostMergeVerifyMismatchAborts(t *testing.T) {
+	m, repo := deliveryHarness(t, "landmismatch")
+	commitGateScript(t, repo, "exit 0")
+	if _, err := projectinit.Init(repo, "local"); err != nil {
+		t.Fatal(err)
+	}
+	task, err := m.Spawn("v1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = commitFeature(t, task.Worktree, "feature.txt", "new\n")
+	if err := m.Approve("v1", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	// Substitute a faulty integrator that advances the default branch to a DIFFERENT
+	// commit than the validated one.
+	orig := landIntegrate
+	t.Cleanup(func() { landIntegrate = orig })
+	landIntegrate = func(_ *Manager, _ state.Task, _ string, _ bool, _ string) (string, error) {
+		if err := os.WriteFile(filepath.Join(repo, "tampered.txt"), []byte("x\n"), 0o644); err != nil {
+			return "", err
+		}
+		gitIn(t, repo, "add", "tampered.txt")
+		gitIn(t, repo, "commit", "-q", "-m", "tampered landing")
+		return gitIn(t, repo, "rev-parse", "HEAD"), nil
+	}
+
+	_, err = m.Land("v1", false)
+	if err == nil {
+		t.Fatal("land must abort when the landed tip does not match the validated commit")
+	}
+	if !strings.Contains(err.Error(), "POST-MERGE VERIFY FAILED") {
+		t.Fatalf("expected a post-merge verify alarm, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "feature.txt") || !strings.Contains(err.Error(), "tampered.txt") {
+		t.Fatalf("the alarm should name the drifting files, got: %v", err)
+	}
+	_, _ = m.Teardown("v1", true)
+}
+
+// TestVerifyLanded exercises the strict (local fast-forward) post-merge tripwire directly
+// (no tmux): an identical tip verifies, a divergent one fails and names every drifting file.
+func TestVerifyLanded(t *testing.T) {
+	repo := newRepoMain(t)
+	base := gitIn(t, repo, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(repo, "feature.txt"), []byte("v\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "-A")
+	gitIn(t, repo, "commit", "-q", "-m", "feature")
+	rebasedHead := gitIn(t, repo, "rev-parse", "HEAD")
+
+	if got, err := verifyLanded(repo, "main", base, rebasedHead, true); err != nil || got != rebasedHead {
+		t.Fatalf("identical tip must verify: got %q err %v", got, err)
+	}
+
+	// Advance the default to a divergent tip: drop feature.txt, add other.txt.
+	gitIn(t, repo, "reset", "--hard", "-q", base)
+	if err := os.WriteFile(filepath.Join(repo, "other.txt"), []byte("o\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "-A")
+	gitIn(t, repo, "commit", "-q", "-m", "other")
+	_, err := verifyLanded(repo, "main", base, rebasedHead, true)
+	if err == nil {
+		t.Fatal("a divergent tip must fail strict post-merge verify")
+	}
+	if !strings.Contains(err.Error(), "POST-MERGE VERIFY FAILED") {
+		t.Fatalf("got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "feature.txt") || !strings.Contains(err.Error(), "other.txt") {
+		t.Fatalf("the alarm should name every drifting file, got: %v", err)
+	}
+}
+
+// TestVerifyLanded_PRModeToleratesConcurrentBaseMove covers the non-strict (PR) branch: a
+// base that legitimately advanced (a concurrent file landed alongside the worker's) passes,
+// because the worker's OWN files landed verbatim — but a merge that alters a worker file fails.
+func TestVerifyLanded_PRModeToleratesConcurrentBaseMove(t *testing.T) {
+	repo := newRepoMain(t)
+	base := gitIn(t, repo, "rev-parse", "HEAD")
+	// The validated commit: base + the worker's feature.txt.
+	if err := os.WriteFile(filepath.Join(repo, "feature.txt"), []byte("worker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "-A")
+	gitIn(t, repo, "commit", "-q", "-m", "worker feature")
+	rebasedHead := gitIn(t, repo, "rev-parse", "HEAD")
+
+	// The landed tip: the worker's feature.txt verbatim PLUS a concurrent other.txt — as a
+	// PR merging onto an advanced base would produce. Worker files intact ⇒ verify passes.
+	if err := os.WriteFile(filepath.Join(repo, "other.txt"), []byte("concurrent\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "-A")
+	gitIn(t, repo, "commit", "-q", "-m", "concurrent landing")
+	landedOK := gitIn(t, repo, "rev-parse", "HEAD")
+	if got, err := verifyLanded(repo, "main", base, rebasedHead, false); err != nil || got != landedOK {
+		t.Fatalf("a concurrent base move that keeps worker files verbatim must verify: got %q err %v", got, err)
+	}
+
+	// Now a merge that ALTERS the worker's own file must fail even in non-strict mode.
+	if err := os.WriteFile(filepath.Join(repo, "feature.txt"), []byte("tampered\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "-A")
+	gitIn(t, repo, "commit", "-q", "-m", "tamper worker file")
+	_, err := verifyLanded(repo, "main", base, rebasedHead, false)
+	if err == nil {
+		t.Fatal("a merge that alters a worker file must fail PR-mode verify")
+	}
+	if !strings.Contains(err.Error(), "POST-MERGE VERIFY FAILED") || !strings.Contains(err.Error(), "feature.txt") {
+		t.Fatalf("the alarm should name the altered worker file, got: %v", err)
+	}
+}
+
+// TestLand_RebaseMovedRequiresReapproval is the headline correctness case: when the default
+// branch advances after approval, land rebases the worker (changing its sha), so the prior
+// approval no longer covers what would merge. Land must refuse loudly WITHOUT consuming the
+// approval or moving the default — and once the lead approves the rebased commit, a re-run
+// lands it cleanly with both the concurrent change and the worker's change present.
+func TestLand_RebaseMovedRequiresReapproval(t *testing.T) {
+	m, repo := deliveryHarness(t, "landmoved")
+	commitGateScript(t, repo, "exit 0")
+	if _, err := projectinit.Init(repo, "local"); err != nil {
+		t.Fatal(err)
+	}
+	task, err := m.Spawn("m1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := task.Worktree
+	feat := commitFeature(t, wt, "feature.txt", "new\n")
+	if err := m.Approve("m1", time.Minute); err != nil { // pinned to the pre-rebase sha
+		t.Fatal(err)
+	}
+	// The default branch advances non-conflictingly (a different file) after approval.
+	if err := os.WriteFile(filepath.Join(repo, "other.txt"), []byte("o\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "other.txt")
+	gitIn(t, repo, "commit", "-q", "-m", "concurrent landing")
+	defBefore := gitIn(t, repo, "rev-parse", "HEAD")
+
+	// First land: the rebase moves the worker's sha, so the stale approval no longer covers
+	// it — refuse loudly, leave the default untouched, and keep the approval intact.
+	_, err = m.Land("m1", false)
+	if err == nil {
+		t.Fatal("land must refuse when the rebase moved the worker past the approved commit")
+	}
+	if !strings.Contains(err.Error(), "no valid approval covers the rebased commit") {
+		t.Fatalf("expected a re-approve instruction, got: %v", err)
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") != defBefore {
+		t.Fatal("the default branch must not move when the rebased commit is unapproved")
+	}
+	if !approval.Valid(m.P.ApprovalFile("m1")) {
+		t.Fatal("the stale approval must NOT be consumed by the refusal")
+	}
+	rebased := gitIn(t, wt, "rev-parse", "HEAD")
+	if rebased == feat {
+		t.Fatal("the rebase should have moved the worker HEAD onto the advanced default")
+	}
+
+	// The lead reviews the rebased diff and approves the rebased commit; the re-run lands.
+	if err := m.Approve("m1", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	out, err := m.Land("m1", false)
+	if err != nil {
+		t.Fatalf("land should succeed after approving the rebased commit: %v", err)
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") != rebased {
+		t.Fatal("the default branch must fast-forward to the rebased commit")
+	}
+	// The re-run's rebase is a no-op (the first land already rebased the worktree), so the
+	// summary reads "worker already current"; what matters is the verified landing.
+	if !strings.Contains(out, "landed m1") || !strings.Contains(out, "verified") {
+		t.Fatalf("unexpected land summary: %q", out)
+	}
+	for _, f := range []string{"feature.txt", "other.txt"} {
+		if _, err := os.Stat(filepath.Join(repo, f)); err != nil {
+			t.Fatalf("%s should be present on the landed default branch: %v", f, err)
+		}
+	}
+	_, _ = m.Teardown("m1", true)
+}
+
+// TestLand_PRModeRejectsRequireVerdict: --require-verdict has no local merge to gate in pr
+// mode, so it is rejected loudly rather than silently dropped.
+func TestLand_PRModeRejectsRequireVerdict(t *testing.T) {
+	m, repo := deliveryHarness(t, "landprrv")
+	if _, err := projectinit.Init(repo, "pr"); err != nil {
+		t.Fatal(err)
+	}
+	task, err := m.Spawn("p1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = commitFeature(t, task.Worktree, "feature.txt", "new\n")
+	if _, err := m.Land("p1", true); err == nil {
+		t.Fatal("pr mode must reject --require-verdict")
+	} else if !strings.Contains(err.Error(), "--require-verdict applies to") {
+		t.Fatalf("got: %v", err)
+	}
+	_, _ = m.Teardown("p1", true)
+}
+
+// TestLand_PRModeRequiresOrigin: pr delivery has nowhere to push without an origin remote,
+// so land refuses up front rather than failing deep in the gh flow.
+func TestLand_PRModeRequiresOrigin(t *testing.T) {
+	m, repo := deliveryHarness(t, "landprorigin")
+	if _, err := projectinit.Init(repo, "pr"); err != nil {
+		t.Fatal(err)
+	}
+	task, err := m.Spawn("p2", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = commitFeature(t, task.Worktree, "feature.txt", "new\n")
+	if _, err := m.Land("p2", false); err == nil {
+		t.Fatal("pr mode must refuse a repo with no origin remote")
+	} else if !strings.Contains(err.Error(), "no 'origin' remote") {
+		t.Fatalf("got: %v", err)
+	}
+	_, _ = m.Teardown("p2", true)
+}
+
+// TestLand_RefusesUninitializedRepo: land must not guess a delivery mode — an uninitialized
+// repo is refused with an actionable message rather than silently routed to pr.
+func TestLand_RefusesUninitializedRepo(t *testing.T) {
+	m, repo := deliveryHarness(t, "landuninit")
+	task, err := m.Spawn("u1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = commitFeature(t, task.Worktree, "feature.txt", "new\n")
+	_, err = m.Land("u1", false)
+	if err == nil {
+		t.Fatal("land must refuse an uninitialized repo")
+	}
+	if !strings.Contains(err.Error(), "no ttorch delivery mode configured") {
+		t.Fatalf("expected an init-required message, got: %v", err)
+	}
+	_, _ = m.Teardown("u1", true)
+}
+
+// worktreeIsDirty reports whether path has any pending change (tracked or untracked).
+func worktreeIsDirty(t *testing.T, path string) (bool, error) {
+	t.Helper()
+	out := gitIn(t, path, "status", "--porcelain")
+	return strings.TrimSpace(out) != "", nil
+}
