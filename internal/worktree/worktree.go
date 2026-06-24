@@ -168,6 +168,45 @@ func reset(slot, repo string) error {
 	return err
 }
 
+// StartBranch prepares a (possibly reused) pooled worktree slot for a NEW task on a
+// fresh branch. It fetches the default branch from origin when the repo has one, so
+// the branch is cut from the up-to-date tip, then force-creates branch at that base
+// and hard-resets the slot's tracked tree to it. A prior task's branch and tracked
+// changes are discarded; untracked build caches are kept (no `git clean`). After it
+// returns, the slot is checked out on branch at the current default-branch tip with a
+// clean tracked tree, so a worker never inherits a previous task's branch or state.
+//
+// The fetch is best-effort (offline, or a repo with no remote, falls back to the
+// local default branch); an unresolvable base or a failed checkout is returned as an
+// error so a stale-branch start fails loudly rather than silently reusing prior state.
+func StartBranch(repo, slot, branch string) error {
+	if RemoteExists(repo, "origin") {
+		_ = Fetch(repo) // refresh origin/<default>; offline keeps the last-known tip
+	}
+	base := defaultBase(repo)
+	if _, err := git("-C", slot, "checkout", "-q", "-B", branch, base); err != nil {
+		return err
+	}
+	// Belt-and-suspenders: guarantee the tracked tree matches base exactly even if the
+	// checkout carried something across (untracked caches are left untouched).
+	_, err := git("-C", slot, "reset", "--hard", "-q", base)
+	return err
+}
+
+// defaultBase returns the ref a fresh task branch should be cut from: the remote
+// default branch origin/<default> when it resolves (the authoritative, just-fetched
+// tip), else the local <default> branch, else HEAD.
+func defaultBase(repo string) string {
+	def := DefaultBranch(repo)
+	if RefExists(repo, "origin/"+def) {
+		return "origin/" + def
+	}
+	if RefExists(repo, def) {
+		return def
+	}
+	return "HEAD"
+}
+
 func listSlots(poolDir string) []string {
 	entries, err := os.ReadDir(poolDir)
 	if err != nil {

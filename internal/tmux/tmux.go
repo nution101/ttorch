@@ -168,6 +168,19 @@ func CapturePane(session, window string, n int) (string, error) {
 	return run("capture-pane", "-p", "-t", target(session, window), "-S", "-"+strconv.Itoa(n))
 }
 
+// PaneCurrentCommand returns the command name of the process in the foreground of a
+// window's pane (tmux's #{pane_current_command}) — e.g. "zsh" while the window is
+// still a bare shell, and "claude"/"node" once a harness has taken over. It returns
+// "" if the window or pane cannot be read (e.g. the window has already exited). Spawn
+// polls this to tell when a launched worker command is actually up before returning.
+func PaneCurrentCommand(session, window string) string {
+	out, err := run("display-message", "-p", "-t", target(session, window), "#{pane_current_command}")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
 // PanePID returns the PID of the process running in a window's pane, or 0.
 func PanePID(session, window string) int {
 	out, err := run("list-panes", "-t", target(session, window), "-F", "#{pane_pid}")

@@ -160,6 +160,74 @@ func TestSpawnPeekTeardown(t *testing.T) {
 	_, _ = m.Teardown("t2", true)
 }
 
+// TestSpawn_WaitsForLaunchBeforeReturning proves Spawn does not return — and so does
+// not let a brief be sent — until the launched command has actually taken over the
+// pane. If it returned early the foreground would still be the bare shell.
+func TestSpawn_WaitsForLaunchBeforeReturning(t *testing.T) {
+	m, repo := deliveryHarness(t, "ready")
+	task, err := m.Spawn("r1", repo, false, "sleep 30")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cmd := tmux.PaneCurrentCommand(m.Session, task.Window); cmd != "sleep" {
+		t.Fatalf("foreground command right after spawn = %q, want %q (Spawn returned before the worker came up)", cmd, "sleep")
+	}
+	_, _ = m.Teardown("r1", true)
+}
+
+// TestSpawn_FailsLoudlyWhenCommandNeverStarts proves a launch that never takes over
+// the pane fails the spawn loudly and unwinds — no phantom window, no recorded task —
+// rather than handing back a worker that would silently drop the manager's brief.
+func TestSpawn_FailsLoudlyWhenCommandNeverStarts(t *testing.T) {
+	m, repo := deliveryHarness(t, "nostart")
+	origTimeout, origInterval := spawnReadyTimeout, spawnReadyInterval
+	spawnReadyTimeout, spawnReadyInterval = 600*time.Millisecond, 50*time.Millisecond
+	defer func() { spawnReadyTimeout, spawnReadyInterval = origTimeout, origInterval }()
+
+	// ":" is a shell no-op: it returns to the prompt at once, so the window stays a
+	// bare shell and the launch is never observed to start.
+	if _, err := m.Spawn("n1", repo, false, ":"); err == nil {
+		t.Fatal("Spawn must fail loudly when the launched command never takes over the pane")
+	}
+	if tasks, _ := m.Status(); len(tasks) != 0 {
+		t.Fatalf("a failed spawn must persist no task, got %d", len(tasks))
+	}
+	if tmux.WindowExists(m.Session, "wk-n1") {
+		t.Fatal("a failed spawn must not leave a phantom window behind")
+	}
+}
+
+// TestSpawn_StartsOnFreshTaskBranch proves a spawned worker starts on a fresh
+// per-task branch off the default branch, never a reused worktree's prior branch.
+func TestSpawn_StartsOnFreshTaskBranch(t *testing.T) {
+	m, repo := deliveryHarness(t, "branch")
+	task, err := m.Spawn("b1", repo, false, "sleep 30")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if br := gitIn(t, task.Worktree, "rev-parse", "--abbrev-ref", "HEAD"); br != "ttorch/b1" {
+		t.Fatalf("worker should start on the fresh task branch ttorch/b1, got %q", br)
+	}
+	_, _ = m.Teardown("b1", true)
+}
+
+// TestSend_FailsLoudlyWhenWindowGone proves a message to a worker whose window has
+// gone away fails loudly instead of vanishing into a dead target.
+func TestSend_FailsLoudlyWhenWindowGone(t *testing.T) {
+	m, repo := deliveryHarness(t, "send")
+	task, err := m.Spawn("s1", repo, false, "sleep 30")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tmux.KillWindow(m.Session, task.Window); err != nil {
+		t.Fatalf("kill window: %v", err)
+	}
+	if err := m.Send("s1", "hello"); err == nil {
+		t.Fatal("Send must fail loudly when the worker has no live window")
+	}
+	_, _ = m.Teardown("s1", true)
+}
+
 func TestTeardownRefusesDirtyWorktree(t *testing.T) {
 	if !tmux.Available() {
 		t.Skip("tmux not installed")
