@@ -17,6 +17,9 @@ import (
 )
 
 func TestTick_SignalsHeartbeatAndDedup(t *testing.T) {
+	// This test is about the wake-queue, not the auto-driver: opt out so the default
+	// poke seam never reaches a live tmux/manager window on a dev box.
+	t.Setenv("TTORCH_NO_AUTODRIVE", "1")
 	t.Setenv("TTORCH_HOME", t.TempDir())
 	p := paths.Default()
 	if err := os.MkdirAll(p.StateDir(), 0o755); err != nil {
@@ -58,6 +61,118 @@ func hasWake(ws []wake.Wake, kind, key string) bool {
 		}
 	}
 	return false
+}
+
+// fakeManager stands in for the manager window so the auto-driver tests can count
+// pokes and steer the manager's presence/busy state without a live tmux.
+type fakeManager struct {
+	pokes int
+	live  bool
+	busy  bool
+}
+
+// newAutodriveSup builds a Supervisor whose poke seams are wired to a fakeManager
+// (present and idle by default), so no test ever reaches real tmux.
+func newAutodriveSup(t *testing.T) (*Supervisor, *fakeManager) {
+	t.Helper()
+	t.Setenv("TTORCH_HOME", t.TempDir())
+	p := paths.Default()
+	if err := os.MkdirAll(p.StateDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := New(p)
+	fm := &fakeManager{live: true}
+	s.sendPoke = func() error { fm.pokes++; return nil }
+	s.inspectManager = func() (bool, bool) { return fm.live, fm.busy }
+	return s, fm
+}
+
+// TestAutodrive_ActionableWakePokesOnce: a worker turn-end pokes the manager once.
+func TestAutodrive_ActionableWakePokesOnce(t *testing.T) {
+	s, fm := newAutodriveSup(t)
+	if err := os.WriteFile(s.P.TurnEndMarker("t1"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.tick()
+	if fm.pokes != 1 {
+		t.Fatalf("a worker turn-end should poke the manager exactly once, got %d", fm.pokes)
+	}
+}
+
+// TestAutodrive_SecondWakeWithinCooldownSuppressed: the debounce drops a second poke
+// inside the cooldown, then delivers the coalesced poke once the cooldown elapses.
+func TestAutodrive_SecondWakeWithinCooldownSuppressed(t *testing.T) {
+	s, fm := newAutodriveSup(t)
+	clock := time.Unix(1000, 0)
+	s.now = func() time.Time { return clock }
+	s.Cfg.PokeCooldown = 25 * time.Second
+
+	s.requestPoke()
+	if fm.pokes != 1 {
+		t.Fatalf("first actionable wake should poke, got %d", fm.pokes)
+	}
+
+	clock = clock.Add(10 * time.Second) // still within the cooldown
+	s.requestPoke()
+	if fm.pokes != 1 {
+		t.Fatalf("a second wake within the cooldown must be suppressed, got %d pokes", fm.pokes)
+	}
+
+	clock = clock.Add(20 * time.Second) // now 30s after the first poke, cooldown elapsed
+	s.flushPoke()
+	if fm.pokes != 2 {
+		t.Fatalf("after the cooldown the coalesced poke should fire once, got %d", fm.pokes)
+	}
+}
+
+// TestAutodrive_BusyManagerDefersUntilIdle: a busy manager is never poked; the poke
+// lands once it goes idle.
+func TestAutodrive_BusyManagerDefersUntilIdle(t *testing.T) {
+	s, fm := newAutodriveSup(t)
+	fm.busy = true
+
+	s.requestPoke()
+	if fm.pokes != 0 {
+		t.Fatalf("a busy manager must not be poked, got %d", fm.pokes)
+	}
+
+	fm.busy = false
+	s.flushPoke()
+	if fm.pokes != 1 {
+		t.Fatalf("once the manager is idle the coalesced poke should fire, got %d", fm.pokes)
+	}
+}
+
+// TestAutodrive_HeartbeatPokes: the heartbeat backstop pokes even with no event.
+func TestAutodrive_HeartbeatPokes(t *testing.T) {
+	s, fm := newAutodriveSup(t)
+	s.lastHeartbeat = time.Now().Add(-time.Hour) // due
+	s.tick()
+	if fm.pokes != 1 {
+		t.Fatalf("the heartbeat backstop should poke the manager, got %d", fm.pokes)
+	}
+}
+
+// TestAutodrive_OptOutDisables: TTORCH_NO_AUTODRIVE suppresses every poke while the
+// wake-queue keeps filling.
+func TestAutodrive_OptOutDisables(t *testing.T) {
+	t.Setenv("TTORCH_NO_AUTODRIVE", "1")
+	s, fm := newAutodriveSup(t)
+	if err := os.WriteFile(s.P.TurnEndMarker("t1"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.lastHeartbeat = time.Now().Add(-time.Hour) // heartbeat also due
+	s.tick()
+	if fm.pokes != 0 {
+		t.Fatalf("TTORCH_NO_AUTODRIVE must disable all pokes, got %d", fm.pokes)
+	}
+
+	// The queue still received the events — opt-out gates poking, not queueing.
+	q := wake.Queue{Path: s.P.WakeQueue()}
+	ws, _ := q.Drain()
+	if !hasWake(ws, "signal", "t1") || !hasWake(ws, "heartbeat", "") {
+		t.Fatalf("opt-out should still queue wakes, got %+v", ws)
+	}
 }
 
 // TestAcquire covers claiming a slot that has no live lock-holder: a fresh slot, a
