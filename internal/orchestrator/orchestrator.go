@@ -4,6 +4,7 @@
 package orchestrator
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"github.com/nution101/ttorch/internal/paths"
 	"github.com/nution101/ttorch/internal/profile"
 	"github.com/nution101/ttorch/internal/projectinit"
+	"github.com/nution101/ttorch/internal/review"
 	"github.com/nution101/ttorch/internal/state"
 	"github.com/nution101/ttorch/internal/supervisor"
 	"github.com/nution101/ttorch/internal/termtab"
@@ -24,6 +26,11 @@ import (
 	"github.com/nution101/ttorch/internal/validate"
 	"github.com/nution101/ttorch/internal/worktree"
 )
+
+// requiredReviewers are the adversarial-review dimensions every trust verdict must
+// cover. It is the single source of truth for both recording (which per-dimension
+// reports to aggregate) and completeness (a missing dimension fails closed).
+var requiredReviewers = []string{"correctness", "scope", "security"}
 
 // Manager performs runtime operations against a tmux session and the state store.
 type Manager struct {
@@ -573,6 +580,105 @@ func (m *Manager) Approve(taskID string, ttl time.Duration) error {
 	return nil
 }
 
+// TrustPrep materializes the inputs the adversarial reviewers read for taskID into
+// ReviewInputsDir: the diff against the default branch (diff.patch), the brief
+// (brief.md, if one was written), a fresh validate run (validate.json), and the
+// reviewed HEAD (head.txt). It is the read-only setup step before review subagents
+// run and enforces nothing. It returns the inputs dir.
+func (m *Manager) TrustPrep(taskID string) (string, error) {
+	t, err := m.Store.Load(taskID)
+	if err != nil {
+		return "", fmt.Errorf("unknown task %q", taskID)
+	}
+	dir := m.P.ReviewInputsDir(taskID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	head, err := worktree.Head(t.Worktree)
+	if err != nil {
+		return "", err
+	}
+	diff, err := worktree.Diff(t.Worktree, worktree.DefaultBranch(t.Project), false)
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "diff.patch"), []byte(diff), 0o644); err != nil {
+		return "", err
+	}
+	// A worker may run without a written brief; copy it only when present.
+	if b, err := os.ReadFile(m.P.BriefPath(taskID)); err == nil {
+		if err := os.WriteFile(filepath.Join(dir, "brief.md"), b, 0o644); err != nil {
+			return "", err
+		}
+	}
+	results, _ := m.Validate(taskID) // nil when no checks are detected
+	vb, err := json.MarshalIndent(results, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "validate.json"), append(vb, '\n'), 0o644); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "head.txt"), []byte(head+"\n"), 0o644); err != nil {
+		return "", err
+	}
+	m.audit(fmt.Sprintf("trust-prep task=%s commit=%s", taskID, short(head)))
+	return dir, nil
+}
+
+// TrustRecord aggregates the reviewers' per-dimension reports for taskID into a
+// commit-pinned verdict and persists it, recording GatePassed/ReviewedSHA on the
+// task. The sha it covers must still be the worker's HEAD (a record-time pin against
+// a commit landing after review).
+//
+// The verdict authorizes nothing on its own — it is advisory in every mode. Both the
+// trusted-mode auto-approve AND the merge-time enforcement (requiring + re-checking
+// this verdict inside MergeLocal, with a fresh validate that treats no-checks-detected
+// as a hard block) belong to the deferred trust-gate commit. Until then every mode —
+// pr/local/validated/trusted — behaves identically: a merge still requires the human
+// approval token.
+func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Verdict, error) {
+	var zero review.Verdict
+	t, err := m.Store.Load(taskID)
+	if err != nil {
+		return zero, fmt.Errorf("unknown task %q", taskID)
+	}
+	if ttl <= 0 {
+		return zero, fmt.Errorf("--ttl must be positive (got %s)", ttl)
+	}
+	head, err := worktree.Head(t.Worktree)
+	if err != nil {
+		return zero, err
+	}
+	if sha == "" {
+		sha = head
+	}
+	if sha != head {
+		return zero, fmt.Errorf("review covers %s but the worker HEAD is now %s; re-run 'ttorch trust prep %s' and review again", short(sha), short(head), taskID)
+	}
+	verdict, err := review.Aggregate(m.P.ReviewInputsDir(taskID), sha, requiredReviewers)
+	if err != nil {
+		return zero, err
+	}
+	if err := review.Write(m.P.ReviewVerdictFile(taskID), verdict, ttl); err != nil {
+		return zero, err
+	}
+	t.ReviewedSHA = sha
+	t.GatePassed = verdict.Overall == review.Pass
+	if err := m.Store.Save(t); err != nil {
+		return zero, err
+	}
+	m.audit(fmt.Sprintf("trust-record task=%s commit=%s verdict=%s mode=%s",
+		taskID, short(sha), verdict.Overall, projectinit.ReadMode(t.Project)))
+	return verdict, nil
+}
+
+// TrustShow returns the current valid (unexpired) verdict for taskID, if any,
+// without consuming it.
+func (m *Manager) TrustShow(taskID string) (review.Verdict, bool) {
+	return review.Load(m.P.ReviewVerdictFile(taskID))
+}
+
 // MergeLocal fast-forwards the repo's local default branch to the worker's HEAD —
 // the sole sanctioned state-changing write to a real checkout. It requires a valid
 // approval token, the default branch checked out and clean, and a clean
@@ -585,6 +691,11 @@ func (m *Manager) MergeLocal(taskID string) (string, error) {
 	if !approval.Valid(m.P.ApprovalFile(taskID)) {
 		return "", fmt.Errorf("no valid approval for %q; the lead must run 'ttorch approve %s' first", taskID, taskID)
 	}
+	// FUTURE (trust gate, later commit): when ReadMode(repo)=="trusted" || --require-verdict,
+	// also require a passing, commit-pinned review.Verdict here AND re-run a FRESH validate,
+	// treating no-checks-detected as a hard BLOCK (Validate returns nil results when nothing
+	// is detected — an empty Failures() must NOT be read as a pass). Consume the verdict and
+	// assert verdict.ReviewedSHA==workerHead alongside approvedHead==workerHead below.
 	repo := t.Project
 	def := worktree.DefaultBranch(repo)
 	cur, _ := worktree.CurrentBranch(repo)

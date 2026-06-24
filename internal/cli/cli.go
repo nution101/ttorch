@@ -31,9 +31,11 @@ import (
 	"github.com/nution101/ttorch/internal/paths"
 	"github.com/nution101/ttorch/internal/profile"
 	"github.com/nution101/ttorch/internal/projectinit"
+	"github.com/nution101/ttorch/internal/review"
 	"github.com/nution101/ttorch/internal/selfupdate"
 	"github.com/nution101/ttorch/internal/skills"
 	"github.com/nution101/ttorch/internal/supervisor"
+	"github.com/nution101/ttorch/internal/validate"
 	"github.com/nution101/ttorch/internal/wake"
 	"github.com/nution101/ttorch/internal/worktree"
 )
@@ -107,6 +109,8 @@ func Main(args []string) int {
 		return run(cmdReviewDiff(rest))
 	case "approve":
 		return run(cmdApprove(rest))
+	case "trust":
+		return run(cmdTrust(rest))
 	case "merge-local":
 		return run(cmdMergeLocal(rest))
 	case "promote":
@@ -587,6 +591,17 @@ func cmdValidate(args []string) error {
 		fmt.Println("no checks detected for this worktree (add .ttorch/validate.sh to define them)")
 		return nil
 	}
+	failed := printResults(os.Stdout, results)
+	if failed > 0 {
+		return fmt.Errorf("%d of %d checks failed", failed, len(results))
+	}
+	fmt.Printf("all %d checks passed\n", len(results))
+	return nil
+}
+
+// printResults renders check results in the shared PASS/FAIL format (reused by
+// `validate` and `trust show`) and returns how many failed.
+func printResults(w io.Writer, results []validate.Result) int {
 	failed := 0
 	for _, r := range results {
 		status := "PASS"
@@ -594,16 +609,12 @@ func cmdValidate(args []string) error {
 			status = "FAIL"
 			failed++
 		}
-		fmt.Printf("  [%s] %s\n", status, r.Name)
+		fmt.Fprintf(w, "  [%s] %s\n", status, r.Name)
 		if !r.Passed && r.Output != "" {
-			fmt.Println(indentTail(r.Output, 15))
+			fmt.Fprintln(w, indentTail(r.Output, 15))
 		}
 	}
-	if failed > 0 {
-		return fmt.Errorf("%d of %d checks failed", failed, len(results))
-	}
-	fmt.Printf("all %d checks passed\n", len(results))
-	return nil
+	return failed
 }
 
 // indentTail returns the last n lines of s, each indented for readability.
@@ -655,6 +666,49 @@ func cmdApprove(args []string) error {
 	}
 	fmt.Printf("approved %s for %s — now run: ttorch merge-local %s\n", id, *ttl, id)
 	return nil
+}
+
+func cmdTrust(args []string) error {
+	if len(args) < 2 {
+		return errors.New("usage: ttorch trust prep|record|show <task-id> [flags]")
+	}
+	sub, id := args[0], args[1]
+	switch sub {
+	case "prep":
+		dir, err := mgr().TrustPrep(id)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("prepared review inputs for %s in %s\n", id, dir)
+		fmt.Printf("  run the three reviewers (%s), then: ttorch trust record %s\n",
+			strings.Join([]string{"correctness", "scope", "security"}, " | "), id)
+		return nil
+	case "record":
+		fs := flag.NewFlagSet("trust record", flag.ContinueOnError)
+		sha := fs.String("sha", "", "commit the review covers (default: the worker's current HEAD)")
+		ttl := fs.Duration("ttl", 30*time.Minute, "how long the verdict stays valid")
+		if err := fs.Parse(args[2:]); err != nil {
+			return err
+		}
+		v, err := mgr().TrustRecord(id, *sha, *ttl)
+		if err != nil {
+			return err
+		}
+		printResults(os.Stdout, review.ToResults(v))
+		fmt.Printf("recorded %s verdict for %s (valid %s)\n", v.Overall, id, *ttl)
+		return nil
+	case "show":
+		v, ok := mgr().TrustShow(id)
+		if !ok {
+			fmt.Printf("no valid verdict for %s — run 'ttorch trust record %s'\n", id, id)
+			return nil
+		}
+		printResults(os.Stdout, review.ToResults(v))
+		fmt.Printf("verdict: %s\n", v.Overall)
+		return nil
+	default:
+		return errors.New("usage: ttorch trust prep|record|show <task-id> [flags]")
+	}
 }
 
 func cmdMergeLocal(args []string) error {
@@ -902,6 +956,7 @@ Delivery:
   validate <id>               run the repo's build/test/lint checks on a worker
   review-diff <id> [--stat]   show a worker's changes vs the default branch
   approve <id> [--ttl 10m]    grant a time-boxed approval (run by the lead)
+  trust prep|record|show <id> prep/record/show the adversarial-review verdict
   merge-local <id>            fast-forward the local default branch (needs approval)
   promote <id>                turn a scout task into a ship task
   pr-check <id> <url>         watch a PR and wake when it merges
