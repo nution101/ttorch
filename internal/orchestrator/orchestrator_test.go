@@ -228,6 +228,80 @@ func TestSend_FailsLoudlyWhenWindowGone(t *testing.T) {
 	_, _ = m.Teardown("s1", true)
 }
 
+// TestSend_FailsLoudlyWhenTaskUnknown proves a send to a task that was never
+// recorded returns a non-nil error (mapped to a non-zero exit by the CLI) rather
+// than silently doing nothing. Hermetic: it never reaches tmux.
+func TestSend_FailsLoudlyWhenTaskUnknown(t *testing.T) {
+	m := &Manager{Session: "ttorch-unknown", Store: state.Store{Dir: t.TempDir()}}
+	if err := m.Send("ghost", "hi"); err == nil {
+		t.Fatal("Send to an unknown task must return an error")
+	}
+}
+
+// fakeTmux installs a stub `tmux` on PATH for the duration of the test. It answers
+// list-windows with the given window name (so a task looks live) and appends every
+// send-keys invocation's argv — one element per line — to the returned log file.
+// This exercises the real delivery path hermetically, with no real tmux and no
+// shell between ttorch and the recorded argv, which is exactly what proves a
+// message is handed to `send-keys -l` verbatim.
+func fakeTmux(t *testing.T, window string) string {
+	t.Helper()
+	dir := t.TempDir()
+	log := filepath.Join(dir, "send.log")
+	script := `#!/bin/sh
+case "$1" in
+  list-windows) printf '%s\n' "$TTORCH_FAKE_WINDOW"; exit 0 ;;
+  send-keys) printf '%s\n' "$@" >> "$TTORCH_FAKE_LOG"; exit 0 ;;
+esac
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(dir, "tmux"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TTORCH_FAKE_WINDOW", window)
+	t.Setenv("TTORCH_FAKE_LOG", log)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return log
+}
+
+// TestSend_DeliversMessageVerbatim proves a message dense with shell-significant
+// characters reaches `send-keys -l` as a single, untouched argv element — the
+// guarantee that closes the silent-failure hole where a caller's shell would
+// otherwise re-interpret backticks or $(...).
+func TestSend_DeliversMessageVerbatim(t *testing.T) {
+	const msg = "build `whoami` && echo $(id) $HOME \"dq\" 'sq' <tag> a|b; c > d < e"
+	if strings.Contains(msg, "\n") {
+		t.Fatal("test message must be single-line for line-based capture")
+	}
+	log := fakeTmux(t, "wk-v1")
+	m := &Manager{Session: "ttorch-verbatim", Store: state.Store{Dir: t.TempDir()}}
+	if err := m.Store.Save(state.Task{ID: "v1", Window: "wk-v1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Send("v1", msg); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	b, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatalf("read fake tmux log: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+	var got string
+	found := false
+	for i := 0; i+1 < len(lines); i++ {
+		if lines[i] == "-l" {
+			got, found = lines[i+1], true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("no `send-keys -l` recorded; fake tmux log:\n%s", b)
+	}
+	if got != msg {
+		t.Fatalf("delivered message = %q, want %q (verbatim)", got, msg)
+	}
+}
+
 func TestTeardownRefusesDirtyWorktree(t *testing.T) {
 	if !tmux.Available() {
 		t.Skip("tmux not installed")

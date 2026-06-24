@@ -365,15 +365,98 @@ func cmdPeek(args []string) error {
 	return nil
 }
 
+const sendUsage = "usage: ttorch send <task-id> <text...> | <task-id> - | <task-id> --message-file <path>"
+
 func cmdSend(args []string) error {
-	if len(args) < 2 {
-		return errors.New("usage: ttorch send <task-id> <text...>")
+	if len(args) < 1 {
+		return errors.New(sendUsage)
 	}
-	if err := mgr().Send(args[0], strings.Join(args[1:], " ")); err != nil {
+	id := args[0]
+	msg, err := resolveSendMessage(args[1:], os.Stdin, stdinIsTerminal())
+	if err != nil {
 		return err
 	}
-	fmt.Printf("sent to %s\n", args[0])
+	// A send that resolves to nothing is a silent no-op waiting to happen: the
+	// worker would get a bare Enter and the caller would believe a brief landed.
+	// Fail loudly instead.
+	if msg == "" {
+		return errors.New("send: empty message — nothing to deliver")
+	}
+	if err := mgr().Send(id, msg); err != nil {
+		return err
+	}
+	fmt.Printf("sent to %s\n", id)
 	return nil
+}
+
+// resolveSendMessage determines the message body for `ttorch send` from the
+// arguments that follow the task id. It supports three mutually exclusive
+// sources, all of which carry the message as raw bytes that never reach a
+// shell command line — so backticks, $(...), quotes, and angle brackets survive
+// verbatim:
+//
+//   - inline:        send <id> <text...>            (joined with spaces; unchanged)
+//   - stdin:         send <id> -                    (or no text at all, when piped)
+//   - message file:  send <id> --message-file PATH  (also --message-file=PATH)
+//
+// Reading from stdin or a file is the safe path for arbitrary text: the bytes
+// are passed to the worker untouched (tmux send-keys -l, never re-evaluated by a
+// shell). For those two sources a single trailing newline run is trimmed so a
+// plain `echo msg | ttorch send <id> -` does not deliver a spurious extra Enter;
+// the inline form is left exactly as before. stdinIsTerminal guards the no-text
+// case from blocking forever on an interactive terminal.
+func resolveSendMessage(rest []string, stdin io.Reader, stdinIsTerminal bool) (string, error) {
+	// --message-file <path> | --message-file=<path>
+	if len(rest) > 0 && (rest[0] == "--message-file" || strings.HasPrefix(rest[0], "--message-file=")) {
+		var path string
+		var extra []string
+		if eq := strings.IndexByte(rest[0], '='); eq >= 0 {
+			path, extra = rest[0][eq+1:], rest[1:]
+		} else {
+			if len(rest) < 2 {
+				return "", errors.New("send --message-file: missing <path>")
+			}
+			path, extra = rest[1], rest[2:]
+		}
+		if path == "" {
+			return "", errors.New("send --message-file: empty <path>")
+		}
+		if len(extra) > 0 {
+			return "", fmt.Errorf("send --message-file takes a single path; unexpected extra arguments: %v", extra)
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("send: read message file: %w", err)
+		}
+		return strings.TrimRight(string(b), "\r\n"), nil
+	}
+
+	// Explicit stdin (`-`), or no text given at all: read the whole of stdin.
+	// With no text and an interactive terminal, fail loudly rather than hang.
+	if (len(rest) == 1 && rest[0] == "-") || len(rest) == 0 {
+		if len(rest) == 0 && stdinIsTerminal {
+			return "", errors.New(sendUsage)
+		}
+		b, err := io.ReadAll(stdin)
+		if err != nil {
+			return "", fmt.Errorf("send: read message from stdin: %w", err)
+		}
+		return strings.TrimRight(string(b), "\r\n"), nil
+	}
+
+	// Inline text — preserved byte-for-byte as before.
+	return strings.Join(rest, " "), nil
+}
+
+// stdinIsTerminal reports whether ttorch's stdin is an interactive terminal (as
+// opposed to a pipe or a redirected file). Used to decide whether a textless
+// `ttorch send <id>` should read stdin or refuse rather than block on a TTY.
+func stdinIsTerminal() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
 }
 
 func cmdTeardown(args []string) error {
@@ -984,7 +1067,9 @@ Team:
     --cmd "..."             run a raw command instead of the default harness
   status                  list active workers
   peek <id> [lines]       read recent output from a worker
-  send <id> <text...>     type a message into a worker
+  send <id> <text...>     type a message into a worker (delivered verbatim)
+    send <id> -             read the message body from stdin (safe for any chars)
+    send <id> --message-file <path>   read the message body from a file
   teardown <id> [--force] finish a worker (refuses to discard unlanded work)
 
 Supervision:
