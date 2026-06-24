@@ -23,6 +23,21 @@ type Wake struct {
 // Queue is an append-only wake-queue backed by a file.
 type Queue struct{ Path string }
 
+// Filter partitions drained wakes for a task-scoped waiter (`ttorch wait --task`):
+// matched are the wakes belonging to task (Key == task), rest is every other wake.
+// A task-scoped waiter returns matched and must put rest back on the queue so no
+// other task's wake is dropped. An empty task matches every wake (plain wait).
+func Filter(task string, ws []Wake) (matched, rest []Wake) {
+	for _, w := range ws {
+		if task == "" || w.Key == task {
+			matched = append(matched, w)
+		} else {
+			rest = append(rest, w)
+		}
+	}
+	return matched, rest
+}
+
 func sanitize(s string) string {
 	return strings.NewReplacer("\t", " ", "\n", " ").Replace(s)
 }

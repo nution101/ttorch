@@ -19,6 +19,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
+
 	ttorchembed "github.com/nution101/ttorch"
 	"github.com/nution101/ttorch/internal/buildinfo"
 	"github.com/nution101/ttorch/internal/doctor"
@@ -97,6 +99,8 @@ func Main(args []string) int {
 		return run(cmdSupervise())
 	case "wake":
 		return run(cmdWake(rest))
+	case "wait":
+		return run(cmdWait(rest))
 	case "validate":
 		return run(cmdValidate(rest))
 	case "review-diff":
@@ -321,11 +325,7 @@ func cmdStatus() error {
 	}
 	fmt.Printf("%-16s %-6s %-8s %-12s %s\n", "TASK", "KIND", "STATE", "WINDOW", "PROJECT")
 	for _, t := range tasks {
-		st := "gone"
-		if m.Live(t) {
-			st = "running"
-		}
-		fmt.Printf("%-16s %-6s %-8s %-12s %s\n", t.ID, t.Kind, st, t.Window, t.Project)
+		fmt.Printf("%-16s %-6s %-8s %-12s %s\n", t.ID, t.Kind, m.TaskState(t), t.Window, t.Project)
 	}
 	return nil
 }
@@ -488,6 +488,12 @@ func cmdWake(args []string) error {
 		fmt.Println("no pending wakes")
 		return nil
 	}
+	printWakes(ws)
+	return nil
+}
+
+// printWakes renders drained wakes in the shared `wake drain` / `wait` format.
+func printWakes(ws []wake.Wake) {
 	fmt.Printf("%d wake(s):\n", len(ws))
 	for _, w := range ws {
 		key := w.Key
@@ -496,7 +502,77 @@ func cmdWake(args []string) error {
 		}
 		fmt.Printf("  %-9s %-14s %s\n", w.Kind, key, w.Payload)
 	}
-	return nil
+}
+
+// cmdWait blocks until a relevant supervision event is queued, then drains and
+// prints it (same format as `wake drain`). With --task it returns only for that
+// task's wakes; any other task's wakes that it drains while waiting are put back on
+// the queue so they are never lost. It blocks efficiently via fsnotify on the state
+// dir, with a periodic poll fallback, and is cancellable with Ctrl-C or --timeout.
+func cmdWait(args []string) error {
+	fs := flag.NewFlagSet("wait", flag.ContinueOnError)
+	task := fs.String("task", "", "only return for wakes belonging to this task")
+	timeout := fs.Duration("timeout", 0, "give up after this long (0 = wait forever)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	p := paths.Default()
+	q := wake.Queue{Path: p.WakeQueue()}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if *timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, *timeout)
+		defer cancel()
+	}
+
+	// Wakes for other tasks are drained but not consumed; return them to the queue
+	// on the way out (normal return, timeout, or Ctrl-C) so no other task's wake is
+	// dropped. Held in memory rather than re-appended each loop to avoid waking
+	// ourselves on our own write.
+	var held []wake.Wake
+	defer func() {
+		for _, w := range held {
+			_ = q.Append(w.Kind, w.Key, w.Payload)
+		}
+	}()
+
+	// fsnotify lets a queue write wake us instantly; if it can't start we degrade to
+	// the poll ticker alone.
+	var events chan fsnotify.Event
+	var errs chan error
+	if w, err := fsnotify.NewWatcher(); err == nil {
+		defer w.Close()
+		_ = os.MkdirAll(p.StateDir(), 0o755)
+		if err := w.Add(p.StateDir()); err == nil {
+			events = w.Events
+			errs = w.Errors
+		}
+	}
+	poll := time.NewTicker(time.Second)
+	defer poll.Stop()
+
+	for {
+		ws, err := q.Drain()
+		if err != nil {
+			return err
+		}
+		matched, rest := wake.Filter(*task, ws)
+		held = append(held, rest...)
+		if len(matched) > 0 {
+			printWakes(matched)
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			fmt.Println("no pending wakes")
+			return nil
+		case <-events:
+		case <-errs:
+		case <-poll.C:
+		}
+	}
 }
 
 func cmdValidate(args []string) error {
@@ -722,31 +798,14 @@ func cmdLearnings(args []string) error {
 
 func daemonStart() error {
 	p := paths.Default()
-	if pid, ok := supervisor.Running(p); ok {
+	pid, started, err := supervisor.Start(p)
+	if err != nil {
+		return err
+	}
+	if !started {
 		fmt.Printf("supervisor already running (pid %d)\n", pid)
 		return nil
 	}
-	exe, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(p.Home, 0o755); err != nil {
-		return err
-	}
-	logf, err := os.OpenFile(p.DaemonLog(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return err
-	}
-	c := exec.Command(exe, "daemon", "run")
-	c.Env = append(os.Environ(), "TTORCH_DAEMON=1")
-	c.Stdout = logf
-	c.Stderr = logf
-	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := c.Start(); err != nil {
-		return err
-	}
-	pid := c.Process.Pid
-	_ = c.Process.Release()
 	fmt.Printf("supervisor started (pid %d); logging to %s\n", pid, p.DaemonLog())
 	return nil
 }
@@ -836,6 +895,8 @@ Supervision:
   supervise               ensure the background supervisor is running
   daemon run|start|stop|status   manage the supervisor process
   wake drain              print and clear pending supervision events
+  wait [--task id]        block until the next supervision event, then print it
+    --timeout d             give up after this long (0 = wait forever)
 
 Delivery:
   validate <id>               run the repo's build/test/lint checks on a worker

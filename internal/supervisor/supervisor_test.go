@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -57,5 +58,28 @@ func TestRunningFalseWhenNoPID(t *testing.T) {
 	t.Setenv("TTORCH_HOME", t.TempDir())
 	if _, ok := Running(paths.Default()); ok {
 		t.Fatal("Running should be false with no pid file")
+	}
+}
+
+func TestStart_NoOpWhenRunning(t *testing.T) {
+	t.Setenv("TTORCH_HOME", t.TempDir())
+	p := paths.Default()
+	if err := os.MkdirAll(p.StateDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A live supervisor is represented by a pid file naming a running process; our
+	// own pid is alive, so Start must treat the singleton as held and launch nothing.
+	if err := os.WriteFile(p.PIDFile(), []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pid, started, err := Start(p)
+	if err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+	if started {
+		t.Fatal("Start launched a second supervisor while one was running")
+	}
+	if pid != os.Getpid() {
+		t.Fatalf("Start returned pid %d, want the running pid %d", pid, os.Getpid())
 	}
 }
