@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/nution101/ttorch/internal/paths"
+	"github.com/nution101/ttorch/internal/state"
 	"github.com/nution101/ttorch/internal/wake"
 )
 
@@ -172,6 +173,155 @@ func TestAutodrive_OptOutDisables(t *testing.T) {
 	ws, _ := q.Drain()
 	if !hasWake(ws, "signal", "t1") || !hasWake(ws, "heartbeat", "") {
 		t.Fatalf("opt-out should still queue wakes, got %+v", ws)
+	}
+}
+
+// labeledTab records one tab-label write so the coloring tests can assert the exact
+// title strings the supervisor pushed to tmux, in order.
+type labeledTab struct {
+	window string
+	label  string
+}
+
+// newLabelSup builds a Supervisor whose tab-coloring seams are driven by an in-memory
+// pane map (window -> pane text) and record every label write, so no test reaches a
+// live tmux. A window absent from the pane map is treated as gone: capture returns
+// ok=false. The returned slice pointer accumulates label writes in order.
+func newLabelSup(t *testing.T) (s *Supervisor, panes map[string]string, writes *[]labeledTab) {
+	t.Helper()
+	t.Setenv("TTORCH_HOME", t.TempDir())
+	p := paths.Default()
+	if err := os.MkdirAll(p.StateDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s = New(p)
+	panes = map[string]string{}
+	recorded := []labeledTab{}
+	s.captureWorker = func(window string) (string, bool) {
+		out, ok := panes[window]
+		return out, ok
+	}
+	s.labelWindow = func(window, label string) error {
+		recorded = append(recorded, labeledTab{window, label})
+		return nil
+	}
+	return s, panes, &recorded
+}
+
+func mustSaveTask(t *testing.T, s *Supervisor, task state.Task) {
+	t.Helper()
+	if err := s.Store.Save(task); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// lastLabel returns the most recent label written for a window, or "" if none.
+func lastLabel(writes []labeledTab, window string) string {
+	last := ""
+	for _, w := range writes {
+		if w.window == window {
+			last = w.label
+		}
+	}
+	return last
+}
+
+// TestScanLabels_GlyphPerState: a busy worker gets the blue glyph, an idle one the
+// amber glyph — both prefixed onto the task id.
+func TestScanLabels_GlyphPerState(t *testing.T) {
+	s, panes, writes := newLabelSup(t)
+	mustSaveTask(t, s, state.Task{ID: "trust-gate", Window: "w-trust-gate", Kind: "ship"})
+	mustSaveTask(t, s, state.Task{ID: "scout-trust-surface", Window: "w-scout", Kind: "scout"})
+	panes["w-trust-gate"] = "… esc to interrupt …" // a busy indicator
+	panes["w-scout"] = "$ waiting at the prompt"   // no busy indicator -> idle
+
+	s.scanLabels()
+
+	if got := lastLabel(*writes, "w-trust-gate"); got != "🔵 trust-gate" {
+		t.Fatalf("busy worker label = %q, want %q", got, "🔵 trust-gate")
+	}
+	if got := lastLabel(*writes, "w-scout"); got != "🟡 scout-trust-surface" {
+		t.Fatalf("idle worker label = %q, want %q", got, "🟡 scout-trust-surface")
+	}
+}
+
+// TestScanLabels_OnlyWritesOnChange: identical state across ticks is not relabeled;
+// a state change writes exactly one new label.
+func TestScanLabels_OnlyWritesOnChange(t *testing.T) {
+	s, panes, writes := newLabelSup(t)
+	mustSaveTask(t, s, state.Task{ID: "t1", Window: "w1", Kind: "ship"})
+	panes["w1"] = "thinking…" // busy
+
+	s.scanLabels()
+	s.scanLabels() // identical state — must not relabel
+	if n := len(*writes); n != 1 {
+		t.Fatalf("unchanged state relabeled %d times, want 1", n)
+	}
+
+	panes["w1"] = "$ back at the prompt" // now idle
+	s.scanLabels()
+	if n := len(*writes); n != 2 {
+		t.Fatalf("a state change should add exactly one relabel, got %d total", n)
+	}
+	if last := lastLabel(*writes, "w1"); last != "🟡 t1" {
+		t.Fatalf("idle relabel = %q, want %q", last, "🟡 t1")
+	}
+}
+
+// TestScanLabels_SkipsManagerAndCC: the manager window and attached cc sessions are
+// not ttorch workers and are never colored, even when busy.
+func TestScanLabels_SkipsManagerAndCC(t *testing.T) {
+	s, panes, writes := newLabelSup(t)
+	mustSaveTask(t, s, state.Task{ID: "mgr", Window: managerWindow, Kind: "ship"})
+	mustSaveTask(t, s, state.Task{ID: "attached", Window: "w-cc", Kind: "cc"})
+	mustSaveTask(t, s, state.Task{ID: "real", Window: "w-real", Kind: "ship"})
+	panes[managerWindow] = "thinking…"
+	panes["w-cc"] = "thinking…"
+	panes["w-real"] = "thinking…"
+
+	s.scanLabels()
+
+	if n := len(*writes); n != 1 {
+		t.Fatalf("only the real worker should be labeled, got %d writes: %+v", n, *writes)
+	}
+	if (*writes)[0].window != "w-real" {
+		t.Fatalf("labeled window = %q, want w-real", (*writes)[0].window)
+	}
+}
+
+// TestScanLabels_SkipsUnreadableWindow: a worker whose window has gone (capture
+// fails) keeps its last label rather than being relabeled blind.
+func TestScanLabels_SkipsUnreadableWindow(t *testing.T) {
+	s, _, writes := newLabelSup(t)
+	mustSaveTask(t, s, state.Task{ID: "gone", Window: "w-gone", Kind: "ship"})
+	// No pane entry for w-gone -> captureWorker returns ok=false.
+
+	s.scanLabels()
+
+	if n := len(*writes); n != 0 {
+		t.Fatalf("a gone window must not be labeled, got %d writes", n)
+	}
+}
+
+// TestScanLabels_RetriesAfterLabelError: a failed label write is left unrecorded, so
+// the next tick retries it even though the state is unchanged (best-effort).
+func TestScanLabels_RetriesAfterLabelError(t *testing.T) {
+	s, panes, _ := newLabelSup(t)
+	mustSaveTask(t, s, state.Task{ID: "t1", Window: "w1", Kind: "ship"})
+	panes["w1"] = "working…"
+	calls := 0
+	s.labelWindow = func(window, label string) error {
+		calls++
+		if calls == 1 {
+			return errors.New("tmux blip")
+		}
+		return nil
+	}
+
+	s.scanLabels() // first attempt fails -> glyph not recorded
+	s.scanLabels() // same state -> must retry because the failure wasn't recorded
+	if calls != 2 {
+		t.Fatalf("a failed label write should be retried next tick, got %d calls", calls)
 	}
 }
 

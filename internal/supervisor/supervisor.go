@@ -70,6 +70,14 @@ type Supervisor struct {
 	sendPoke       func() error             // deliver one poke to the manager window
 	inspectManager func() (live, busy bool) // is a manager window present, and is it mid-generation?
 
+	// Live tab coloring: every poll the supervisor derives each worker's state and
+	// reflects it in its terminal tab title via a status glyph. labelGlyph remembers
+	// the glyph last written per task so we only touch tmux when it actually changes.
+	// The capture/label seams reach real tmux in production and are swapped in tests.
+	labelGlyph    map[string]string                          // task id -> last-set status glyph
+	captureWorker func(window string) (pane string, ok bool) // read a worker pane; ok=false if gone/unreadable
+	labelWindow   func(window, label string) error           // set a worker window's tab label
+
 	lock *os.File // held while this process owns the singleton (nil otherwise)
 }
 
@@ -89,6 +97,7 @@ func New(p paths.Paths) *Supervisor {
 		checked:       map[string]bool{},
 		checkEvery:    60 * time.Second,
 		now:           time.Now,
+		labelGlyph:    map[string]string{},
 	}
 	// Default auto-driver seams drive the real manager window via tmux, reusing the
 	// shared helpers. Tests override them to count pokes and simulate the manager's
@@ -105,6 +114,19 @@ func New(p paths.Paths) *Supervisor {
 			return true, true
 		}
 		return true, Busy(out)
+	}
+	// Live-tab-coloring seams: read a worker pane to derive its state, and write its
+	// tab label. Both reach real tmux in production; tests swap them to drive state
+	// and count label writes without a live session.
+	s.captureWorker = func(window string) (string, bool) {
+		out, err := tmux.CapturePane(s.Session, window, labelCaptureLines)
+		if err != nil {
+			return "", false
+		}
+		return out, true
+	}
+	s.labelWindow = func(window, label string) error {
+		return tmux.LabelWindow(s.Session, window, label)
 	}
 	return s
 }
@@ -168,6 +190,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 func (s *Supervisor) tick() {
 	s.scanSignals()
 	s.scanStale()
+	s.scanLabels()
 	s.scanChecks()
 	s.heartbeat()
 	s.flushPoke() // retry any poke the guards deferred (manager was busy / within cooldown)
@@ -258,6 +281,51 @@ func (s *Supervisor) scanStale() {
 			s.paneHash[task.ID] = h
 			s.staleCount[task.ID] = 0
 		}
+	}
+}
+
+// Status glyphs the supervisor prefixes onto a worker's tab title to show its live
+// state at a glance: blue while the worker is mid-turn, amber while it sits idle.
+const (
+	glyphWorking = "🔵"
+	glyphIdle    = "🟡"
+)
+
+// labelCaptureLines is how many trailing pane lines scanLabels reads to decide a
+// worker's busy state — matched to scanStale so the two agree on what "busy" means.
+const labelCaptureLines = 6
+
+// scanLabels reflects each worker's live state in its terminal tab title — '🔵 <id>'
+// while mid-turn, '🟡 <id>' while idle — so the tabs read e.g. '🔵 trust-gate' /
+// '🟡 scout-trust-surface'. It runs every poll and is best-effort: a tmux hiccup is
+// swallowed so it can never crash the supervisor, and a failed write is left
+// unrecorded so the next tick retries it. To avoid hammering tmux it remembers the
+// glyph last written per task and only relabels when the glyph changes. The manager
+// window and attached cc sessions are not ttorch workers, so they are skipped. A
+// worker whose window has gone (capture fails) keeps its last label rather than
+// being relabeled blind. The done/merged "green, move-to-end" state is owned by the
+// orchestrator merge path and is intentionally not handled here.
+func (s *Supervisor) scanLabels() {
+	tasks, _ := s.Store.List()
+	for _, task := range tasks {
+		if task.Kind == "cc" || task.Window == managerWindow {
+			continue
+		}
+		pane, ok := s.captureWorker(task.Window)
+		if !ok {
+			continue // window gone or unreadable — leave its last label in place
+		}
+		glyph := glyphIdle
+		if Busy(pane) {
+			glyph = glyphWorking
+		}
+		if s.labelGlyph[task.ID] == glyph {
+			continue // unchanged — skip the redundant tmux call
+		}
+		if err := s.labelWindow(task.Window, glyph+" "+task.ID); err != nil {
+			continue // best-effort; don't record so the next tick retries
+		}
+		s.labelGlyph[task.ID] = glyph
 	}
 }
 
