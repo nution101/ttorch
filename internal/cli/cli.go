@@ -300,16 +300,27 @@ func cmdSpawn(args []string) error {
 	// Task id and repo are the first two positionals; flags follow (the stdlib
 	// flag parser stops at the first positional, so parse the remainder).
 	if len(args) < 2 {
-		return errors.New(`usage: ttorch spawn <task-id> <repo-path> [--scout] [--cmd "..."]`)
+		return errors.New(`usage: ttorch spawn <task-id> <repo-path> [--scout] [--init] [--cmd "..."]`)
 	}
 	id, repo := args[0], args[1]
 	fs := flag.NewFlagSet("spawn", flag.ContinueOnError)
 	scout := fs.Bool("scout", false, "investigation task: report only, no code changes")
+	doInit := fs.Bool("init", false, "set the repo up for ttorch first (writes AGENTS.md block + CLAUDE.md symlink); plain spawn never modifies tracked files")
 	raw := fs.String("cmd", "", "raw command to run instead of the default harness launch")
 	if err := fs.Parse(args[2:]); err != nil {
 		return err
 	}
-	t, err := mgr().Spawn(id, repo, *scout, *raw)
+	m := mgr()
+	if *doInit {
+		notes, err := m.InitRepo(repo, "pr")
+		if err != nil {
+			return err
+		}
+		for _, n := range notes {
+			fmt.Println("  " + n)
+		}
+	}
+	t, err := m.Spawn(id, repo, *scout, *raw)
 	if err != nil {
 		return err
 	}
@@ -938,7 +949,10 @@ Team:
   stop                    stop the manager session + supervisor (resumable: run 'ttorch')
   cc [--isolated]         open a Claude session attached to the team
   spawn <id> <repo>       start a worker on a task in an isolated worktree
+                          (read-only w.r.t. the repo's tracked files)
     --scout                 investigation only (report, no code changes)
+    --init                  set the repo up for ttorch first (AGENTS.md block +
+                            CLAUDE.md symlink); otherwise spawn never writes them
     --cmd "..."             run a raw command instead of the default harness
   status                  list active workers
   peek <id> [lines]       read recent output from a worker

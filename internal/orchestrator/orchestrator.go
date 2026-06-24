@@ -118,7 +118,10 @@ func (m *Manager) Spawn(taskID, projectPath string, scout bool, rawCmd string) (
 	if err != nil {
 		return zero, fmt.Errorf("%s is not inside a git repository", projectPath)
 	}
-	autoInit(repo) // first-use setup so workers always have AGENTS.md to read
+	// Read-only with respect to the lead's checkout: announce the delivery mode and
+	// never write tracked files. First-use setup (AGENTS.md managed block + CLAUDE.md
+	// symlink + profile) is opt-in via `ttorch init` or `ttorch spawn --init`.
+	noticeDeliveryMode(repo)
 
 	window := "wk-" + taskID
 	if tmux.WindowExists(m.Session, window) {
@@ -280,34 +283,55 @@ func (m *Manager) Teardown(taskID string, force bool) ([]string, error) {
 	return notes, nil
 }
 
-// autoInit sets a repository up for ttorch on first use, so the lead never has to
-// remember to run `ttorch init`. If path is inside a git repo that has not been
-// initialized yet, it writes the AGENTS.md managed block (+ CLAUDE.md symlink) and
-// the project profile, printing what it did. It is best-effort and opt-out via
-// TTORCH_NO_AUTOINIT; it no-ops on non-git dirs and already-initialized repos.
-func autoInit(path string) {
-	if os.Getenv("TTORCH_NO_AUTOINIT") != "" {
-		return
-	}
+// uninitNotice returns the one-line notice to print on spawn (and manager start) when
+// path is inside a git repo that has not been `ttorch init`'d, or "" when no notice is
+// warranted — a non-git path or an already-initialized repo. Splitting the decision
+// from the printing keeps the read-only-on-spawn contract testable without tmux.
+//
+// It is strictly read-only: it never writes AGENTS.md, the CLAUDE.md symlink, or the
+// project profile. Setup is opt-in via `ttorch init` or `ttorch spawn --init`
+// (see InitRepo). The mode reported is whatever projectinit.ReadMode resolves, which
+// defaults to "pr" for an uninitialized repo.
+func uninitNotice(path string) string {
 	repo, err := worktree.RepoRoot(path)
 	if err != nil || projectinit.Initialized(repo) {
-		return
+		return ""
 	}
-	notes, err := projectinit.Init(repo, "pr")
+	return fmt.Sprintf("%s not ttorch-init'd; using delivery-mode=%s (run \"ttorch init\" to persist).",
+		repo, projectinit.ReadMode(repo))
+}
+
+// noticeDeliveryMode prints the uninitNotice for path to stderr, if any. It is the
+// non-destructive replacement for the former auto-init: spawn and manager start tell
+// the lead which delivery mode is in effect without ever mutating their checkout.
+func noticeDeliveryMode(path string) {
+	if msg := uninitNotice(path); msg != "" {
+		fmt.Fprintln(os.Stderr, "ttorch: "+msg)
+	}
+}
+
+// InitRepo performs the explicit, consented first-use setup for the repo containing
+// projectPath: it writes the AGENTS.md managed block, the CLAUDE.md symlink (both
+// clobber-safe), and the project profile. This is the opt-in write path behind
+// `ttorch init` and `ttorch spawn --init`; plain spawn never calls it. It returns
+// human-readable notes describing what changed.
+func (m *Manager) InitRepo(projectPath, mode string) ([]string, error) {
+	repo, err := worktree.RepoRoot(projectPath)
 	if err != nil {
-		return
+		return nil, fmt.Errorf("%s is not inside a git repository", projectPath)
 	}
-	fmt.Fprintf(os.Stderr, "ttorch: set up %s for ttorch (set TTORCH_NO_AUTOINIT=1 to skip)\n", repo)
-	for _, n := range notes {
-		fmt.Fprintln(os.Stderr, "  "+n)
+	notes, err := projectinit.Init(repo, mode)
+	if err != nil {
+		return nil, err
 	}
 	if p, err := profile.Apply(repo); err == nil {
 		stack := p.Stack
 		if stack == "" {
 			stack = "unknown"
 		}
-		fmt.Fprintf(os.Stderr, "  wrote project profile (stack: %s)\n", stack)
+		notes = append(notes, fmt.Sprintf("wrote project profile (stack: %s)", stack))
 	}
+	return notes, nil
 }
 
 // StartManager attaches the lead to the manager. If the manager window is already
@@ -345,7 +369,7 @@ func (m *Manager) StartManager() error {
 	if err := m.Store.SaveManager(state.Manager{Dir: dir, SessionID: sid}); err != nil {
 		return err
 	}
-	autoInit(dir) // first-use setup of the default project (the launch dir)
+	noticeDeliveryMode(dir) // read-only: never mutate the launch dir's tracked files
 	if err := m.newWindow("manager", dir, "manager"); err != nil {
 		return err
 	}

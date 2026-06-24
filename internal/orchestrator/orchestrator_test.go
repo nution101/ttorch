@@ -561,39 +561,157 @@ func TestTrustRecord_TrustedBlocksHighFinding(t *testing.T) {
 	_, _ = m.Teardown("tb1", true)
 }
 
-func TestAutoInit(t *testing.T) {
+// TestUninitNotice pins the read-only-on-spawn decision: an uninitialized git repo
+// gets a notice naming the default delivery mode and how to persist one, while an
+// already-initialized repo and a non-git path get none (so initialized repos behave
+// exactly as before, with no spurious output). Neither case writes any file — the
+// helper only reads.
+func TestUninitNotice(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+
+	// Uninitialized git repo: a notice that defaults to pr and points at `ttorch init`.
+	repo := t.TempDir()
+	exec.Command("git", "-C", repo, "init").Run()
+	msg := uninitNotice(repo)
+	if msg == "" {
+		t.Fatal("an uninitialized git repo should produce a notice")
+	}
+	for _, want := range []string{"delivery-mode=pr", "ttorch init"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("notice %q missing %q", msg, want)
+		}
+	}
+	// The notice must be read-only: it does not create AGENTS.md or CLAUDE.md.
+	if projectinit.Initialized(repo) {
+		t.Fatal("uninitNotice must not initialize the repo")
+	}
+	for _, f := range []string{"AGENTS.md", "CLAUDE.md"} {
+		if _, err := os.Stat(filepath.Join(repo, f)); err == nil {
+			t.Fatalf("uninitNotice must not create %s", f)
+		}
+	}
+
+	// Already-initialized repo: no notice, behaves exactly as before.
+	if _, err := projectinit.Init(repo, "local"); err != nil {
+		t.Fatal(err)
+	}
+	if msg := uninitNotice(repo); msg != "" {
+		t.Fatalf("an initialized repo should produce no notice, got %q", msg)
+	}
+
+	// Non-git directory: no notice, no panic.
+	if msg := uninitNotice(t.TempDir()); msg != "" {
+		t.Fatalf("a non-git path should produce no notice, got %q", msg)
+	}
+}
+
+// TestInitRepo covers the opt-in write path (`ttorch init` / `ttorch spawn --init`):
+// it sets the repo up and reports what it wrote, and is idempotent.
+func TestInitRepo(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
 	}
 	repo := t.TempDir()
 	exec.Command("git", "-C", repo, "init").Run()
 
-	if projectinit.Initialized(repo) {
-		t.Fatal("fresh repo should not be initialized")
+	m := New(paths.Default())
+	notes, err := m.InitRepo(repo, "pr")
+	if err != nil {
+		t.Fatal(err)
 	}
-	autoInit(repo)
 	if !projectinit.Initialized(repo) {
-		t.Fatal("autoInit should have set up the repo")
+		t.Fatal("InitRepo should set up the repo")
+	}
+	if !strings.Contains(strings.Join(notes, " "), "profile") {
+		t.Fatalf("InitRepo should report the project profile write, got %v", notes)
 	}
 
 	// Idempotent: a second call leaves it initialized and does not error.
-	autoInit(repo)
+	if _, err := m.InitRepo(repo, "pr"); err != nil {
+		t.Fatalf("second InitRepo: %v", err)
+	}
 	if !projectinit.Initialized(repo) {
-		t.Fatal("repo should stay initialized after a second autoInit")
+		t.Fatal("repo should stay initialized after a second InitRepo")
 	}
 
-	// Opt-out: a fresh repo with TTORCH_NO_AUTOINIT set is left untouched.
-	other := t.TempDir()
-	exec.Command("git", "-C", other, "init").Run()
-	t.Setenv("TTORCH_NO_AUTOINIT", "1")
-	autoInit(other)
-	if projectinit.Initialized(other) {
-		t.Fatal("TTORCH_NO_AUTOINIT should skip auto-init")
+	// A path outside any git repo is an error, not a silent write.
+	if _, err := m.InitRepo(t.TempDir(), "pr"); err == nil {
+		t.Fatal("InitRepo should reject a non-git path")
+	}
+}
+
+// TestSpawnDoesNotModifyTrackedFiles is the regression guard for the spawn-ux fix:
+// dispatching a worker to an uninitialized repo must leave the lead's checkout
+// untouched — no managed block, no AGENTS.md/CLAUDE.md, no tracked-file changes (the
+// exact condition that previously blocked a clean fast-forward merge) — and the
+// delivery mode falls back to the documented default of "pr".
+func TestSpawnDoesNotModifyTrackedFiles(t *testing.T) {
+	m, repo := deliveryHarness(t, "noinit")
+
+	if projectinit.Initialized(repo) {
+		t.Fatal("fresh repo should not be initialized")
+	}
+	if st := gitIn(t, repo, "status", "--porcelain"); st != "" {
+		t.Fatalf("fresh repo should be clean, got %q", st)
 	}
 
-	// Non-git directory is a no-op (and never panics).
-	t.Setenv("TTORCH_NO_AUTOINIT", "")
-	autoInit(t.TempDir())
+	if _, err := m.Spawn("ni1", repo, false, "sleep 60"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { m.Teardown("ni1", true) })
+
+	if projectinit.Initialized(repo) {
+		t.Fatal("spawn must not initialize the repo")
+	}
+	for _, f := range []string{"AGENTS.md", "CLAUDE.md"} {
+		if _, err := os.Stat(filepath.Join(repo, f)); err == nil {
+			t.Fatalf("spawn must not create %s in the lead's checkout", f)
+		}
+	}
+	if st := gitIn(t, repo, "status", "--porcelain"); st != "" {
+		t.Fatalf("spawn must not change tracked files, git status: %q", st)
+	}
+	if mode := projectinit.ReadMode(repo); mode != "pr" {
+		t.Fatalf("uninitialized repo should default to pr, got %q", mode)
+	}
+}
+
+// TestSpawnLeavesInitializedRepoUnchanged is the companion guard: an already
+// `ttorch init`'d repo behaves exactly as before — spawn reads the committed managed
+// block and rewrites nothing, leaving the checkout byte-identical and clean.
+func TestSpawnLeavesInitializedRepoUnchanged(t *testing.T) {
+	m, repo := deliveryHarness(t, "preinit")
+
+	if _, err := m.InitRepo(repo, "validated"); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "-A")
+	gitIn(t, repo, "commit", "-q", "-m", "ttorch init")
+	before, err := os.ReadFile(filepath.Join(repo, "AGENTS.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.Spawn("pi1", repo, false, "sleep 60"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { m.Teardown("pi1", true) })
+
+	after, err := os.ReadFile(filepath.Join(repo, "AGENTS.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatal("spawn must not rewrite an already-initialized AGENTS.md")
+	}
+	if st := gitIn(t, repo, "status", "--porcelain"); st != "" {
+		t.Fatalf("spawn must leave an initialized repo clean, git status: %q", st)
+	}
+	if mode := projectinit.ReadMode(repo); mode != "validated" {
+		t.Fatalf("ReadMode = %q, want validated (read from the committed block)", mode)
+	}
 }
 
 func TestStopSession(t *testing.T) {

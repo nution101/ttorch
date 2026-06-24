@@ -98,14 +98,26 @@ session id, so it can later be resumed to the exact conversation it had.
 Restore is best-effort: if a worker's worktree is gone its tab is skipped (noted),
 and one window that fails to rebuild never aborts the rest.
 
-## Project setup (automatic)
+## Project setup (opt-in)
 
-You don't have to remember to run `ttorch init`. The first time ttorch touches a git repo —
-when you start the manager in it, or when the manager dispatches a worker to it — ttorch
-sets it up automatically: it writes the AGENTS.md managed block (+ the `CLAUDE.md` symlink)
-and the project profile, so workers always have project memory to read. It's clobber-safe
-(your AGENTS.md content is preserved), idempotent, and a no-op outside a git repo. Set
-`TTORCH_NO_AUTOINIT=1` to turn it off and run `ttorch init` yourself.
+Spawning a worker — and starting the manager — is **read-only with respect to your
+checkout**: ttorch never writes a tracked file you didn't ask it to. When a repo hasn't
+been set up yet, ttorch reads the delivery mode (defaulting to `pr`) and prints a one-line
+notice instead of editing anything:
+
+```
+ttorch: /path/to/repo not ttorch-init'd; using delivery-mode=pr (run "ttorch init" to persist).
+```
+
+To persist a delivery mode and the project profile, set the repo up explicitly. This writes
+the AGENTS.md managed block (+ the `CLAUDE.md` symlink) and the project profile so workers
+have project memory to read. It's clobber-safe (your AGENTS.md content is preserved),
+idempotent, and a no-op outside a git repo:
+
+```sh
+ttorch init [--mode pr|local|validated|trusted]   # set up the repo in your current dir
+ttorch spawn <id> <repo> --init                   # set the repo up, then dispatch a worker
+```
 
 ## Session effort
 
