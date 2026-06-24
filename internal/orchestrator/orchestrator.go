@@ -202,6 +202,10 @@ func (m *Manager) Spawn(taskID, projectPath string, scout bool, rawCmd string) (
 		Harness: h, Kind: kind, Created: time.Now(), SessionID: sid,
 	}
 	if err := m.Store.Save(t); err != nil {
+		// The worker is live by now (waitForLaunch confirmed it), so a failed save would
+		// otherwise strand a running worker with no task record to tear it down — unwind
+		// it like every other spawn failure rather than leak a phantom worker + slot.
+		m.abortSpawn(window, repo, wt)
 		return zero, err
 	}
 	return t, nil
@@ -235,13 +239,22 @@ var (
 func (m *Manager) waitForLaunch(window string) error {
 	deadline := time.Now().Add(spawnReadyTimeout)
 	for {
-		if !tmux.WindowExists(m.Session, window) {
-			return errors.New("the worker's window exited before its command started")
-		}
-		if cur := tmux.PaneCurrentCommand(m.Session, window); cur != "" && !isShellCommand(cur) {
-			return nil
+		// Only a window CONFIRMED absent (read succeeded, window not listed) means the
+		// launch died; a transient tmux read failure is retried until the deadline so a
+		// momentary hiccup never tears down a healthy, just-launched worker.
+		exists, err := tmux.WindowExistsErr(m.Session, window)
+		if err == nil {
+			if !exists {
+				return errors.New("the worker's window exited before its command started")
+			}
+			if cur := tmux.PaneCurrentCommand(m.Session, window); cur != "" && !isShellCommand(cur) {
+				return nil
+			}
 		}
 		if time.Now().After(deadline) {
+			if err != nil {
+				return fmt.Errorf("could not read the worker's window within %s: %w", spawnReadyTimeout, err)
+			}
 			return fmt.Errorf("the worker's command did not start within %s (its window is still a bare shell)", spawnReadyTimeout)
 		}
 		time.Sleep(spawnReadyInterval)

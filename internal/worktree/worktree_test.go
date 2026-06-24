@@ -253,6 +253,54 @@ func TestStartBranch_FreshOffDefaultDiscardsPrior(t *testing.T) {
 	}
 }
 
+// TestRelease_DetachesAndDropsTaskBranch proves a released slot is parked detached
+// and its per-task branch is deleted, so a later spawn can (re)create that branch in a
+// DIFFERENT slot without colliding with a stale checkout, and a fresh branch cut off
+// origin/<default> does not carry origin as its upstream.
+func TestRelease_DetachesAndDropsTaskBranch(t *testing.T) {
+	repo := makeRepo(t)
+	def := DefaultBranch(repo)
+	bare := t.TempDir()
+	gitT(t, bare, "init", "--bare", "-q")
+	gitT(t, repo, "remote", "add", "origin", bare)
+	gitT(t, repo, "push", "-q", "origin", def)
+
+	p := Pool{Root: t.TempDir(), Max: 4}
+	slot, err := p.Acquire(repo, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := StartBranch(repo, slot, "ttorch/t1"); err != nil {
+		t.Fatalf("StartBranch: %v", err)
+	}
+	// A fresh branch cut off origin/<default> must not adopt origin/<default> upstream:
+	// resolving its upstream must fail (no upstream configured).
+	if _, err := git("-C", slot, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "ttorch/t1@{u}"); err == nil {
+		t.Fatal("task branch should have no upstream after --no-track")
+	}
+
+	if err := p.Release(repo, slot); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if br := gitT(t, slot, "rev-parse", "--abbrev-ref", "HEAD"); br != "HEAD" {
+		t.Fatalf("released slot should be detached, got branch %q", br)
+	}
+	if RefExists(repo, "refs/heads/ttorch/t1") {
+		t.Fatal("the per-task branch must be deleted when the slot is released")
+	}
+	// With the prior slot no longer pinning ttorch/t1, a DIFFERENT slot can take it.
+	other, err := p.Acquire(repo, []string{slot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other == slot {
+		t.Fatal("expected a distinct slot for this part of the test")
+	}
+	if err := StartBranch(repo, other, "ttorch/t1"); err != nil {
+		t.Fatalf("re-creating ttorch/t1 in another slot must succeed after release: %v", err)
+	}
+}
+
 // TestStartBranch_NoRemoteUsesLocalDefault confirms a remote-less repo cuts the fresh
 // branch from its local default branch (no fetch required).
 func TestStartBranch_NoRemoteUsesLocalDefault(t *testing.T) {

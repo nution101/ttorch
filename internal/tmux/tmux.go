@@ -103,16 +103,25 @@ func ListWindows(session string) ([]string, error) {
 
 // WindowExists reports whether a named window exists in the session.
 func WindowExists(session, window string) bool {
+	exists, _ := WindowExistsErr(session, window)
+	return exists
+}
+
+// WindowExistsErr reports whether a named window exists, distinguishing a window that
+// is genuinely absent (false, nil) from a tmux read that failed (false, err). Callers
+// that must not treat a transient `tmux list-windows` hiccup as "the window is gone"
+// (e.g. Spawn's readiness wait) use this instead of WindowExists.
+func WindowExistsErr(session, window string) (bool, error) {
 	ws, err := ListWindows(session)
 	if err != nil {
-		return false
+		return false, err
 	}
 	for _, w := range ws {
 		if w == window {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // NewWindow creates a detached window with the given working directory. The
