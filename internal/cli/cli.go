@@ -724,9 +724,16 @@ func cmdTrust(args []string) error {
 
 func cmdMergeLocal(args []string) error {
 	if len(args) < 1 {
-		return errors.New("usage: ttorch merge-local <task-id>")
+		return errors.New("usage: ttorch merge-local <task-id> [--require-verdict]")
 	}
-	out, err := mgr().MergeLocal(args[0])
+	id := args[0]
+	fs := flag.NewFlagSet("merge-local", flag.ContinueOnError)
+	requireVerdict := fs.Bool("require-verdict", false,
+		"also require a passing adversarial-review verdict + a fresh green validate (implied by trusted mode)")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	out, err := mgr().MergeLocal(id, *requireVerdict)
 	if err != nil {
 		return err
 	}
@@ -971,7 +978,9 @@ Delivery:
   review-diff <id> [--stat]   show a worker's changes vs the default branch
   approve <id> [--ttl 10m]    grant a time-boxed approval (run by the lead)
   trust prep|record|show <id> prep/record/show the adversarial-review verdict
-  merge-local <id>            fast-forward the local default branch (needs approval)
+  merge-local <id> [--require-verdict]
+                              fast-forward the local default branch (needs approval;
+                              --require-verdict also gates on a passing verdict + validate)
   promote <id>                turn a scout task into a ship task
   pr-check <id> <url>         watch a PR and wake when it merges
   fleet-sync [dir]            refresh local default from origin; prune gone branches

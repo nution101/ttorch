@@ -143,15 +143,17 @@ func Load(path string) (Verdict, bool) {
 	return v, true
 }
 
-// Consume removes the verdict file and returns it if it was still valid (unexpired).
-// A stale (expired) verdict is also removed.
+// Consume removes the verdict file and returns it only if it was still valid AS AN
+// AUTHORIZATION: present, unexpired, AND overall pass. A stale (expired) or blocking
+// verdict is also removed but returns ok=false, so a non-passing verdict can never be
+// consumed to authorize a merge (fail closed), even if it raced past a prior Load.
 func Consume(path string) (Verdict, bool) {
 	v, present := read(path)
 	if !present {
 		return Verdict{}, false
 	}
 	_ = os.Remove(path)
-	if time.Now().UnixNano() >= v.Expires {
+	if time.Now().UnixNano() >= v.Expires || v.Overall != Pass {
 		return Verdict{}, false
 	}
 	return v, true

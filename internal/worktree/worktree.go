@@ -146,6 +146,19 @@ func HasTrackedChanges(path string) (bool, error) {
 	return strings.TrimSpace(out) != "", nil
 }
 
+// IsClean reports whether path has NO pending changes at all — nothing staged,
+// unstaged, or untracked (`git status --porcelain` empty). Unlike HasTrackedChanges
+// (the merge-target gate, which tolerates untracked files), this is the gate for a
+// worker's own worktree before trust review: it guarantees the state being reviewed
+// and validated is exactly the committed HEAD that will be merged.
+func IsClean(path string) (bool, error) {
+	out, err := git("-C", path, "status", "--porcelain")
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) == "", nil
+}
+
 func reset(slot, repo string) error {
 	head, err := headCommit(repo)
 	if err != nil {
@@ -228,6 +241,56 @@ func CurrentBranch(repo string) (string, error) {
 func IsAncestor(repo, a, b string) bool {
 	_, err := git("-C", repo, "merge-base", "--is-ancestor", a, b)
 	return err == nil
+}
+
+// ShowFile returns the contents of repoPath as it exists at ref in repo
+// (`git show <ref>:<repoPath>`), and whether that file exists there. It is read-only
+// and never touches any working tree — the trust gate uses it to read the gate
+// definition from the default branch rather than the worker-controlled worktree copy.
+func ShowFile(repo, ref, repoPath string) (string, bool) {
+	out, err := exec.Command("git", "-C", repo, "show", ref+":"+repoPath).Output()
+	if err != nil {
+		return "", false
+	}
+	return string(out), true
+}
+
+// ChangedFiles returns the repo-relative paths changed between base and the COMMITTED
+// rev (`git diff --name-only base rev`) — committed objects, never the working tree.
+// Used to detect when a worker's committed diff touches the trust gate's definition.
+func ChangedFiles(path, base, rev string) ([]string, error) {
+	out, err := git("-C", path, "diff", "--name-only", base, rev)
+	if err != nil {
+		return nil, err
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return nil, nil
+	}
+	return strings.Split(out, "\n"), nil
+}
+
+// DiffCommitted returns the diff between base and a COMMITTED rev (`git diff base rev`),
+// i.e. the changes in the committed object — NOT the working tree. The trust gate shows
+// reviewers this so a worker cannot present a benign working tree while a different
+// commit is what actually fast-forwards.
+func DiffCommitted(path, base, rev string) (string, error) {
+	return git("-C", path, "diff", base, rev)
+}
+
+// AddDetached creates a temporary linked worktree at dir checked out (detached) to rev,
+// materializing exactly that committed tree in isolation from any live worktree, so it
+// can be validated free of mutation by a running worker. The caller must RemoveWorktree
+// it when done. dir must not already exist.
+func AddDetached(repo, dir, rev string) error {
+	_, err := git("-C", repo, "worktree", "add", "--detach", dir, rev)
+	return err
+}
+
+// RemoveWorktree removes a linked worktree created by AddDetached.
+func RemoveWorktree(repo, dir string) error {
+	_, err := git("-C", repo, "worktree", "remove", "--force", dir)
+	return err
 }
 
 // Diff returns the diff of a worktree against base (working tree vs base ref).

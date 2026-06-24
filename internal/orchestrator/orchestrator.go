@@ -597,7 +597,14 @@ func (m *Manager) Approve(taskID string, ttl time.Duration) error {
 	if err != nil {
 		return err
 	}
-	if err := approval.Grant(m.P.ApprovalFile(taskID), ttl, head); err != nil {
+	if err := approval.Grant(m.P.ApprovalFile(taskID), ttl, approvalPayload("human", head)); err != nil {
+		return err
+	}
+	// Record that THIS approval was the lead's — both in the token's provenance (the
+	// authority for the merge's audit label) and in the persisted task state (overwriting
+	// any prior auto-mint marker so the two never drift).
+	t.ApprovedBy = "human"
+	if err := m.Store.Save(t); err != nil {
 		return err
 	}
 	m.audit(fmt.Sprintf("approve task=%s commit=%s ttl=%s", taskID, short(head), ttl))
@@ -605,24 +612,31 @@ func (m *Manager) Approve(taskID string, ttl time.Duration) error {
 }
 
 // TrustPrep materializes the inputs the adversarial reviewers read for taskID into
-// ReviewInputsDir: the diff against the default branch (diff.patch), the brief
-// (brief.md, if one was written), a fresh validate run (validate.json), and the
-// reviewed HEAD (head.txt). It is the read-only setup step before review subagents
-// run and enforces nothing. It returns the inputs dir.
+// ReviewInputsDir: the COMMITTED diff against the default branch (diff.patch), the brief
+// (brief.md, if one was written), a fresh validate of the committed sha (validate.json),
+// and the reviewed HEAD (head.txt). It refuses a dirty worktree and reads only committed
+// objects, so the reviewers see exactly the commit that will fast-forward — a worker
+// cannot present a benign working tree while a different commit merges. It returns the
+// inputs dir.
 func (m *Manager) TrustPrep(taskID string) (string, error) {
 	t, err := m.Store.Load(taskID)
 	if err != nil {
 		return "", fmt.Errorf("unknown task %q", taskID)
 	}
-	dir := m.P.ReviewInputsDir(taskID)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", err
+	// Reviewed state must equal the committed state that will merge.
+	if clean, err := worktree.IsClean(t.Worktree); err != nil || !clean {
+		return "", fmt.Errorf("worktree for %q is not clean; commit or discard changes before review so the reviewers see exactly the committed diff that will merge", taskID)
 	}
 	head, err := worktree.Head(t.Worktree)
 	if err != nil {
 		return "", err
 	}
-	diff, err := worktree.Diff(t.Worktree, worktree.DefaultBranch(t.Project), false)
+	dir := m.P.ReviewInputsDir(taskID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	// The reviewers' diff is the COMMITTED diff (base..HEAD), never the working tree.
+	diff, err := worktree.DiffCommitted(t.Worktree, worktree.DefaultBranch(t.Project), head)
 	if err != nil {
 		return "", err
 	}
@@ -635,7 +649,9 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 			return "", err
 		}
 	}
-	results, _ := m.Validate(taskID) // nil when no checks are detected
+	// validate.json reflects the gate's own check of the committed sha (default-branch
+	// definition, immutable checkout) — the same notion of "green" the gate enforces.
+	_, results, _ := validateCommitted(t.Project, head) // nil when no checks are detected
 	vb, err := json.MarshalIndent(results, "", "  ")
 	if err != nil {
 		return "", err
@@ -655,12 +671,13 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 // task. The sha it covers must still be the worker's HEAD (a record-time pin against
 // a commit landing after review).
 //
-// The verdict authorizes nothing on its own — it is advisory in every mode. Both the
-// trusted-mode auto-approve AND the merge-time enforcement (requiring + re-checking
-// this verdict inside MergeLocal, with a fresh validate that treats no-checks-detected
-// as a hard block) belong to the deferred trust-gate commit. Until then every mode —
-// pr/local/validated/trusted — behaves identically: a merge still requires the human
-// approval token.
+// In every mode except trusted the verdict authorizes nothing on its own — it is
+// advisory, and a merge still requires the human approval token. In trusted mode a
+// PASS verdict whose worktree is also fresh-validate green auto-mints the approval
+// token (ApprovedBy="auto"): this is the "merge without a human reading the diff"
+// path. A no-checks-detected repo is NOT green (an empty Failures() must never read as
+// a pass), so it never auto-approves; the same fail-closed re-check runs again at the
+// merge gate in MergeLocal.
 func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Verdict, error) {
 	var zero review.Verdict
 	t, err := m.Store.Load(taskID)
@@ -689,11 +706,43 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 	}
 	t.ReviewedSHA = sha
 	t.GatePassed = verdict.Overall == review.Pass
+	t.ApprovedBy = ""
+	// Trusted mode is the sole carve-out: a PASS verdict auto-mints the approval token so
+	// the lead need not read the diff — but ONLY when the worktree is clean (reviewed
+	// state == the committed HEAD that will merge), the worktree passes the gate's fresh
+	// validate resolved from the DEFAULT BRANCH (not the worker's own copy), and the diff
+	// does not touch the gate definition itself (changing the gate requires a human). The
+	// token is bound to the reviewed sha so a later commit invalidates it. All of these
+	// are re-checked at the merge in MergeLocal — minting here is an optimization, not the
+	// authority. Any non-trusted mode leaves the verdict advisory.
+	if verdict.Overall == review.Pass && projectinit.ReadMode(t.Project) == "trusted" {
+		base := worktree.DefaultBranch(t.Project)
+		clean, cerr := worktree.IsClean(t.Worktree)
+		touched, _, terr := diffTouchesGateConfig(t.Project, base, sha)
+		green := false
+		// A trusted auto-mint's green authority MUST be the default-branch gate script,
+		// never ecosystem detection on the worker's checkout (which the worker controls
+		// via go.mod/package.json). Without it, leave the verdict advisory — a human must
+		// approve — and skip validation entirely so no worker-defined checks run.
+		if cerr == nil && terr == nil && clean && !touched && hasDefaultBranchGateScript(t.Project) {
+			green, _, _ = validateCommitted(t.Project, sha)
+		}
+		if green {
+			if err := approval.Grant(m.P.ApprovalFile(taskID), ttl, approvalPayload("auto", sha)); err != nil {
+				return zero, err
+			}
+			t.ApprovedBy = "auto"
+		}
+	}
 	if err := m.Store.Save(t); err != nil {
 		return zero, err
 	}
-	m.audit(fmt.Sprintf("trust-record task=%s commit=%s verdict=%s mode=%s",
-		taskID, short(sha), verdict.Overall, projectinit.ReadMode(t.Project)))
+	autoMinted := "no"
+	if t.ApprovedBy == "auto" {
+		autoMinted = "yes"
+	}
+	m.audit(fmt.Sprintf("trust-record task=%s commit=%s verdict=%s mode=%s auto-approved=%s",
+		taskID, short(sha), verdict.Overall, projectinit.ReadMode(t.Project), autoMinted))
 	return verdict, nil
 }
 
@@ -704,10 +753,18 @@ func (m *Manager) TrustShow(taskID string) (review.Verdict, bool) {
 }
 
 // MergeLocal fast-forwards the repo's local default branch to the worker's HEAD —
-// the sole sanctioned state-changing write to a real checkout. It requires a valid
-// approval token, the default branch checked out and clean, and a clean
-// fast-forward. Every merge is recorded in the audit log.
-func (m *Manager) MergeLocal(taskID string) (string, error) {
+// the sole sanctioned state-changing write to a real checkout. It always requires a
+// valid approval token, the default branch checked out and clean, and a clean
+// fast-forward.
+//
+// The trust gate is layered on top: when requireVerdict is set, or the repo is in
+// trusted delivery mode, the merge ADDITIONALLY requires a passing, commit-pinned
+// review.Verdict and a fresh, green validate run — and treats no-checks-detected as a
+// hard BLOCK (an empty Failures() must never read as a pass). The verdict, like the
+// approval, is consumed only immediately before the merge and pinned to the exact
+// commit being merged (verdict.ReviewedSHA==workerHead), closing the TOCTOU window
+// where a commit lands after review. Every merge is recorded in the audit log.
+func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error) {
 	t, err := m.Store.Load(taskID)
 	if err != nil {
 		return "", fmt.Errorf("unknown task %q", taskID)
@@ -715,13 +772,79 @@ func (m *Manager) MergeLocal(taskID string) (string, error) {
 	if !approval.Valid(m.P.ApprovalFile(taskID)) {
 		return "", fmt.Errorf("no valid approval for %q; the lead must run 'ttorch approve %s' first", taskID, taskID)
 	}
-	// FUTURE (trust gate, later commit): when ReadMode(repo)=="trusted" || --require-verdict,
-	// also require a passing, commit-pinned review.Verdict here AND re-run a FRESH validate,
-	// treating no-checks-detected as a hard BLOCK (Validate returns nil results when nothing
-	// is detected — an empty Failures() must NOT be read as a pass). Consume the verdict and
-	// assert verdict.ReviewedSHA==workerHead alongside approvedHead==workerHead below.
 	repo := t.Project
+	gated := requireVerdict || projectinit.ReadMode(repo) == "trusted"
+	// Read the approval token's provenance (human|auto) from the token itself, not from
+	// mutable task state, so a crash between minting and saving can never relabel a merge.
+	tokData, _ := approval.Data(m.P.ApprovalFile(taskID))
+	tokBy, _ := splitApprovalPayload(tokData)
+	// Fail closed: an AUTO-minted approval is only valid through the active gate. If the
+	// gate is not active here (the repo no longer reads as trusted — e.g. a degraded
+	// AGENTS.md silently dropped the mode — and no --require-verdict), an auto token must
+	// not merge ungated.
+	if !gated && tokBy == "auto" {
+		return "", fmt.Errorf("%q carries an auto-approval that is only valid through the trust gate, but the gate is not active (repo not in trusted mode and no --require-verdict); refusing to merge ungated", taskID)
+	}
+	// The committed object that will fast-forward. Everything the gate validates and pins
+	// is THIS sha — never the mutable worktree, which a running worker could change.
+	workerHead, err := worktree.Head(t.Worktree)
+	if err != nil {
+		return "", err
+	}
 	def := worktree.DefaultBranch(repo)
+	if gated {
+		// Defense in depth: the worktree must be clean (a clean signal that no worker is
+		// mid-edit), though correctness no longer depends on it — the gate validates the
+		// committed sha, not the worktree.
+		if clean, err := worktree.IsClean(t.Worktree); err != nil || !clean {
+			return "", fmt.Errorf("trust gate: the worktree for %q is not clean; commit or discard all changes before merging", taskID)
+		}
+		// A trusted AUTO-merge's green authority must be the default-branch gate script —
+		// never ecosystem detection on the worker's checkout (go.mod/package.json, which
+		// the worker controls). Without it, require a human approval; refuse here before
+		// any worker-defined validation runs. (A human-approved gated merge may use the
+		// detection fallback.)
+		if tokBy == "auto" && !hasDefaultBranchGateScript(repo) {
+			return "", fmt.Errorf("trust gate: %q has no .ttorch/validate.sh on the default branch, so a trusted auto-merge's checks would be worker-defined; the lead must approve it explicitly with 'ttorch approve %s'", taskID, taskID)
+		}
+		// Require a passing, unexpired verdict (load, not yet consume — a recoverable
+		// refusal below must leave it intact for a retry). Absent/expired/blocking all
+		// fail closed.
+		v, ok := review.Load(m.P.ReviewVerdictFile(taskID))
+		if !ok {
+			return "", fmt.Errorf("trust gate: no valid review verdict for %q; run 'ttorch trust prep %s', review, then 'ttorch trust record %s'", taskID, taskID, taskID)
+		}
+		if v.Overall != review.Pass {
+			return "", fmt.Errorf("trust gate: the review verdict for %q is %q, not pass; resolve the blocking findings and re-record", taskID, v.Overall)
+		}
+		// Fresh validate of the COMMITTED sha (an immutable detached checkout), using the
+		// gate definition from the DEFAULT BRANCH. No checks detected is a hard BLOCK.
+		green, results, err := validateCommitted(repo, workerHead)
+		if err != nil {
+			return "", err
+		}
+		if !green {
+			if len(results) == 0 {
+				return "", fmt.Errorf("trust gate: no checks detected for %q; the gate requires a build/test/lint suite on the default branch (add .ttorch/validate.sh)", taskID)
+			}
+			return "", fmt.Errorf("trust gate: %d of %d checks failed for %q; fix them, re-validate, and re-record the verdict", len(validate.Failures(results)), len(results), taskID)
+		}
+		// A trusted AUTO-merge may not change the gate's own definition — that requires a
+		// human. Checked against the COMMITTED diff, so reverting the bytes in the worktree
+		// cannot hide it. (A human-approved gated merge, tokBy=="human", is allowed to.)
+		if tokBy == "auto" {
+			if touched, name, err := diffTouchesGateConfig(repo, def, workerHead); err != nil {
+				return "", err
+			} else if touched {
+				return "", fmt.Errorf("trust gate: %q changes a gate-definition file (%s); a trusted auto-merge cannot alter its own gate — the lead must approve it explicitly with 'ttorch approve %s'", taskID, name, taskID)
+			}
+		}
+		// HEAD-unchanged bracket: the worker must not have advanced HEAD during the gate,
+		// so the sha we validated and pinned is still the sha that merges.
+		if cur, err := worktree.Head(t.Worktree); err != nil || cur != workerHead {
+			return "", fmt.Errorf("trust gate: the worker for %q advanced during review; re-prep, re-review, and re-record", taskID)
+		}
+	}
 	cur, _ := worktree.CurrentBranch(repo)
 	if cur != def {
 		return "", fmt.Errorf("repo is on %q, not the default branch %q", cur, def)
@@ -731,10 +854,6 @@ func (m *Manager) MergeLocal(taskID string) (string, error) {
 	// guards the rare untracked-collision case.
 	if changed, _ := worktree.HasTrackedChanges(repo); changed {
 		return "", fmt.Errorf("repo has uncommitted changes to tracked files; commit or stash before merging")
-	}
-	workerHead, err := worktree.Head(t.Worktree)
-	if err != nil {
-		return "", err
 	}
 	defHead, err := worktree.Head(repo)
 	if err != nil {
@@ -746,18 +865,165 @@ func (m *Manager) MergeLocal(taskID string) (string, error) {
 	// Consume the approval only now — immediately before the state change — so a
 	// recoverable refusal above leaves it intact for a retry, and require it to
 	// authorize exactly the commit being merged (no changes since the lead reviewed).
-	approvedHead, ok := approval.Consume(m.P.ApprovalFile(taskID))
+	approvedData, ok := approval.Consume(m.P.ApprovalFile(taskID))
 	if !ok {
 		return "", fmt.Errorf("approval for %q expired before merge; run 'ttorch approve %s' again", taskID, taskID)
 	}
+	approvedBy, approvedHead := splitApprovalPayload(approvedData)
 	if approvedHead != workerHead {
 		return "", fmt.Errorf("worker %q changed since approval (approved %s, now %s); re-review with 'ttorch review-diff %s' and approve again", taskID, short(approvedHead), short(workerHead), taskID)
+	}
+	if !gated {
+		if err := worktree.MergeFastForward(repo, workerHead); err != nil {
+			return "", err
+		}
+		m.audit(fmt.Sprintf("merge-local task=%s repo=%s %s -> %s", taskID, repo, def, short(workerHead)))
+		return fmt.Sprintf("fast-forwarded %s to %s for task %s", def, short(workerHead), taskID), nil
+	}
+	// Consume the verdict beside the approval and pin it to the merged commit — the
+	// second commit-pin, parallel to approvedHead==workerHead, so a commit pushed after
+	// review can never ride in unreviewed. Consume re-checks pass, so a verdict that
+	// turned blocking since the load above fails closed here too.
+	cv, ok := review.Consume(m.P.ReviewVerdictFile(taskID))
+	if !ok {
+		return "", fmt.Errorf("trust gate: the review verdict for %q expired or is no longer passing; re-record it with 'ttorch trust record %s'", taskID, taskID)
+	}
+	if cv.ReviewedSHA != workerHead {
+		return "", fmt.Errorf("trust gate: the verdict for %q covers %s but the worker is now %s; re-review and re-record", taskID, short(cv.ReviewedSHA), short(workerHead))
+	}
+	// Attribute the audit to the consumed token's provenance, and fail closed if it is
+	// unknown (a legacy token with no provenance must not merge through the gate).
+	var approver string
+	switch approvedBy {
+	case "auto", "human":
+		approver = approvedBy
+	default:
+		return "", fmt.Errorf("trust gate: the approval for %q has no recorded provenance; re-approve with 'ttorch approve %s'", taskID, taskID)
+	}
+	// A trusted merge MUST be auditable (every trusted merge must be reconstructable):
+	// write + flush the record BEFORE the fast-forward and abort if it cannot be
+	// persisted — for finance, an unrecorded merge is not acceptable.
+	auditLine := fmt.Sprintf("merge-local task=%s repo=%s %s -> %s gate=verdict approver=%s", taskID, repo, def, short(workerHead), approver)
+	if err := m.writeAudit(auditLine); err != nil {
+		return "", fmt.Errorf("trust gate: cannot record the merge for %q in the audit log (%v); refusing to merge unaudited", taskID, err)
 	}
 	if err := worktree.MergeFastForward(repo, workerHead); err != nil {
 		return "", err
 	}
-	m.audit(fmt.Sprintf("merge-local task=%s repo=%s %s -> %s", taskID, repo, def, short(workerHead)))
 	return fmt.Sprintf("fast-forwarded %s to %s for task %s", def, short(workerHead), taskID), nil
+}
+
+// gateConfigFiles define the trust gate itself: the validation script and the repo's
+// delivery-mode/gate config. A trusted AUTO-merge must never change them — altering the
+// gate requires an explicit human approval.
+var gateConfigFiles = []string{".ttorch/validate.sh", "AGENTS.md"}
+
+// gateValidate runs the trust gate's fresh validation against the worker's worktree, but
+// using the validation DEFINITION resolved from the repo's DEFAULT BRANCH: the
+// .ttorch/validate.sh as it exists on the default branch (run from a temp copy so a
+// worker cannot weaken its own gate by editing the script on its branch), or, when the
+// default branch defines none, the built-in ecosystem steps (fixed ttorch commands the
+// worker cannot redefine). It returns whether the worktree is green, the results for
+// reporting, and any error. No detected checks => NOT green (a hard block): an empty
+// Failures() must never be read as a pass.
+func gateValidate(worktreeDir, repo string) (bool, []validate.Result, error) {
+	def := worktree.DefaultBranch(repo)
+	var steps []validate.Step
+	if script, ok := worktree.ShowFile(repo, def, ".ttorch/validate.sh"); ok {
+		tmp, err := os.CreateTemp("", "ttorch-gate-validate-*.sh")
+		if err != nil {
+			return false, nil, err
+		}
+		defer os.Remove(tmp.Name())
+		if _, err := tmp.WriteString(script); err != nil {
+			tmp.Close()
+			return false, nil, err
+		}
+		if err := tmp.Close(); err != nil {
+			return false, nil, err
+		}
+		steps = []validate.Step{{Name: "gate", Cmd: []string{"sh", tmp.Name()}}}
+	} else {
+		steps = validate.DetectDefaults(worktreeDir)
+	}
+	if len(steps) == 0 {
+		return false, nil, nil
+	}
+	results := validate.Run(worktreeDir, steps)
+	return gateGreen(steps, results), results, nil
+}
+
+// gateGreen reports whether every detected step produced a passing result. A step that
+// failed even to start is reported by validate.Run as a non-passing result, so it is
+// treated as a failure (block), never conflated with a pass; a missing result for any
+// step is likewise not green.
+func gateGreen(steps []validate.Step, results []validate.Result) bool {
+	return len(steps) > 0 && len(results) == len(steps) && len(validate.Failures(results)) == 0
+}
+
+// validateCommitted runs the trust gate's validation against an IMMUTABLE detached
+// checkout of the committed sha — never the live worktree, which a running worker could
+// mutate mid-run (race good bytes in, validate, revert) — using the validation
+// definition from the default branch. This makes the thing validated exactly the thing
+// that fast-forwards.
+func validateCommitted(repo, sha string) (bool, []validate.Result, error) {
+	parent, err := os.MkdirTemp("", "ttorch-gate-*")
+	if err != nil {
+		return false, nil, err
+	}
+	defer os.RemoveAll(parent)
+	// A unique basename (the temp dir's own name) avoids linked-worktree id collisions
+	// when gates run concurrently.
+	co := filepath.Join(parent, filepath.Base(parent))
+	if err := worktree.AddDetached(repo, co, sha); err != nil {
+		return false, nil, err
+	}
+	defer worktree.RemoveWorktree(repo, co)
+	return gateValidate(co, repo)
+}
+
+// hasDefaultBranchGateScript reports whether the repo's default branch defines the gate
+// script (.ttorch/validate.sh). The trusted AUTO path requires it: without it,
+// gateValidate falls back to ecosystem detection (go.mod / package.json) on the worker's
+// own checkout, whose presence and scripts the worker controls — so "green" would be
+// worker-influenced. A human `ttorch approve` is still allowed to use the detection
+// fallback (a human is then in the loop).
+func hasDefaultBranchGateScript(repo string) bool {
+	_, ok := worktree.ShowFile(repo, worktree.DefaultBranch(repo), ".ttorch/validate.sh")
+	return ok
+}
+
+// diffTouchesGateConfig reports whether the COMMITTED diff base..rev modifies any
+// gate-definition file (and which one), so a trusted auto-merge of such a change can be
+// refused in favor of an explicit human approval. It reads committed objects, not the
+// working tree, so the check cannot be evaded by reverting the bytes in the worktree.
+func diffTouchesGateConfig(repo, base, rev string) (bool, string, error) {
+	names, err := worktree.ChangedFiles(repo, base, rev)
+	if err != nil {
+		return false, "", err
+	}
+	for _, n := range names {
+		for _, g := range gateConfigFiles {
+			if n == g {
+				return true, n, nil
+			}
+		}
+	}
+	return false, "", nil
+}
+
+// approvalPayload packs the grant provenance ("human"|"auto") with the reviewed sha into
+// the approval token's opaque data, so a merge attributes the audit from the token it
+// actually consumes rather than from mutable task state (which a crash could desync).
+func approvalPayload(by, sha string) string { return by + " " + sha }
+
+// splitApprovalPayload unpacks approvalPayload. A token with no provenance prefix
+// (legacy/plain sha) yields by=="" so the gated path can fail closed on it.
+func splitApprovalPayload(data string) (by, sha string) {
+	if i := strings.IndexByte(data, ' '); i >= 0 {
+		return data[:i], data[i+1:]
+	}
+	return "", data
 }
 
 // Promote turns a scout task into a ship task (restoring teardown protection).
@@ -846,14 +1112,29 @@ func (m *Manager) Recovery() ([]string, error) {
 	return notes, nil
 }
 
-func (m *Manager) audit(line string) {
-	_ = os.MkdirAll(m.P.Home, 0o755)
+func (m *Manager) audit(line string) { _ = m.writeAudit(line) }
+
+// writeAudit appends a timestamped record to the audit log and flushes it to disk,
+// returning any error. Trusted merges call it directly and ABORT on failure — an
+// unrecorded finance merge is not acceptable (every trusted merge must be
+// reconstructable). Other call sites use audit() best-effort.
+func (m *Manager) writeAudit(line string) error {
+	if err := os.MkdirAll(m.P.Home, 0o755); err != nil {
+		return err
+	}
 	f, err := os.OpenFile(m.P.AuditLog(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
-		return
+		return err
 	}
-	defer f.Close()
-	_, _ = fmt.Fprintf(f, "%s %s\n", time.Now().Format(time.RFC3339), line)
+	if _, err := fmt.Fprintf(f, "%s %s\n", time.Now().Format(time.RFC3339), line); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 func short(sha string) string {

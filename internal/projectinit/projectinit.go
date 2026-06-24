@@ -102,10 +102,18 @@ func Init(dir, mode string) ([]string, error) {
 }
 
 func managedBlock(mode string) string {
-	return markerBegin + "\n" +
+	b := markerBegin + "\n" +
 		"This repository is managed by ttorch. The manager reads the delivery mode below.\n\n" +
-		"- delivery-mode: " + mode + "\n" +
-		markerEnd
+		"- delivery-mode: " + mode + "\n"
+	if mode == "trusted" {
+		b += "\nTrusted mode: worker output may be merged through the ttorch-review adversarial-review\n" +
+			"gate (a passing verdict plus a fresh green validate, commit-pinned and enforced in Go)\n" +
+			"WITHOUT a separate human approval. This is an explicit, repo-scoped decision; the default\n" +
+			"is pr. Auto-merge REQUIRES a .ttorch/validate.sh on this default branch (the gate's\n" +
+			"validation authority); without it, auto-merge is refused and a human approval is needed.\n" +
+			"A change to the gate itself (this block or .ttorch/validate.sh) always requires a human.\n"
+	}
+	return b + markerEnd
 }
 
 // upsertBlock replaces the ttorch-managed block in an existing AGENTS.md, or appends

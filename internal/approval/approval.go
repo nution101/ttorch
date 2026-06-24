@@ -33,6 +33,17 @@ func Valid(path string) bool {
 	return ok && time.Now().UnixNano() < exp
 }
 
+// Data returns the bound data of a non-expired token without consuming it, so a caller
+// can inspect a token's provenance (e.g. who minted it) before deciding whether the
+// token may be consumed at all. It mirrors Valid but also yields the data.
+func Data(path string) (string, bool) {
+	exp, data, ok := read(path)
+	if !ok || time.Now().UnixNano() >= exp {
+		return "", false
+	}
+	return data, true
+}
+
 // Consume removes the token and returns its bound data and whether it was valid.
 // A stale (expired) token is also removed.
 func Consume(path string) (data string, ok bool) {

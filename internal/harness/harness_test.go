@@ -154,6 +154,40 @@ func TestWriteManagerCharter(t *testing.T) {
 	}
 }
 
+// TestManagerCharterTrustedCarveOut guards the two encodings of the manager protocol
+// against drift: the launch-time charter const must carry the same trusted-mode
+// carve-out the ttorch-manager skill documents (the lead-approval rule with its one
+// trusted-mode exception), so a manager launched from either source behaves the same.
+func TestManagerCharterTrustedCarveOut(t *testing.T) {
+	// The lead-approval rule must stay verbatim — it is the load-bearing sentence.
+	if !strings.Contains(managerCharter, "Never merge or deliver without the lead's explicit approval") {
+		t.Errorf("managerCharter dropped the lead-approval rule")
+	}
+	// ...and it must carry the trusted-mode carve-out + its mechanism, framed as a narrow
+	// exception (case-insensitive: the charter may emphasize TRUSTED in caps).
+	lower := strings.ToLower(managerCharter)
+	for _, want := range []string{"trusted", "exception", "ttorch trust", "ttorch-review"} {
+		if !strings.Contains(lower, want) {
+			t.Errorf("managerCharter is missing %q — keep it in sync with the ttorch-manager skill", want)
+		}
+	}
+	// Two-sided: the OTHER encodings of the protocol must carry the same carve-out, so a
+	// drift in either the skill or the global guidance — not just the charter — is caught.
+	for _, f := range []string{
+		filepath.Join("..", "..", "content", "skills", "ttorch-manager", "SKILL.md"),
+		filepath.Join("..", "..", "content", "assets", "AGENTS.global.md"),
+	} {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("reading %s: %v", f, err)
+		}
+		s := strings.ToLower(string(b))
+		if !strings.Contains(s, "trusted") || !strings.Contains(s, "ttorch-review") {
+			t.Errorf("%s is missing the trusted-mode carve-out — the three protocol encodings must stay in sync", f)
+		}
+	}
+}
+
 func TestBriefCommandCarriesSessionID(t *testing.T) {
 	t.Setenv("TTORCH_EFFORT", "off")
 	cmd := BriefCommand("claude", "/tmp/b.md", "wk-sid")

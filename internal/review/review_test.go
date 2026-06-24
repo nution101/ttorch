@@ -175,6 +175,22 @@ func TestExpiredVerdict(t *testing.T) {
 	}
 }
 
+// TestConsumeRefusesBlock pins the fail-closed contract: a blocking verdict can never be
+// consumed as an authorization, even while unexpired (it is removed but returns ok=false),
+// so a verdict that turned blocking after a prior Load cannot still authorize a merge.
+func TestConsumeRefusesBlock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "t1.verdict")
+	if err := Write(path, Verdict{Overall: Block, ReviewedSHA: "deadbeef"}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := Consume(path); ok {
+		t.Fatal("a blocking verdict must not be consumable as an authorization")
+	}
+	if _, ok := Load(path); ok {
+		t.Fatal("the blocking verdict should still have been removed by Consume")
+	}
+}
+
 func TestToResults(t *testing.T) {
 	v := Verdict{
 		Overall: Block,
