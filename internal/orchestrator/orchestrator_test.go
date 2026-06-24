@@ -1101,6 +1101,123 @@ func TestMergeLocal_GateRefusesLegacyBareToken(t *testing.T) {
 	_, _ = m.Teardown("lt1", true)
 }
 
+// TestMergeLocal_TrustedAutoRequiresDefaultBranchScript mirrors the reproduced bypass:
+// with NO .ttorch/validate.sh on the default branch, gateValidate would fall back to
+// ecosystem detection on the worker's checkout — which the worker controls. Here the
+// worker deletes go.mod and adds a package.json whose test is a no-op, alongside a broken
+// payload. The trusted auto path must refuse (no auto-mint, merge refused) rather than
+// trust the worker-defined check.
+func TestMergeLocal_TrustedAutoRequiresDefaultBranchScript(t *testing.T) {
+	m, repo := deliveryHarness(t, "noscriptauto")
+	// Default branch has a go.mod but NO .ttorch/validate.sh.
+	if err := os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module example.com/x\n\ngo 1.21\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "go.mod")
+	gitIn(t, repo, "commit", "-q", "-m", "add go.mod")
+	if _, err := projectinit.Init(repo, "trusted"); err != nil {
+		t.Fatal(err)
+	}
+	task, err := m.Spawn("ns1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := task.Worktree
+	// The worker swaps the ecosystem to a no-op test and slips in a broken payload.
+	if err := os.Remove(filepath.Join(wt, "go.mod")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "package.json"), []byte(`{"scripts":{"test":"exit 0"}}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "payload.txt"), []byte("BROKEN\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, wt, "add", "-A")
+	gitIn(t, wt, "commit", "-q", "-m", "swap ecosystem")
+	head := gitIn(t, wt, "rev-parse", "HEAD")
+	writeReviewReports(t, m.P.ReviewInputsDir("ns1"), head, nil) // verdict passes
+
+	if _, err := m.TrustRecord("ns1", "", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	// The bypass is closed: no default-branch gate script ⇒ NO auto-mint, even though the
+	// worker's own package.json test would "pass".
+	if approval.Valid(m.P.ApprovalFile("ns1")) {
+		t.Fatal("a trusted auto-mint must require a default-branch .ttorch/validate.sh; worker-defined checks must never authorize")
+	}
+	// Auto-merge is refused.
+	if _, err := m.MergeLocal("ns1", false); err == nil {
+		t.Fatal("a trusted auto-merge must be refused without a default-branch gate script")
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") == head {
+		t.Fatal("the broken commit must not have auto-merged")
+	}
+	// Defense-in-depth: even a fabricated auto token is refused at the merge before any
+	// worker-defined validation runs.
+	if err := approval.Grant(m.P.ApprovalFile("ns1"), time.Minute, "auto "+head); err != nil {
+		t.Fatal(err)
+	}
+	_, err = m.MergeLocal("ns1", false)
+	if err == nil || !strings.Contains(err.Error(), "no .ttorch/validate.sh on the default branch") {
+		t.Fatalf("an auto token without a default-branch script must be refused at the gate, got: %v", err)
+	}
+	_, _ = m.Teardown("ns1", true)
+}
+
+// TestMergeLocal_TrustedAutoRunsRealDefaultBranchScript is the companion: WITH a real
+// default-branch gate script that actually tests, the broken payload is caught — the
+// script governs over the worker's package.json no-op, so auto-mint is refused and a
+// human-approved gated merge fails the real check too.
+func TestMergeLocal_TrustedAutoRunsRealDefaultBranchScript(t *testing.T) {
+	m, repo := deliveryHarness(t, "realscript")
+	// A real default-branch gate that fails when the broken payload is present.
+	commitGateScript(t, repo, "test ! -e payload.txt")
+	if _, err := projectinit.Init(repo, "trusted"); err != nil {
+		t.Fatal(err)
+	}
+	task, err := m.Spawn("rs1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := task.Worktree
+	// The worker tries the same package.json no-op trick alongside the broken payload.
+	if err := os.WriteFile(filepath.Join(wt, "package.json"), []byte(`{"scripts":{"test":"exit 0"}}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "payload.txt"), []byte("BROKEN\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, wt, "add", "-A")
+	gitIn(t, wt, "commit", "-q", "-m", "broken payload")
+	head := gitIn(t, wt, "rev-parse", "HEAD")
+	writeReviewReports(t, m.P.ReviewInputsDir("rs1"), head, nil)
+
+	if _, err := m.TrustRecord("rs1", "", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	// The real default-branch script fails on the payload ⇒ not green ⇒ no auto-mint.
+	if approval.Valid(m.P.ApprovalFile("rs1")) {
+		t.Fatal("the real default-branch gate (which fails on the payload) must prevent auto-mint")
+	}
+	// Even a human-approved gated merge runs the real script and fails — the worker's
+	// package.json no-op never governs.
+	if err := m.Approve("rs1", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	_, err = m.MergeLocal("rs1", false)
+	if err == nil {
+		t.Fatal("the real default-branch gate must fail on the broken payload")
+	}
+	if !strings.Contains(err.Error(), "checks failed") {
+		t.Fatalf("expected the real default-branch script to fail the gate, got: %v", err)
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") == head {
+		t.Fatal("the broken commit must not have merged")
+	}
+	_, _ = m.Teardown("rs1", true)
+}
+
 func TestTrustRecord_TrustedBlocksHighFinding(t *testing.T) {
 	m, repo := deliveryHarness(t, "trustblock")
 	task, err := m.Spawn("tb1", repo, false, "sleep 60")

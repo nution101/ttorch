@@ -109,8 +109,9 @@ func managedBlock(mode string) string {
 		b += "\nTrusted mode: worker output may be merged through the ttorch-review adversarial-review\n" +
 			"gate (a passing verdict plus a fresh green validate, commit-pinned and enforced in Go)\n" +
 			"WITHOUT a separate human approval. This is an explicit, repo-scoped decision; the default\n" +
-			"is pr. The validation definition is taken from this default branch, and a change to the\n" +
-			"gate itself (this block or .ttorch/validate.sh) always requires a human approval.\n"
+			"is pr. Auto-merge REQUIRES a .ttorch/validate.sh on this default branch (the gate's\n" +
+			"validation authority); without it, auto-merge is refused and a human approval is needed.\n" +
+			"A change to the gate itself (this block or .ttorch/validate.sh) always requires a human.\n"
 	}
 	return b + markerEnd
 }

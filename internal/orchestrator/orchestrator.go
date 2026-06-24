@@ -720,7 +720,11 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 		clean, cerr := worktree.IsClean(t.Worktree)
 		touched, _, terr := diffTouchesGateConfig(t.Project, base, sha)
 		green := false
-		if cerr == nil && terr == nil && clean && !touched {
+		// A trusted auto-mint's green authority MUST be the default-branch gate script,
+		// never ecosystem detection on the worker's checkout (which the worker controls
+		// via go.mod/package.json). Without it, leave the verdict advisory — a human must
+		// approve — and skip validation entirely so no worker-defined checks run.
+		if cerr == nil && terr == nil && clean && !touched && hasDefaultBranchGateScript(t.Project) {
 			green, _, _ = validateCommitted(t.Project, sha)
 		}
 		if green {
@@ -794,6 +798,14 @@ func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error)
 		// committed sha, not the worktree.
 		if clean, err := worktree.IsClean(t.Worktree); err != nil || !clean {
 			return "", fmt.Errorf("trust gate: the worktree for %q is not clean; commit or discard all changes before merging", taskID)
+		}
+		// A trusted AUTO-merge's green authority must be the default-branch gate script —
+		// never ecosystem detection on the worker's checkout (go.mod/package.json, which
+		// the worker controls). Without it, require a human approval; refuse here before
+		// any worker-defined validation runs. (A human-approved gated merge may use the
+		// detection fallback.)
+		if tokBy == "auto" && !hasDefaultBranchGateScript(repo) {
+			return "", fmt.Errorf("trust gate: %q has no .ttorch/validate.sh on the default branch, so a trusted auto-merge's checks would be worker-defined; the lead must approve it explicitly with 'ttorch approve %s'", taskID, taskID)
 		}
 		// Require a passing, unexpired verdict (load, not yet consume — a recoverable
 		// refusal below must leave it intact for a retry). Absent/expired/blocking all
@@ -968,6 +980,17 @@ func validateCommitted(repo, sha string) (bool, []validate.Result, error) {
 	}
 	defer worktree.RemoveWorktree(repo, co)
 	return gateValidate(co, repo)
+}
+
+// hasDefaultBranchGateScript reports whether the repo's default branch defines the gate
+// script (.ttorch/validate.sh). The trusted AUTO path requires it: without it,
+// gateValidate falls back to ecosystem detection (go.mod / package.json) on the worker's
+// own checkout, whose presence and scripts the worker controls — so "green" would be
+// worker-influenced. A human `ttorch approve` is still allowed to use the detection
+// fallback (a human is then in the loop).
+func hasDefaultBranchGateScript(repo string) bool {
+	_, ok := worktree.ShowFile(repo, worktree.DefaultBranch(repo), ".ttorch/validate.sh")
+	return ok
 }
 
 // diffTouchesGateConfig reports whether the COMMITTED diff base..rev modifies any

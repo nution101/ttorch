@@ -61,10 +61,13 @@ invalidates the verdict — re-prep, re-review, re-record.
 
 **The gate is worker-proof by design:**
 
-- The fresh validate runs the validation definition from the **default branch** (the
-  `.ttorch/validate.sh` as it exists there, or the built-in ecosystem checks) — never the
-  worker's own copy — so a worker cannot weaken its own gate by editing the script on its
-  branch. A repo with no detectable checks fails closed (a hard block).
+- The fresh validate runs the validation definition from the **default branch**, against
+  an immutable checkout of the committed sha — never the worker's own copy — so a worker
+  cannot weaken its own gate by editing the script on its branch. A trusted **auto**-merge
+  **requires** a `.ttorch/validate.sh` on the default branch: without it the gate would
+  fall back to ecosystem detection (`go.mod`/`package.json`) on the worker's checkout,
+  which the worker controls, so the auto path is refused and a human `ttorch approve` is
+  required instead. A repo with no detectable checks fails closed (a hard block).
 - A trusted **auto**-merge may not change the gate's own definition. If a worker's diff
   touches `.ttorch/validate.sh` or `AGENTS.md`, the auto-merge is refused and the change
   requires an explicit `ttorch approve` — altering the gate is always a human decision.
