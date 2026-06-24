@@ -121,6 +121,10 @@ func (p Paths) ClaudeAgents() string { return filepath.Join(p.Claude, "agents") 
 // ClaudeCommands is the slash-command install root.
 func (p Paths) ClaudeCommands() string { return filepath.Join(p.Claude, "commands") }
 
+// ClaudeHooks is the install root for ttorch's shipped hook scripts. The global
+// settings file references these scripts by absolute path.
+func (p Paths) ClaudeHooks() string { return filepath.Join(p.Claude, "hooks") }
+
 // GlobalAgentsMD is the global guidance file (CLAUDE.md symlinks to it).
 func (p Paths) GlobalAgentsMD() string { return filepath.Join(p.Claude, "AGENTS.md") }
 

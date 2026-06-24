@@ -3,12 +3,42 @@ package installer
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/nution101/ttorch/internal/paths"
 )
+
+// promptHookCommand digs the single command string out of the ttorch-managed
+// UserPromptSubmit entry: hooks.UserPromptSubmit[0].hooks[0].command.
+func promptHookCommand(t *testing.T, hooks map[string]any) string {
+	t.Helper()
+	ups, ok := hooks["UserPromptSubmit"].([]any)
+	if !ok || len(ups) == 0 {
+		t.Fatalf("UserPromptSubmit not a non-empty array: %v", hooks["UserPromptSubmit"])
+	}
+	entry, ok := ups[0].(map[string]any)
+	if !ok {
+		t.Fatalf("UserPromptSubmit[0] not an object: %v", ups[0])
+	}
+	inner, ok := entry["hooks"].([]any)
+	if !ok || len(inner) == 0 {
+		t.Fatalf("UserPromptSubmit[0].hooks not a non-empty array: %v", entry)
+	}
+	cmd, ok := inner[0].(map[string]any)
+	if !ok {
+		t.Fatalf("UserPromptSubmit[0].hooks[0] not an object: %v", inner[0])
+	}
+	s, ok := cmd["command"].(string)
+	if !ok {
+		t.Fatalf("command is not a string: %v", cmd["command"])
+	}
+	return s
+}
 
 // readSettings reads and decodes the global settings file at path into a map.
 func readSettings(t *testing.T, path string) map[string]any {
@@ -53,8 +83,18 @@ func TestApplyGlobalSettings_MergeIntoMissingFile(t *testing.T) {
 	if !ok {
 		t.Fatalf("hooks not an object: %v", got["hooks"])
 	}
-	if _, ok := hooks["SessionStart"]; !ok {
-		t.Fatalf("placeholder hook not installed: %v", hooks)
+	if _, ok := hooks["UserPromptSubmit"]; !ok {
+		t.Fatalf("UserPromptSubmit hook not installed: %v", hooks)
+	}
+	// The registered command must reference the installed hook script by an
+	// absolute path under p.ClaudeHooks().
+	cmd := promptHookCommand(t, hooks)
+	wantPath := filepath.Join(p.ClaudeHooks(), promptReminderScript)
+	if !strings.Contains(cmd, wantPath) {
+		t.Fatalf("hook command %q does not reference %q", cmd, wantPath)
+	}
+	if !strings.HasPrefix(cmd, "sh ") {
+		t.Fatalf("hook command %q should invoke the interpreter explicitly", cmd)
 	}
 	// Nothing existed, so no backup should be written.
 	if _, err := os.Stat(p.GlobalSettingsBackup()); !os.IsNotExist(err) {
@@ -107,8 +147,102 @@ func TestApplyGlobalSettings_PreservesExistingKeys(t *testing.T) {
 	if _, ok := hooks["PreToolUse"]; !ok {
 		t.Fatal("developer hook event was dropped")
 	}
-	if _, ok := hooks["SessionStart"]; !ok {
+	if _, ok := hooks["UserPromptSubmit"]; !ok {
 		t.Fatal("ttorch hook event not merged alongside developer's")
+	}
+}
+
+func TestApplyGlobalSettings_DefersToDeveloperUserPromptSubmit(t *testing.T) {
+	p := sandbox(t)
+	// Developer already runs their own UserPromptSubmit hook. ttorch treats the
+	// array as a leaf it does not own, so it must leave it exactly as-is.
+	seedSettings(t, p, map[string]any{
+		"hooks": map[string]any{
+			"UserPromptSubmit": []any{
+				map[string]any{
+					"hooks": []any{
+						map[string]any{"type": "command", "command": "echo mine"},
+					},
+				},
+			},
+		},
+	})
+	if _, err := applyGlobalSettings(p); err != nil {
+		t.Fatal(err)
+	}
+	got := readSettings(t, p.GlobalSettingsFile())
+	hooks := got["hooks"].(map[string]any)
+	if cmd := promptHookCommand(t, hooks); cmd != "echo mine" {
+		t.Fatalf("ttorch clobbered the developer's UserPromptSubmit hook: %q", cmd)
+	}
+	// The scalar leaf is still merged even while ttorch defers on the hook array.
+	if got["includeCoAuthoredBy"] != false {
+		t.Fatalf("scalar leaf not merged: %v", got)
+	}
+	// ttorch must not claim the developer's hook in its ledger, so uninstall leaves
+	// it untouched.
+	if _, err := removeGlobalSettings(p); err != nil {
+		t.Fatal(err)
+	}
+	got = readSettings(t, p.GlobalSettingsFile())
+	hooks = got["hooks"].(map[string]any)
+	if cmd := promptHookCommand(t, hooks); cmd != "echo mine" {
+		t.Fatalf("uninstall removed the developer's own hook: %q", cmd)
+	}
+}
+
+func TestApplyGlobalSettings_IdempotentUpgradePath(t *testing.T) {
+	p := sandbox(t)
+	// The real upgrade path: a developer settings file that already has other keys
+	// and its own hook event. Applying twice must keep the ttorch hook a single
+	// entry (never duplicated/appended) and never disturb the developer's data.
+	seedSettings(t, p, map[string]any{
+		"model": "opus",
+		"hooks": map[string]any{
+			"PreToolUse": []any{map[string]any{"matcher": "Bash"}},
+		},
+	})
+	for i := 0; i < 2; i++ {
+		if _, err := applyGlobalSettings(p); err != nil {
+			t.Fatalf("apply %d: %v", i, err)
+		}
+		got := readSettings(t, p.GlobalSettingsFile())
+		hooks, ok := got["hooks"].(map[string]any)
+		if !ok {
+			t.Fatalf("apply %d: hooks not an object: %v", i, got["hooks"])
+		}
+		ups, ok := hooks["UserPromptSubmit"].([]any)
+		if !ok || len(ups) != 1 {
+			t.Fatalf("apply %d: UserPromptSubmit must stay a single-element array, got %v", i, hooks["UserPromptSubmit"])
+		}
+		if _, ok := hooks["PreToolUse"]; !ok {
+			t.Fatalf("apply %d: developer hook event dropped", i)
+		}
+		if got["model"] != "opus" {
+			t.Fatalf("apply %d: developer key dropped", i)
+		}
+	}
+}
+
+func TestShellSingleQuote(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell quoting is not exercised on Windows")
+	}
+	// The escaped command must parse back, via a real shell, to the original path —
+	// covering spaces and embedded apostrophes (e.g. /Users/o'brien).
+	for _, path := range []string{
+		"/Users/dev/.claude/hooks/prompt-reminders.sh",
+		"/Users/o'brien/.claude/hooks/prompt-reminders.sh",
+		"/Users/a b/c'd/hooks/x.sh",
+	} {
+		quoted := shellSingleQuote(path)
+		out, err := exec.Command("sh", "-c", "printf %s "+quoted).Output()
+		if err != nil {
+			t.Fatalf("shell rejected %q: %v", quoted, err)
+		}
+		if string(out) != path {
+			t.Fatalf("round-trip mismatch: quoted %q -> %q, want %q", quoted, out, path)
+		}
 	}
 }
 
@@ -294,7 +428,7 @@ func TestRemoveGlobalSettings_KeepsDeveloperHookEvent(t *testing.T) {
 	if _, ok := hooks["PreToolUse"]; !ok {
 		t.Fatal("developer hook event lost on uninstall")
 	}
-	if _, ok := hooks["SessionStart"]; ok {
+	if _, ok := hooks["UserPromptSubmit"]; ok {
 		t.Fatal("ttorch hook event not removed on uninstall")
 	}
 }

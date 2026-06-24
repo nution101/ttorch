@@ -101,6 +101,9 @@ func desiredFiles(content fs.FS, p paths.Paths) (map[string][]byte, []byte, erro
 		case strings.HasPrefix(rel, "commands/"):
 			sub := strings.TrimPrefix(rel, "commands/")
 			desired[filepath.Join(p.ClaudeCommands(), filepath.FromSlash(sub))] = b
+		case strings.HasPrefix(rel, "hooks/"):
+			sub := strings.TrimPrefix(rel, "hooks/")
+			desired[filepath.Join(p.ClaudeHooks(), filepath.FromSlash(sub))] = b
 		default:
 			// Other assets are not installed to disk in this milestone.
 		}
