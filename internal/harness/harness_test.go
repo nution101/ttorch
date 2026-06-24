@@ -171,6 +171,21 @@ func TestManagerCharterTrustedCarveOut(t *testing.T) {
 			t.Errorf("managerCharter is missing %q — keep it in sync with the ttorch-manager skill", want)
 		}
 	}
+	// Two-sided: the OTHER encodings of the protocol must carry the same carve-out, so a
+	// drift in either the skill or the global guidance — not just the charter — is caught.
+	for _, f := range []string{
+		filepath.Join("..", "..", "content", "skills", "ttorch-manager", "SKILL.md"),
+		filepath.Join("..", "..", "content", "assets", "AGENTS.global.md"),
+	} {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("reading %s: %v", f, err)
+		}
+		s := strings.ToLower(string(b))
+		if !strings.Contains(s, "trusted") || !strings.Contains(s, "ttorch-review") {
+			t.Errorf("%s is missing the trusted-mode carve-out — the three protocol encodings must stay in sync", f)
+		}
+	}
 }
 
 func TestBriefCommandCarriesSessionID(t *testing.T) {

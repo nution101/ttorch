@@ -51,9 +51,20 @@ repo's own build/test/lint — enforced in Go at the merge point, not by convent
    - **Any other mode:** the lead runs `ttorch approve <id>`, then
      `ttorch merge-local <id> --require-verdict` opts that one merge into the same gate.
 
-The merge **re-checks everything**, commit-pinned: a passing unexpired verdict, a fresh
+The merge **re-checks everything**, commit-pinned: a clean worktree (so the reviewed
+state is exactly the committed HEAD that merges), a passing unexpired verdict, a fresh
 green validate, and `verdict.ReviewedSHA == worker HEAD`. Any commit landing after review
 invalidates the verdict — re-prep, re-review, re-record.
+
+**The gate is worker-proof by design:**
+
+- The fresh validate runs the validation definition from the **default branch** (the
+  `.ttorch/validate.sh` as it exists there, or the built-in ecosystem checks) — never the
+  worker's own copy — so a worker cannot weaken its own gate by editing the script on its
+  branch. A repo with no detectable checks fails closed (a hard block).
+- A trusted **auto**-merge may not change the gate's own definition. If a worker's diff
+  touches `.ttorch/validate.sh` or `AGENTS.md`, the auto-merge is refused and the change
+  requires an explicit `ttorch approve` — altering the gate is always a human decision.
 
 ## Findings contract
 

@@ -39,6 +39,16 @@ func Detect(dir string) []Step {
 	if fileExists(filepath.Join(dir, ".ttorch", "validate.sh")) {
 		return []Step{{Name: "custom", Cmd: []string{"sh", ".ttorch/validate.sh"}}}
 	}
+	return DetectDefaults(dir)
+}
+
+// DetectDefaults returns the built-in, ecosystem-detected checks for dir, IGNORING any
+// repo-provided .ttorch/validate.sh override. Detect uses these as its fallback; the
+// trust gate uses them directly so a worker cannot redefine the gate's commands by
+// committing a .ttorch/validate.sh on its own branch — only the fixed ttorch-defined
+// steps run. Returns nil when no ecosystem is detected (the caller treats that as a
+// hard block).
+func DetectDefaults(dir string) []Step {
 	if fileExists(filepath.Join(dir, "go.mod")) {
 		return []Step{
 			{Name: "build", Cmd: []string{"go", "build", "./..."}},
