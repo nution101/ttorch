@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/nution101/ttorch/internal/orchestrator"
 )
 
 // nasty is a message body packed with the characters a shell would re-interpret:
@@ -142,6 +144,95 @@ func TestResolveSendMessage_EmptyMessageFileResolvesEmpty(t *testing.T) {
 	}
 	if got != "" {
 		t.Fatalf("empty file = %q, want empty", got)
+	}
+}
+
+func TestParseTouches(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"internal/cli,internal/orchestrator", []string{"internal/cli", "internal/orchestrator"}},
+		// trims spaces, drops empties, cleans trailing slashes and ./
+		{" internal/cli/ , , ./internal/state ", []string{"internal/cli", "internal/state"}},
+		// de-duplicates (after cleaning) while preserving first-seen order
+		{"internal/cli,internal/cli/,docs,internal/cli", []string{"internal/cli", "docs"}},
+		{"", nil},
+		{"   ", nil},
+	}
+	for _, c := range cases {
+		got := parseTouches(c.in)
+		if strings.Join(got, "|") != strings.Join(c.want, "|") {
+			t.Errorf("parseTouches(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestRenderStatus(t *testing.T) {
+	var b strings.Builder
+	renderStatus(&b, []statusRow{
+		{ID: "a", Kind: "ship", State: "idle", Window: "wk-a", Project: "/repo", Footprint: []string{"internal/cli", "internal/state"}},
+		{ID: "b", Kind: "ship", State: "working", Window: "wk-b", Project: "/repo"},
+		// A gone worker that still carries a footprint: its row shows it, but the
+		// summary must NOT count it (the conflict gate ignores gone workers).
+		{ID: "d", Kind: "ship", State: "gone", Window: "wk-d", Project: "/repo", Footprint: []string{"internal/orchestrator"}},
+	})
+	out := b.String()
+	// The footprint of a declaring worker is shown, including the gone one.
+	if !strings.Contains(out, "touches: internal/cli, internal/state") {
+		t.Fatalf("status should show worker a's footprint, got:\n%s", out)
+	}
+	if !strings.Contains(out, "touches: internal/orchestrator") {
+		t.Fatalf("status should still show a gone worker's footprint for context, got:\n%s", out)
+	}
+	// Summary counts live only: a (idle) + b (working) are live; only a is idle;
+	// only a declared a footprint among the live (d is gone, so not counted).
+	if !strings.Contains(out, "2 live · 1 idle slots · 1 with footprints") {
+		t.Fatalf("status summary line missing/wrong, got:\n%s", out)
+	}
+}
+
+func TestCheckOverlapArgs(t *testing.T) {
+	// One comma-separated argument.
+	fp, repo, err := checkOverlapArgs([]string{"internal/cli,internal/orchestrator"})
+	if err != nil || repo != "" || strings.Join(fp, "|") != "internal/cli|internal/orchestrator" {
+		t.Fatalf("comma form: fp=%v repo=%q err=%v", fp, repo, err)
+	}
+	// Multiple space-separated positional arguments (the advertised alternative).
+	fp, _, err = checkOverlapArgs([]string{"internal/cli", "internal/orchestrator"})
+	if err != nil || strings.Join(fp, "|") != "internal/cli|internal/orchestrator" {
+		t.Fatalf("space form: fp=%v err=%v", fp, err)
+	}
+	// --repo is parsed and the remaining positional is the footprint.
+	fp, repo, err = checkOverlapArgs([]string{"--repo", "/r", "internal/cli"})
+	if err != nil || repo != "/r" || strings.Join(fp, "|") != "internal/cli" {
+		t.Fatalf("--repo form: fp=%v repo=%q err=%v", fp, repo, err)
+	}
+	// No paths -> a loud usage error (never a silent empty-footprint check).
+	if _, _, err := checkOverlapArgs(nil); err == nil {
+		t.Fatal("empty args must return a usage error")
+	}
+	if _, _, err := checkOverlapArgs([]string{"  ", ","}); err == nil {
+		t.Fatal("whitespace/comma-only args must return a usage error")
+	}
+}
+
+func TestRenderOverlap(t *testing.T) {
+	// Disjoint -> a clear safe-to-dispatch line, no worker names.
+	var safe strings.Builder
+	renderOverlap(&safe, []string{"docs"}, nil)
+	if !strings.Contains(safe.String(), "no conflicts") || !strings.Contains(safe.String(), "safe to dispatch") {
+		t.Fatalf("disjoint report should say it is safe, got:\n%s", safe.String())
+	}
+
+	// Conflicts -> names each worker and the overlapping paths.
+	var conf strings.Builder
+	renderOverlap(&conf, []string{"internal/cli/cli.go"}, []orchestrator.Conflict{
+		{TaskID: "a1", Window: "wk-a1", Project: "/repo", Overlaps: [][2]string{{"internal/cli/cli.go", "internal/cli"}}},
+	})
+	out := conf.String()
+	if !strings.Contains(out, "a1") || !strings.Contains(out, "internal/cli/cli.go↔internal/cli") {
+		t.Fatalf("conflict report should name the worker and overlap, got:\n%s", out)
 	}
 }
 

@@ -71,6 +71,128 @@ func TestWindowLabel(t *testing.T) {
 	}
 }
 
+// TestComputeConflicts pins the pure overlap core: which live workers a proposed
+// footprint collides with, independent of tmux. Disjoint footprints conflict with
+// nobody; a worker that declared no footprint is exempt; an overlap names the
+// worker and the colliding paths.
+func TestComputeConflicts(t *testing.T) {
+	tasks := []state.Task{
+		{ID: "a", Window: "wk-a", Project: "/repo", Footprint: []string{"internal/cli"}},
+		{ID: "b", Window: "wk-b", Project: "/repo", Footprint: []string{"internal/orchestrator"}},
+		{ID: "c", Window: "wk-c", Project: "/repo"}, // declared nothing -> exempt
+	}
+
+	// Disjoint from every footprint.
+	if got := computeConflicts([]string{"docs"}, tasks); len(got) != 0 {
+		t.Fatalf("disjoint footprint should conflict with nobody, got %v", got)
+	}
+	// A footprint that declared nothing never conflicts, even against a path under it.
+	if got := computeConflicts([]string{"internal/state"}, tasks); len(got) != 0 {
+		t.Fatalf("footprint hitting only the undeclared worker should not conflict, got %v", got)
+	}
+	// Overlap: a prefix of worker a's footprint names a (and only a).
+	got := computeConflicts([]string{"internal/cli/cli.go"}, tasks)
+	if len(got) != 1 || got[0].TaskID != "a" {
+		t.Fatalf("expected one conflict with task a, got %v", got)
+	}
+	if got[0].OverlapString() != "internal/cli/cli.go↔internal/cli" {
+		t.Fatalf("overlap string = %q, want internal/cli/cli.go↔internal/cli", got[0].OverlapString())
+	}
+}
+
+// TestFootprintCandidate pins the pure pre-liveness filter: only footprint-declaring
+// ship/scout tasks in the requested repo (and not the excluded id) are eligible for
+// overlap. This is the repo-scoping + cc-exclusion guarantee, tested without tmux.
+func TestFootprintCandidate(t *testing.T) {
+	base := state.Task{ID: "x", Kind: "ship", Project: "/repo", Footprint: []string{"internal/cli"}}
+	cases := []struct {
+		name          string
+		task          state.Task
+		repo, exclude string
+		want          bool
+	}{
+		{"in-repo declarer", base, "/repo", "", true},
+		{"unscoped matches any repo", base, "", "", true},
+		{"other repo excluded by scope", base, "/other", "", false},
+		{"excluded id", base, "/repo", "x", false},
+		{"cc session excluded", state.Task{ID: "c", Kind: "cc", Project: "/repo", Footprint: []string{"internal/cli"}}, "/repo", "", false},
+		{"no footprint excluded", state.Task{ID: "n", Kind: "ship", Project: "/repo"}, "/repo", "", false},
+	}
+	for _, c := range cases {
+		if got := footprintCandidate(c.task, c.repo, c.exclude); got != c.want {
+			t.Errorf("%s: footprintCandidate = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestSpawn_RefusesFootprintOverlap proves the deterministic conflict gate: once a
+// live worker holds a footprint, a second spawn onto overlapping files is refused
+// (naming the conflict) with no side effects, a disjoint footprint is allowed, and
+// --force-overlap overrides. It exercises the real runtime against tmux + git.
+func TestSpawn_RefusesFootprintOverlap(t *testing.T) {
+	m, repo := deliveryHarness(t, "overlap")
+
+	if _, err := m.SpawnWithFootprint("a1", repo, false, "sleep 30", []string{"internal/cli"}, false); err != nil {
+		t.Fatalf("first spawn: %v", err)
+	}
+
+	// An overlapping footprint is refused, names the conflicting task, and leaves
+	// no task record or window behind.
+	_, err := m.SpawnWithFootprint("b1", repo, false, "sleep 30", []string{"internal/cli/cli.go"}, false)
+	if err == nil {
+		t.Fatal("a spawn onto a live worker's files must be refused")
+	}
+	if !strings.Contains(err.Error(), "a1") {
+		t.Fatalf("refusal should name the conflicting task a1, got %q", err)
+	}
+	if _, lerr := m.Store.Load("b1"); lerr == nil {
+		t.Fatal("a refused spawn must persist no task record")
+	}
+	if tmux.WindowExists(m.Session, "wk-b1") {
+		t.Fatal("a refused spawn must not leave a window behind")
+	}
+
+	// A disjoint footprint dispatches fine.
+	if _, err := m.SpawnWithFootprint("c1", repo, false, "sleep 30", []string{"internal/orchestrator"}, false); err != nil {
+		t.Fatalf("disjoint spawn should succeed: %v", err)
+	}
+
+	// --force-overlap overrides the refusal and records the footprint anyway.
+	d, err := m.SpawnWithFootprint("d1", repo, false, "sleep 30", []string{"internal/cli"}, true)
+	if err != nil {
+		t.Fatalf("forced overlapping spawn should succeed: %v", err)
+	}
+	if strings.Join(d.Footprint, ",") != "internal/cli" {
+		t.Fatalf("forced spawn should record its footprint, got %v", d.Footprint)
+	}
+
+	for _, id := range []string{"a1", "c1", "d1"} {
+		_, _ = m.Teardown(id, true)
+	}
+}
+
+// TestCheckOverlap_OnlyLiveWorkers proves the conflict gate is gated on liveness:
+// a torn-down worker's footprint no longer blocks, so a freed slot is reusable.
+func TestCheckOverlap_OnlyLiveWorkers(t *testing.T) {
+	m, repo := deliveryHarness(t, "live")
+	// CheckOverlap scopes by canonicalized repo, matching the stored task.Project
+	// (both go through worktree.RepoRoot); use task.Project so the test is immune to
+	// the /var -> /private/var symlink on macOS.
+	a, err := m.SpawnWithFootprint("a1", repo, false, "sleep 30", []string{"internal/cli"}, false)
+	if err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	if got := m.CheckOverlap(a.Project, []string{"internal/cli"}); len(got) != 1 {
+		t.Fatalf("a live worker on internal/cli should conflict, got %v", got)
+	}
+	if _, err := m.Teardown("a1", true); err != nil {
+		t.Fatalf("teardown: %v", err)
+	}
+	if got := m.CheckOverlap(a.Project, []string{"internal/cli"}); len(got) != 0 {
+		t.Fatalf("a torn-down worker must no longer conflict, got %v", got)
+	}
+}
+
 // TestSpawnPeekTeardown exercises the real runtime against tmux + git. It is
 // skipped where tmux is unavailable (e.g. CI without tmux installed).
 func TestSpawnPeekTeardown(t *testing.T) {

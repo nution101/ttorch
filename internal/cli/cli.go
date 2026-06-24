@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
 	"runtime"
 	"strconv"
 	"strings"
@@ -89,6 +90,8 @@ func Main(args []string) int {
 		return run(cmdSpawn(rest))
 	case "status":
 		return run(cmdStatus())
+	case "check-overlap":
+		return run(cmdCheckOverlap(rest))
 	case "peek":
 		return run(cmdPeek(rest))
 	case "send":
@@ -302,12 +305,14 @@ func cmdSpawn(args []string) error {
 	// Task id and repo are the first two positionals; flags follow (the stdlib
 	// flag parser stops at the first positional, so parse the remainder).
 	if len(args) < 2 {
-		return errors.New(`usage: ttorch spawn <task-id> <repo-path> [--scout] [--init] [--cmd "..."]`)
+		return errors.New(`usage: ttorch spawn <task-id> <repo-path> [--scout] [--init] [--touches "a,b"] [--force-overlap] [--cmd "..."]`)
 	}
 	id, repo := args[0], args[1]
 	fs := flag.NewFlagSet("spawn", flag.ContinueOnError)
 	scout := fs.Bool("scout", false, "investigation task: report only, no code changes")
 	doInit := fs.Bool("init", false, "set the repo up for ttorch first (writes AGENTS.md block + CLAUDE.md symlink); plain spawn never modifies tracked files")
+	touches := fs.String("touches", "", `comma-separated file paths/prefixes this task will touch; refuses to dispatch onto files a live worker already holds`)
+	forceOverlap := fs.Bool("force-overlap", false, "dispatch even if the footprint overlaps a live worker (override the conflict refusal)")
 	raw := fs.String("cmd", "", "raw command to run instead of the default harness launch")
 	if err := fs.Parse(args[2:]); err != nil {
 		return err
@@ -322,12 +327,42 @@ func cmdSpawn(args []string) error {
 			fmt.Println("  " + n)
 		}
 	}
-	t, err := m.Spawn(id, repo, *scout, *raw)
+	footprint := parseTouches(*touches)
+	t, err := m.SpawnWithFootprint(id, repo, *scout, *raw, footprint, *forceOverlap)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("spawned %s (%s) in window %s\n  worktree: %s\n", t.ID, t.Kind, t.Window, t.Worktree)
+	if len(t.Footprint) > 0 {
+		note := ""
+		if *forceOverlap {
+			note = " (overlap forced)"
+		}
+		fmt.Printf("  touches: %s%s\n", strings.Join(t.Footprint, ", "), note)
+	}
 	return nil
+}
+
+// parseTouches splits a --touches value into a normalized footprint: entries are
+// comma-separated, trimmed, path-cleaned (so "internal/cli/" and "./internal/cli"
+// tidy to "internal/cli"), de-duplicated, and empties dropped. Order is preserved,
+// so the result is deterministic.
+func parseTouches(s string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, raw := range strings.Split(s, ",") {
+		f := strings.TrimSpace(raw)
+		if f == "" {
+			continue
+		}
+		f = path.Clean(f)
+		if seen[f] {
+			continue
+		}
+		seen[f] = true
+		out = append(out, f)
+	}
+	return out
 }
 
 func cmdStatus() error {
@@ -340,11 +375,104 @@ func cmdStatus() error {
 		fmt.Println("no active workers. dispatch with: ttorch spawn <task-id> <repo-path>")
 		return nil
 	}
-	fmt.Printf("%-16s %-6s %-8s %-12s %s\n", "TASK", "KIND", "STATE", "WINDOW", "PROJECT")
-	for _, t := range tasks {
-		fmt.Printf("%-16s %-6s %-8s %-12s %s\n", t.ID, t.Kind, m.TaskState(t), t.Window, t.Project)
+	rows := make([]statusRow, len(tasks))
+	for i, t := range tasks {
+		rows[i] = statusRow{
+			ID: t.ID, Kind: t.Kind, State: m.TaskState(t),
+			Window: t.Window, Project: t.Project, Footprint: t.Footprint,
+		}
 	}
+	renderStatus(os.Stdout, rows)
 	return nil
+}
+
+// statusRow is one worker's line in `ttorch status`, with its declared footprint.
+// Split from cmdStatus so the rendering (the footprint display + summary line) is
+// unit-testable without tmux.
+type statusRow struct {
+	ID, Kind, State, Window, Project string
+	Footprint                        []string
+}
+
+// renderStatus prints the worker table — each worker's declared footprint on an
+// indented continuation line beneath it — followed by a summary line that makes
+// "how many idle slots could take disjoint work?" visible at a glance. The summary
+// counts only LIVE workers (idle or working), so "with footprints" agrees with the
+// conflict gate, which ignores gone workers; a gone worker's footprint still shows
+// on its row for context.
+func renderStatus(w io.Writer, rows []statusRow) {
+	fmt.Fprintf(w, "%-16s %-6s %-8s %-12s %s\n", "TASK", "KIND", "STATE", "WINDOW", "PROJECT")
+	var live, idle, declared int
+	for _, r := range rows {
+		fmt.Fprintf(w, "%-16s %-6s %-8s %-12s %s\n", r.ID, r.Kind, r.State, r.Window, r.Project)
+		if len(r.Footprint) > 0 {
+			fmt.Fprintf(w, "%-16s touches: %s\n", "", strings.Join(r.Footprint, ", "))
+		}
+		if r.State != "idle" && r.State != "working" {
+			continue // gone (or unknown): not a live slot, not counted in the summary
+		}
+		live++
+		if r.State == "idle" {
+			idle++
+		}
+		if len(r.Footprint) > 0 {
+			declared++
+		}
+	}
+	fmt.Fprintf(w, "%d live · %d idle slots · %d with footprints\n", live, idle, declared)
+}
+
+// cmdCheckOverlap reports which live workers a proposed footprint would conflict
+// with, so the manager can plan parallel dispatch without guessing. Footprints are
+// repo-relative, so it always scopes to a concrete repo: --repo, or the repo
+// containing the current directory. It refuses loudly if neither resolves, rather
+// than silently widening to every repo (which would invent cross-repo conflicts).
+func cmdCheckOverlap(args []string) error {
+	footprint, repoFlag, err := checkOverlapArgs(args)
+	if err != nil {
+		return err
+	}
+	scope := repoFlag
+	if scope == "" {
+		scope = "."
+	}
+	repo, err := worktree.RepoRoot(scope)
+	if err != nil {
+		return fmt.Errorf("check-overlap: %s is not inside a git repository; cd into the repo or pass --repo <dir> (footprints are repo-relative)", scope)
+	}
+	renderOverlap(os.Stdout, footprint, mgr().CheckOverlap(repo, footprint))
+	return nil
+}
+
+// checkOverlapArgs parses check-overlap's arguments into the proposed footprint and
+// the --repo flag value. Split from cmdCheckOverlap so the arg handling — paths
+// given comma- or space-separated, and the empty-footprint usage error — is
+// testable without touching the filesystem.
+func checkOverlapArgs(args []string) (footprint []string, repoFlag string, err error) {
+	fs := flag.NewFlagSet("check-overlap", flag.ContinueOnError)
+	rf := fs.String("repo", "", "repo to scope to (default: the repo containing the current directory)")
+	if e := fs.Parse(args); e != nil {
+		return nil, "", e
+	}
+	fp := parseTouches(strings.Join(fs.Args(), ","))
+	if len(fp) == 0 {
+		return nil, "", errors.New(`usage: ttorch check-overlap [--repo dir] "<paths>"   (comma- or space-separated)`)
+	}
+	return fp, *rf, nil
+}
+
+// renderOverlap prints a check-overlap report: a clear "safe to dispatch" line
+// when disjoint, else each conflicting live worker and the overlapping paths.
+func renderOverlap(w io.Writer, footprint []string, conflicts []orchestrator.Conflict) {
+	joined := strings.Join(footprint, ", ")
+	if len(conflicts) == 0 {
+		fmt.Fprintf(w, "no conflicts: %q is disjoint from every live worker — safe to dispatch in parallel\n", joined)
+		return
+	}
+	fmt.Fprintf(w, "%q conflicts with %d live worker(s):\n", joined, len(conflicts))
+	for _, c := range conflicts {
+		fmt.Fprintf(w, "  %s (window %s, %s): %s\n", c.TaskID, c.Window, c.Project, c.OverlapString())
+	}
 }
 
 func cmdPeek(args []string) error {
@@ -1064,8 +1192,14 @@ Team:
     --scout                 investigation only (report, no code changes)
     --init                  set the repo up for ttorch first (AGENTS.md block +
                             CLAUDE.md symlink); otherwise spawn never writes them
+    --touches "a,b"         file paths/prefixes this task will touch; refuses to
+                            dispatch onto files a live worker already holds
+    --force-overlap         dispatch anyway when --touches overlaps a live worker
     --cmd "..."             run a raw command instead of the default harness
-  status                  list active workers
+  status                  list active workers (with footprints + idle-slot summary)
+  check-overlap "<paths>" show which live workers a proposed footprint conflicts
+    [--repo dir]            with, to plan disjoint parallel dispatch (scopes to the
+                            cwd's repo, or --repo)
   peek <id> [lines]       read recent output from a worker
   send <id> <text...>     type a message into a worker (delivered verbatim)
     send <id> -             read the message body from stdin (safe for any chars)

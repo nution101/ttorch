@@ -28,6 +28,13 @@ type Task struct {
 	GatePassed  bool   `json:"gatePassed,omitempty"`  // the adversarial-review verdict passed
 	ApprovedBy  string `json:"approvedBy,omitempty"`  // human | auto (trusted-mode auto-approval)
 	ReviewedSHA string `json:"reviewedSha,omitempty"` // the commit the verdict was recorded against
+	// Footprint is the repo-relative file paths / directory prefixes this task
+	// declares it will touch, set via `ttorch spawn --touches`. It makes "do two
+	// workers overlap?" computable rather than guesswork, so two tasks are never
+	// dispatched onto the same files. Absent (nil) means undeclared: no overlap
+	// enforcement, preserving prior behavior. omitempty + additive, so old records
+	// load to nil and re-save byte-identical.
+	Footprint []string `json:"footprint,omitempty"`
 }
 
 // Manager is the durable record for the manager window, so a restore can rebuild

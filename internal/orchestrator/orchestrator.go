@@ -105,8 +105,26 @@ func (m *Manager) newWindow(window, cwd, label string) error {
 
 // Spawn starts a worker for taskID against the repo containing projectPath. If
 // rawCmd is empty, it launches the detected harness with the task brief; otherwise
-// it runs rawCmd (used for testing and escape hatches).
+// it runs rawCmd (used for testing and escape hatches). It declares no footprint,
+// so it is exempt from overlap enforcement — the back-compat entry point.
 func (m *Manager) Spawn(taskID, projectPath string, scout bool, rawCmd string) (state.Task, error) {
+	return m.SpawnWithFootprint(taskID, projectPath, scout, rawCmd, nil, false)
+}
+
+// SpawnWithFootprint is Spawn plus deterministic overlap prevention: footprint is
+// the repo-relative paths/prefixes the task will touch. When it is non-empty and
+// forceOverlap is false, the spawn is REFUSED if the footprint overlaps any live
+// worker's footprint (in the same repo), naming the conflicting task — so two
+// workers are never dispatched onto the same files. The check runs before any side
+// effect (worktree, window), so a refusal leaves nothing behind. A declared
+// footprint is recorded on the task; an empty footprint enforces nothing.
+//
+// The gate reads the persisted, live worker set and the task's own footprint is
+// saved only after its window comes up, so the no-overlap guarantee holds for
+// serial dispatch (the manager dispatches one worker at a time). This matches the
+// unlocked worktree-pool semantics; two truly concurrent spawns of overlapping
+// footprints are not serialized.
+func (m *Manager) SpawnWithFootprint(taskID, projectPath string, scout bool, rawCmd string, footprint []string, forceOverlap bool) (state.Task, error) {
 	var zero state.Task
 	if err := m.requireTmux(); err != nil {
 		return zero, err
@@ -131,6 +149,15 @@ func (m *Manager) Spawn(taskID, projectPath string, scout bool, rawCmd string) (
 	kind := "ship"
 	if scout {
 		kind = "scout"
+	}
+
+	// Deterministic overlap gate: refuse a dispatch that would put this worker onto
+	// files a live worker already holds. Done before acquiring any resource so a
+	// refusal has no side effects; --force-overlap is the explicit manager override.
+	if len(footprint) > 0 && !forceOverlap {
+		if conflicts := m.CheckOverlap(repo, footprint); len(conflicts) > 0 {
+			return zero, ConflictError(footprint, conflicts)
+		}
 	}
 
 	wt, err := m.Pool.Acquire(repo, m.inUseWorktrees(repo))
@@ -200,6 +227,7 @@ func (m *Manager) Spawn(taskID, projectPath string, scout bool, rawCmd string) (
 	t := state.Task{
 		ID: taskID, Window: window, Worktree: wt, Project: repo,
 		Harness: h, Kind: kind, Created: time.Now(), SessionID: sid,
+		Footprint: footprint,
 	}
 	if err := m.Store.Save(t); err != nil {
 		// The worker is live by now (waitForLaunch confirmed it), so a failed save would
