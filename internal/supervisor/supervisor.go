@@ -3,6 +3,12 @@
 // the manager drains. Running as a daemon (vs a one-shot) lets it hold cadence in
 // memory and react quickly; durability lives in the wake-queue file, so a restart
 // never loses an event.
+//
+// On an actionable event (a worker turn-end, an idle/stalled worker, or a merged
+// PR) — and on the periodic heartbeat as a backstop — it also pokes the manager
+// window so the queue is actually drained. Without that poke the manager is dead
+// between turns: it has no way to learn a worker went idle. The supervisor only
+// pokes; the manager still drains and acts on its own turn.
 package supervisor
 
 import (
@@ -28,13 +34,14 @@ import (
 
 // Config tunes the polling cadence.
 type Config struct {
-	Poll      time.Duration
-	Heartbeat time.Duration
+	Poll         time.Duration
+	Heartbeat    time.Duration
+	PokeCooldown time.Duration // minimum interval between manager pokes (debounce)
 }
 
 // DefaultConfig returns sensible defaults (override via env in a later milestone).
 func DefaultConfig() Config {
-	return Config{Poll: 5 * time.Second, Heartbeat: 10 * time.Minute}
+	return Config{Poll: 5 * time.Second, Heartbeat: 10 * time.Minute, PokeCooldown: 25 * time.Second}
 }
 
 // Supervisor watches a tmux session's workers and emits wakes.
@@ -53,12 +60,22 @@ type Supervisor struct {
 	checked       map[string]bool // task id -> PR-merge already reported
 	checkEvery    time.Duration
 	now           func() time.Time
-	lock          *os.File // held while this process owns the singleton (nil otherwise)
+
+	// Auto-driver: deliver actionable wakes to the manager window so it actually
+	// takes a turn and drains the queue. pokePending coalesces a burst of events
+	// into one poke; lastPoke debounces. The two seams reach real tmux in
+	// production and are swapped out in tests.
+	lastPoke       time.Time
+	pokePending    bool
+	sendPoke       func() error             // deliver one poke to the manager window
+	inspectManager func() (live, busy bool) // is a manager window present, and is it mid-generation?
+
+	lock *os.File // held while this process owns the singleton (nil otherwise)
 }
 
 // New builds a Supervisor using the standard layout.
 func New(p paths.Paths) *Supervisor {
-	return &Supervisor{
+	s := &Supervisor{
 		P:             p,
 		Session:       tmux.SessionName(),
 		Store:         state.Store{Dir: p.StateDir()},
@@ -73,6 +90,23 @@ func New(p paths.Paths) *Supervisor {
 		checkEvery:    60 * time.Second,
 		now:           time.Now,
 	}
+	// Default auto-driver seams drive the real manager window via tmux, reusing the
+	// shared helpers. Tests override them to count pokes and simulate the manager's
+	// presence/busy state without a live tmux.
+	s.sendPoke = func() error { return tmux.SendLine(s.Session, managerWindow, pokeDirective) }
+	s.inspectManager = func() (live, busy bool) {
+		if !tmux.Available() || !tmux.WindowExists(s.Session, managerWindow) {
+			return false, false
+		}
+		out, err := tmux.CapturePane(s.Session, managerWindow, 6)
+		if err != nil {
+			// Can't read the pane: assume busy so we wait for a clean idle window
+			// rather than risk interrupting a generating manager.
+			return true, true
+		}
+		return true, Busy(out)
+	}
+	return s
 }
 
 // Run owns the supervisor process until ctx is cancelled.
@@ -136,6 +170,7 @@ func (s *Supervisor) tick() {
 	s.scanStale()
 	s.scanChecks()
 	s.heartbeat()
+	s.flushPoke() // retry any poke the guards deferred (manager was busy / within cooldown)
 }
 
 // scanChecks polls armed PR checks (rate-limited) and emits a wake when a task's
@@ -160,6 +195,7 @@ func (s *Supervisor) scanChecks() {
 		if strings.TrimSpace(string(out)) == "MERGED" {
 			_ = s.Q.Append("check", t.ID, "PR merged: "+t.PR)
 			s.checked[t.ID] = true
+			s.requestPoke() // a PR merged — actionable
 		}
 	}
 }
@@ -182,6 +218,11 @@ func (s *Supervisor) scanSignals() {
 			s.seen[name] = mt
 			id := strings.TrimSuffix(strings.TrimSuffix(name, ".turn-ended"), ".status")
 			_ = s.Q.Append("signal", id, name)
+			// A turn boundary means a worker just went idle — actionable, so drive the
+			// manager. A bare ".status" write is not a turn end and never pokes.
+			if strings.HasSuffix(name, ".turn-ended") {
+				s.requestPoke()
+			}
 		}
 	}
 }
@@ -211,6 +252,7 @@ func (s *Supervisor) scanStale() {
 			s.staleCount[task.ID]++
 			if s.staleCount[task.ID] == 2 {
 				_ = s.Q.Append("stale", task.ID, task.Window)
+				s.requestPoke() // a worker went idle — actionable
 			}
 		} else {
 			s.paneHash[task.ID] = h
@@ -224,7 +266,67 @@ func (s *Supervisor) heartbeat() {
 	if s.now().Sub(s.lastHeartbeat) >= s.Cfg.Heartbeat {
 		_ = s.Q.Append("heartbeat", "", "")
 		s.lastHeartbeat = s.now()
+		s.requestPoke() // backstop: drive the manager even if an event was missed (same debounce)
 	}
+}
+
+// managerWindow is the tmux window name the manager session runs in (created by the
+// orchestrator). The auto-driver pokes this window.
+const managerWindow = "manager"
+
+// pokeDirective is the one-line instruction the auto-driver types into the manager
+// window when a worker goes idle/finished/merged (or the heartbeat fires). It tells
+// the manager to take its turn; the manager — not the supervisor — drains the
+// wake-queue and advances the backlog.
+const pokeDirective = "ttorch wake: a worker is idle/finished/merged — run ttorch status, drain wakes, advance the backlog (land/answer/dispatch)."
+
+// autodriveDisabled reports whether the operator opted out of auto-driving the
+// manager (TTORCH_NO_AUTODRIVE). When set, the supervisor still queues wakes; it
+// just never pokes, leaving the manager to be driven by hand.
+func autodriveDisabled() bool { return os.Getenv("TTORCH_NO_AUTODRIVE") != "" }
+
+// requestPoke records that the manager owes a turn (a worker went idle/finished/
+// merged, or the heartbeat fired) and tries to deliver the poke immediately. A poke
+// the guards defer (within the cooldown, or the manager busy) stays pending and is
+// retried by flushPoke on the next tick, so a burst of events collapses into one
+// poke once the manager is idle.
+func (s *Supervisor) requestPoke() {
+	if autodriveDisabled() {
+		return
+	}
+	s.pokePending = true
+	s.flushPoke()
+}
+
+// flushPoke delivers a pending poke when every guard allows it: auto-driving is on,
+// the cooldown since the last poke has elapsed (debounce), a manager window exists,
+// and it is idle — never interrupt a generating manager (reuses Busy). It is
+// best-effort: a send-keys failure leaves the poke pending for the next tick and is
+// never propagated, so a tmux hiccup can't crash the supervisor. pokePending is
+// cleared only on a successful send, which is what coalesces a burst into one poke.
+func (s *Supervisor) flushPoke() {
+	if autodriveDisabled() {
+		s.pokePending = false
+		return
+	}
+	if !s.pokePending {
+		return
+	}
+	if s.now().Sub(s.lastPoke) < s.Cfg.PokeCooldown {
+		return // debounce: within the cooldown, stay pending
+	}
+	live, busy := s.inspectManager()
+	if !live {
+		return // no manager to wake yet; stay pending in case one appears
+	}
+	if busy {
+		return // mid-generation; coalesce and wait for an idle window
+	}
+	if err := s.sendPoke(); err != nil {
+		return // best-effort; stay pending and retry next tick
+	}
+	s.lastPoke = s.now()
+	s.pokePending = false
 }
 
 func (s *Supervisor) beat() { _ = touch(s.P.Beacon()) }
