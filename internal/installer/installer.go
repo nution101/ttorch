@@ -55,6 +55,16 @@ func Apply(content fs.FS, p paths.Paths, version string) (*Result, error) {
 		res.Notes = append(res.Notes, note)
 		res.Notes = append(res.Notes, ensureSymlink(p.GlobalClaudeMD(), "AGENTS.md"))
 	}
+
+	// Merge the ttorch-managed block into the global settings file (clobber-safe,
+	// idempotent). A malformed settings.json is reported, never overwritten.
+	note, err := applyGlobalSettings(p)
+	if err != nil {
+		return nil, err
+	}
+	if note != "" {
+		res.Notes = append(res.Notes, note)
+	}
 	return res, nil
 }
 
@@ -133,6 +143,13 @@ func Uninstall(p paths.Paths, purge bool) (*Result, error) {
 
 	res.Notes = append(res.Notes, stripAgentsBlock(p.GlobalAgentsMD()))
 	removeSymlinkIfManaged(p.GlobalClaudeMD())
+	// Strip only the keys ttorch added to the global settings file; developer keys
+	// (and any leaf they changed) stay. Best-effort: never fail uninstall over it.
+	if note, err := removeGlobalSettings(p); err != nil {
+		res.Notes = append(res.Notes, "global settings: "+err.Error())
+	} else if note != "" {
+		res.Notes = append(res.Notes, note)
+	}
 	_ = os.Remove(p.ManifestFile())
 	_ = os.Remove(p.ManifestFile() + ".bak")
 	_ = os.Remove(p.VersionFile())

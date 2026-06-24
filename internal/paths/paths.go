@@ -126,3 +126,22 @@ func (p Paths) GlobalAgentsMD() string { return filepath.Join(p.Claude, "AGENTS.
 
 // GlobalClaudeMD is the symlink target name (-> AGENTS.md).
 func (p Paths) GlobalClaudeMD() string { return filepath.Join(p.Claude, "CLAUDE.md") }
+
+// GlobalSettingsFile is Claude Code's global settings file. ttorch merges a
+// ttorch-owned block of keys/hooks into it in place (clobber-safe), never parking
+// it as a side-file because it is a shared live file other tools also write.
+func (p Paths) GlobalSettingsFile() string { return filepath.Join(p.Claude, "settings.json") }
+
+// GlobalSettingsBackup is the one-time snapshot ttorch writes before its first
+// modification of GlobalSettingsFile, so the developer's original is recoverable.
+func (p Paths) GlobalSettingsBackup() string {
+	return filepath.Join(p.Claude, "settings.json.ttorch-backup")
+}
+
+// GlobalSettingsLedger records which leaves of GlobalSettingsFile ttorch owns (and
+// the exact value it wrote), so updates upgrade only ttorch-owned keys and uninstall
+// removes only them — developer-set keys are never touched. It is ttorch state, so
+// it lives under ~/.ttorch and is never part of the content manifest.
+func (p Paths) GlobalSettingsLedger() string {
+	return filepath.Join(p.Home, "global-settings-ledger.json")
+}
