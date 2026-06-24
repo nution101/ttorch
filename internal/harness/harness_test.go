@@ -154,6 +154,25 @@ func TestWriteManagerCharter(t *testing.T) {
 	}
 }
 
+// TestManagerCharterTrustedCarveOut guards the two encodings of the manager protocol
+// against drift: the launch-time charter const must carry the same trusted-mode
+// carve-out the ttorch-manager skill documents (the lead-approval rule with its one
+// trusted-mode exception), so a manager launched from either source behaves the same.
+func TestManagerCharterTrustedCarveOut(t *testing.T) {
+	// The lead-approval rule must stay verbatim — it is the load-bearing sentence.
+	if !strings.Contains(managerCharter, "Never merge or deliver without the lead's explicit approval") {
+		t.Errorf("managerCharter dropped the lead-approval rule")
+	}
+	// ...and it must carry the trusted-mode carve-out + its mechanism, framed as a narrow
+	// exception (case-insensitive: the charter may emphasize TRUSTED in caps).
+	lower := strings.ToLower(managerCharter)
+	for _, want := range []string{"trusted", "exception", "ttorch trust", "ttorch-review"} {
+		if !strings.Contains(lower, want) {
+			t.Errorf("managerCharter is missing %q — keep it in sync with the ttorch-manager skill", want)
+		}
+	}
+}
+
 func TestBriefCommandCarriesSessionID(t *testing.T) {
 	t.Setenv("TTORCH_EFFORT", "off")
 	cmd := BriefCommand("claude", "/tmp/b.md", "wk-sid")
