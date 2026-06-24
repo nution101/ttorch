@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -25,25 +26,48 @@ import (
 )
 
 // noGlobalHooksEnv opts out of global settings/hook management entirely, in line
-// with the other TTORCH_NO_* opt-outs (autotrust, supervisor, autoinit).
+// with the other TTORCH_NO_* opt-outs (autotrust, supervisor, autoinit). It is an
+// install-time switch: set it and ttorch neither merges nor removes any settings.
 const noGlobalHooksEnv = "TTORCH_NO_GLOBAL_HOOKS"
+
+// promptReminderScript is the shipped UserPromptSubmit hook (see content/hooks).
+// The manifest engine installs it into p.ClaudeHooks(); the global settings entry
+// below references it by absolute path. The script itself honors a separate
+// runtime opt-out (TTORCH_NO_PROMPT_REMINDERS) so a developer can silence it for a
+// session without uninstalling.
+const promptReminderScript = "prompt-reminders.sh"
 
 // managedGlobalSettings is the ttorch-owned block merged into the global settings
 // file. The merge is generic: it installs whatever appears here, at leaf
-// granularity, leaving every other key untouched. This default is intentionally
-// minimal — one representative scalar plus a placeholder hooks namespace so the
-// mechanism is exercised against a nested (object + array) value, not just scalars.
-// The real hook commands are authored in a separate task and merged through this
-// same path; nothing dangerous is wired here.
-func managedGlobalSettings() map[string]any {
+// granularity, leaving every other key untouched. Arrays are treated as single
+// leaves (owned and upgraded whole), so the UserPromptSubmit entry below is
+// claimed wholesale — and if a developer already has their own UserPromptSubmit
+// array, ttorch defers to it and installs nothing there.
+//
+// The hook command invokes the interpreter explicitly (`sh '<path>'`) rather than
+// relying on an executable bit, because the manifest engine writes content files
+// 0644. The path is absolute and resolved at apply time, so it is stable per
+// machine and the merge stays idempotent.
+func managedGlobalSettings(p paths.Paths) map[string]any {
+	hookCommand := "sh " + shellSingleQuote(filepath.Join(p.ClaudeHooks(), promptReminderScript))
 	return map[string]any{
 		// Keep AI co-author trailers out of every Claude session globally (the
 		// repo's no-AI-authorship convention), not only inside worker worktrees.
 		"includeCoAuthoredBy": false,
-		// Placeholder hooks namespace: proves the merge handles a structured value.
-		// Real hook entries replace the empty array in the dedicated hook-content task.
+		// A safe, advisory UserPromptSubmit hook: it surfaces cautions for
+		// destructive command patterns and generic engineering reminders. It never
+		// blocks (always exits 0). UserPromptSubmit takes no matcher.
 		"hooks": map[string]any{
-			"SessionStart": []any{},
+			"UserPromptSubmit": []any{
+				map[string]any{
+					"hooks": []any{
+						map[string]any{
+							"type":    "command",
+							"command": hookCommand,
+						},
+					},
+				},
+			},
 		},
 	}
 }
@@ -75,6 +99,14 @@ func loadSettingsLedger(path string) settingsLedger {
 	var l settingsLedger
 	if b, err := os.ReadFile(path); err == nil {
 		_ = json.Unmarshal(b, &l)
+	}
+	// Normalize recorded values to compact canonical JSON. The ledger file is saved
+	// with MarshalIndent, which re-indents structured (object/array) values; without
+	// this, a nested leaf's recorded bytes would never byte-equal the compact
+	// canonJSON(live) used in every ownership comparison, so ttorch would fail to
+	// recognize — and thus to upgrade or remove — its own structured entries.
+	for i := range l.Entries {
+		l.Entries[i].Value = canonRaw(l.Entries[i].Value)
 	}
 	return l
 }
@@ -125,7 +157,7 @@ func applyGlobalSettings(p paths.Paths) (string, error) {
 
 	old := loadSettingsLedger(p.GlobalSettingsLedger())
 	next := settingsLedger{}
-	managed := managedGlobalSettings()
+	managed := managedGlobalSettings(p)
 
 	changed := mergeManaged(settings, managed, nil, old, &next)
 
@@ -401,3 +433,26 @@ func canonJSON(v any) json.RawMessage {
 }
 
 func jsonEqual(a, b json.RawMessage) bool { return bytes.Equal(a, b) }
+
+// shellSingleQuote wraps s in single quotes for safe use in a POSIX shell command,
+// escaping any embedded single quote via the standard close-quote/escaped-quote/
+// reopen-quote idiom. This keeps the hook command correct even when the install
+// path contains a space or an apostrophe (e.g. /Users/o'brien/.claude/hooks).
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// canonRaw recompacts an already-encoded JSON value into the same canonical
+// (sorted-key, unindented) form canonJSON produces, so a value the ledger stored
+// indented still compares byte-equal to a freshly marshaled live value. A value
+// that fails to parse is returned unchanged.
+func canonRaw(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return raw
+	}
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return raw
+	}
+	return canonJSON(v)
+}

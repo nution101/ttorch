@@ -27,6 +27,7 @@ func content(skill string) fstest.MapFS {
 		"content/skills/ttorch-manager/SKILL.md": {Data: []byte(skill)},
 		"content/agents/ttorch-worker.md":        {Data: []byte("worker")},
 		"content/commands/ttorch.md":             {Data: []byte("cmd")},
+		"content/hooks/prompt-reminders.sh":      {Data: []byte("#!/bin/sh\nexit 0\n")},
 		"content/assets/AGENTS.global.md":        {Data: []byte("GLOBAL GUIDANCE")},
 	}
 }
@@ -77,6 +78,24 @@ func TestApply_LaysDownDualMirrorAndGuidance(t *testing.T) {
 	}
 	if res.Report.Count(manifest.Unchanged) == 0 {
 		t.Fatal("expected unchanged files on idempotent re-apply")
+	}
+}
+
+func TestApply_InstallsAndRemovesHookScript(t *testing.T) {
+	p := sandbox(t)
+	if _, err := Apply(content("skill-v1"), p, "0.1.0"); err != nil {
+		t.Fatal(err)
+	}
+	hookPath := filepath.Join(p.ClaudeHooks(), "prompt-reminders.sh")
+	if read(t, hookPath) != "#!/bin/sh\nexit 0\n" {
+		t.Fatalf("hook script not installed under %s", p.ClaudeHooks())
+	}
+
+	if _, err := Uninstall(p, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(hookPath); !os.IsNotExist(err) {
+		t.Fatalf("hook script not removed on uninstall: %v", err)
 	}
 }
 
