@@ -29,9 +29,12 @@ repo's own build/test/lint — enforced in Go at the merge point, not by convent
 ## Protocol
 
 1. **Prepare inputs.** `ttorch trust prep <id>` materializes, into the task's review
-   inputs dir (the path it prints): `diff.patch` (changes vs the default branch),
-   `brief.md` (the task brief, if any), `validate.json` (a fresh build/test/lint run),
-   and `head.txt` (the reviewed commit). This step enforces nothing.
+   inputs dir (the path it prints): `diff.patch` (the **committed** diff vs the default
+   branch), `brief.md` (the task brief, if any), `validate.json` (a fresh validate of the
+   committed commit), and `head.txt` (the reviewed commit). It **refuses a dirty
+   worktree** and reads only committed objects, so the reviewers see exactly the commit
+   that will fast-forward — a worker cannot show a benign working tree while a different
+   commit merges. Commit (or discard) all changes before prep.
 
 2. **Fan out three reviewers — in parallel, one per dimension.** Dispatch the
    `ttorch-reviewer-correctness`, `ttorch-reviewer-scope`, and `ttorch-reviewer-security`

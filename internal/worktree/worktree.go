@@ -255,11 +255,11 @@ func ShowFile(repo, ref, repoPath string) (string, bool) {
 	return string(out), true
 }
 
-// ChangedFiles returns the repo-relative paths a worktree changes against base
-// (`git diff --name-only base`). Used to detect when a worker's diff touches the trust
-// gate's own definition files.
-func ChangedFiles(path, base string) ([]string, error) {
-	out, err := git("-C", path, "diff", "--name-only", base)
+// ChangedFiles returns the repo-relative paths changed between base and the COMMITTED
+// rev (`git diff --name-only base rev`) — committed objects, never the working tree.
+// Used to detect when a worker's committed diff touches the trust gate's definition.
+func ChangedFiles(path, base, rev string) ([]string, error) {
+	out, err := git("-C", path, "diff", "--name-only", base, rev)
 	if err != nil {
 		return nil, err
 	}
@@ -268,6 +268,29 @@ func ChangedFiles(path, base string) ([]string, error) {
 		return nil, nil
 	}
 	return strings.Split(out, "\n"), nil
+}
+
+// DiffCommitted returns the diff between base and a COMMITTED rev (`git diff base rev`),
+// i.e. the changes in the committed object — NOT the working tree. The trust gate shows
+// reviewers this so a worker cannot present a benign working tree while a different
+// commit is what actually fast-forwards.
+func DiffCommitted(path, base, rev string) (string, error) {
+	return git("-C", path, "diff", base, rev)
+}
+
+// AddDetached creates a temporary linked worktree at dir checked out (detached) to rev,
+// materializing exactly that committed tree in isolation from any live worktree, so it
+// can be validated free of mutation by a running worker. The caller must RemoveWorktree
+// it when done. dir must not already exist.
+func AddDetached(repo, dir, rev string) error {
+	_, err := git("-C", repo, "worktree", "add", "--detach", dir, rev)
+	return err
+}
+
+// RemoveWorktree removes a linked worktree created by AddDetached.
+func RemoveWorktree(repo, dir string) error {
+	_, err := git("-C", repo, "worktree", "remove", "--force", dir)
+	return err
 }
 
 // Diff returns the diff of a worktree against base (working tree vs base ref).

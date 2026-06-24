@@ -989,6 +989,118 @@ func TestMergeLocal_TrustedAbortsWhenAuditUnwritable(t *testing.T) {
 	_, _ = m.Teardown("af1", true)
 }
 
+// TestTrustPrep_CommittedDiffDefeatsBenignWorktreeAttack is the headline guard for the
+// reviewed-state == committed-state invariant. A worker commits a malicious HEAD, then
+// reverts those bytes in the WORKING TREE so a worktree-vs-base diff would look benign.
+// Prep must refuse the dirty worktree; and once clean, the reviewers' diff is the
+// COMMITTED diff, which still exposes the malicious change — there is nowhere to hide it.
+func TestTrustPrep_CommittedDiffDefeatsBenignWorktreeAttack(t *testing.T) {
+	m, repo := deliveryHarness(t, "hideattack")
+	task, err := m.Spawn("ha1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := task.Worktree
+	// A malicious COMMITTED head.
+	if err := os.WriteFile(filepath.Join(wt, "payload.txt"), []byte("MALICIOUS\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, wt, "add", "-A")
+	gitIn(t, wt, "commit", "-q", "-m", "looks innocent")
+	// Revert the bytes in the working tree so a working-tree-vs-base diff shows nothing.
+	if err := os.Remove(filepath.Join(wt, "payload.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Prep refuses: reviewed state must equal the committed state that merges.
+	if _, err := m.TrustPrep("ha1"); err == nil {
+		t.Fatal("prep must refuse a dirty worktree so reviewers cannot be shown a benign tree while a malicious commit merges")
+	}
+
+	// Restore the worktree to match HEAD (clean again). The committed diff still exposes
+	// the malicious change.
+	gitIn(t, wt, "checkout", "--", ".")
+	dir, err := m.TrustPrep("ha1")
+	if err != nil {
+		t.Fatalf("prep on a clean worktree should succeed: %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "diff.patch")); !strings.Contains(string(b), "MALICIOUS") {
+		t.Fatalf("the reviewers' diff must be the committed diff exposing the change, got: %s", b)
+	}
+	_, _ = m.Teardown("ha1", true)
+}
+
+// TestMergeLocal_GateRefusesDirtyWorktreeAtMerge: even after an auto-mint, a live worker
+// that dirties the worktree before the merge is refused at the gate (defense in depth on
+// top of committed-object validation), and the refusal leaves the approval intact.
+func TestMergeLocal_GateRefusesDirtyWorktreeAtMerge(t *testing.T) {
+	m, repo := deliveryHarness(t, "dirtymerge")
+	commitGateScript(t, repo, "exit 0")
+	if _, err := projectinit.Init(repo, "trusted"); err != nil {
+		t.Fatal(err)
+	}
+	task, err := m.Spawn("dm1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := task.Worktree
+	head := commitFeature(t, wt, "feature.txt", "new\n")
+	writeReviewReports(t, m.P.ReviewInputsDir("dm1"), head, nil)
+	if _, err := m.TrustRecord("dm1", "", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if !approval.Valid(m.P.ApprovalFile("dm1")) {
+		t.Fatal("expected an auto-mint over the clean, green worktree")
+	}
+	// A live worker dirties the worktree after review.
+	if err := os.WriteFile(filepath.Join(wt, "scratch.txt"), []byte("uncommitted\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err = m.MergeLocal("dm1", false)
+	if err == nil {
+		t.Fatal("a gated merge must refuse a dirty worktree")
+	}
+	if !strings.Contains(err.Error(), "not clean") {
+		t.Fatalf("expected a not-clean refusal, got: %v", err)
+	}
+	if !approval.Valid(m.P.ApprovalFile("dm1")) {
+		t.Fatal("a recoverable refusal must not consume the approval")
+	}
+	_, _ = m.Teardown("dm1", true)
+}
+
+// TestMergeLocal_GateRefusesLegacyBareToken: a gated merge must fail closed on an approval
+// token that carries no provenance (a legacy bare-sha token), because such a merge cannot
+// be attributed (human vs auto) in the audit.
+func TestMergeLocal_GateRefusesLegacyBareToken(t *testing.T) {
+	m, repo := deliveryHarness(t, "baretoken")
+	commitGateScript(t, repo, "exit 0")
+	task, err := m.Spawn("lt1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := commitFeature(t, task.Worktree, "feature.txt", "new\n")
+	writeReviewReports(t, m.P.ReviewInputsDir("lt1"), head, nil)
+	if _, err := m.TrustRecord("lt1", "", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	// A legacy approval token carrying only a bare sha (no "human "/"auto " prefix).
+	if err := approval.Grant(m.P.ApprovalFile("lt1"), time.Minute, head); err != nil {
+		t.Fatal(err)
+	}
+	_, err = m.MergeLocal("lt1", true) // --require-verdict
+	if err == nil {
+		t.Fatal("a gated merge must fail closed on a token with no recorded provenance")
+	}
+	if !strings.Contains(err.Error(), "provenance") {
+		t.Fatalf("expected a provenance refusal, got: %v", err)
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") == head {
+		t.Fatal("the unattributable merge must not have happened")
+	}
+	_, _ = m.Teardown("lt1", true)
+}
+
 func TestTrustRecord_TrustedBlocksHighFinding(t *testing.T) {
 	m, repo := deliveryHarness(t, "trustblock")
 	task, err := m.Spawn("tb1", repo, false, "sleep 60")
