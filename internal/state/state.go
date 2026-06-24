@@ -22,6 +22,12 @@ type Task struct {
 	Created   time.Time `json:"created"`
 	PR        string    `json:"pr,omitempty"`
 	SessionID string    `json:"sessionId,omitempty"` // stable harness session id for resume
+	// Delivery provenance, so a merge no human read can be reconstructed from state.
+	// All omitempty and additive: old records load to zero values and re-save
+	// byte-identical.
+	GatePassed  bool   `json:"gatePassed,omitempty"`  // the adversarial-review verdict passed
+	ApprovedBy  string `json:"approvedBy,omitempty"`  // human | auto (trusted-mode auto-approval)
+	ReviewedSHA string `json:"reviewedSha,omitempty"` // the commit the verdict was recorded against
 }
 
 // Manager is the durable record for the manager window, so a restore can rebuild

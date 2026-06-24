@@ -244,7 +244,7 @@ func cmdSkills(args []string) error {
 
 func cmdInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
-	mode := fs.String("mode", "pr", "delivery mode for this repo: pr | local | validated")
+	mode := fs.String("mode", "pr", "delivery mode for this repo: pr | local | validated | trusted")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
