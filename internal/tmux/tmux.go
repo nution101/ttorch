@@ -103,16 +103,25 @@ func ListWindows(session string) ([]string, error) {
 
 // WindowExists reports whether a named window exists in the session.
 func WindowExists(session, window string) bool {
+	exists, _ := WindowExistsErr(session, window)
+	return exists
+}
+
+// WindowExistsErr reports whether a named window exists, distinguishing a window that
+// is genuinely absent (false, nil) from a tmux read that failed (false, err). Callers
+// that must not treat a transient `tmux list-windows` hiccup as "the window is gone"
+// (e.g. Spawn's readiness wait) use this instead of WindowExists.
+func WindowExistsErr(session, window string) (bool, error) {
 	ws, err := ListWindows(session)
 	if err != nil {
-		return false
+		return false, err
 	}
 	for _, w := range ws {
 		if w == window {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // NewWindow creates a detached window with the given working directory. The
@@ -166,6 +175,19 @@ func SendKey(session, window, key string) error {
 // CapturePane returns the last n lines of a window's pane.
 func CapturePane(session, window string, n int) (string, error) {
 	return run("capture-pane", "-p", "-t", target(session, window), "-S", "-"+strconv.Itoa(n))
+}
+
+// PaneCurrentCommand returns the command name of the process in the foreground of a
+// window's pane (tmux's #{pane_current_command}) — e.g. "zsh" while the window is
+// still a bare shell, and "claude"/"node" once a harness has taken over. It returns
+// "" if the window or pane cannot be read (e.g. the window has already exited). Spawn
+// polls this to tell when a launched worker command is actually up before returning.
+func PaneCurrentCommand(session, window string) string {
+	out, err := run("display-message", "-p", "-t", target(session, window), "#{pane_current_command}")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
 }
 
 // PanePID returns the PID of the process running in a window's pane, or 0.

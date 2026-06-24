@@ -191,6 +191,137 @@ func TestRebaseCleanAndConflictAbort(t *testing.T) {
 	}
 }
 
+// TestStartBranch_FreshOffDefaultDiscardsPrior proves a reused slot is rebased onto a
+// fresh task branch cut from the up-to-date (fetched) default tip, with the prior
+// task's branch and commit gone but untracked build caches preserved.
+func TestStartBranch_FreshOffDefaultDiscardsPrior(t *testing.T) {
+	repo := makeRepo(t)
+	def := DefaultBranch(repo)
+
+	// Give the repo an origin so StartBranch exercises the fetch + origin/<def> path.
+	bare := t.TempDir()
+	gitT(t, bare, "init", "--bare", "-q")
+	gitT(t, repo, "remote", "add", "origin", bare)
+	gitT(t, repo, "push", "-q", "origin", def)
+
+	p := Pool{Root: t.TempDir(), Max: 4}
+	slot, err := p.Acquire(repo, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A prior task left the slot on a stale branch carrying its own commit + file.
+	gitT(t, slot, "checkout", "-q", "-B", "stale/prev")
+	if err := os.WriteFile(filepath.Join(slot, "stale.txt"), []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, slot, "add", "-A")
+	gitT(t, slot, "commit", "-q", "-m", "prior task work")
+	// An untracked build cache should survive the fresh start.
+	cache := filepath.Join(slot, "cache_marker")
+	if err := os.WriteFile(cache, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The default branch advances on the remote — what a new worker should start from.
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("advanced\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, repo, "add", "-A")
+	gitT(t, repo, "commit", "-q", "-m", "default advanced")
+	gitT(t, repo, "push", "-q", "origin", def)
+	wantTip := gitT(t, bare, "rev-parse", "refs/heads/"+def)
+
+	if err := StartBranch(repo, slot, "ttorch/new"); err != nil {
+		t.Fatalf("StartBranch: %v", err)
+	}
+
+	if br := gitT(t, slot, "rev-parse", "--abbrev-ref", "HEAD"); br != "ttorch/new" {
+		t.Fatalf("slot should be on the fresh branch, got %q", br)
+	}
+	if got := gitT(t, slot, "rev-parse", "HEAD"); got != wantTip {
+		t.Fatalf("fresh branch should start at the fetched default tip %s, got %s", wantTip, got)
+	}
+	if _, err := os.Stat(filepath.Join(slot, "stale.txt")); !os.IsNotExist(err) {
+		t.Fatal("the prior task's tracked file must be gone after a fresh start")
+	}
+	if tracked, _ := HasTrackedChanges(slot); tracked {
+		t.Fatal("the slot's tracked tree must be clean after a fresh start")
+	}
+	if _, err := os.Stat(cache); err != nil {
+		t.Fatal("an untracked build cache must survive a fresh start")
+	}
+}
+
+// TestRelease_DetachesAndDropsTaskBranch proves a released slot is parked detached
+// and its per-task branch is deleted, so a later spawn can (re)create that branch in a
+// DIFFERENT slot without colliding with a stale checkout, and a fresh branch cut off
+// origin/<default> does not carry origin as its upstream.
+func TestRelease_DetachesAndDropsTaskBranch(t *testing.T) {
+	repo := makeRepo(t)
+	def := DefaultBranch(repo)
+	bare := t.TempDir()
+	gitT(t, bare, "init", "--bare", "-q")
+	gitT(t, repo, "remote", "add", "origin", bare)
+	gitT(t, repo, "push", "-q", "origin", def)
+
+	p := Pool{Root: t.TempDir(), Max: 4}
+	slot, err := p.Acquire(repo, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := StartBranch(repo, slot, "ttorch/t1"); err != nil {
+		t.Fatalf("StartBranch: %v", err)
+	}
+	// A fresh branch cut off origin/<default> must not adopt origin/<default> upstream:
+	// resolving its upstream must fail (no upstream configured).
+	if _, err := git("-C", slot, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "ttorch/t1@{u}"); err == nil {
+		t.Fatal("task branch should have no upstream after --no-track")
+	}
+
+	if err := p.Release(repo, slot); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if br := gitT(t, slot, "rev-parse", "--abbrev-ref", "HEAD"); br != "HEAD" {
+		t.Fatalf("released slot should be detached, got branch %q", br)
+	}
+	if RefExists(repo, "refs/heads/ttorch/t1") {
+		t.Fatal("the per-task branch must be deleted when the slot is released")
+	}
+	// With the prior slot no longer pinning ttorch/t1, a DIFFERENT slot can take it.
+	other, err := p.Acquire(repo, []string{slot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other == slot {
+		t.Fatal("expected a distinct slot for this part of the test")
+	}
+	if err := StartBranch(repo, other, "ttorch/t1"); err != nil {
+		t.Fatalf("re-creating ttorch/t1 in another slot must succeed after release: %v", err)
+	}
+}
+
+// TestStartBranch_NoRemoteUsesLocalDefault confirms a remote-less repo cuts the fresh
+// branch from its local default branch (no fetch required).
+func TestStartBranch_NoRemoteUsesLocalDefault(t *testing.T) {
+	repo := makeRepo(t)
+	def := DefaultBranch(repo)
+	p := Pool{Root: t.TempDir(), Max: 4}
+	slot, err := p.Acquire(repo, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := StartBranch(repo, slot, "ttorch/x"); err != nil {
+		t.Fatalf("StartBranch: %v", err)
+	}
+	if br := gitT(t, slot, "rev-parse", "--abbrev-ref", "HEAD"); br != "ttorch/x" {
+		t.Fatalf("slot should be on the fresh branch, got %q", br)
+	}
+	if got, want := gitT(t, slot, "rev-parse", "HEAD"), gitT(t, repo, "rev-parse", def); got != want {
+		t.Fatalf("fresh branch should start at the local default tip %s, got %s", want, got)
+	}
+}
+
 func TestPool_KeepsUntrackedCachesOnReuse(t *testing.T) {
 	repo := makeRepo(t)
 	p := Pool{Root: t.TempDir(), Max: 4}

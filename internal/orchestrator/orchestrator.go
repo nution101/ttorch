@@ -137,10 +137,20 @@ func (m *Manager) Spawn(taskID, projectPath string, scout bool, rawCmd string) (
 	if err != nil {
 		return zero, err
 	}
+	// A pooled worktree may be handed back still on a prior task's (often already
+	// merged) branch; start every worker on a FRESH branch cut from the up-to-date
+	// default branch with a clean tree so it never inherits a previous task's branch
+	// or state. Release the slot on failure so a bad start does not leak it.
+	if err := worktree.StartBranch(repo, wt, taskBranch(taskID)); err != nil {
+		_ = m.Pool.Release(repo, wt)
+		return zero, fmt.Errorf("spawn %q: preparing a fresh task branch: %w", taskID, err)
+	}
 	if err := tmux.EnsureSession(m.Session); err != nil {
+		_ = m.Pool.Release(repo, wt)
 		return zero, err
 	}
 	if err := m.newWindow(window, wt, windowLabel(kind, taskID)); err != nil {
+		_ = m.Pool.Release(repo, wt)
 		return zero, err
 	}
 
@@ -155,6 +165,7 @@ func (m *Manager) Spawn(taskID, projectPath string, scout bool, rawCmd string) (
 	// background supervisor is up so this worker's turn boundaries and idle become
 	// wakes the manager is told about.
 	m.ensureSupervisor()
+	harnessLaunch := rawCmd == ""
 	cmd := rawCmd
 	if cmd == "" {
 		brief := m.P.BriefPath(taskID)
@@ -164,7 +175,22 @@ func (m *Manager) Spawn(taskID, projectPath string, scout bool, rawCmd string) (
 		cmd = harness.BriefCommand(h, brief, sid)
 	}
 	if err := tmux.SendLine(m.Session, window, cmd); err != nil {
+		m.abortSpawn(window, repo, wt)
 		return zero, err
+	}
+	// Do not return — and so do not let the manager send a brief — until the worker is
+	// actually up and able to receive input. A brief sent into a still-booting harness
+	// is silently dropped, stranding the worker on its stub brief; if the worker never
+	// comes up, fail the spawn loudly rather than hand back a phantom worker.
+	if err := m.waitForLaunch(window); err != nil {
+		m.abortSpawn(window, repo, wt)
+		return zero, fmt.Errorf("spawn %q: %w", taskID, err)
+	}
+	// A real harness needs a moment after its process appears to finish wiring up its
+	// interactive input before it will reliably accept typed text; the rawCmd escape
+	// hatch (tests, plain commands) has no such TUI, so it skips the settle.
+	if harnessLaunch && h == "claude" {
+		time.Sleep(spawnSettle)
 	}
 	// Best-effort: open a native terminal tab/window that attaches a view onto
 	// this worker's tmux window so the lead can watch it. The worker stays in
@@ -176,9 +202,87 @@ func (m *Manager) Spawn(taskID, projectPath string, scout bool, rawCmd string) (
 		Harness: h, Kind: kind, Created: time.Now(), SessionID: sid,
 	}
 	if err := m.Store.Save(t); err != nil {
+		// The worker is live by now (waitForLaunch confirmed it), so a failed save would
+		// otherwise strand a running worker with no task record to tear it down — unwind
+		// it like every other spawn failure rather than leak a phantom worker + slot.
+		m.abortSpawn(window, repo, wt)
 		return zero, err
 	}
 	return t, nil
+}
+
+// taskBranch is the local branch a freshly spawned worker starts on: a stable,
+// per-task name so a reused pooled worktree never leaves the worker on a prior task's
+// branch. It matches the branch the PR delivery path publishes (see integratePR), so
+// the local and remote branch names stay aligned.
+func taskBranch(taskID string) string { return "ttorch/" + taskID }
+
+// Spawn-readiness tunables (vars so tests can shrink them): spawnReadyTimeout bounds
+// how long Spawn waits for a launched worker command to take over its pane before
+// giving up; spawnReadyInterval is the poll cadence; spawnSettle is an extra pause
+// after a real harness's process appears, to let its TUI finish wiring up input
+// handling before Spawn returns (and before the manager's brief is sent).
+var (
+	spawnReadyTimeout  = 20 * time.Second
+	spawnReadyInterval = 200 * time.Millisecond
+	spawnSettle        = 600 * time.Millisecond
+)
+
+// waitForLaunch blocks until the command launched in window has taken over the pane —
+// i.e. its foreground process is no longer the bare shell that started in the window —
+// so a spawn never returns (and a brief is never sent) while the worker is still a
+// shell that would silently drop the input. It returns an error if the window exits or
+// no non-shell command appears within spawnReadyTimeout, so a failed launch fails the
+// spawn loudly instead of yielding a phantom worker. Comparing against a shell denylist
+// (rather than the pre-launch command) is robust to the shell's own startup churn,
+// where the foreground transitions through launchers like `env` before settling.
+func (m *Manager) waitForLaunch(window string) error {
+	deadline := time.Now().Add(spawnReadyTimeout)
+	for {
+		// Only a window CONFIRMED absent (read succeeded, window not listed) means the
+		// launch died; a transient tmux read failure is retried until the deadline so a
+		// momentary hiccup never tears down a healthy, just-launched worker.
+		exists, err := tmux.WindowExistsErr(m.Session, window)
+		if err == nil {
+			if !exists {
+				return errors.New("the worker's window exited before its command started")
+			}
+			if cur := tmux.PaneCurrentCommand(m.Session, window); cur != "" && !isShellCommand(cur) {
+				return nil
+			}
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				return fmt.Errorf("could not read the worker's window within %s: %w", spawnReadyTimeout, err)
+			}
+			return fmt.Errorf("the worker's command did not start within %s (its window is still a bare shell)", spawnReadyTimeout)
+		}
+		time.Sleep(spawnReadyInterval)
+	}
+}
+
+// shellCommands are the foreground process names that mean a window is still a bare
+// shell (or a shell launcher), not a worker command that has taken over the pane.
+var shellCommands = map[string]bool{
+	"sh": true, "bash": true, "zsh": true, "fish": true, "dash": true,
+	"ksh": true, "tcsh": true, "csh": true, "ash": true, "env": true, "login": true,
+}
+
+// isShellCommand reports whether a pane's foreground command name is a shell or shell
+// launcher (tmux strips no leading login dash, but guard for it anyway).
+func isShellCommand(cmd string) bool {
+	return shellCommands[strings.TrimPrefix(cmd, "-")]
+}
+
+// abortSpawn unwinds a half-started spawn: it reaps the window's processes, kills the
+// window, and returns the worktree to the pool, so a launch that fails midway leaves
+// behind no phantom worker window or leaked pool slot.
+func (m *Manager) abortSpawn(window, repo, wt string) {
+	m.killPaneProcesses(window)
+	_ = tmux.KillWindow(m.Session, window)
+	if repo != "" && wt != "" {
+		_ = m.Pool.Release(repo, wt)
+	}
 }
 
 // ensureSupervisor starts the background supervisor if it isn't already running,
@@ -246,11 +350,16 @@ func (m *Manager) Peek(taskID string, lines int) (string, error) {
 	return tmux.CapturePane(m.Session, t.Window, lines)
 }
 
-// Send types a line into a worker's pane.
+// Send types a line into a worker's pane. It refuses loudly when the worker has no
+// live window (torn down or never came up) rather than letting the keystrokes vanish
+// into a dead target — a dropped message must fail, never silently no-op.
 func (m *Manager) Send(taskID, text string) error {
 	t, err := m.Store.Load(taskID)
 	if err != nil {
 		return fmt.Errorf("unknown task %q", taskID)
+	}
+	if !tmux.WindowExists(m.Session, t.Window) {
+		return fmt.Errorf("task %q has no live window to receive %q; it was torn down or never started", taskID, text)
 	}
 	return tmux.SendLine(m.Session, t.Window, text)
 }

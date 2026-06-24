@@ -112,9 +112,30 @@ func (p Pool) Acquire(repo string, inUse []string) (string, error) {
 	return s, nil
 }
 
-// Release resets a finished slot to a clean tracked state and keeps it for reuse.
+// Release resets a finished slot to a clean tracked state and keeps it for reuse. It
+// first parks the slot on a detached HEAD, dropping any per-task branch it was on, so
+// a pooled slot never pins a branch name (e.g. ttorch/<id>) that a later spawn may
+// need to (re)create in a different slot, and idle task branches do not accumulate.
 func (p Pool) Release(repo, slot string) error {
+	detachTaskBranch(slot)
 	return reset(slot, repo)
+}
+
+// detachTaskBranch parks slot on a detached HEAD and deletes the branch it was on.
+// Best-effort: a slot already detached (a freshly created slot, or one on "HEAD") is
+// left untouched, and any git hiccup is swallowed so the caller's reset still runs.
+// Releasing a slot already discards its commits (reset to the repo HEAD), so dropping
+// the now-idle branch ref alongside is consistent — landed work lives on the default
+// branch, and abandoned work was going to be discarded anyway.
+func detachTaskBranch(slot string) {
+	br, err := CurrentBranch(slot)
+	if err != nil || br == "" || br == "HEAD" {
+		return
+	}
+	if _, err := git("-C", slot, "checkout", "-q", "--detach"); err != nil {
+		return
+	}
+	_, _ = git("-C", slot, "branch", "-D", br)
 }
 
 // Destroy removes a slot from the repo entirely (for prune/uninstall).
@@ -166,6 +187,47 @@ func reset(slot, repo string) error {
 	}
 	_, err = git("-C", slot, "reset", "--hard", "-q", head)
 	return err
+}
+
+// StartBranch prepares a (possibly reused) pooled worktree slot for a NEW task on a
+// fresh branch. It fetches the default branch from origin when the repo has one, so
+// the branch is cut from the up-to-date tip, then force-creates branch at that base
+// and hard-resets the slot's tracked tree to it. The slot leaves whatever branch it
+// was on and any tracked changes are discarded; untracked build caches are kept (no
+// `git clean`). After it returns, the slot is checked out on branch at the current
+// default-branch tip with a clean tracked tree, so a worker never inherits a previous
+// task's branch or state. `--no-track` keeps the task branch from adopting
+// origin/<default> as its upstream when cut from a remote ref.
+//
+// The fetch is best-effort (offline, or a repo with no remote, falls back to the
+// local default branch); an unresolvable base or a failed checkout is returned as an
+// error so a stale-branch start fails loudly rather than silently reusing prior state.
+func StartBranch(repo, slot, branch string) error {
+	if RemoteExists(repo, "origin") {
+		_ = Fetch(repo) // refresh origin/<default>; offline keeps the last-known tip
+	}
+	base := defaultBase(repo)
+	if _, err := git("-C", slot, "checkout", "-q", "--no-track", "-B", branch, base); err != nil {
+		return fmt.Errorf("checkout %s off %s: %w", branch, base, err)
+	}
+	// Belt-and-suspenders: guarantee the tracked tree matches base exactly even if the
+	// checkout carried something across (untracked caches are left untouched).
+	_, err := git("-C", slot, "reset", "--hard", "-q", base)
+	return err
+}
+
+// defaultBase returns the ref a fresh task branch should be cut from: the remote
+// default branch origin/<default> when it resolves (the authoritative, just-fetched
+// tip), else the local <default> branch, else HEAD.
+func defaultBase(repo string) string {
+	def := DefaultBranch(repo)
+	if RefExists(repo, "origin/"+def) {
+		return "origin/" + def
+	}
+	if RefExists(repo, def) {
+		return def
+	}
+	return "HEAD"
 }
 
 func listSlots(poolDir string) []string {
