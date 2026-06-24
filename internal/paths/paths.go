@@ -92,6 +92,20 @@ func (p Paths) ApprovalFile(id string) string {
 	return filepath.Join(p.StateDir(), id+".approve")
 }
 
+// ReviewVerdictFile holds a short-lived, commit-pinned adversarial-review verdict
+// for a task. It sits beside ApprovalFile and is kept distinct from it so an audit
+// can always tell "a human approved" from "the reviewers passed".
+func (p Paths) ReviewVerdictFile(id string) string {
+	return filepath.Join(p.StateDir(), id+".verdict")
+}
+
+// ReviewInputsDir holds the materialized inputs the review subagents read for a task
+// (the diff, brief, validate results, reviewed HEAD) and the per-dimension findings
+// reports they write back. It is durable manager data, beside BriefPath.
+func (p Paths) ReviewInputsDir(id string) string {
+	return filepath.Join(p.DataDir(), id, "review")
+}
+
 // AuditLog records state-changing delivery actions (merges).
 func (p Paths) AuditLog() string { return filepath.Join(p.Home, "audit.log") }
 

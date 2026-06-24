@@ -18,10 +18,39 @@ const (
 // ValidMode reports whether mode is a recognized delivery mode.
 func ValidMode(mode string) bool {
 	switch mode {
-	case "pr", "local", "validated":
+	case "pr", "local", "validated", "trusted":
 		return true
 	}
 	return false
+}
+
+// ReadMode returns the delivery mode recorded in dir/AGENTS.md's ttorch-managed
+// block, defaulting to "pr" when the file, the managed block, or a recognized
+// "- delivery-mode:" line is absent. It is the first Go reader of the mode the
+// manager has so far only consulted as prose, so a typed gate can require behavior
+// per mode instead of trusting the LLM to honor it.
+func ReadMode(dir string) string {
+	const def = "pr"
+	b, err := os.ReadFile(filepath.Join(dir, "AGENTS.md"))
+	if err != nil {
+		return def
+	}
+	text := string(b)
+	bi := strings.Index(text, markerBegin)
+	ei := strings.Index(text, markerEnd)
+	if bi < 0 || ei <= bi {
+		return def
+	}
+	for _, line := range strings.Split(text[bi:ei], "\n") {
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), "- delivery-mode:"); ok {
+			mode := strings.TrimSpace(rest)
+			if ValidMode(mode) {
+				return mode
+			}
+			return def
+		}
+	}
+	return def
 }
 
 // Initialized reports whether dir already carries the ttorch-managed block in its
@@ -41,7 +70,7 @@ func Init(dir, mode string) ([]string, error) {
 		mode = "pr"
 	}
 	if !ValidMode(mode) {
-		return nil, fmt.Errorf("unknown delivery mode %q (want: pr | local | validated)", mode)
+		return nil, fmt.Errorf("unknown delivery mode %q (want: pr | local | validated | trusted)", mode)
 	}
 	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
 		return nil, fmt.Errorf("%s is not a directory", dir)

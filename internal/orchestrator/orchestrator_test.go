@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,6 +13,7 @@ import (
 	"github.com/nution101/ttorch/internal/approval"
 	"github.com/nution101/ttorch/internal/paths"
 	"github.com/nution101/ttorch/internal/projectinit"
+	"github.com/nution101/ttorch/internal/review"
 	"github.com/nution101/ttorch/internal/state"
 	"github.com/nution101/ttorch/internal/tmux"
 )
@@ -362,6 +364,201 @@ func TestMergeLocal_ApprovalBinding(t *testing.T) {
 		t.Fatal("default branch was not fast-forwarded after re-approval")
 	}
 	_, _ = m.Teardown("b1", true)
+}
+
+// deliveryHarness spins up a Manager against a fresh main-branch repo and a unique
+// tmux session, registering teardown. It mirrors the inline setup the other
+// delivery tests use.
+func deliveryHarness(t *testing.T, tag string) (*Manager, string) {
+	t.Helper()
+	if !tmux.Available() {
+		t.Skip("tmux not installed")
+	}
+	repo := newRepoMain(t)
+	session := fmt.Sprintf("ttorch-%s-%d", tag, os.Getpid())
+	t.Setenv("TTORCH_HOME", t.TempDir())
+	t.Setenv("TTORCH_TMUX_SESSION", session)
+	t.Cleanup(func() { exec.Command("tmux", "kill-session", "-t", session).Run() })
+	return New(paths.Default()), repo
+}
+
+// writeReviewReports drops one per-dimension report per required reviewer into dir,
+// pinned to sha, as the reviewer subagents would after `ttorch trust prep`.
+func writeReviewReports(t *testing.T, dir, sha string, perDim map[string][]review.Finding) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, dim := range requiredReviewers {
+		b, err := json.Marshal(review.Report{Dimension: dim, ReviewedSHA: sha, Findings: perDim[dim]})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, dim+".json"), b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestTrustPrep(t *testing.T) {
+	m, repo := deliveryHarness(t, "prep")
+	task, err := m.Spawn("pp1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := task.Worktree
+	os.WriteFile(filepath.Join(wt, "feature.txt"), []byte("new\n"), 0o644)
+	gitIn(t, wt, "add", "-A")
+	gitIn(t, wt, "commit", "-q", "-m", "add feature")
+	head := gitIn(t, wt, "rev-parse", "HEAD")
+
+	dir, err := m.TrustPrep("pp1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"diff.patch", "validate.json", "head.txt"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("trust prep did not write %s: %v", name, err)
+		}
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "diff.patch")); !strings.Contains(string(b), "feature.txt") {
+		t.Fatalf("diff.patch missing the change: %s", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "head.txt")); strings.TrimSpace(string(b)) != head {
+		t.Fatalf("head.txt = %q, want %q", b, head)
+	}
+	_, _ = m.Teardown("pp1", true)
+}
+
+func TestTrustRecord_RefusesStaleSha(t *testing.T) {
+	m, repo := deliveryHarness(t, "stale")
+	if _, err := m.Spawn("sr1", repo, false, "sleep 60"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.TrustRecord("sr1", "deadbeefdeadbeef", time.Minute); err == nil {
+		t.Fatal("trust record must refuse a sha that is not the worker HEAD")
+	}
+	_, _ = m.Teardown("sr1", true)
+}
+
+// TestTrustRecord_PrModeUnaffectedByVerdict is the regression guard: in pr mode a
+// recorded verdict neither auto-mints an approval nor authorizes a merge. The
+// merge path stays exactly as today — approval-only.
+func TestTrustRecord_PrModeUnaffectedByVerdict(t *testing.T) {
+	m, repo := deliveryHarness(t, "pr")
+	task, err := m.Spawn("p1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := task.Worktree
+	os.WriteFile(filepath.Join(wt, "feature.txt"), []byte("new\n"), 0o644)
+	gitIn(t, wt, "add", "-A")
+	gitIn(t, wt, "commit", "-q", "-m", "work")
+	head := gitIn(t, wt, "rev-parse", "HEAD")
+
+	writeReviewReports(t, m.P.ReviewInputsDir("p1"), head, nil) // all clean → pass
+	v, err := m.TrustRecord("p1", "", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Overall != review.Pass {
+		t.Fatalf("clean reports should pass, got %q", v.Overall)
+	}
+	if approval.Valid(m.P.ApprovalFile("p1")) {
+		t.Fatal("pr mode must NOT auto-mint an approval token")
+	}
+	reloaded, _ := m.Store.Load("p1")
+	if !reloaded.GatePassed || reloaded.ReviewedSHA != head || reloaded.ApprovedBy != "" {
+		t.Fatalf("provenance wrong in pr mode: %+v", reloaded)
+	}
+	// A verdict alone must not authorize a merge in pr mode.
+	if _, err := m.MergeLocal("p1"); err == nil {
+		t.Fatal("pr-mode merge must still require an approval token")
+	}
+	// Identical to today: approve, then merge succeeds.
+	if err := m.Approve("p1", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.MergeLocal("p1"); err != nil {
+		t.Fatalf("approved pr-mode merge: %v", err)
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") != head {
+		t.Fatal("default branch was not fast-forwarded to the worker HEAD")
+	}
+	_, _ = m.Teardown("p1", true)
+}
+
+// TestTrustRecord_TrustedIsInert proves the foundation is fully behavior-inert: even
+// in trusted mode TrustRecord records a passing verdict and provenance but mints NO
+// approval token and authorizes no merge. Auto-approve is deferred to the trust-gate
+// commit; until then trusted behaves exactly like pr/local/validated.
+func TestTrustRecord_TrustedIsInert(t *testing.T) {
+	m, repo := deliveryHarness(t, "trusted")
+	task, err := m.Spawn("tr1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := task.Worktree
+	if _, err := projectinit.Init(repo, "trusted"); err != nil {
+		t.Fatal(err)
+	}
+	if projectinit.ReadMode(repo) != "trusted" {
+		t.Fatal("repo should be in trusted mode for this test")
+	}
+	head := gitIn(t, wt, "rev-parse", "HEAD")
+	writeReviewReports(t, m.P.ReviewInputsDir("tr1"), head, nil) // all clean → pass
+
+	v, err := m.TrustRecord("tr1", "", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Overall != review.Pass {
+		t.Fatalf("clean reports should pass, got %q", v.Overall)
+	}
+	if approval.Valid(m.P.ApprovalFile("tr1")) {
+		t.Fatal("trusted mode must NOT auto-mint an approval token in the foundation")
+	}
+	reloaded, _ := m.Store.Load("tr1")
+	if !reloaded.GatePassed || reloaded.ReviewedSHA != head || reloaded.ApprovedBy != "" {
+		t.Fatalf("provenance wrong: %+v", reloaded)
+	}
+	// Identical to every other mode: a verdict alone does not authorize a merge.
+	if _, err := m.MergeLocal("tr1"); err == nil {
+		t.Fatal("trusted-mode merge must still require an approval token in the foundation")
+	}
+	_, _ = m.Teardown("tr1", true)
+}
+
+func TestTrustRecord_TrustedBlocksHighFinding(t *testing.T) {
+	m, repo := deliveryHarness(t, "trustblock")
+	task, err := m.Spawn("tb1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := task.Worktree
+	if _, err := projectinit.Init(repo, "trusted"); err != nil {
+		t.Fatal(err)
+	}
+	head := gitIn(t, wt, "rev-parse", "HEAD")
+	writeReviewReports(t, m.P.ReviewInputsDir("tb1"), head, map[string][]review.Finding{
+		"security": {{Severity: review.SeverityHigh, Reviewer: "sec", Summary: "secret in diff"}},
+	})
+
+	v, err := m.TrustRecord("tb1", "", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Overall != review.Block {
+		t.Fatalf("a high finding must block, got %q", v.Overall)
+	}
+	if approval.Valid(m.P.ApprovalFile("tb1")) {
+		t.Fatal("a blocking verdict must not auto-mint, even in trusted mode")
+	}
+	reloaded, _ := m.Store.Load("tb1")
+	if reloaded.GatePassed || reloaded.ApprovedBy != "" {
+		t.Fatalf("blocked verdict must not record a passing/auto provenance: %+v", reloaded)
+	}
+	_, _ = m.Teardown("tb1", true)
 }
 
 func TestAutoInit(t *testing.T) {
