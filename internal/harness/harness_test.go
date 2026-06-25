@@ -196,14 +196,25 @@ func TestManagerCharterTrustedCarveOut(t *testing.T) {
 // into an action-level rule (never assert an unverifiable stall, never command a worker
 // to abandon work on inference) — must each be present in BOTH encodings, matched by
 // stable anchor phrases, so the charter a manager launches with cannot diverge from the
-// skill it is told to follow.
+// skill it is told to follow. The guardrail is additionally asserted in the global
+// managed-block template (content/assets/AGENTS.global.md) — a third encoding whose
+// condensed wording the five-rule anchors don't share, but which must still carry the
+// guardrail or that copy can silently drift.
 func TestManagerOperatingRulesInSync(t *testing.T) {
 	skill, err := os.ReadFile(filepath.Join("..", "..", "content", "skills", "ttorch-manager", "SKILL.md"))
 	if err != nil {
 		t.Fatalf("reading SKILL.md: %v", err)
 	}
-	charter := strings.ToLower(managerCharter)
-	skillText := strings.ToLower(string(skill))
+	// Normalize whitespace (collapse newlines and runs of spaces to one space) so a
+	// markdown line-wrap can't hide an anchor that happens to span two lines.
+	charter := collapseSpaces(strings.ToLower(managerCharter))
+	skillText := collapseSpaces(strings.ToLower(string(skill)))
+
+	// guardrailAnchors are asserted in all three encodings below, so they are named once.
+	guardrailAnchors := []string{
+		"ground truth about its own execution",
+		"repeated-looking progress counter is not evidence",
+	}
 
 	rules := []struct {
 		name    string
@@ -214,7 +225,7 @@ func TestManagerOperatingRulesInSync(t *testing.T) {
 		{"manager tab = orchestration only", []string{"orchestration only", "independent"}},
 		{"keep the fleet moving", []string{"keep the fleet moving", "disjoint", "pre-yield"}},
 		{"autonomy loop", []string{"autonomy loop", "interrupt"}},
-		{"diagnose from evidence, not inference", []string{"ground truth about its own execution", "repeated-looking progress counter is not evidence"}},
+		{"diagnose from evidence, not inference", guardrailAnchors},
 	}
 	for _, r := range rules {
 		for _, a := range r.anchors {
@@ -226,6 +237,27 @@ func TestManagerOperatingRulesInSync(t *testing.T) {
 			}
 		}
 	}
+
+	// The global managed-block template is a third encoding of the protocol; its condensed
+	// wording doesn't carry the five-rule anchors, but it must still carry the
+	// diagnose-from-evidence guardrail or that copy can silently drift from charter + skill.
+	global, err := os.ReadFile(filepath.Join("..", "..", "content", "assets", "AGENTS.global.md"))
+	if err != nil {
+		t.Fatalf("reading AGENTS.global.md: %v", err)
+	}
+	globalText := collapseSpaces(strings.ToLower(string(global)))
+	for _, a := range guardrailAnchors {
+		if !strings.Contains(globalText, a) {
+			t.Errorf("content/assets/AGENTS.global.md is missing guardrail anchor %q — keep it in sync with the managerCharter const and the ttorch-manager skill", a)
+		}
+	}
+}
+
+// collapseSpaces normalizes every run of whitespace (including newlines) to a single
+// space, so a phrase check is resilient to markdown line-wrapping that would otherwise
+// split an anchor across two lines.
+func collapseSpaces(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
 
 func TestBriefCommandCarriesSessionID(t *testing.T) {
