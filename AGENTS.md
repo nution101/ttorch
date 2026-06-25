@@ -56,5 +56,18 @@ conventions — match these when changing code here.
 - Lint/format: `gofmt -l .`, `go vet ./...`
 - Tests: standard `testing` package; tests in *_test.go beside sources
 - Layout: cmd/, content/, docs/, internal/
-- Match the style of: internal/paths/paths.go, internal/tmux/tmux.go, internal/validate/validate.go
+- Match the style of: internal/learnings/learnings.go, internal/paths/paths.go, internal/selfupdate/selfupdate.go
 <!-- END ttorch-profile -->
+
+<!-- BEGIN ttorch-managed -->
+This repository is managed by ttorch. The manager reads the delivery mode below.
+
+- delivery-mode: trusted
+
+Trusted mode: worker output may be merged through the ttorch-review adversarial-review
+gate (a passing verdict plus a fresh green validate, commit-pinned and enforced in Go)
+WITHOUT a separate human approval. This is an explicit, repo-scoped decision; the default
+is pr. Auto-merge REQUIRES a .ttorch/validate.sh on this default branch (the gate's
+validation authority); without it, auto-merge is refused and a human approval is needed.
+A change to the gate itself (this block or .ttorch/validate.sh) always requires a human.
+<!-- END ttorch-managed -->
