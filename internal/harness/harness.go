@@ -300,6 +300,71 @@ func quote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
+// WorkerLaunchPrefix builds the leading environment assignments prepended to a
+// worker's launch command so the worker's `ttorch report/stage/note/follow-on`
+// resolve their task and DB from the environment without a flag (§3.1). Each value
+// is single-quoted so a path or id with shell metacharacters survives verbatim; an
+// empty value is omitted. The returned string ends in a trailing space (ready to
+// prepend) or is empty when nothing is set.
+func WorkerLaunchPrefix(taskID, dbPath string) string {
+	var parts []string
+	if taskID != "" {
+		parts = append(parts, "TTORCH_TASK_ID="+shq(taskID))
+	}
+	if dbPath != "" {
+		parts = append(parts, "TTORCH_DB="+shq(dbPath))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, " ") + " "
+}
+
+// workerTaskFileRel is the worktree-relative path of the git-excluded file a spawned
+// worker carries so its `ttorch report/stage/note/follow-on` can resolve the task +
+// DB by walking up from cwd, independent of any environment (§3.1).
+const workerTaskFileRel = ".ttorch/task"
+
+// WriteWorkerTaskFile writes <worktree>/.ttorch/task recording the task id and DB
+// path, then keeps it out of git's view via the same exclusion mechanism as the
+// Stop hook (excludeInWorktree). The format is one `key=value` line per field so it
+// stays human-readable and forward-extensible; ReadWorkerTaskFile is its reader.
+func WriteWorkerTaskFile(worktree, taskID, dbPath string) error {
+	dir := filepath.Join(worktree, ".ttorch")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	body := "task_id=" + taskID + "\ndb=" + dbPath + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "task"), []byte(body), 0o644); err != nil {
+		return err
+	}
+	return excludeInWorktree(worktree, workerTaskFileRel)
+}
+
+// ReadWorkerTaskFile parses a <dir>/.ttorch/task file, returning the recorded task
+// id and DB path. ok is false when the file is absent or carries no task id. It does
+// not walk up the tree — the caller decides the search policy (§3.1). Unknown keys
+// and blank lines are ignored so the format can grow without breaking older readers.
+func ReadWorkerTaskFile(dir string) (taskID, dbPath string, ok bool) {
+	b, err := os.ReadFile(filepath.Join(dir, ".ttorch", "task"))
+	if err != nil {
+		return "", "", false
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		key, val, found := strings.Cut(strings.TrimSpace(line), "=")
+		if !found {
+			continue
+		}
+		switch strings.TrimSpace(key) {
+		case "task_id":
+			taskID = strings.TrimSpace(val)
+		case "db":
+			dbPath = strings.TrimSpace(val)
+		}
+	}
+	return taskID, dbPath, taskID != ""
+}
+
 // TrustWorktree pre-accepts Claude Code's one-time folder-trust prompt for a
 // worker's repo and worktree, so a spawned worker runs without an interactive
 // prompt blocking it. It sets hasTrustDialogAccepted in Claude's config

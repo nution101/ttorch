@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -24,7 +25,9 @@ import (
 
 	ttorchembed "github.com/nution101/ttorch"
 	"github.com/nution101/ttorch/internal/buildinfo"
+	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/doctor"
+	"github.com/nution101/ttorch/internal/harness"
 	"github.com/nution101/ttorch/internal/installer"
 	"github.com/nution101/ttorch/internal/learnings"
 	"github.com/nution101/ttorch/internal/manifest"
@@ -98,6 +101,14 @@ func Main(args []string) int {
 		return run(cmdCC(rest))
 	case "spawn":
 		return run(cmdSpawn(rest))
+	case "report":
+		return run(cmdReport(rest))
+	case "stage":
+		return run(cmdStage(rest))
+	case "note":
+		return run(cmdNote(rest))
+	case "follow-on":
+		return run(cmdFollowOn(rest))
 	case "status":
 		return run(cmdStatus())
 	case "check-overlap":
@@ -385,6 +396,271 @@ func parseTouches(s string) []string {
 		out = append(out, f)
 	}
 	return out
+}
+
+// --- worker-facing reporting (§3.1) -----------------------------------------
+//
+// report/stage/note/follow-on let the CALLING worker write to its OWN task without
+// the orchestrator/tmux machinery: each is short-lived (one db.Open + defer Close),
+// mutates exactly one task, and validates its input. The task is resolved by --task →
+// $TTORCH_TASK_ID → the worktree's .ttorch/task (cwd walk-up); the DB by $TTORCH_DB →
+// that file's db → the default StateDB(). The actor is worker:<id>, so transitioning
+// into done/blocked/needs-input — and only that — wakes the manager (§1.3).
+
+const reportUsage = `usage: ttorch report <done|blocked|needs-input|active> [--task <id>] [-m "msg"]`
+
+func cmdReport(args []string) error {
+	if len(args) < 1 {
+		return errors.New(reportUsage)
+	}
+	status, ok := reportStatusValue(args[0])
+	if !ok {
+		return fmt.Errorf("report: unknown status %q\n%s", args[0], reportUsage)
+	}
+	fs := flag.NewFlagSet("report", flag.ContinueOnError)
+	taskFlag := fs.String("task", "", "task id (default: $TTORCH_TASK_ID or the worktree's .ttorch/task)")
+	msg := fs.String("m", "", "note recorded with the status change (also carried on the event)")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	taskID, dbPath, err := resolveWorkerTarget(*taskFlag)
+	if err != nil {
+		return err
+	}
+	store, err := db.Open(dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	ev, err := store.ReportStatus(context.Background(), taskID, status, workerActor(taskID), *msg)
+	if err != nil {
+		return err
+	}
+	tail := ""
+	if ev.Actionable {
+		tail = " (the manager has been notified)"
+	}
+	fmt.Printf("%s → %s%s\n", taskID, status, tail)
+	return nil
+}
+
+// reportStatusValue maps a CLI report verb to its db task status. The hyphenated
+// needs-input verb maps to the needs_input status enum.
+func reportStatusValue(verb string) (string, bool) {
+	switch verb {
+	case "done":
+		return db.StatusDone, true
+	case "blocked":
+		return db.StatusBlocked, true
+	case "needs-input":
+		return db.StatusNeedsInput, true
+	case "active":
+		return db.StatusActive, true
+	}
+	return "", false
+}
+
+const stageUsage = `usage: ttorch stage <text> [--task <id>]`
+
+func cmdStage(args []string) error {
+	taskFlag, rest, err := extractTaskFlag(args)
+	if err != nil {
+		return err
+	}
+	stage := strings.TrimSpace(strings.Join(rest, " "))
+	if stage == "" {
+		return errors.New(stageUsage)
+	}
+	taskID, dbPath, err := resolveWorkerTarget(taskFlag)
+	if err != nil {
+		return err
+	}
+	store, err := db.Open(dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if _, err := store.SetStage(context.Background(), taskID, stage, workerActor(taskID)); err != nil {
+		return err
+	}
+	fmt.Printf("%s stage: %s\n", taskID, stage)
+	return nil
+}
+
+const noteUsage = "usage: ttorch note <text...> | - | --message-file <path> [--task <id>]"
+
+func cmdNote(args []string) error {
+	taskFlag, rest, err := extractTaskFlag(args)
+	if err != nil {
+		return err
+	}
+	// Reuse send's safe message resolution — inline text, stdin (-), or --message-file —
+	// so a note body with shell metacharacters is carried verbatim, never re-evaluated.
+	body, err := resolveSendMessage(rest, os.Stdin, stdinIsTerminal())
+	if err != nil {
+		return err
+	}
+	if body == "" {
+		return errors.New("note: empty message — nothing to record")
+	}
+	taskID, dbPath, err := resolveWorkerTarget(taskFlag)
+	if err != nil {
+		return err
+	}
+	store, err := db.Open(dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if err := store.AddNote(context.Background(), taskID, workerActor(taskID), body); err != nil {
+		return err
+	}
+	fmt.Printf("noted on %s\n", taskID)
+	return nil
+}
+
+const followOnUsage = `usage: ttorch follow-on <new-id> --title "…" [--touches "a,b"] [--task <parent>]`
+
+func cmdFollowOn(args []string) error {
+	if len(args) < 1 || args[0] == "" || strings.HasPrefix(args[0], "-") {
+		return errors.New(followOnUsage)
+	}
+	newID := args[0]
+	fs := flag.NewFlagSet("follow-on", flag.ContinueOnError)
+	title := fs.String("title", "", "one-line title for the follow-on task (required)")
+	touches := fs.String("touches", "", "comma-separated files/prefixes the follow-on will touch")
+	taskFlag := fs.String("task", "", "parent task id (default: $TTORCH_TASK_ID or the worktree's .ttorch/task)")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*title) == "" {
+		return errors.New("follow-on: --title is required")
+	}
+	parentID, dbPath, err := resolveWorkerTarget(*taskFlag)
+	if err != nil {
+		return err
+	}
+	store, err := db.Open(dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	ctx := context.Background()
+	parent, ok, err := store.GetTask(ctx, parentID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("follow-on: parent task %q not found", parentID)
+	}
+	if _, exists, err := store.GetTask(ctx, newID); err != nil {
+		return err
+	} else if exists {
+		return fmt.Errorf("follow-on: task %q already exists", newID)
+	}
+	actor := workerActor(parentID)
+	// A pending backlog child OF the parent, created BY the worker. CreateTask writes
+	// the canonical 'created' event; the follow_on_created event is the typed signal
+	// the manager surfaces on its next re-derive. Both are non-actionable — a follow-on
+	// is backlog, never an interrupt (the lead's decision, §9).
+	//
+	// These are two transactions (CreateTask, then AppendEvent), not the single tx §1.4
+	// prescribes for "create follow-on task + append event": inc2's footprint excludes
+	// internal/db, so an atomic db.CreateFollowOn (insert + both events in one withTx) is
+	// deferred to inc5 (lifecycle recording, where internal/db is in scope). The task row
+	// commits first, so even if the second write is lost to a crash the child still surfaces
+	// in the manager's pending-backlog re-derive (§7) — only the typed audit event is at
+	// risk in that narrow window.
+	if _, err := store.CreateTask(ctx, db.Task{
+		ID: newID, ProjectID: parent.ProjectID, ParentTaskID: &parentID,
+		CreatedBy: actor, Title: *title, Kind: db.KindShip,
+		Status: db.StatusPending, Footprint: parseTouches(*touches),
+	}, actor); err != nil {
+		return err
+	}
+	if _, err := store.AppendEvent(ctx, db.Event{
+		EntityType: db.EntityTypeTask, EntityID: newID, Type: db.EventFollowOnCreated,
+		Actor: actor, Payload: *title,
+	}); err != nil {
+		return err
+	}
+	fmt.Printf("filed follow-on %s (parent %s)\n", newID, parentID)
+	return nil
+}
+
+// workerActor is the events.actor / notes.author label for a task's own worker. Only
+// a worker actor makes a status transition actionable (§1.3).
+func workerActor(taskID string) string { return "worker:" + taskID }
+
+// extractTaskFlag pulls an optional --task <id> (or --task=<id>) out of args,
+// returning it plus the remaining arguments in order. The text-bearing verbs (stage,
+// note) need it because their free-form body cannot go through the stdlib flag parser
+// (which stops at the first positional). Any other flags are left in rest untouched.
+func extractTaskFlag(args []string) (taskFlag string, rest []string, err error) {
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--task":
+			if i+1 >= len(args) {
+				return "", nil, errors.New("--task: missing <id>")
+			}
+			taskFlag = args[i+1]
+			i++
+		case strings.HasPrefix(args[i], "--task="):
+			taskFlag = args[i][len("--task="):]
+		default:
+			rest = append(rest, args[i])
+		}
+	}
+	return taskFlag, rest, nil
+}
+
+// resolveWorkerTarget determines the calling worker's task id and the DB to write it
+// to (§3.1). Task id precedence: --task → $TTORCH_TASK_ID → the .ttorch/task file
+// found by walking up from cwd. DB precedence: $TTORCH_DB → that file's db → the
+// default StateDB(). The cwd walk-up always runs so the file's db can serve as a
+// fallback even when the id came from a flag or the environment.
+func resolveWorkerTarget(taskFlag string) (taskID, dbPath string, err error) {
+	fileTaskID, fileDB := findTaskFile()
+	switch {
+	case taskFlag != "":
+		taskID = taskFlag
+	case os.Getenv("TTORCH_TASK_ID") != "":
+		taskID = os.Getenv("TTORCH_TASK_ID")
+	default:
+		taskID = fileTaskID
+	}
+	if taskID == "" {
+		return "", "", errors.New("could not resolve the task: pass --task <id>, set TTORCH_TASK_ID, or run inside a worktree containing .ttorch/task")
+	}
+	switch {
+	case os.Getenv("TTORCH_DB") != "":
+		dbPath = os.Getenv("TTORCH_DB")
+	case fileDB != "":
+		dbPath = fileDB
+	default:
+		dbPath = paths.Default().StateDB()
+	}
+	return taskID, dbPath, nil
+}
+
+// findTaskFile walks up from cwd to the first .ttorch/task file, returning its
+// recorded task id and DB path (both empty when none is found). The walk stops at the
+// filesystem root.
+func findTaskFile() (taskID, dbPath string) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", ""
+	}
+	for {
+		if id, dbp, ok := harness.ReadWorkerTaskFile(dir); ok {
+			return id, dbp
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", ""
+		}
+		dir = parent
+	}
 }
 
 func cmdStatus() error {
@@ -1325,6 +1601,17 @@ Team:
     send <id> -             read the message body from stdin (safe for any chars)
     send <id> --message-file <path>   read the message body from a file
   teardown <id> [--force] finish a worker (refuses to discard unlanded work)
+
+Worker reporting (run by a worker about its own task; resolves the task from
+--task, else $TTORCH_TASK_ID, else the worktree's .ttorch/task):
+  report <done|blocked|needs-input|active> [-m "msg"]
+                          set the task's status (done/blocked/needs-input wake the
+                          manager); -m records a note in the same transaction
+  stage "<text>"          set a free-text progress stage (does not wake the manager)
+  note <text...> | - | --message-file <path>
+                          record freeform activity (does not wake the manager)
+  follow-on <new-id> --title "…" [--touches "a,b"]
+                          file a child task into the backlog (does not spawn)
 
 Supervision:
   supervise               ensure the background supervisor is running

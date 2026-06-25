@@ -5,6 +5,8 @@ package orchestrator
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -231,6 +233,11 @@ func (m *Manager) SpawnWithFootprint(taskID, projectPath string, scout bool, raw
 	// and pre-accept the harness's folder-trust prompt so the worker runs autonomously.
 	_ = harness.InstallTurnEndHook(h, wt, m.P.TurnEndMarker(taskID))
 	harness.TrustWorktree(h, repo, wt)
+	// Give the worker its task identity (§3.1): a git-excluded <worktree>/.ttorch/task
+	// file so `ttorch report/stage/note/follow-on` resolve the task + DB by walking up
+	// from cwd even after a resume drops the launch env. Best-effort, like the hook.
+	dbPath := m.P.StateDB()
+	_ = harness.WriteWorkerTaskFile(wt, taskID, dbPath)
 	// The turn-end hook is useless without something reading it: make sure the
 	// background supervisor is up so this worker's turn boundaries and idle become
 	// wakes the manager is told about.
@@ -242,7 +249,10 @@ func (m *Manager) SpawnWithFootprint(taskID, projectPath string, scout bool, raw
 		if _, err := os.Stat(brief); os.IsNotExist(err) {
 			_ = writeBriefStub(brief, taskID, kind)
 		}
-		cmd = harness.BriefCommand(h, brief, sid)
+		// Prepend TTORCH_TASK_ID/TTORCH_DB so the worker's reporting commands resolve
+		// their task + DB from the launch env (the .ttorch/task file is the durable
+		// fallback that also survives a resume). §3.1.
+		cmd = harness.WorkerLaunchPrefix(taskID, dbPath) + harness.BriefCommand(h, brief, sid)
 	}
 	if err := tmux.SendLine(m.Session, window, cmd); err != nil {
 		m.abortSpawn(window, repo, wt)
@@ -268,15 +278,24 @@ func (m *Manager) SpawnWithFootprint(taskID, projectPath string, scout bool, raw
 	_ = termtab.Open(m.Session, window)
 
 	// Persist the task in the DB. The repo is upserted to a project first (FK), then
-	// the task is created in status active (the canonical in-flight status). The
-	// manager-authored 'created' event is non-actionable, so it never wakes a watcher.
+	// the task row is upserted: a `pending` backlog row created by `task add` is
+	// UPDATEd in place (no TEXT-PRIMARY-KEY collision) and a fresh task is INSERTed in
+	// status active. UpsertTask only syncs runtime/coupling fields on the update path,
+	// so the backlog→active transition is driven separately by ReportStatus (§3.4).
+	// Every event written here is manager-authored and non-actionable, so spawning
+	// never wakes a watcher.
 	ctx := context.Background()
 	proj, err := m.Store.UpsertProject(ctx, repo, "")
 	if err != nil {
 		m.abortSpawn(window, repo, wt)
 		return zero, err
 	}
-	t, err := m.Store.CreateTask(ctx, db.Task{
+	prior, existed, err := m.Store.GetTask(ctx, taskID)
+	if err != nil {
+		m.abortSpawn(window, repo, wt)
+		return zero, err
+	}
+	t, err := m.Store.UpsertTask(ctx, db.Task{
 		ID: taskID, ProjectID: proj.ID, Window: window, Worktree: wt,
 		Harness: h, Kind: kind, Created: time.Now(), SessionID: sid,
 		Footprint: footprint, Status: db.StatusActive, Owner: "worker:" + taskID,
@@ -287,6 +306,29 @@ func (m *Manager) SpawnWithFootprint(taskID, projectPath string, scout bool, raw
 		// it like every other spawn failure rather than leak a phantom worker + slot.
 		m.abortSpawn(window, repo, wt)
 		return zero, err
+	}
+	// Flip a pre-existing (backlog) row to active with its status_changed event; a
+	// freshly inserted row is already active (with its 'created' event), so skip it.
+	if existed && prior.Status != db.StatusActive {
+		if _, err := m.Store.ReportStatus(ctx, taskID, db.StatusActive, db.ActorManager, ""); err != nil {
+			// UpsertTask already committed window/worktree onto the (still pending) row in
+			// its own tx; blank them so the worktree abortSpawn is about to release is not
+			// left aliased by a stale row (the same principle as teardown, §3.4). Best-effort
+			// in this error path.
+			_ = m.Store.SetTaskFields(ctx, taskID, db.TaskFields{Window: new(string), Worktree: new(string)})
+			m.abortSpawn(window, repo, wt)
+			return zero, err
+		}
+		// Return the canonical post-transition row (active + last_progress_at); surface a
+		// read failure rather than hand back the pre-flip (still 'pending') UpsertTask result.
+		refreshed, ok, err := m.Store.GetTask(ctx, taskID)
+		if err != nil {
+			m.abortSpawn(window, repo, wt)
+			return zero, err
+		}
+		if ok {
+			t = refreshed
+		}
 	}
 	return t, nil
 }
@@ -723,12 +765,29 @@ func (m *Manager) StopSession() ([]string, error) {
 
 // OpenCC opens an interactive harness session inside the ttorch session as a tracked
 // window, so the manager is aware of it. With isolated, it gets its own worktree.
+// ccSuffix returns a short random hex tag that disambiguates two cc sessions opened
+// in the same wall-clock second (their HHMMSS prefixes are identical), so their ids
+// never collide on the tasks TEXT PRIMARY KEY (§3.4). It is a var so a test can make
+// it deterministic.
+var ccSuffix = func() string {
+	var b [2]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand should never fail; degrade to a fixed tag rather than panic so
+		// an ad-hoc cc session still opens (its DB row is best-effort anyway).
+		return "0000"
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// ccID builds the id for an ad-hoc cc session: cc-HHMMSS-<4hex> (§3.4).
+func ccID() string { return "cc-" + time.Now().Format("150405") + "-" + ccSuffix() }
+
 func (m *Manager) OpenCC(isolated bool) error {
 	if err := m.requireTmux(); err != nil {
 		return err
 	}
 	dir := cwd()
-	id := "cc-" + time.Now().Format("150405")
+	id := ccID()
 	window := id
 	if isolated {
 		if repo, err := worktree.RepoRoot(dir); err == nil {
@@ -1781,6 +1840,22 @@ conventions, and use any relevant skills available to you, before changing code.
 The manager has not written a detailed brief yet. Wait for instructions, or ask
 the manager via your window. Work only within this worktree; commit on a feature
 branch. Do not address the lead directly.
+
+## Reporting (mandatory — this is how the manager sees you)
+
+The manager is woken ONLY by your status reports; run them from this worktree (they
+resolve your task automatically):
+
+- `+"`ttorch report active`"+` when you start the work.
+- `+"`ttorch report done`"+` the moment the work is complete and ready for review,
+  `+"`ttorch report blocked -m \"why\"`"+` when you cannot proceed, and
+  `+"`ttorch report needs-input -m \"the question\"`"+` when you need a decision. You
+  MUST call one of these at the matching transition — the manager does not poll you.
+- `+"`ttorch stage \"<phase>\"`"+` for fine progress (e.g. implementing, testing,
+  validating) and `+"`ttorch note \"<text>\"`"+` for activity worth recording. Neither
+  wakes the manager.
+- `+"`ttorch follow-on <new-id> --title \"…\" [--touches \"a,b\"]`"+` to file a child
+  task for out-of-scope work you discover; it lands in the backlog, it does not spawn.
 `, id, kind)
 	return os.WriteFile(path, []byte(body), 0o644)
 }
