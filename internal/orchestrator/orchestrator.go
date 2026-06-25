@@ -4,6 +4,7 @@
 package orchestrator
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,13 +16,13 @@ import (
 	"time"
 
 	"github.com/nution101/ttorch/internal/approval"
+	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/harness"
 	"github.com/nution101/ttorch/internal/livestate"
 	"github.com/nution101/ttorch/internal/paths"
 	"github.com/nution101/ttorch/internal/profile"
 	"github.com/nution101/ttorch/internal/projectinit"
 	"github.com/nution101/ttorch/internal/review"
-	"github.com/nution101/ttorch/internal/state"
 	"github.com/nution101/ttorch/internal/supervisor"
 	"github.com/nution101/ttorch/internal/termtab"
 	"github.com/nution101/ttorch/internal/tmux"
@@ -38,25 +39,66 @@ var requiredReviewers = []string{review.DimensionCorrectness, review.DimensionSc
 type Manager struct {
 	P       paths.Paths
 	Session string
-	Store   state.Store
+	Store   *db.Store
 	Pool    worktree.Pool
 }
 
-// New builds a Manager from the standard paths.
-func New(p paths.Paths) *Manager {
-	return &Manager{
+// New builds a Manager from the standard paths. It opens the SQLite state store
+// (running migrations, which can fail) and runs the one-shot legacy-JSON import, so
+// it now returns an error. A short-lived CLI command opens one Manager and closes it
+// (Close) at the end of the process; the long-blocking watcher holds its store for
+// its lifetime.
+func New(p paths.Paths) (*Manager, error) {
+	store, err := db.Open(p.StateDB())
+	if err != nil {
+		return nil, err
+	}
+	m := &Manager{
 		P:       p,
 		Session: tmux.SessionName(),
-		Store:   state.Store{Dir: p.StateDir()},
+		Store:   store,
 		Pool:    worktree.Pool{Root: p.Worktrees(), Max: worktree.MaxFromEnv()},
 	}
+	// Migrate any pre-SQLite JSON state into the DB (one-shot, idempotent — §2.5).
+	// A task's tmux window decides its imported status (active vs torn_down). This is
+	// best-effort: the legacy source is preserved either way (state.migrated/), so a
+	// transient import hiccup must not brick startup.
+	if _, err := db.ImportLegacy(context.Background(), store, p.StateDir(), func(window string) bool {
+		return tmux.WindowExists(m.Session, window)
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "ttorch: legacy state import skipped: %v\n", err)
+	}
+	return m, nil
+}
+
+// Close releases the underlying state store. Short-lived CLI commands defer it.
+func (m *Manager) Close() error {
+	if m.Store == nil {
+		return nil
+	}
+	return m.Store.Close()
+}
+
+// liveTasks returns the tracked tasks that are not in a terminal state — the
+// DB-backed equivalent of the old state.List(), which only ever held live records
+// because Teardown deleted them. Retained rows (torn_down/abandoned) are filtered
+// out so callers see exactly today's live fleet.
+func (m *Manager) liveTasks() []db.Task {
+	tasks, _ := m.Store.ListTasks(context.Background(), db.TaskFilter{})
+	var out []db.Task
+	for _, t := range tasks {
+		if t.Status == db.StatusTornDown || t.Status == db.StatusAbandoned {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
 }
 
 // inUseWorktrees returns the worktree paths held by active tasks for a repo.
 func (m *Manager) inUseWorktrees(repo string) []string {
-	tasks, _ := m.Store.List()
 	var out []string
-	for _, t := range tasks {
+	for _, t := range m.liveTasks() {
 		if t.Project == repo && t.Worktree != "" {
 			out = append(out, t.Worktree)
 		}
@@ -108,7 +150,7 @@ func (m *Manager) newWindow(window, cwd, label string) error {
 // rawCmd is empty, it launches the detected harness with the task brief; otherwise
 // it runs rawCmd (used for testing and escape hatches). It declares no footprint,
 // so it is exempt from overlap enforcement — the back-compat entry point.
-func (m *Manager) Spawn(taskID, projectPath string, scout bool, rawCmd string) (state.Task, error) {
+func (m *Manager) Spawn(taskID, projectPath string, scout bool, rawCmd string) (db.Task, error) {
 	return m.SpawnWithFootprint(taskID, projectPath, scout, rawCmd, nil, false)
 }
 
@@ -125,8 +167,8 @@ func (m *Manager) Spawn(taskID, projectPath string, scout bool, rawCmd string) (
 // serial dispatch (the manager dispatches one worker at a time). This matches the
 // unlocked worktree-pool semantics; two truly concurrent spawns of overlapping
 // footprints are not serialized.
-func (m *Manager) SpawnWithFootprint(taskID, projectPath string, scout bool, rawCmd string, footprint []string, forceOverlap bool) (state.Task, error) {
-	var zero state.Task
+func (m *Manager) SpawnWithFootprint(taskID, projectPath string, scout bool, rawCmd string, footprint []string, forceOverlap bool) (db.Task, error) {
+	var zero db.Task
 	if err := m.requireTmux(); err != nil {
 		return zero, err
 	}
@@ -225,12 +267,21 @@ func (m *Manager) SpawnWithFootprint(taskID, projectPath string, scout bool, raw
 	// tmux regardless; never fail the spawn on this.
 	_ = termtab.Open(m.Session, window)
 
-	t := state.Task{
-		ID: taskID, Window: window, Worktree: wt, Project: repo,
-		Harness: h, Kind: kind, Created: time.Now(), SessionID: sid,
-		Footprint: footprint,
+	// Persist the task in the DB. The repo is upserted to a project first (FK), then
+	// the task is created in status active (the canonical in-flight status). The
+	// manager-authored 'created' event is non-actionable, so it never wakes a watcher.
+	ctx := context.Background()
+	proj, err := m.Store.UpsertProject(ctx, repo, "")
+	if err != nil {
+		m.abortSpawn(window, repo, wt)
+		return zero, err
 	}
-	if err := m.Store.Save(t); err != nil {
+	t, err := m.Store.CreateTask(ctx, db.Task{
+		ID: taskID, ProjectID: proj.ID, Window: window, Worktree: wt,
+		Harness: h, Kind: kind, Created: time.Now(), SessionID: sid,
+		Footprint: footprint, Status: db.StatusActive, Owner: "worker:" + taskID,
+	}, db.ActorManager)
+	if err != nil {
 		// The worker is live by now (waitForLaunch confirmed it), so a failed save would
 		// otherwise strand a running worker with no task record to tear it down — unwind
 		// it like every other spawn failure rather than leak a phantom worker + slot.
@@ -334,12 +385,12 @@ func (m *Manager) ensureSupervisor() {
 }
 
 // Live reports whether a task's tmux window is still present.
-func (m *Manager) Live(t state.Task) bool {
+func (m *Manager) Live(t db.Task) bool {
 	return tmux.WindowExists(m.Session, t.Window)
 }
 
-// Status returns all tracked tasks.
-func (m *Manager) Status() ([]state.Task, error) { return m.Store.List() }
+// Status returns the live (non-terminal) tracked tasks.
+func (m *Manager) Status() ([]db.Task, error) { return m.liveTasks(), nil }
 
 // DeriveState classifies a worker from observable inputs: whether its tmux window
 // is live and a recent capture of its pane. It is the pure core of TaskState, kept
@@ -362,7 +413,7 @@ func DeriveState(live bool, pane string) string {
 
 // TaskState reports a worker's live state for `ttorch status` (see DeriveState).
 // A live pane that can't be captured falls back to "idle".
-func (m *Manager) TaskState(t state.Task) string {
+func (m *Manager) TaskState(t db.Task) string {
 	if !tmux.WindowExists(m.Session, t.Window) {
 		return DeriveState(false, "")
 	}
@@ -372,8 +423,8 @@ func (m *Manager) TaskState(t state.Task) string {
 
 // Peek returns the last n lines of a worker's pane.
 func (m *Manager) Peek(taskID string, lines int) (string, error) {
-	t, err := m.Store.Load(taskID)
-	if err != nil {
+	t, ok, err := m.Store.GetTask(context.Background(), taskID)
+	if err != nil || !ok {
 		return "", fmt.Errorf("unknown task %q", taskID)
 	}
 	return tmux.CapturePane(m.Session, t.Window, lines)
@@ -383,8 +434,8 @@ func (m *Manager) Peek(taskID string, lines int) (string, error) {
 // live window (torn down or never came up) rather than letting the keystrokes vanish
 // into a dead target — a dropped message must fail, never silently no-op.
 func (m *Manager) Send(taskID, text string) error {
-	t, err := m.Store.Load(taskID)
-	if err != nil {
+	t, ok, err := m.Store.GetTask(context.Background(), taskID)
+	if err != nil || !ok {
 		return fmt.Errorf("unknown task %q", taskID)
 	}
 	if !tmux.WindowExists(m.Session, t.Window) {
@@ -396,8 +447,8 @@ func (m *Manager) Send(taskID, text string) error {
 // Teardown finishes a task: it refuses to discard a worktree with uncommitted
 // changes unless force is set, then kills the window and returns the worktree.
 func (m *Manager) Teardown(taskID string, force bool) ([]string, error) {
-	t, err := m.Store.Load(taskID)
-	if err != nil {
+	t, ok, err := m.Store.GetTask(context.Background(), taskID)
+	if err != nil || !ok {
 		return nil, fmt.Errorf("unknown task %q", taskID)
 	}
 	var notes []string
@@ -416,7 +467,10 @@ func (m *Manager) Teardown(taskID string, force bool) ([]string, error) {
 			notes = append(notes, "worktree returned to pool for reuse")
 		}
 	}
-	if err := m.Store.Remove(taskID); err != nil {
+	// The DB retains the row (rows are never hard-deleted, §3.4/§7): mark it torn_down
+	// so it drops out of the live fleet (liveTasks) while its history is preserved.
+	// (Increment 5 adds the worktree-blanking refinement on Pool.Release.)
+	if _, err := m.Store.ReportStatus(context.Background(), taskID, db.StatusTornDown, db.ActorManager, ""); err != nil {
 		notes = append(notes, "state: "+err.Error())
 	}
 	return notes, nil
@@ -491,8 +545,8 @@ func (m *Manager) StartManager() error {
 		return m.attachManager()
 	}
 
-	_, ok, _ := m.Store.LoadManager()
-	tasks, _ := m.Store.List()
+	_, ok, _ := m.Store.GetManager(context.Background())
+	tasks := m.liveTasks()
 	if ok || len(tasks) > 0 {
 		notes := m.restore()
 		fmt.Fprintln(os.Stderr, "ttorch: restoring your saved session — manager and workers resume where they left off.")
@@ -505,7 +559,7 @@ func (m *Manager) StartManager() error {
 	// Fresh start: no saved session.
 	dir := cwd()
 	sid := harness.NewSessionID()
-	if err := m.Store.SaveManager(state.Manager{Dir: dir, SessionID: sid}); err != nil {
+	if err := m.Store.SetManager(context.Background(), db.Manager{Dir: dir, SessionID: sid}); err != nil {
 		return err
 	}
 	noticeDeliveryMode(dir) // read-only: never mutate the launch dir's tracked files
@@ -549,7 +603,7 @@ func (m *Manager) restore() []string {
 
 	// Manager window first, so there is always a manager to talk to.
 	if !tmux.WindowExists(m.Session, "manager") {
-		mgr, ok, _ := m.Store.LoadManager()
+		mgr, ok, _ := m.Store.GetManager(context.Background())
 		if ok {
 			if err := m.newWindow("manager", mgr.Dir, "manager"); err != nil {
 				notes = append(notes, "skipped manager ("+err.Error()+")")
@@ -562,7 +616,7 @@ func (m *Manager) restore() []string {
 			// always has one, and persist it for next time.
 			dir := cwd()
 			sid := harness.NewSessionID()
-			if err := m.Store.SaveManager(state.Manager{Dir: dir, SessionID: sid}); err != nil {
+			if err := m.Store.SetManager(context.Background(), db.Manager{Dir: dir, SessionID: sid}); err != nil {
 				notes = append(notes, "could not persist new manager record: "+err.Error())
 			}
 			if err := m.newWindow("manager", dir, "manager"); err != nil {
@@ -574,8 +628,9 @@ func (m *Manager) restore() []string {
 		}
 	}
 
-	// Workers: rebuild each task window whose worktree still exists.
-	tasks, _ := m.Store.List()
+	// Workers: rebuild each task window whose worktree still exists. liveTasks already
+	// excludes torn-down rows; cc sessions are skipped (ad-hoc, lead-driven, §7).
+	tasks := m.liveTasks()
 	for _, t := range tasks {
 		if t.Kind == "cc" {
 			continue // ad-hoc, lead-driven sessions are not auto-restored
@@ -622,14 +677,20 @@ func (m *Manager) Reset() ([]string, error) {
 			notes = append(notes, "killed the ttorch tmux session")
 		}
 	}
-	if err := m.Store.RemoveManager(); err != nil {
-		notes = append(notes, "manager record: "+err.Error())
+	// Discard the saved session by dropping and recreating the schema (a true clean
+	// slate). The store has no per-row delete by design (the model is append-only /
+	// status-based), so the reset is a schema down+up via the reversible migrations.
+	// This wipes the global DB — the same scope as the old global state/ wipe — and,
+	// like the old reset, NEVER touches worktrees or branches.
+	ctx := context.Background()
+	tasks, _ := m.Store.ListTasks(ctx, db.TaskFilter{})
+	if err := m.Store.MigrateDown(ctx, 0); err != nil {
+		notes = append(notes, "state reset (drop): "+err.Error())
+		return notes, nil
 	}
-	tasks, _ := m.Store.List()
-	for _, t := range tasks {
-		if err := m.Store.Remove(t.ID); err != nil {
-			notes = append(notes, fmt.Sprintf("%s: %s", t.ID, err.Error()))
-		}
+	if err := m.Store.Migrate(ctx); err != nil {
+		notes = append(notes, "state reset (recreate): "+err.Error())
+		return notes, nil
 	}
 	notes = append(notes, fmt.Sprintf("discarded the saved session (%d task record(s)); worktrees and branches were kept", len(tasks)))
 	return notes, nil
@@ -689,10 +750,16 @@ func (m *Manager) OpenCC(isolated bool) error {
 		harness.TrustWorktree(h, dir)
 	}
 	_ = tmux.SendLine(m.Session, window, harness.InteractiveCommand(h))
-	_ = m.Store.Save(state.Task{
-		ID: id, Window: window, Worktree: dir, Harness: h,
-		Kind: "cc", Created: time.Now(),
-	})
+	// Track the cc session (best-effort, as before). Every task needs a project (FK),
+	// so the session's directory is upserted as the project — a cc session may not be
+	// in a git repo, and repo_path is only a grouping/display key here.
+	ctx := context.Background()
+	if proj, err := m.Store.UpsertProject(ctx, dir, ""); err == nil {
+		_, _ = m.Store.CreateTask(ctx, db.Task{
+			ID: id, ProjectID: proj.ID, Window: window, Worktree: dir, Harness: h,
+			Kind: db.KindCC, Created: time.Now(), Status: db.StatusActive,
+		}, db.ActorManager)
+	}
 	return tmux.Attach(m.Session, window)
 }
 
@@ -700,8 +767,8 @@ func (m *Manager) OpenCC(isolated bool) error {
 
 // ReviewDiff returns a worker's changes against the repo's default branch.
 func (m *Manager) ReviewDiff(taskID string, stat bool) (string, error) {
-	t, err := m.Store.Load(taskID)
-	if err != nil {
+	t, ok, err := m.Store.GetTask(context.Background(), taskID)
+	if err != nil || !ok {
 		return "", fmt.Errorf("unknown task %q", taskID)
 	}
 	base := worktree.DefaultBranch(t.Project)
@@ -711,8 +778,8 @@ func (m *Manager) ReviewDiff(taskID string, stat bool) (string, error) {
 // Validate runs the worktree's detected checks for a task. It returns nil results
 // when no checks are detected (the caller reports that distinctly from a pass).
 func (m *Manager) Validate(taskID string) ([]validate.Result, error) {
-	t, err := m.Store.Load(taskID)
-	if err != nil {
+	t, ok, err := m.Store.GetTask(context.Background(), taskID)
+	if err != nil || !ok {
 		return nil, fmt.Errorf("unknown task %q", taskID)
 	}
 	steps := validate.Detect(t.Worktree)
@@ -725,8 +792,8 @@ func (m *Manager) Validate(taskID string) ([]validate.Result, error) {
 // Approve grants a short-lived approval token authorizing a merge for taskID.
 // This is intended for the lead to run, not the manager.
 func (m *Manager) Approve(taskID string, ttl time.Duration) error {
-	t, err := m.Store.Load(taskID)
-	if err != nil {
+	t, ok, err := m.Store.GetTask(context.Background(), taskID)
+	if err != nil || !ok {
 		return fmt.Errorf("unknown task %q", taskID)
 	}
 	if ttl <= 0 {
@@ -741,9 +808,13 @@ func (m *Manager) Approve(taskID string, ttl time.Duration) error {
 	}
 	// Record that THIS approval was the lead's — both in the token's provenance (the
 	// authority for the merge's audit label) and in the persisted task state (overwriting
-	// any prior auto-mint marker so the two never drift).
-	t.ApprovedBy = "human"
-	if err := m.Store.Save(t); err != nil {
+	// any prior auto-mint marker so the two never drift). RecordDelivery preserves the
+	// gate/sha fields it is given; the 'approved' event is manager/lead-authored and
+	// non-actionable, so it never wakes a watcher.
+	if err := m.Store.RecordDelivery(context.Background(), taskID, db.Delivery{
+		GatePassed: t.GatePassed, ApprovedBy: "human", ReviewedSHA: t.ReviewedSHA,
+		EventType: db.EventApproved, Actor: db.ActorLead,
+	}); err != nil {
 		return err
 	}
 	m.audit(fmt.Sprintf("approve task=%s commit=%s ttl=%s", taskID, short(head), ttl))
@@ -758,8 +829,8 @@ func (m *Manager) Approve(taskID string, ttl time.Duration) error {
 // cannot present a benign working tree while a different commit merges. It returns the
 // inputs dir.
 func (m *Manager) TrustPrep(taskID string) (string, error) {
-	t, err := m.Store.Load(taskID)
-	if err != nil {
+	t, ok, err := m.Store.GetTask(context.Background(), taskID)
+	if err != nil || !ok {
 		return "", fmt.Errorf("unknown task %q", taskID)
 	}
 	// Reviewed state must equal the committed state that will merge.
@@ -819,8 +890,8 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 // merge gate in MergeLocal.
 func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Verdict, error) {
 	var zero review.Verdict
-	t, err := m.Store.Load(taskID)
-	if err != nil {
+	t, ok, err := m.Store.GetTask(context.Background(), taskID)
+	if err != nil || !ok {
 		return zero, fmt.Errorf("unknown task %q", taskID)
 	}
 	if ttl <= 0 {
@@ -873,7 +944,13 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 			t.ApprovedBy = "auto"
 		}
 	}
-	if err := m.Store.Save(t); err != nil {
+	// Persist the verdict provenance (gate/approval/sha) in one write. The
+	// review_recorded event is manager-authored and non-actionable (§1.3). t was
+	// mutated above as the accumulator for the auto-mint decision.
+	if err := m.Store.RecordDelivery(context.Background(), taskID, db.Delivery{
+		GatePassed: t.GatePassed, ApprovedBy: t.ApprovedBy, ReviewedSHA: t.ReviewedSHA,
+		EventType: db.EventReviewRecorded, Actor: db.ActorManager,
+	}); err != nil {
 		return zero, err
 	}
 	autoMinted := "no"
@@ -916,8 +993,8 @@ func (m *Manager) securityVerdictPath(taskID string) string {
 // verdict (fail closed) telling the manager to actually run the reviewer.
 func (m *Manager) SecurityReview(taskID, sha string, ttl time.Duration) (review.Verdict, error) {
 	var zero review.Verdict
-	t, err := m.Store.Load(taskID)
-	if err != nil {
+	t, ok, err := m.Store.GetTask(context.Background(), taskID)
+	if err != nil || !ok {
 		return zero, fmt.Errorf("unknown task %q", taskID)
 	}
 	if ttl <= 0 {
@@ -964,8 +1041,8 @@ func (m *Manager) SecurityReviewShow(taskID string) (review.Verdict, bool) {
 // commit being merged (verdict.ReviewedSHA==workerHead), closing the TOCTOU window
 // where a commit lands after review. Every merge is recorded in the audit log.
 func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error) {
-	t, err := m.Store.Load(taskID)
-	if err != nil {
+	t, ok, err := m.Store.GetTask(context.Background(), taskID)
+	if err != nil || !ok {
 		return "", fmt.Errorf("unknown task %q", taskID)
 	}
 	if !approval.Valid(m.P.ApprovalFile(taskID)) {
@@ -1232,7 +1309,7 @@ func splitApprovalPayload(data string) (by, sha string) {
 // substitute a faulty integrator and exercise Land's post-merge verification abort path
 // (a clean local fast-forward can never land a tree different from the validated commit,
 // so the only way to drive the mismatch alarm in-process is to inject one).
-var landIntegrate = func(m *Manager, t state.Task, mode string, requireVerdict bool, rebasedHead string) (string, error) {
+var landIntegrate = func(m *Manager, t db.Task, mode string, requireVerdict bool, rebasedHead string) (string, error) {
 	return m.integrate(t, mode, requireVerdict, rebasedHead)
 }
 
@@ -1264,8 +1341,8 @@ var landIntegrate = func(m *Manager, t state.Task, mode string, requireVerdict b
 // case — the worker already current with the default — rebases to a no-op and lands in one
 // command. Every failure is loud; Land never silently no-ops.
 func (m *Manager) Land(taskID string, requireVerdict bool) (string, error) {
-	t, err := m.Store.Load(taskID)
-	if err != nil {
+	t, ok, err := m.Store.GetTask(context.Background(), taskID)
+	if err != nil || !ok {
 		return "", fmt.Errorf("unknown task %q", taskID)
 	}
 	repo, wt := t.Project, t.Worktree
@@ -1417,7 +1494,7 @@ func (m *Manager) securityAuditNote(taskID, landedSHA string, gated bool) string
 // approve the rebased commit when its own rebase moved the worker onto an advanced default,
 // instead of MergeLocal later consuming a now-stale token and reporting a confusing generic
 // mismatch.
-func (m *Manager) gateCoversRebased(t state.Task, rebasedHead string, gated bool) error {
+func (m *Manager) gateCoversRebased(t db.Task, rebasedHead string, gated bool) error {
 	data, ok := approval.Data(m.P.ApprovalFile(t.ID))
 	_, approvedSha := splitApprovalPayload(data)
 	if !ok || approvedSha != rebasedHead {
@@ -1435,7 +1512,7 @@ func (m *Manager) gateCoversRebased(t state.Task, rebasedHead string, gated bool
 }
 
 // integrate performs Land's mode-appropriate merge and returns the local default tip.
-func (m *Manager) integrate(t state.Task, mode string, requireVerdict bool, rebasedHead string) (string, error) {
+func (m *Manager) integrate(t db.Task, mode string, requireVerdict bool, rebasedHead string) (string, error) {
 	repo := t.Project
 	def := worktree.DefaultBranch(repo)
 	if mode == "pr" {
@@ -1454,7 +1531,7 @@ func (m *Manager) integrate(t state.Task, mode string, requireVerdict bool, reba
 // opens (or reuses) a PR, merges it, then fast-forwards the local default branch to the
 // merged tip. GitHub's required reviews / branch protection / status checks are the gate
 // here, and a merge they block fails loudly.
-func (m *Manager) integratePR(t state.Task, def, rebasedHead string) (string, error) {
+func (m *Manager) integratePR(t db.Task, def, rebasedHead string) (string, error) {
 	repo, wt := t.Project, t.Worktree
 	// HEAD-unchanged bracket (mirrors MergeLocal): the worker must not have advanced past
 	// the validated commit between validation and publish, so an unvalidated commit can
@@ -1568,25 +1645,26 @@ func ghEnsurePR(repo, branch, base, taskID string) error {
 
 // Promote turns a scout task into a ship task (restoring teardown protection).
 func (m *Manager) Promote(taskID string) error {
-	t, err := m.Store.Load(taskID)
-	if err != nil {
+	t, ok, err := m.Store.GetTask(context.Background(), taskID)
+	if err != nil || !ok {
 		return fmt.Errorf("unknown task %q", taskID)
 	}
 	if t.Kind != "scout" {
 		return fmt.Errorf("task %q is not a scout task", taskID)
 	}
-	t.Kind = "ship"
-	return m.Store.Save(t)
+	// Flip the kind (a plain field write, no event); the 'promoted' event is layered
+	// on in increment 5 (§3.4). The CHECK constraint validates the new kind.
+	ship := db.KindShip
+	return m.Store.SetTaskFields(context.Background(), taskID, db.TaskFields{Kind: &ship})
 }
 
 // ArmPRCheck records a PR URL on a task so the supervisor polls for its merge.
 func (m *Manager) ArmPRCheck(taskID, url string) error {
-	t, err := m.Store.Load(taskID)
-	if err != nil {
+	if _, ok, err := m.Store.GetTask(context.Background(), taskID); err != nil || !ok {
 		return fmt.Errorf("unknown task %q", taskID)
 	}
-	t.PR = url
-	return m.Store.Save(t)
+	// Record the PR url (no event in increment 1; §3.4 adds pr_armed in increment 5).
+	return m.Store.SetTaskFields(context.Background(), taskID, db.TaskFields{PR: &url})
 }
 
 // FleetSync refreshes a repo's local default branch from origin when safe and
@@ -1633,7 +1711,7 @@ func (m *Manager) Recovery() ([]string, error) {
 	for _, w := range windows {
 		winSet[w] = true
 	}
-	tasks, _ := m.Store.List()
+	tasks := m.liveTasks()
 	hasMeta := map[string]bool{}
 	for _, t := range tasks {
 		hasMeta[t.Window] = true

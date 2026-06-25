@@ -14,8 +14,11 @@ package db
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"testing"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver, registered as "sqlite"
@@ -46,9 +49,40 @@ func dsn(path string) string {
 		"&_txlock=immediate"
 }
 
+// guardRealHomeUnderTest fails closed when a `go test` run resolves a DB or state
+// path to the user's real ~/.ttorch home. It is a data-loss backstop: Open creates
+// state.db there and db.ImportLegacy RENAMES the live state/ directory away, so a
+// test that forgot to point TTORCH_HOME at a temp dir would silently take down the
+// user's running session. Production (testing.Testing() == false) is never affected
+// and migrates normally; a test that genuinely needs the store must set TTORCH_HOME
+// (and TTORCH_DB) to a temp dir. The package-level TestMain in the orchestrator/cli
+// test packages already guarantees this; this guard catches any path that slips
+// past it.
+func guardRealHomeUnderTest(path string) error {
+	if !testing.Testing() {
+		return nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return nil
+	}
+	real := filepath.Join(home, ".ttorch")
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil
+	}
+	if abs == real || strings.HasPrefix(abs, real+string(os.PathSeparator)) {
+		return fmt.Errorf("db: refusing to touch the real ttorch home %q under `go test`; point TTORCH_HOME (and TTORCH_DB) at a temp dir in the test", abs)
+	}
+	return nil
+}
+
 // Open opens (creating if absent) the SQLite database at path, applies the DSN
 // PRAGMAs, runs any pending migrations, and returns a ready Store.
 func Open(path string) (*Store, error) {
+	if err := guardRealHomeUnderTest(path); err != nil {
+		return nil, err
+	}
 	if dir := filepath.Dir(path); dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, err

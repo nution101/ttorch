@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -12,10 +13,29 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/paths"
-	"github.com/nution101/ttorch/internal/state"
 	"github.com/nution101/ttorch/internal/wake"
 )
+
+// TestMain points TTORCH_HOME at a throwaway dir for the whole package (when not
+// already set) so a test that reaches New()/db.Open against paths.StateDB() can
+// never resolve to the real ~/.ttorch. It sets it only-if-unset so the cross-process
+// flock tests, which deliberately pass a shared TTORCH_HOME to their helper
+// subprocess, keep working. The db.Open guard is the final fail-closed backstop.
+func TestMain(m *testing.M) {
+	if os.Getenv("TTORCH_HOME") == "" {
+		home, err := os.MkdirTemp("", "ttorch-supervisor-test-home-*")
+		if err != nil {
+			panic(err)
+		}
+		os.Setenv("TTORCH_HOME", home)
+		code := m.Run()
+		_ = os.RemoveAll(home)
+		os.Exit(code)
+	}
+	os.Exit(m.Run())
+}
 
 func TestTick_SignalsHeartbeatAndDedup(t *testing.T) {
 	// This test is about the wake-queue, not the auto-driver: opt out so the default
@@ -167,7 +187,7 @@ func TestAutodrive_HeartbeatDoesNotPoke(t *testing.T) {
 // not be re-woken for that unchanged stale state it has already seen.
 func TestAutodrive_RepeatedStaleDoesNotRepoke(t *testing.T) {
 	s, fm := newAutodriveSup(t)
-	mustSaveTask(t, s, state.Task{ID: "w1", Window: "w-w1", Kind: "ship"})
+	mustSaveTask(t, s, db.Task{ID: "w1", Window: "w-w1", Kind: "ship"})
 	// A static, non-busy pane: the worker is idle and its pane never changes.
 	s.captureWorker = func(window string) (string, bool) { return "$ idle at the prompt", true }
 
@@ -190,7 +210,7 @@ func TestAutodrive_RepeatedStaleDoesNotRepoke(t *testing.T) {
 // never treated as stale and never pokes — guards against poking a mid-turn worker.
 func TestAutodrive_BusyWorkerNeverStale(t *testing.T) {
 	s, fm := newAutodriveSup(t)
-	mustSaveTask(t, s, state.Task{ID: "w1", Window: "w-w1", Kind: "ship"})
+	mustSaveTask(t, s, db.Task{ID: "w1", Window: "w-w1", Kind: "ship"})
 	s.captureWorker = func(window string) (string, bool) { return "… esc to interrupt …", true }
 
 	for i := 0; i < 6; i++ {
@@ -255,9 +275,24 @@ func newLabelSup(t *testing.T) (s *Supervisor, panes map[string]string, writes *
 	return s, panes, &recorded
 }
 
-func mustSaveTask(t *testing.T, s *Supervisor, task state.Task) {
+func mustSaveTask(t *testing.T, s *Supervisor, task db.Task) {
 	t.Helper()
-	if err := s.Store.Save(task); err != nil {
+	ctx := context.Background()
+	// Each task needs a project (FK NOT NULL); derive one from its id when the test
+	// didn't set Project, since these tests only exercise liveness/label scans.
+	repo := task.Project
+	if repo == "" {
+		repo = "/repo/" + task.ID
+	}
+	proj, err := s.Store.UpsertProject(ctx, repo, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task.ProjectID = proj.ID
+	if task.Status == "" {
+		task.Status = db.StatusActive
+	}
+	if _, err := s.Store.CreateTask(ctx, task, db.ActorManager); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -277,8 +312,8 @@ func lastLabel(writes []labeledTab, window string) string {
 // amber glyph — both prefixed onto the task id.
 func TestScanLabels_GlyphPerState(t *testing.T) {
 	s, panes, writes := newLabelSup(t)
-	mustSaveTask(t, s, state.Task{ID: "trust-gate", Window: "w-trust-gate", Kind: "ship"})
-	mustSaveTask(t, s, state.Task{ID: "scout-trust-surface", Window: "w-scout", Kind: "scout"})
+	mustSaveTask(t, s, db.Task{ID: "trust-gate", Window: "w-trust-gate", Kind: "ship"})
+	mustSaveTask(t, s, db.Task{ID: "scout-trust-surface", Window: "w-scout", Kind: "scout"})
 	panes["w-trust-gate"] = "… esc to interrupt …" // a busy indicator
 	panes["w-scout"] = "$ waiting at the prompt"   // no busy indicator -> idle
 
@@ -296,7 +331,7 @@ func TestScanLabels_GlyphPerState(t *testing.T) {
 // a state change writes exactly one new label.
 func TestScanLabels_OnlyWritesOnChange(t *testing.T) {
 	s, panes, writes := newLabelSup(t)
-	mustSaveTask(t, s, state.Task{ID: "t1", Window: "w1", Kind: "ship"})
+	mustSaveTask(t, s, db.Task{ID: "t1", Window: "w1", Kind: "ship"})
 	panes["w1"] = "thinking…" // busy
 
 	s.scanLabels()
@@ -319,9 +354,9 @@ func TestScanLabels_OnlyWritesOnChange(t *testing.T) {
 // not ttorch workers and are never colored, even when busy.
 func TestScanLabels_SkipsManagerAndCC(t *testing.T) {
 	s, panes, writes := newLabelSup(t)
-	mustSaveTask(t, s, state.Task{ID: "mgr", Window: managerWindow, Kind: "ship"})
-	mustSaveTask(t, s, state.Task{ID: "attached", Window: "w-cc", Kind: "cc"})
-	mustSaveTask(t, s, state.Task{ID: "real", Window: "w-real", Kind: "ship"})
+	mustSaveTask(t, s, db.Task{ID: "mgr", Window: managerWindow, Kind: "ship"})
+	mustSaveTask(t, s, db.Task{ID: "attached", Window: "w-cc", Kind: "cc"})
+	mustSaveTask(t, s, db.Task{ID: "real", Window: "w-real", Kind: "ship"})
 	panes[managerWindow] = "thinking…"
 	panes["w-cc"] = "thinking…"
 	panes["w-real"] = "thinking…"
@@ -340,7 +375,7 @@ func TestScanLabels_SkipsManagerAndCC(t *testing.T) {
 // fails) keeps its last label rather than being relabeled blind.
 func TestScanLabels_SkipsUnreadableWindow(t *testing.T) {
 	s, _, writes := newLabelSup(t)
-	mustSaveTask(t, s, state.Task{ID: "gone", Window: "w-gone", Kind: "ship"})
+	mustSaveTask(t, s, db.Task{ID: "gone", Window: "w-gone", Kind: "ship"})
 	// No pane entry for w-gone -> captureWorker returns ok=false.
 
 	s.scanLabels()
@@ -354,7 +389,7 @@ func TestScanLabels_SkipsUnreadableWindow(t *testing.T) {
 // the next tick retries it even though the state is unchanged (best-effort).
 func TestScanLabels_RetriesAfterLabelError(t *testing.T) {
 	s, panes, _ := newLabelSup(t)
-	mustSaveTask(t, s, state.Task{ID: "t1", Window: "w1", Kind: "ship"})
+	mustSaveTask(t, s, db.Task{ID: "t1", Window: "w1", Kind: "ship"})
 	panes["w1"] = "working…"
 	calls := 0
 	s.labelWindow = func(window, label string) error {

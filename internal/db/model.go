@@ -198,6 +198,10 @@ type TaskFilter struct {
 
 // TaskFields is a partial update of a task's runtime/coupling fields (no event,
 // §2.2). A nil pointer leaves that column unchanged; updated_at always advances.
+//
+// Kind is the scout↔ship lifecycle marker; Promote sets it here (a plain field
+// write, no event) until the manager-authored 'promoted' event is layered on in
+// increment 5 (§3.4). The CHECK constraint validates the value (ship|scout|cc).
 type TaskFields struct {
 	Window    *string
 	Worktree  *string
@@ -206,6 +210,7 @@ type TaskFields struct {
 	PR        *string
 	Owner     *string
 	Title     *string
+	Kind      *string
 	EpicID    *int64
 	PhaseID   *int64
 	Footprint *[]string

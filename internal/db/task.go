@@ -304,6 +304,9 @@ func (s *Store) SetTaskFields(ctx context.Context, id string, f TaskFields) erro
 	if f.Title != nil {
 		add("title", *f.Title)
 	}
+	if f.Kind != nil {
+		add("kind", *f.Kind)
+	}
 	if f.EpicID != nil {
 		add("epic_id", *f.EpicID)
 	}

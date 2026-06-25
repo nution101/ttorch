@@ -52,7 +52,12 @@ func assetName(tag string) string {
 func Main(args []string) int {
 	if len(args) == 0 {
 		// Bare `ttorch` launches the manager session (auto-restoring saved state).
-		return run(mgr().StartManager())
+		m, err := mgr()
+		if err != nil {
+			return run(err)
+		}
+		defer m.Close()
+		return run(m.StartManager())
 	}
 	cmd, rest := args[0], args[1:]
 	switch cmd {
@@ -77,7 +82,12 @@ func Main(args []string) int {
 	case "skills":
 		return run(cmdSkills(rest))
 	case "manager":
-		return run(mgr().StartManager())
+		m, err := mgr()
+		if err != nil {
+			return run(err)
+		}
+		defer m.Close()
+		return run(m.StartManager())
 	case "resume":
 		return run(cmdResume())
 	case "reset":
@@ -303,7 +313,11 @@ func cmdProfile(args []string) error {
 	return nil
 }
 
-func mgr() *orchestrator.Manager { return orchestrator.New(paths.Default()) }
+// mgr opens a Manager (and so the SQLite state store, which can fail to open or
+// migrate). Each short-lived CLI command opens exactly one and closes it with
+// defer m.Close() — one Open + Close per process (§2.4). The error propagates to the
+// shared run(err) exit path.
+func mgr() (*orchestrator.Manager, error) { return orchestrator.New(paths.Default()) }
 
 func cmdSpawn(args []string) error {
 	// Task id and repo are the first two positionals; flags follow (the stdlib
@@ -321,7 +335,11 @@ func cmdSpawn(args []string) error {
 	if err := fs.Parse(args[2:]); err != nil {
 		return err
 	}
-	m := mgr()
+	m, err := mgr()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
 	if *doInit {
 		notes, err := m.InitRepo(repo, "pr")
 		if err != nil {
@@ -370,7 +388,11 @@ func parseTouches(s string) []string {
 }
 
 func cmdStatus() error {
-	m := mgr()
+	m, err := mgr()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
 	tasks, err := m.Status()
 	if err != nil {
 		return err
@@ -444,7 +466,12 @@ func cmdCheckOverlap(args []string) error {
 	if err != nil {
 		return fmt.Errorf("check-overlap: %s is not inside a git repository; cd into the repo or pass --repo <dir> (footprints are repo-relative)", scope)
 	}
-	renderOverlap(os.Stdout, footprint, mgr().CheckOverlap(repo, footprint))
+	m, err := mgr()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	renderOverlap(os.Stdout, footprint, m.CheckOverlap(repo, footprint))
 	return nil
 }
 
@@ -489,7 +516,12 @@ func cmdPeek(args []string) error {
 			lines = n
 		}
 	}
-	out, err := mgr().Peek(args[0], lines)
+	m, err := mgr()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	out, err := m.Peek(args[0], lines)
 	if err != nil {
 		return err
 	}
@@ -514,7 +546,12 @@ func cmdSend(args []string) error {
 	if msg == "" {
 		return errors.New("send: empty message — nothing to deliver")
 	}
-	if err := mgr().Send(id, msg); err != nil {
+	m, err := mgr()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	if err := m.Send(id, msg); err != nil {
 		return err
 	}
 	fmt.Printf("sent to %s\n", id)
@@ -601,7 +638,12 @@ func cmdTeardown(args []string) error {
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
-	notes, err := mgr().Teardown(id, *force)
+	m, err := mgr()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	notes, err := m.Teardown(id, *force)
 	if err != nil {
 		return err
 	}
@@ -618,7 +660,12 @@ func cmdCC(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	return mgr().OpenCC(*isolated)
+	m, err := mgr()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	return m.OpenCC(*isolated)
 }
 
 func cmdDaemon(args []string) error {
@@ -644,7 +691,12 @@ func cmdDaemon(args []string) error {
 
 func cmdStop() error {
 	_ = daemonStop() // stop the supervisor (prints its own line)
-	notes, err := mgr().StopSession()
+	m, err := mgr()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	notes, err := m.StopSession()
 	for _, n := range notes {
 		fmt.Println("  " + n)
 	}
@@ -654,7 +706,11 @@ func cmdStop() error {
 // cmdResume forces a rebuild of the manager window and every worker tab from
 // saved state, then attaches the lead to the manager.
 func cmdResume() error {
-	m := mgr()
+	m, err := mgr()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
 	notes, err := m.Resume()
 	if err != nil {
 		return err
@@ -677,7 +733,12 @@ func cmdReset(args []string) error {
 		fmt.Println("aborted")
 		return nil
 	}
-	notes, err := mgr().Reset()
+	m, err := mgr()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	notes, err := m.Reset()
 	if err != nil {
 		return err
 	}
@@ -811,7 +872,12 @@ func cmdValidate(args []string) error {
 	if len(args) < 1 {
 		return errors.New("usage: ttorch validate <task-id>")
 	}
-	results, err := mgr().Validate(args[0])
+	m, err := mgr()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	results, err := m.Validate(args[0])
 	if err != nil {
 		return err
 	}
@@ -867,7 +933,12 @@ func cmdReviewDiff(args []string) error {
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
-	out, err := mgr().ReviewDiff(id, *stat)
+	m, err := mgr()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	out, err := m.ReviewDiff(id, *stat)
 	if err != nil {
 		return err
 	}
@@ -889,7 +960,12 @@ func cmdApprove(args []string) error {
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
-	if err := mgr().Approve(id, *ttl); err != nil {
+	m, err := mgr()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	if err := m.Approve(id, *ttl); err != nil {
 		return err
 	}
 	fmt.Printf("approved %s for %s — now run: ttorch merge-local %s\n", id, *ttl, id)
@@ -901,9 +977,14 @@ func cmdTrust(args []string) error {
 		return errors.New("usage: ttorch trust prep|record|show <task-id> [flags]")
 	}
 	sub, id := args[0], args[1]
+	m, err := mgr()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
 	switch sub {
 	case "prep":
-		dir, err := mgr().TrustPrep(id)
+		dir, err := m.TrustPrep(id)
 		if err != nil {
 			return err
 		}
@@ -918,7 +999,7 @@ func cmdTrust(args []string) error {
 		if err := fs.Parse(args[2:]); err != nil {
 			return err
 		}
-		v, err := mgr().TrustRecord(id, *sha, *ttl)
+		v, err := m.TrustRecord(id, *sha, *ttl)
 		if err != nil {
 			return err
 		}
@@ -926,7 +1007,7 @@ func cmdTrust(args []string) error {
 		fmt.Printf("recorded %s verdict for %s (valid %s)\n", v.Overall, id, *ttl)
 		return nil
 	case "show":
-		v, ok := mgr().TrustShow(id)
+		v, ok := m.TrustShow(id)
 		if !ok {
 			fmt.Printf("no valid verdict for %s — run 'ttorch trust record %s'\n", id, id)
 			return nil
@@ -950,7 +1031,12 @@ func cmdMergeLocal(args []string) error {
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
-	out, err := mgr().MergeLocal(id, *requireVerdict)
+	m, err := mgr()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	out, err := m.MergeLocal(id, *requireVerdict)
 	if err != nil {
 		return err
 	}
@@ -969,7 +1055,12 @@ func cmdLand(args []string) error {
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
-	out, err := mgr().Land(id, *requireVerdict)
+	m, err := mgr()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	out, err := m.Land(id, *requireVerdict)
 	if err != nil {
 		return err
 	}
@@ -981,7 +1072,12 @@ func cmdPromote(args []string) error {
 	if len(args) < 1 {
 		return errors.New("usage: ttorch promote <task-id>")
 	}
-	if err := mgr().Promote(args[0]); err != nil {
+	m, err := mgr()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	if err := m.Promote(args[0]); err != nil {
 		return err
 	}
 	fmt.Printf("promoted %s to a ship task\n", args[0])
@@ -992,7 +1088,12 @@ func cmdPRCheck(args []string) error {
 	if len(args) < 2 {
 		return errors.New("usage: ttorch pr-check <task-id> <pr-url>")
 	}
-	if err := mgr().ArmPRCheck(args[0], args[1]); err != nil {
+	m, err := mgr()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	if err := m.ArmPRCheck(args[0], args[1]); err != nil {
 		return err
 	}
 	fmt.Printf("watching %s for merge of %s\n", args[0], args[1])
@@ -1004,7 +1105,12 @@ func cmdFleetSync(args []string) error {
 	if len(args) > 0 {
 		dir = args[0]
 	}
-	notes, err := mgr().FleetSync(dir)
+	m, err := mgr()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	notes, err := m.FleetSync(dir)
 	if err != nil {
 		return err
 	}
@@ -1015,7 +1121,12 @@ func cmdFleetSync(args []string) error {
 }
 
 func cmdRecovery() error {
-	notes, err := mgr().Recovery()
+	m, err := mgr()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	notes, err := m.Recovery()
 	if err != nil {
 		return err
 	}
@@ -1032,8 +1143,13 @@ func resolveRepo(repoFlag, taskFlag string) (string, error) {
 		return worktree.RepoRoot(repoFlag)
 	}
 	if taskFlag != "" {
-		t, err := mgr().Store.Load(taskFlag)
+		m, err := mgr()
 		if err != nil {
+			return "", err
+		}
+		defer m.Close()
+		t, ok, err := m.Store.GetTask(context.Background(), taskFlag)
+		if err != nil || !ok {
 			return "", fmt.Errorf("unknown task %q", taskFlag)
 		}
 		if t.Project != "" {

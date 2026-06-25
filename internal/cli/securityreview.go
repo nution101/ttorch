@@ -27,12 +27,17 @@ func cmdSecurityReview(args []string) error {
 		return errors.New("usage: ttorch security-review prep|record|show <task-id> [flags]")
 	}
 	sub, id := args[0], args[1]
+	m, err := mgr()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
 	switch sub {
 	case "prep":
 		// The security reviewer reads exactly the inputs trust prep materializes
 		// (diff.patch / brief.md / validate.json / head.txt), so reuse it rather than
 		// duplicate the materialization.
-		dir, err := mgr().TrustPrep(id)
+		dir, err := m.TrustPrep(id)
 		if err != nil {
 			return err
 		}
@@ -46,14 +51,14 @@ func cmdSecurityReview(args []string) error {
 		if err := fs.Parse(args[2:]); err != nil {
 			return err
 		}
-		v, err := mgr().SecurityReview(id, *sha, *ttl)
+		v, err := m.SecurityReview(id, *sha, *ttl)
 		if err != nil {
 			return err
 		}
 		printSecurityVerdict(id, v)
 		return nil
 	case "show":
-		v, ok := mgr().SecurityReviewShow(id)
+		v, ok := m.SecurityReviewShow(id)
 		if !ok {
 			fmt.Printf("no security audit recorded for %s — run 'ttorch security-review prep %s', review, then 'ttorch security-review record %s'\n", id, id, id)
 			return nil

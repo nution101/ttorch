@@ -10,6 +10,24 @@ import (
 	"github.com/nution101/ttorch/internal/orchestrator"
 )
 
+// TestMain points TTORCH_HOME at a throwaway dir for the whole package so any test
+// that reaches mgr()/orchestrator.New() (and thus db.Open against paths.StateDB())
+// can never resolve to the real ~/.ttorch — where Open would create state.db and
+// ImportLegacy would rename the live state/ dir away. The db.Open guard is the final
+// fail-closed backstop.
+func TestMain(m *testing.M) {
+	os.Setenv("TTORCH_WORKER_TABS", "off")
+	os.Setenv("TTORCH_NO_SUPERVISOR", "1")
+	home, err := os.MkdirTemp("", "ttorch-cli-test-home-*")
+	if err != nil {
+		panic(err)
+	}
+	os.Setenv("TTORCH_HOME", home)
+	code := m.Run()
+	_ = os.RemoveAll(home)
+	os.Exit(code)
+}
+
 // nasty is a message body packed with the characters a shell would re-interpret:
 // command substitution (backticks and $(...)), variable expansion, both quote
 // kinds, angle-bracket redirects, pipes, and semicolons. The whole point of the

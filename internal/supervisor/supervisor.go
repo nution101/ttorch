@@ -29,9 +29,9 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 
+	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/livestate"
 	"github.com/nution101/ttorch/internal/paths"
-	"github.com/nution101/ttorch/internal/state"
 	"github.com/nution101/ttorch/internal/tmux"
 	"github.com/nution101/ttorch/internal/wake"
 )
@@ -52,7 +52,7 @@ func DefaultConfig() Config {
 type Supervisor struct {
 	P       paths.Paths
 	Session string
-	Store   state.Store
+	Store   *db.Store
 	Q       wake.Queue
 	Cfg     Config
 
@@ -87,10 +87,15 @@ type Supervisor struct {
 
 // New builds a Supervisor using the standard layout.
 func New(p paths.Paths) *Supervisor {
+	// Read the task set from the SQLite store (the source of truth) so the daemon
+	// keeps working through the migration; it is retired entirely in increment 6.
+	// Opening is best-effort: a failure leaves Store nil and the task scans no-op,
+	// while the daemon's marker/heartbeat work still runs.
+	store, _ := db.Open(p.StateDB())
 	s := &Supervisor{
 		P:             p,
 		Session:       tmux.SessionName(),
-		Store:         state.Store{Dir: p.StateDir()},
+		Store:         store,
 		Q:             wake.Queue{Path: p.WakeQueue()},
 		Cfg:           DefaultConfig(),
 		seen:          map[string]int64{},
@@ -148,6 +153,11 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		return err
 	}
 	defer s.release()
+	defer func() {
+		if s.Store != nil {
+			_ = s.Store.Close()
+		}
+	}()
 
 	t := time.NewTicker(s.Cfg.Poll)
 	defer t.Stop()
@@ -200,6 +210,16 @@ func (s *Supervisor) tick() {
 	s.flushPoke() // retry any poke the guards deferred (manager was busy / within cooldown)
 }
 
+// tasks returns the tracked tasks from the SQLite store, or nil if the store could
+// not be opened (best-effort, §8 row 1). The supervisor is retired in increment 6.
+func (s *Supervisor) tasks() []db.Task {
+	if s.Store == nil {
+		return nil
+	}
+	tasks, _ := s.Store.ListTasks(context.Background(), db.TaskFilter{})
+	return tasks
+}
+
 // scanChecks polls armed PR checks (rate-limited) and emits a wake when a task's
 // PR is merged. Requires the gh CLI.
 func (s *Supervisor) scanChecks() {
@@ -210,8 +230,7 @@ func (s *Supervisor) scanChecks() {
 		return
 	}
 	s.lastCheck = s.now()
-	tasks, _ := s.Store.List()
-	for _, t := range tasks {
+	for _, t := range s.tasks() {
 		if t.PR == "" || s.checked[t.ID] {
 			continue
 		}
@@ -265,8 +284,7 @@ func (s *Supervisor) scanSignals() {
 // new state, not the same idle one. (The matching wake is still appended once to the
 // durable queue; Drain dedupes by kind+key as a backstop.)
 func (s *Supervisor) scanStale() {
-	tasks, _ := s.Store.List()
-	for _, task := range tasks {
+	for _, task := range s.tasks() {
 		if task.Kind == "cc" {
 			continue
 		}
@@ -315,8 +333,7 @@ const labelCaptureLines = 6
 // being relabeled blind. The done/merged "green, move-to-end" state is owned by the
 // orchestrator merge path and is intentionally not handled here.
 func (s *Supervisor) scanLabels() {
-	tasks, _ := s.Store.List()
-	for _, task := range tasks {
+	for _, task := range s.tasks() {
 		if task.Kind == "cc" || task.Window == managerWindow {
 			continue
 		}

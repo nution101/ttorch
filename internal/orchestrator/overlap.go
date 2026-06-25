@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/state"
 )
 
@@ -23,7 +24,7 @@ type Conflict struct {
 // overlaps, and on which path pairs. A task with an empty footprint never
 // conflicts (a worker that declared nothing is exempt). Deterministic — tasks are
 // reported in input order — and free of tmux/liveness so it is unit-testable.
-func computeConflicts(proposed []string, tasks []state.Task) []Conflict {
+func computeConflicts(proposed []string, tasks []db.Task) []Conflict {
 	var out []Conflict
 	for _, t := range tasks {
 		if ov := state.FootprintOverlap(proposed, t.Footprint); len(ov) > 0 {
@@ -43,7 +44,7 @@ func computeConflicts(proposed []string, tasks []state.Task) []Conflict {
 // ad-hoc cc/manager session, is not the excluded task, and — when repo is non-empty
 // — belongs to that repo (footprints are repo-relative, so paths in different repos
 // can't actually collide). Pure, so the scoping rules are unit-testable.
-func footprintCandidate(t state.Task, repo, excludeID string) bool {
+func footprintCandidate(t db.Task, repo, excludeID string) bool {
 	if t.ID == excludeID || t.Kind == "cc" || len(t.Footprint) == 0 {
 		return false
 	}
@@ -53,10 +54,9 @@ func footprintCandidate(t state.Task, repo, excludeID string) bool {
 // liveFootprintTasks returns the live worker tasks eligible for overlap, scoped to
 // repo when non-empty. Liveness depends on tmux, so this impure half is kept out of
 // footprintCandidate / computeConflicts.
-func (m *Manager) liveFootprintTasks(repo, excludeID string) []state.Task {
-	tasks, _ := m.Store.List()
-	var out []state.Task
-	for _, t := range tasks {
+func (m *Manager) liveFootprintTasks(repo, excludeID string) []db.Task {
+	var out []db.Task
+	for _, t := range m.liveTasks() {
 		if footprintCandidate(t, repo, excludeID) && m.Live(t) {
 			out = append(out, t)
 		}

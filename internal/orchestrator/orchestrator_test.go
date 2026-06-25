@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,10 +12,10 @@ import (
 	"time"
 
 	"github.com/nution101/ttorch/internal/approval"
+	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/paths"
 	"github.com/nution101/ttorch/internal/projectinit"
 	"github.com/nution101/ttorch/internal/review"
-	"github.com/nution101/ttorch/internal/state"
 	"github.com/nution101/ttorch/internal/tmux"
 )
 
@@ -26,7 +27,20 @@ import (
 func TestMain(m *testing.M) {
 	os.Setenv("TTORCH_WORKER_TABS", "off")
 	os.Setenv("TTORCH_NO_SUPERVISOR", "1")
-	os.Exit(m.Run())
+	// Safety net: point TTORCH_HOME at a throwaway dir for the whole package so a
+	// test that forgets its own t.Setenv can never resolve the DB to the real
+	// ~/.ttorch — where db.Open would create state.db and ImportLegacy would rename
+	// the live state/ dir away (a session-wiping data-loss bug). Per-test
+	// t.Setenv("TTORCH_HOME", t.TempDir()) still overrides this for isolation; the
+	// db.Open guard is the final fail-closed backstop.
+	home, err := os.MkdirTemp("", "ttorch-orchestrator-test-home-*")
+	if err != nil {
+		panic(err)
+	}
+	os.Setenv("TTORCH_HOME", home)
+	code := m.Run()
+	_ = os.RemoveAll(home)
+	os.Exit(code)
 }
 
 func TestDeriveState(t *testing.T) {
@@ -76,7 +90,7 @@ func TestWindowLabel(t *testing.T) {
 // nobody; a worker that declared no footprint is exempt; an overlap names the
 // worker and the colliding paths.
 func TestComputeConflicts(t *testing.T) {
-	tasks := []state.Task{
+	tasks := []db.Task{
 		{ID: "a", Window: "wk-a", Project: "/repo", Footprint: []string{"internal/cli"}},
 		{ID: "b", Window: "wk-b", Project: "/repo", Footprint: []string{"internal/orchestrator"}},
 		{ID: "c", Window: "wk-c", Project: "/repo"}, // declared nothing -> exempt
@@ -104,10 +118,10 @@ func TestComputeConflicts(t *testing.T) {
 // ship/scout tasks in the requested repo (and not the excluded id) are eligible for
 // overlap. This is the repo-scoping + cc-exclusion guarantee, tested without tmux.
 func TestFootprintCandidate(t *testing.T) {
-	base := state.Task{ID: "x", Kind: "ship", Project: "/repo", Footprint: []string{"internal/cli"}}
+	base := db.Task{ID: "x", Kind: "ship", Project: "/repo", Footprint: []string{"internal/cli"}}
 	cases := []struct {
 		name          string
-		task          state.Task
+		task          db.Task
 		repo, exclude string
 		want          bool
 	}{
@@ -115,8 +129,8 @@ func TestFootprintCandidate(t *testing.T) {
 		{"unscoped matches any repo", base, "", "", true},
 		{"other repo excluded by scope", base, "/other", "", false},
 		{"excluded id", base, "/repo", "x", false},
-		{"cc session excluded", state.Task{ID: "c", Kind: "cc", Project: "/repo", Footprint: []string{"internal/cli"}}, "/repo", "", false},
-		{"no footprint excluded", state.Task{ID: "n", Kind: "ship", Project: "/repo"}, "/repo", "", false},
+		{"cc session excluded", db.Task{ID: "c", Kind: "cc", Project: "/repo", Footprint: []string{"internal/cli"}}, "/repo", "", false},
+		{"no footprint excluded", db.Task{ID: "n", Kind: "ship", Project: "/repo"}, "/repo", "", false},
 	}
 	for _, c := range cases {
 		if got := footprintCandidate(c.task, c.repo, c.exclude); got != c.want {
@@ -145,7 +159,7 @@ func TestSpawn_RefusesFootprintOverlap(t *testing.T) {
 	if !strings.Contains(err.Error(), "a1") {
 		t.Fatalf("refusal should name the conflicting task a1, got %q", err)
 	}
-	if _, lerr := m.Store.Load("b1"); lerr == nil {
+	if _, ok, _ := m.Store.GetTask(context.Background(), "b1"); ok {
 		t.Fatal("a refused spawn must persist no task record")
 	}
 	if tmux.WindowExists(m.Session, "wk-b1") {
@@ -225,7 +239,11 @@ func TestSpawnPeekTeardown(t *testing.T) {
 	t.Setenv("TTORCH_TMUX_SESSION", session)
 	defer exec.Command("tmux", "kill-session", "-t", session).Run()
 
-	m := New(paths.Default())
+	m, err := New(paths.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
 
 	task, err := m.Spawn("t1", repo, false, "printf 'TTORCH_MARKER\\n'; sleep 30")
 	if err != nil {
@@ -354,7 +372,12 @@ func TestSend_FailsLoudlyWhenWindowGone(t *testing.T) {
 // recorded returns a non-nil error (mapped to a non-zero exit by the CLI) rather
 // than silently doing nothing. Hermetic: it never reaches tmux.
 func TestSend_FailsLoudlyWhenTaskUnknown(t *testing.T) {
-	m := &Manager{Session: "ttorch-unknown", Store: state.Store{Dir: t.TempDir()}}
+	store, err := db.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	m := &Manager{Session: "ttorch-unknown", Store: store}
 	if err := m.Send("ghost", "hi"); err == nil {
 		t.Fatal("Send to an unknown task must return an error")
 	}
@@ -396,8 +419,19 @@ func TestSend_DeliversMessageVerbatim(t *testing.T) {
 		t.Fatal("test message must be single-line for line-based capture")
 	}
 	log := fakeTmux(t, "wk-v1")
-	m := &Manager{Session: "ttorch-verbatim", Store: state.Store{Dir: t.TempDir()}}
-	if err := m.Store.Save(state.Task{ID: "v1", Window: "wk-v1"}); err != nil {
+	store, err := db.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	m := &Manager{Session: "ttorch-verbatim", Store: store}
+	// Seed the task (and its project, for the FK) so Send resolves window "wk-v1".
+	proj, err := store.UpsertProject(context.Background(), "/repo", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateTask(context.Background(),
+		db.Task{ID: "v1", ProjectID: proj.ID, Window: "wk-v1", Status: db.StatusActive}, db.ActorManager); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.Send("v1", msg); err != nil {
@@ -451,7 +485,11 @@ func TestTeardownRefusesDirtyWorktree(t *testing.T) {
 	t.Setenv("TTORCH_TMUX_SESSION", session)
 	defer exec.Command("tmux", "kill-session", "-t", session).Run()
 
-	m := New(paths.Default())
+	m, err := New(paths.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
 	task, err := m.Spawn("d1", repo, false, "sleep 30")
 	if err != nil {
 		t.Fatal(err)
@@ -508,7 +546,11 @@ func TestDeliveryLifecycle(t *testing.T) {
 	t.Setenv("TTORCH_TMUX_SESSION", session)
 	defer exec.Command("tmux", "kill-session", "-t", session).Run()
 
-	m := New(paths.Default())
+	m, err := New(paths.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
 	task, err := m.Spawn("d1", repo, false, "sleep 60")
 	if err != nil {
 		t.Fatal(err)
@@ -563,7 +605,7 @@ func TestDeliveryLifecycle(t *testing.T) {
 	if err := m.Promote("s9"); err != nil {
 		t.Fatal(err)
 	}
-	reloaded, _ := m.Store.Load("s9")
+	reloaded, _, _ := m.Store.GetTask(context.Background(), "s9")
 	if reloaded.Kind != "ship" {
 		t.Fatalf("promote did not flip kind: %q", reloaded.Kind)
 	}
@@ -580,7 +622,11 @@ func TestMergeLocal_ApprovalBinding(t *testing.T) {
 	t.Setenv("TTORCH_TMUX_SESSION", session)
 	defer exec.Command("tmux", "kill-session", "-t", session).Run()
 
-	m := New(paths.Default())
+	m, err := New(paths.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
 	task, err := m.Spawn("b1", repo, false, "sleep 60")
 	if err != nil {
 		t.Fatal(err)
@@ -643,7 +689,12 @@ func deliveryHarness(t *testing.T, tag string) (*Manager, string) {
 	t.Setenv("TTORCH_HOME", t.TempDir())
 	t.Setenv("TTORCH_TMUX_SESSION", session)
 	t.Cleanup(func() { exec.Command("tmux", "kill-session", "-t", session).Run() })
-	return New(paths.Default()), repo
+	m, err := New(paths.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+	return m, repo
 }
 
 // writeReviewReports drops one per-dimension report per required reviewer into dir,
@@ -731,7 +782,7 @@ func TestTrustRecord_PrModeUnaffectedByVerdict(t *testing.T) {
 	if approval.Valid(m.P.ApprovalFile("p1")) {
 		t.Fatal("pr mode must NOT auto-mint an approval token")
 	}
-	reloaded, _ := m.Store.Load("p1")
+	reloaded, _, _ := m.Store.GetTask(context.Background(), "p1")
 	if !reloaded.GatePassed || reloaded.ReviewedSHA != head || reloaded.ApprovedBy != "" {
 		t.Fatalf("provenance wrong in pr mode: %+v", reloaded)
 	}
@@ -814,7 +865,7 @@ func TestMergeLocal_TrustedAutoApproveHappyPath(t *testing.T) {
 	if !approval.Valid(m.P.ApprovalFile("ta1")) {
 		t.Fatal("trusted + pass verdict + green validate must auto-mint an approval")
 	}
-	reloaded, _ := m.Store.Load("ta1")
+	reloaded, _, _ := m.Store.GetTask(context.Background(), "ta1")
 	if reloaded.ApprovedBy != "auto" || !reloaded.GatePassed || reloaded.ReviewedSHA != head {
 		t.Fatalf("auto-approve provenance wrong: %+v", reloaded)
 	}
@@ -859,7 +910,7 @@ func TestMergeLocal_TrustedHumanApproveOverridesAutoLabel(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The auto-mint happened first...
-	if reloaded, _ := m.Store.Load("ho1"); reloaded.ApprovedBy != "auto" {
+	if reloaded, _, _ := m.Store.GetTask(context.Background(), "ho1"); reloaded.ApprovedBy != "auto" {
 		t.Fatalf("expected an auto-mint first, got ApprovedBy=%q", reloaded.ApprovedBy)
 	}
 	// ...but the lead then explicitly approves the same commit, which must take over the
@@ -867,7 +918,7 @@ func TestMergeLocal_TrustedHumanApproveOverridesAutoLabel(t *testing.T) {
 	if err := m.Approve("ho1", time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if reloaded, _ := m.Store.Load("ho1"); reloaded.ApprovedBy != "human" {
+	if reloaded, _, _ := m.Store.GetTask(context.Background(), "ho1"); reloaded.ApprovedBy != "human" {
 		t.Fatalf("an explicit approve must record a human approver, got %q", reloaded.ApprovedBy)
 	}
 	if _, err := m.MergeLocal("ho1", false); err != nil {
@@ -910,7 +961,7 @@ func TestMergeLocal_TrustedNoChecksHardBlock(t *testing.T) {
 	if approval.Valid(m.P.ApprovalFile("nc1")) {
 		t.Fatal("no-checks-detected must never auto-mint, even with a pass verdict in trusted mode")
 	}
-	if reloaded, _ := m.Store.Load("nc1"); reloaded.ApprovedBy != "" {
+	if reloaded, _, _ := m.Store.GetTask(context.Background(), "nc1"); reloaded.ApprovedBy != "" {
 		t.Fatalf("no-checks repo must not record an auto approver: %+v", reloaded)
 	}
 
@@ -1159,7 +1210,7 @@ func TestMergeLocal_TrustedAutoMergeRefusesGateConfigChange(t *testing.T) {
 	if approval.Valid(m.P.ApprovalFile("gc1")) {
 		t.Fatal("a diff touching the gate definition must not auto-approve in trusted mode")
 	}
-	if reloaded, _ := m.Store.Load("gc1"); reloaded.ApprovedBy != "" {
+	if reloaded, _, _ := m.Store.GetTask(context.Background(), "gc1"); reloaded.ApprovedBy != "" {
 		t.Fatalf("a gate-config change must not record an auto approver: %+v", reloaded)
 	}
 	// With an explicit human approval, the gate-config change may merge (a human reviewed it).
@@ -1507,7 +1558,7 @@ func TestTrustRecord_TrustedBlocksHighFinding(t *testing.T) {
 	if approval.Valid(m.P.ApprovalFile("tb1")) {
 		t.Fatal("a blocking verdict must not auto-mint, even in trusted mode")
 	}
-	reloaded, _ := m.Store.Load("tb1")
+	reloaded, _, _ := m.Store.GetTask(context.Background(), "tb1")
 	if reloaded.GatePassed || reloaded.ApprovedBy != "" {
 		t.Fatalf("blocked verdict must not record a passing/auto provenance: %+v", reloaded)
 	}
@@ -1566,10 +1617,15 @@ func TestInitRepo(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
 	}
+	t.Setenv("TTORCH_HOME", t.TempDir())
 	repo := t.TempDir()
 	exec.Command("git", "-C", repo, "init").Run()
 
-	m := New(paths.Default())
+	m, err := New(paths.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
 	notes, err := m.InitRepo(repo, "pr")
 	if err != nil {
 		t.Fatal(err)
@@ -1676,7 +1732,11 @@ func TestStopSession(t *testing.T) {
 	t.Setenv("TTORCH_TMUX_SESSION", session)
 	defer exec.Command("tmux", "kill-session", "-t", session).Run()
 
-	m := New(paths.Default())
+	m, err := New(paths.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
 	if err := tmux.EnsureSession(m.Session); err != nil {
 		t.Fatal(err)
 	}
@@ -1709,10 +1769,14 @@ func TestRestoreAndReset(t *testing.T) {
 	t.Setenv("TTORCH_TMUX_SESSION", session)
 	defer exec.Command("tmux", "kill-session", "-t", session).Run()
 
-	m := New(paths.Default())
+	m, err := New(paths.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
 
 	// Save a manager record so restore rebuilds the manager window too.
-	if err := m.Store.SaveManager(state.Manager{Dir: repo, SessionID: "mgr-sid"}); err != nil {
+	if err := m.Store.SetManager(context.Background(), db.Manager{Dir: repo, SessionID: "mgr-sid"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := tmux.EnsureSession(m.Session); err != nil {
@@ -1754,10 +1818,10 @@ func TestRestoreAndReset(t *testing.T) {
 	if _, err := m.Reset(); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, _ := m.Store.LoadManager(); ok {
+	if _, ok, _ := m.Store.GetManager(context.Background()); ok {
 		t.Fatal("Reset should remove the manager record")
 	}
-	if tasks, _ := m.Store.List(); len(tasks) != 0 {
+	if tasks, _ := m.Store.ListTasks(context.Background(), db.TaskFilter{}); len(tasks) != 0 {
 		t.Fatalf("Reset should clear task records, got %d", len(tasks))
 	}
 	if tmux.HasSession(session) {
@@ -1908,7 +1972,7 @@ func TestLand_PostMergeVerifyMismatchAborts(t *testing.T) {
 	// commit than the validated one.
 	orig := landIntegrate
 	t.Cleanup(func() { landIntegrate = orig })
-	landIntegrate = func(_ *Manager, _ state.Task, _ string, _ bool, _ string) (string, error) {
+	landIntegrate = func(_ *Manager, _ db.Task, _ string, _ bool, _ string) (string, error) {
 		if err := os.WriteFile(filepath.Join(repo, "tampered.txt"), []byte("x\n"), 0o644); err != nil {
 			return "", err
 		}
@@ -2192,7 +2256,7 @@ func TestSecurityReview_AdvisoryAndIndependentOfTrustGate(t *testing.T) {
 		t.Fatal("security-review must NOT write the trust gate's verdict file")
 	}
 	// Task gate state is untouched (the advisory pass is side-effect-free on it).
-	reloaded, _ := m.Store.Load("sv1")
+	reloaded, _, _ := m.Store.GetTask(context.Background(), "sv1")
 	if reloaded.GatePassed || reloaded.ReviewedSHA != "" || reloaded.ApprovedBy != "" {
 		t.Fatalf("security-review must not touch the task's gate state: %+v", reloaded)
 	}
@@ -2285,7 +2349,11 @@ func TestSecurityReview_RefusesStaleSha(t *testing.T) {
 // It never blocks; it just reports whether a fresh security audit covers the landed commit.
 func TestSecurityAuditNote(t *testing.T) {
 	t.Setenv("TTORCH_HOME", t.TempDir())
-	m := New(paths.Default())
+	m, err := New(paths.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
 	const id, sha = "sn1", "deadbeefcafe0001"
 
 	// A gated land (trusted / --require-verdict) already ran the full review gate → no note.
