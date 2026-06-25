@@ -444,6 +444,97 @@ func TestExtract_ReportsParseErrors(t *testing.T) {
 	}
 }
 
+// Steps that would mutate/escalate the host must be skipped, not auto-run locally.
+const hostMutationWorkflow = `on: [pull_request]
+jobs:
+  setup:
+    steps:
+      - name: sudo-step
+        run: sudo systemctl restart nginx
+      - name: apt
+        run: apt-get install -y jq
+      - name: npm-global
+        run: npm install -g typescript
+      - name: gem-global
+        run: gem install bundler
+      - name: safe
+        run: go build ./...
+`
+
+func TestParseWorkflow_HostMutationSkipped(t *testing.T) {
+	steps, skips := parse(t, "host.yml", hostMutationWorkflow)
+
+	if names := stepNames(steps); !equalStrings(names, []string{"safe"}) {
+		t.Fatalf("reproducible steps = %v, want [safe] (host-mutating steps must be skipped)", names)
+	}
+	want := map[string]string{
+		"sudo-step":  "sudo",
+		"apt":        "apt-get install",
+		"npm-global": "npm install -g",
+		"gem-global": "gem install",
+	}
+	for name, tok := range want {
+		s, ok := skipByName(skips, name)
+		if !ok {
+			t.Fatalf("expected step %q to be skipped; skips = %+v", name, skips)
+		}
+		if !strings.Contains(s.Reason, tok) || !strings.Contains(s.Reason, "not auto-run locally") {
+			t.Fatalf("skip %q reason = %q, want it to name %q and say it is not auto-run", name, s.Reason, tok)
+		}
+	}
+}
+
+func TestContainsCommand_WordBoundary(t *testing.T) {
+	// A real invocation matches; the token embedded in an unrelated word does not.
+	if !containsCommand("sudo apt-get update", "sudo") {
+		t.Fatal("expected sudo invocation to match")
+	}
+	if containsCommand("echo pseudocode", "sudo") {
+		t.Fatal("sudo must not match inside `pseudocode`")
+	}
+	if containsCommand("npm install typescript", "npm install -g") {
+		t.Fatal("a local npm install must not match the -g pattern")
+	}
+}
+
+func TestParseWorkflow_EnvNoteAllScopes(t *testing.T) {
+	const wf = `on: [pull_request]
+env:
+  WF_ONE: "1"
+jobs:
+  j:
+    env:
+      JOB_ONE: "2"
+    steps:
+      - name: build
+        env:
+          STEP_ONE: "3"
+        run: go build ./...
+`
+	steps, _ := parse(t, "env.yml", wf)
+	s, ok := stepByName(steps, "build")
+	if !ok {
+		t.Fatalf("expected reproducible step build; steps = %+v", steps)
+	}
+	for _, want := range []string{"workflow (WF_ONE)", "job (JOB_ONE)", "step (STEP_ONE)"} {
+		if !strings.Contains(s.Note, want) {
+			t.Fatalf("env note = %q, want it to contain %q", s.Note, want)
+		}
+	}
+}
+
+func TestParseWorkflow_EmptyFileIsNotAnError(t *testing.T) {
+	for _, body := range []string{"", "# just a comment\n", "\n\n"} {
+		steps, skips, err := ParseWorkflow("empty.yml", []byte(body))
+		if err != nil {
+			t.Fatalf("empty/comment-only workflow %q should not error, got %v", body, err)
+		}
+		if len(steps) != 0 || len(skips) != 0 {
+			t.Fatalf("empty/comment-only workflow %q should yield nothing, got steps=%v skips=%v", body, steps, skips)
+		}
+	}
+}
+
 func stepNames(steps []Step) []string {
 	out := make([]string, len(steps))
 	for i, s := range steps {

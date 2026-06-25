@@ -8,15 +8,16 @@
 // action steps, steps in a workflow that is not a pull_request/push-branch CI workflow
 // (e.g. a tag-triggered release), jobs or steps guarded by a non-trivial `if:`, steps
 // whose script contains an unresolved GitHub Actions expression (${{ … }}, including
-// matrix/secret references), deploy/publish steps, steps that mutate global host state
-// (e.g. `git config --global`), and steps using a non-shell `shell:` (whether set on the
-// step or inherited from `defaults.run`). Structurally unexpected jobs/steps (a
+// matrix/secret references), deploy/publish steps, steps that mutate or escalate host
+// state (e.g. `git config --global`, `sudo`, or global/system package installs such as
+// `apt-get install` or `npm install -g`), and steps using a non-shell `shell:` (whether set
+// on the step or inherited from `defaults.run`). Structurally unexpected jobs/steps (a
 // reusable-workflow `uses:` job, a non-mapping job or step) are reported as skips too,
 // never dropped.
 //
-// Known limitation (documented rather than silently ignored): per-step / per-job / workflow
-// `env:` is not injected into the local run. A reproducible step that declares its own
-// `env:` carries a Note saying so.
+// Known limitation (documented rather than silently ignored): `env:` is not injected into
+// the local run. A reproducible step carries a Note naming the workflow-, job-, and
+// step-level env that applies to it but is not reproduced.
 //
 // Parsing is dependency-free and deliberately narrow (see yaml.go); it is not a general
 // YAML parser. Extract reads the filesystem; ParseWorkflow operates on bytes so tests can
@@ -120,7 +121,11 @@ func Extract(dir string) (*Plan, error) {
 // ParseWorkflow extracts reproducible steps and skips from one workflow file's bytes.
 // It is the byte-level entry point used by tests (no filesystem or network access).
 func ParseWorkflow(file string, data []byte) (steps []Step, skipped []Skip, err error) {
-	top, ok := parseYAML(string(data)).(*mapping)
+	root := parseYAML(string(data))
+	if root == nil {
+		return nil, nil, nil // empty or comment-only file: nothing to reproduce
+	}
+	top, ok := root.(*mapping)
 	if !ok {
 		return nil, nil, fmt.Errorf("%s: top level is not a YAML mapping", file)
 	}
@@ -139,6 +144,7 @@ func ParseWorkflow(file string, data []byte) (steps []Step, skipped []Skip, err 
 		return steps, skipped, nil
 	}
 	wfShell, wfWorkdir := runDefaults(top)
+	wfEnvKeys := envKeys(top)
 
 	for _, jobID := range jobs.keys {
 		job, ok := jobs.values[jobID].(*mapping)
@@ -174,6 +180,7 @@ func ParseWorkflow(file string, data []byte) (steps []Step, skipped []Skip, err 
 			continue
 		}
 		jobShell, jobWorkdir := runDefaults(job)
+		jobEnvKeys := envKeys(job)
 		for idx, sn := range seq {
 			sm, ok := sn.(*mapping)
 			if !ok {
@@ -189,6 +196,7 @@ func ParseWorkflow(file string, data []byte) (steps []Step, skipped []Skip, err 
 			shell := firstNonEmpty(scalarOf(sm, "shell"), jobShell, wfShell)
 			workdir := firstNonEmpty(scalarOf(sm, "working-directory"), jobWorkdir, wfWorkdir)
 			if st, sk := classifyStep(file, jobID, idx, sm, shell, workdir); st != nil {
+				st.Note = envNote(wfEnvKeys, jobEnvKeys, sm)
 				steps = append(steps, *st)
 			} else if sk != nil {
 				skipped = append(skipped, *sk)
@@ -238,17 +246,40 @@ func classifyStep(file, job string, idx int, sm *mapping, shell, workdir string)
 	if tok := publishToken(run); tok != "" {
 		return skip(fmt.Sprintf("looks like a deploy/publish step (%s)", tok))
 	}
-	if tok := globalMutationToken(run); tok != "" {
-		return skip(fmt.Sprintf("mutates global host state (%s)", tok))
+	if tok := hostMutationToken(run); tok != "" {
+		return skip(fmt.Sprintf("would mutate the host or require elevation (%s) — not auto-run locally", tok))
 	}
+	return &Step{Workflow: file, Job: job, Name: label, Run: run, Shell: shell}, nil
+}
 
-	step := &Step{Workflow: file, Job: job, Name: label, Run: run, Shell: shell}
-	if env, ok := sm.get("env"); ok {
-		if em, ok := env.(*mapping); ok && len(em.keys) > 0 {
-			step.Note = "step sets env (" + strings.Join(em.keys, ", ") + ") which is not reproduced locally"
+// envNote describes the env that applies to a reproducible step but is NOT reproduced
+// locally — at workflow, job, and step scope — so the gap is surfaced rather than silent.
+// It returns "" when no env applies.
+func envNote(wfKeys, jobKeys []string, sm *mapping) string {
+	var parts []string
+	if len(wfKeys) > 0 {
+		parts = append(parts, "workflow ("+strings.Join(wfKeys, ", ")+")")
+	}
+	if len(jobKeys) > 0 {
+		parts = append(parts, "job ("+strings.Join(jobKeys, ", ")+")")
+	}
+	if k := envKeys(sm); len(k) > 0 {
+		parts = append(parts, "step ("+strings.Join(k, ", ")+")")
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "env not reproduced locally — " + strings.Join(parts, "; ")
+}
+
+// envKeys returns the keys of a mapping's `env:` block, in document order, or nil.
+func envKeys(m *mapping) []string {
+	if env, ok := m.get("env"); ok {
+		if em, ok := env.(*mapping); ok {
+			return em.keys
 		}
 	}
-	return step, nil
+	return nil
 }
 
 // isCIWorkflow reports whether a workflow's `on:` triggers make it a pull_request or
@@ -357,17 +388,74 @@ func publishToken(run string) string {
 	return ""
 }
 
-// globalMutationToken returns the first global/host-mutating command found in a run
-// script, or "". These run fine on an ephemeral CI runner but would clobber a developer's
-// machine if reproduced locally.
-func globalMutationToken(run string) string {
-	tokens := []string{"git config --global", "git config --system"}
-	for _, t := range tokens {
+// hostInstallPatterns are command prefixes that install packages globally / system-wide.
+// Reproduced locally they would mutate the developer's machine (and several need sudo,
+// which would hang on an interactive password prompt), so steps that run them are skipped.
+var hostInstallPatterns = []string{
+	"apt-get install", "apt-get update", "apt-get upgrade",
+	"apt install", "apt update", "apt upgrade",
+	"brew install", "brew bundle",
+	"dnf install", "yum install", "zypper install",
+	"apk add", "pacman -S", "snap install",
+	"npm install -g", "npm install --global", "npm i -g", "npm i --global",
+	"pnpm add -g", "pnpm install -g", "yarn global add",
+	"gem install",
+	"pip install --global", "pip3 install --global",
+}
+
+// hostMutationToken returns a short description of the first host-mutating or
+// privilege-escalating command found in a run script, or "". Such commands run cleanly on
+// an ephemeral CI runner but, reproduced on a developer's machine, would clobber global
+// state, trigger an interactive sudo prompt (hanging the run), or install packages
+// system-wide. Because ci-parity auto-executes the steps it extracts, these are skipped
+// (reported, never run) rather than reproduced.
+func hostMutationToken(run string) string {
+	if containsCommand(run, "sudo") {
+		return "sudo"
+	}
+	for _, t := range []string{"git config --global", "git config --system"} {
 		if strings.Contains(run, t) {
 			return t
 		}
 	}
+	for _, p := range hostInstallPatterns {
+		if containsCommand(run, p) {
+			return p
+		}
+	}
 	return ""
+}
+
+// containsCommand reports whether cmd appears in run as a command invocation — at the
+// start of the script or right after a shell separator, and ending on a word boundary —
+// so it is not matched inside an unrelated word, path, or string literal.
+func containsCommand(run, cmd string) bool {
+	for idx := 0; ; {
+		i := strings.Index(run[idx:], cmd)
+		if i < 0 {
+			return false
+		}
+		pos := idx + i
+		before := pos == 0
+		if !before {
+			switch run[pos-1] {
+			case ' ', '\t', '\n', '\r', ';', '&', '|', '(', '{':
+				before = true
+			}
+		}
+		end := pos + len(cmd)
+		after := end >= len(run)
+		if !after {
+			switch run[end] {
+			case ' ', '\t', '\n', '\r', ';':
+				after = true
+			}
+		}
+		if before && after {
+			return true
+		}
+		idx = pos + 1
+	}
 }
 
 // runDefaults returns the shell and working-directory declared under a mapping's
