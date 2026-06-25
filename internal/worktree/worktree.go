@@ -422,8 +422,24 @@ func ResolveRef(repo, ref string) (string, error) {
 // leaving HEAD at the rebased tip. On conflict it returns an error WITHOUT cleaning
 // up — the caller must RebaseAbort to restore the original HEAD.
 func Rebase(dir, onto string) error {
-	_, err := git("-C", dir, "rebase", onto)
+	args := append([]string{"-C", dir}, fallbackIdentityArgs(dir)...)
+	_, err := git(append(args, "rebase", onto)...)
 	return err
+}
+
+// fallbackIdentityArgs returns `-c user.name=… -c user.email=…` flags only when dir
+// has no committer identity configured. Rebase writes new commits and aborts with
+// "empty ident name" if neither git config nor the environment supplies one — this
+// happens on bare CI runners and on developer machines without a global identity.
+// We inject a placeholder only as a last resort, so a real configured identity (the
+// common case) is always preserved.
+func fallbackIdentityArgs(dir string) []string {
+	if name, _ := git("-C", dir, "config", "user.name"); name != "" {
+		if email, _ := git("-C", dir, "config", "user.email"); email != "" {
+			return nil
+		}
+	}
+	return []string{"-c", "user.name=ttorch", "-c", "user.email=ttorch@localhost"}
 }
 
 // RebaseAbort aborts an in-progress rebase in dir, restoring the pre-rebase HEAD.
