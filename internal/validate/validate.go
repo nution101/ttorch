@@ -18,6 +18,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/nution101/ttorch/internal/ciparity"
 )
 
 // Step is one named check to run in the worktree.
@@ -71,6 +73,19 @@ func DetectDefaults(dir string) []Step {
 		return steps
 	}
 	return nil
+}
+
+// CIParitySteps converts CI-parity steps extracted from a repository's GitHub Actions
+// workflows (see internal/ciparity) into runnable validate Steps. This lets a CI-parity
+// run report per-step PASS/FAIL through the same Run/Result path as the heuristic checks,
+// while being clearly distinct in source: these are the repo's actual CI commands rather
+// than the ecosystem defaults from Detect/DetectDefaults.
+func CIParitySteps(ciSteps []ciparity.Step) []Step {
+	steps := make([]Step, 0, len(ciSteps))
+	for _, s := range ciSteps {
+		steps = append(steps, Step{Name: s.Label(), Cmd: s.Command()})
+	}
+	return steps
 }
 
 // DefaultTimeout bounds each check; override with TTORCH_VALIDATE_TIMEOUT.

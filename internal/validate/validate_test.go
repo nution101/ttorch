@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/nution101/ttorch/internal/ciparity"
 )
 
 func TestRun_ReportsEachStep(t *testing.T) {
@@ -107,6 +109,24 @@ func TestRun_FmtFailureNamesFiles(t *testing.T) {
 	}
 	if !strings.Contains(res[0].Output, "unformatted") || !strings.Contains(res[0].Output, "bad.go") {
 		t.Fatalf("fmt failure should name the unformatted file; got %q", res[0].Output)
+	}
+}
+
+func TestCIParitySteps_RunsThroughResultPath(t *testing.T) {
+	ciSteps := []ciparity.Step{
+		{Workflow: "ci.yml", Job: "build", Name: "ok", Run: "exit 0"},
+		{Workflow: "ci.yml", Job: "build", Name: "bad", Run: "echo boom; exit 1"},
+	}
+	steps := CIParitySteps(ciSteps)
+	if len(steps) != 2 || steps[0].Name != "ci(ci.yml/build): ok" {
+		t.Fatalf("converted steps = %+v", steps)
+	}
+	results := Run(t.TempDir(), steps)
+	if len(results) != 2 || !results[0].Passed || results[1].Passed {
+		t.Fatalf("expected ok-pass/bad-fail, got %+v", results)
+	}
+	if f := Failures(results); len(f) != 1 || !strings.Contains(f[0].Output, "boom") {
+		t.Fatalf("failure not captured: %+v", f)
 	}
 }
 

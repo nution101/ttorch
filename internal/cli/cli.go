@@ -108,6 +108,8 @@ func Main(args []string) int {
 		return run(cmdWait(rest))
 	case "validate":
 		return run(cmdValidate(rest))
+	case "ci-parity":
+		return run(cmdCIParity(rest))
 	case "review-diff":
 		return run(cmdReviewDiff(rest))
 	case "approve":
@@ -1217,6 +1219,8 @@ Supervision:
 
 Delivery:
   validate <id>               run the repo's build/test/lint checks on a worker
+  ci-parity [dir] [--list]    reproduce the repo's actual CI run-steps locally
+                              (green here == green in CI); --list shows the plan only
   review-diff <id> [--stat]   show a worker's changes vs the default branch
   approve <id> [--ttl 10m]    grant a time-boxed approval (run by the lead)
   trust prep|record|show <id> prep/record/show the adversarial-review verdict
