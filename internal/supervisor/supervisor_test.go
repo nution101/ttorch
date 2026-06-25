@@ -144,13 +144,60 @@ func TestAutodrive_BusyManagerDefersUntilIdle(t *testing.T) {
 	}
 }
 
-// TestAutodrive_HeartbeatPokes: the heartbeat backstop pokes even with no event.
-func TestAutodrive_HeartbeatPokes(t *testing.T) {
+// TestAutodrive_HeartbeatDoesNotPoke: the heartbeat is a silent liveness beacon — it
+// queues a heartbeat wake for the manager's next real turn but never pokes, so an
+// otherwise-quiet fleet never burns a manager turn just because time passed.
+func TestAutodrive_HeartbeatDoesNotPoke(t *testing.T) {
 	s, fm := newAutodriveSup(t)
 	s.lastHeartbeat = time.Now().Add(-time.Hour) // due
 	s.tick()
+	if fm.pokes != 0 {
+		t.Fatalf("a heartbeat tick must not poke the manager, got %d pokes", fm.pokes)
+	}
+	// Liveness is preserved: the heartbeat wake is still recorded for the next turn.
+	q := wake.Queue{Path: s.P.WakeQueue()}
+	ws, _ := q.Drain()
+	if !hasWake(ws, "heartbeat", "") {
+		t.Fatalf("heartbeat must still queue a liveness wake, got %+v", ws)
+	}
+}
+
+// TestAutodrive_RepeatedStaleDoesNotRepoke: a worker that goes idle pokes the manager
+// once, then keeps showing the same idle pane across many sweeps — the manager must
+// not be re-woken for that unchanged stale state it has already seen.
+func TestAutodrive_RepeatedStaleDoesNotRepoke(t *testing.T) {
+	s, fm := newAutodriveSup(t)
+	mustSaveTask(t, s, state.Task{ID: "w1", Window: "w-w1", Kind: "ship"})
+	// A static, non-busy pane: the worker is idle and its pane never changes.
+	s.captureWorker = func(window string) (string, bool) { return "$ idle at the prompt", true }
+
+	// Sweep well past the stale threshold; the idle state never changes.
+	for i := 0; i < 6; i++ {
+		s.scanStale()
+	}
 	if fm.pokes != 1 {
-		t.Fatalf("the heartbeat backstop should poke the manager, got %d", fm.pokes)
+		t.Fatalf("an unchanged stale worker must poke exactly once, got %d pokes", fm.pokes)
+	}
+	// The actionable wake was still recorded (once) for the manager to act on.
+	q := wake.Queue{Path: s.P.WakeQueue()}
+	ws, _ := q.Drain()
+	if !hasWake(ws, "stale", "w1") {
+		t.Fatalf("expected one stale wake for w1, got %+v", ws)
+	}
+}
+
+// TestAutodrive_BusyWorkerNeverStale: a worker that keeps showing a busy indicator is
+// never treated as stale and never pokes — guards against poking a mid-turn worker.
+func TestAutodrive_BusyWorkerNeverStale(t *testing.T) {
+	s, fm := newAutodriveSup(t)
+	mustSaveTask(t, s, state.Task{ID: "w1", Window: "w-w1", Kind: "ship"})
+	s.captureWorker = func(window string) (string, bool) { return "… esc to interrupt …", true }
+
+	for i := 0; i < 6; i++ {
+		s.scanStale()
+	}
+	if fm.pokes != 0 {
+		t.Fatalf("a busy worker must never go stale or poke, got %d pokes", fm.pokes)
 	}
 }
 

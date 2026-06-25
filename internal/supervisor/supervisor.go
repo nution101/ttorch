@@ -4,11 +4,14 @@
 // memory and react quickly; durability lives in the wake-queue file, so a restart
 // never loses an event.
 //
-// On an actionable event (a worker turn-end, an idle/stalled worker, or a merged
-// PR) — and on the periodic heartbeat as a backstop — it also pokes the manager
-// window so the queue is actually drained. Without that poke the manager is dead
-// between turns: it has no way to learn a worker went idle. The supervisor only
-// pokes; the manager still drains and acts on its own turn.
+// On an actionable event — a worker turn-end, an idle/stalled worker, or a merged
+// PR — it also pokes the manager window so the queue is actually drained. Without
+// that poke the manager is dead between turns: it has no way to learn a worker went
+// idle. The periodic heartbeat is deliberately NOT such an event: it is a silent
+// liveness beacon that records a wake for the manager's next real turn but never
+// pokes, so an otherwise-quiet fleet never burns a manager turn just because time
+// passed. The supervisor only pokes; the manager still drains and acts on its own
+// turn.
 package supervisor
 
 import (
@@ -251,18 +254,23 @@ func (s *Supervisor) scanSignals() {
 }
 
 // scanStale emits a wake when a worker's pane stops changing and shows no busy
-// indicator for two consecutive sweeps.
+// indicator for two consecutive sweeps. It captures through the captureWorker seam
+// (shared with scanLabels) so the dedup below is exercisable without a live tmux.
+//
+// The poke fires exactly once per idle episode: it is gated on the stale counter
+// hitting the threshold, after which further unchanged sweeps only advance the
+// counter and never re-poke — so the manager is not re-woken for a stale state it
+// has already seen. A pane change resets the counter, because a changed pane is a
+// new state, not the same idle one. (The matching wake is still appended once to the
+// durable queue; Drain dedupes by kind+key as a backstop.)
 func (s *Supervisor) scanStale() {
-	if !tmux.Available() {
-		return
-	}
 	tasks, _ := s.Store.List()
 	for _, task := range tasks {
 		if task.Kind == "cc" {
 			continue
 		}
-		out, err := tmux.CapturePane(s.Session, task.Window, 6)
-		if err != nil {
+		out, ok := s.captureWorker(task.Window)
+		if !ok {
 			continue
 		}
 		if Busy(out) {
@@ -275,7 +283,7 @@ func (s *Supervisor) scanStale() {
 			s.staleCount[task.ID]++
 			if s.staleCount[task.ID] == 2 {
 				_ = s.Q.Append("stale", task.ID, task.Window)
-				s.requestPoke() // a worker went idle — actionable
+				s.requestPoke() // a worker just went idle — actionable; poked once per episode
 			}
 		} else {
 			s.paneHash[task.ID] = h
@@ -329,12 +337,16 @@ func (s *Supervisor) scanLabels() {
 	}
 }
 
-// heartbeat emits a periodic review wake.
+// heartbeat emits a periodic review wake. It is a SILENT liveness beacon: it records
+// a heartbeat on the durable queue (drained on the manager's next real turn) and
+// advances lastHeartbeat, but it never pokes the manager. Poking on every heartbeat
+// re-invoked the manager — burning a turn and tokens — even when nothing was
+// actionable (observed firing every tick overnight on an idle fleet), so only genuine
+// worker state changes (turn-end, idle/stalled, merged PR) drive a poke.
 func (s *Supervisor) heartbeat() {
 	if s.now().Sub(s.lastHeartbeat) >= s.Cfg.Heartbeat {
 		_ = s.Q.Append("heartbeat", "", "")
 		s.lastHeartbeat = s.now()
-		s.requestPoke() // backstop: drive the manager even if an event was missed (same debounce)
 	}
 }
 
