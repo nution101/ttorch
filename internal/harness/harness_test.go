@@ -192,9 +192,11 @@ func TestManagerCharterTrustedCarveOut(t *testing.T) {
 // operating loop — the launch-time managerCharter const and the ttorch-manager
 // SKILL.md — against drift. The five rules that reframe the loop (board-as-source-of-
 // truth, lead↔manager-only, manager-tab-orchestration-only, keep-the-fleet-moving, and
-// the autonomy loop) must each be present in BOTH encodings, matched by stable anchor
-// phrases, so the charter a manager launches with cannot diverge from the skill it is
-// told to follow.
+// the autonomy loop) — plus the diagnose-from-evidence guardrail that sharpens rule 1
+// into an action-level rule (never assert an unverifiable stall, never command a worker
+// to abandon work on inference) — must each be present in BOTH encodings, matched by
+// stable anchor phrases, so the charter a manager launches with cannot diverge from the
+// skill it is told to follow.
 func TestManagerOperatingRulesInSync(t *testing.T) {
 	skill, err := os.ReadFile(filepath.Join("..", "..", "content", "skills", "ttorch-manager", "SKILL.md"))
 	if err != nil {
@@ -212,6 +214,7 @@ func TestManagerOperatingRulesInSync(t *testing.T) {
 		{"manager tab = orchestration only", []string{"orchestration only", "independent"}},
 		{"keep the fleet moving", []string{"keep the fleet moving", "disjoint", "pre-yield"}},
 		{"autonomy loop", []string{"autonomy loop", "interrupt"}},
+		{"diagnose from evidence, not inference", []string{"ground truth about its own execution", "repeated-looking progress counter is not evidence"}},
 	}
 	for _, r := range rules {
 		for _, a := range r.anchors {

@@ -131,6 +131,14 @@ act, then re-check.
   requires the lead's go-ahead.
 - Never discard a worker's unlanded work without confirmation. `ttorch teardown` refuses
   to do so unless `--force` is given after the lead approves.
+- **Diagnose from evidence, not inference.** When a worker looks stuck, idle, or slow,
+  ask it what is happening with `ttorch send <id>`, or keep observing — but never assert a
+  diagnosis you cannot verify, and never command a worker to stop, abandon, or discard
+  work on a hunch. The worker has ground truth about its own execution; you, reading pane
+  output, do not, and a repeated-looking progress counter is not evidence of a stall. This
+  is the action-level edge of rule 1 (the board is the source of truth, not assumed
+  state): phrase steers to workers as questions or options, not commanded conclusions,
+  unless you have direct evidence.
 - Do not approve your own merges. `ttorch approve` is the lead's action; you run
   `ttorch merge-local` only after the lead has approved.
 - Workers never address the lead; you are the single point of contact.
