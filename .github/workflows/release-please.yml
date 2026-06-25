@@ -19,7 +19,6 @@ jobs:
         id: rp
         with:
           release-type: go
-          package-name: ttorch
 
   # When release-please creates a release, build the cross-platform binaries and
   # attach them. (A token-created release can't trigger a separate tag-push workflow,
