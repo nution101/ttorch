@@ -4,7 +4,8 @@ description: >
   Run the adversarial-review trust gate on a worker's diff: prepare the review inputs,
   fan out three independent reviewer subagents (correctness, scope, security), record a
   commit-pinned verdict, and — in trusted delivery mode — merge without a separate lead
-  approval. Use when gating a task for a trusted-mode or --require-verdict merge.
+  approval. Use when gating a task for a trusted-mode or --require-verdict merge. Also runs
+  the standalone, advisory security audit that applies in EVERY delivery mode.
 metadata:
   managed-by: ttorch
 user-invocable: true
@@ -16,15 +17,45 @@ The adversarial-review **trust gate**: let a repository merge a worker's output 
 parallel AI review (correctness / scope-vs-brief / security-compliance) **plus** the
 repo's own build/test/lint — enforced in Go at the merge point, not by convention.
 
-> **When to run.** After a worker is **green** (`ttorch validate <id>` passes) and the
-> repo is in **trusted** delivery mode, or you want to gate one merge in another mode
-> with `--require-verdict`. In any non-trusted mode the lead still approves the merge —
-> this gate does not replace that. Default to proposing, not delivering.
+> **When to run.** This full three-dimension **gate** (correctness + scope + security, with
+> the hard block) runs after a worker is **green** (`ttorch validate <id>` passes) and the
+> repo is in **trusted** delivery mode, or you want to gate one merge in another mode with
+> `--require-verdict`. In any non-trusted mode the lead still approves the merge — this gate
+> does not replace that. Default to proposing, not delivering. (The advisory **security
+> audit** above runs in *every* mode by default and is separate from this gate.)
 
 > **Trust boundary.** In trusted mode the gate authorizes a merge **with no human reading
 > the diff**: the boundary moves onto these reviewers and their prompts. Treat it as
 > defense in depth, not an unbreakable barrier — opting a repo into trusted mode is the
 > lead's decision, recorded per-repo via `ttorch init --mode trusted`.
+
+## Security audit in every mode
+
+The full three-dimension gate above is the **trusted-mode** path. Independently of it, a
+**security audit runs in every delivery mode** (`pr` / `local` / `validated` / `trusted`) —
+run it **by default** before proposing or delivering any worker. It reuses the same
+`ttorch-reviewer-security` agent and the same commit-pinned report mechanism, folding **only**
+the security dimension:
+
+1. `ttorch security-review prep <id>` — materializes the same inputs dir as `trust prep`
+   (committed `diff.patch`, `brief.md`, `validate.json`, `head.txt`); refuses a dirty worktree.
+2. Dispatch the **`ttorch-reviewer-security`** agent over that dir + the commit in `head.txt`.
+   It writes `security.json` following the findings contract below.
+3. `ttorch security-review record <id>` — folds `security.json` into a commit-pinned verdict
+   and prints it. `ttorch security-review show <id>` reprints the latest.
+
+This pass is **advisory and never blocks delivery**: it never mints an approval, never writes
+the trust gate's verdict, and never gates a merge. It mirrors how a recorded verdict is
+advisory in every non-trusted mode — the lead's `ttorch approve` still governs those merges.
+**Surface its findings to the lead;** a `high`/`critical` (or "no review recorded", which
+fails closed) is a reason to pause and decide, not an automatic block. The trusted-mode gate
+above is **unchanged** — it still hard-blocks on the same findings; this only ADDS a security
+pass to the other modes. `ttorch land` prints a non-blocking reminder when no fresh security
+audit covers the commit it lands in a non-gated mode.
+
+> **Opt-out.** The security audit is on by default. Skip it for a given task only when the
+> lead explicitly says so (e.g. a trivial docs-only change, or the lead is reading the diff
+> themselves) — note that you skipped it when you report.
 
 ## Protocol
 

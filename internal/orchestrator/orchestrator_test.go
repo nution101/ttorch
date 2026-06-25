@@ -2143,3 +2143,200 @@ func worktreeIsDirty(t *testing.T, path string) (bool, error) {
 	out := gitIn(t, path, "status", "--porcelain")
 	return strings.TrimSpace(out) != "", nil
 }
+
+// --- ttorch security-review (the security-everywhere advisory pass) ---
+
+// writeSecurityReport drops ONLY the security reviewer's report into dir (the manager ran
+// just the security reviewer, not the full three-dimension gate), as the
+// security-everywhere pass expects.
+func writeSecurityReport(t *testing.T, dir, sha string, findings []review.Finding) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(review.Report{Dimension: review.DimensionSecurity, ReviewedSHA: sha, Findings: findings})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "security.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSecurityReview_AdvisoryAndIndependentOfTrustGate is the headline guard: a security
+// audit recorded in a non-trusted repo folds the security reviewer's report into a
+// verdict, but is purely ADVISORY — it never mints an approval, never writes the trust
+// gate's verdict file, and never touches the task's gate state. Only the security
+// reviewer's report need be present (the manager ran just that one reviewer).
+func TestSecurityReview_AdvisoryAndIndependentOfTrustGate(t *testing.T) {
+	m, repo := deliveryHarness(t, "secrev")
+	task, err := m.Spawn("sv1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := commitFeature(t, task.Worktree, "feature.txt", "new\n")
+
+	writeSecurityReport(t, m.P.ReviewInputsDir("sv1"), head, nil) // clean
+	v, err := m.SecurityReview("sv1", "", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Overall != review.Pass {
+		t.Fatalf("a clean security report should pass, got %q", v.Overall)
+	}
+	// Advisory: no approval minted, and the trust gate's verdict file is untouched.
+	if approval.Valid(m.P.ApprovalFile("sv1")) {
+		t.Fatal("security-review must NOT mint an approval token")
+	}
+	if _, ok := review.Load(m.P.ReviewVerdictFile("sv1")); ok {
+		t.Fatal("security-review must NOT write the trust gate's verdict file")
+	}
+	// Task gate state is untouched (the advisory pass is side-effect-free on it).
+	reloaded, _ := m.Store.Load("sv1")
+	if reloaded.GatePassed || reloaded.ReviewedSHA != "" || reloaded.ApprovedBy != "" {
+		t.Fatalf("security-review must not touch the task's gate state: %+v", reloaded)
+	}
+	// SecurityReviewShow returns the recorded advisory verdict.
+	got, ok := m.SecurityReviewShow("sv1")
+	if !ok || got.ReviewedSHA != head {
+		t.Fatalf("SecurityReviewShow = %+v ok=%v, want the recorded verdict pinned to %s", got, ok, head)
+	}
+	_, _ = m.Teardown("sv1", true)
+}
+
+// TestSecurityReview_BlockingFindingStaysAdvisory pins that a high security finding yields
+// a "block" verdict for the manager to surface, yet — outside the trusted gate — it does
+// NOT block delivery: the normal approval-gated merge still proceeds. The audit's hard
+// block remains exclusively the trusted gate's job.
+func TestSecurityReview_BlockingFindingStaysAdvisory(t *testing.T) {
+	m, repo := deliveryHarness(t, "secblock")
+	task, err := m.Spawn("sb1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := commitFeature(t, task.Worktree, "feature.txt", "new\n")
+
+	writeSecurityReport(t, m.P.ReviewInputsDir("sb1"), head, []review.Finding{
+		{Severity: review.SeverityHigh, Reviewer: "ttorch-reviewer-security", Summary: "leaked key in fixture"},
+	})
+	v, err := m.SecurityReview("sb1", "", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Overall != review.Block {
+		t.Fatalf("a high finding should yield a block verdict, got %q", v.Overall)
+	}
+	if approval.Valid(m.P.ApprovalFile("sb1")) {
+		t.Fatal("a blocking advisory must not mint an approval")
+	}
+	// The blocking advisory does NOT gate a non-trusted merge: approve + merge still works.
+	if err := m.Approve("sb1", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.MergeLocal("sb1", false); err != nil {
+		t.Fatalf("a blocking security advisory must not block a non-trusted merge: %v", err)
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") != head {
+		t.Fatal("default branch was not fast-forwarded despite a clean approval")
+	}
+	_, _ = m.Teardown("sb1", true)
+}
+
+// TestSecurityReview_MissingReportFailsClosed: recording before the security reviewer ran
+// (no security.json) folds to a "block" advisory verdict, not a silent pass.
+func TestSecurityReview_MissingReportFailsClosed(t *testing.T) {
+	m, repo := deliveryHarness(t, "secmiss")
+	task, err := m.Spawn("sm1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitFeature(t, task.Worktree, "feature.txt", "new\n")
+
+	v, err := m.SecurityReview("sm1", "", time.Minute)
+	if err != nil {
+		t.Fatalf("a missing report must fold to a block verdict, not error: %v", err)
+	}
+	if v.Overall != review.Block {
+		t.Fatalf("a missing security report must fail closed to block, got %q", v.Overall)
+	}
+	_, _ = m.Teardown("sm1", true)
+}
+
+// TestSecurityReview_RefusesStaleSha mirrors the trust-record commit pin: a report covering
+// a sha that is no longer the worker HEAD is refused rather than silently accepted.
+func TestSecurityReview_RefusesStaleSha(t *testing.T) {
+	m, repo := deliveryHarness(t, "secstale")
+	if _, err := m.Spawn("ss1", repo, false, "sleep 60"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.SecurityReview("ss1", "deadbeefdeadbeef", time.Minute); err == nil {
+		t.Fatal("security-review must refuse a sha that is not the worker HEAD")
+	}
+	_, _ = m.Teardown("ss1", true)
+}
+
+// TestSecurityAuditNote covers the advisory note `ttorch land` appends in non-gated modes.
+// It never blocks; it just reports whether a fresh security audit covers the landed commit.
+func TestSecurityAuditNote(t *testing.T) {
+	t.Setenv("TTORCH_HOME", t.TempDir())
+	m := New(paths.Default())
+	const id, sha = "sn1", "deadbeefcafe0001"
+
+	// A gated land (trusted / --require-verdict) already ran the full review gate → no note.
+	if note := m.securityAuditNote(id, sha, true); note != "" {
+		t.Fatalf("a gated land must not emit a security note, got %q", note)
+	}
+	// Non-gated, no audit recorded → a non-blocking nudge.
+	if note := m.securityAuditNote(id, sha, false); !strings.Contains(note, "no security audit covers") || !strings.Contains(note, "does not block") {
+		t.Fatalf("missing-audit note wrong: %q", note)
+	}
+	// A clean PASS advisory covering the landed sha → "passed".
+	if err := review.Write(m.securityVerdictPath(id), review.Verdict{Overall: review.Pass, ReviewedSHA: sha}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if note := m.securityAuditNote(id, sha, false); !strings.Contains(note, "security audit passed") {
+		t.Fatalf("pass note wrong: %q", note)
+	}
+	// An audit pinned to a DIFFERENT commit is stale → treated as missing (nudge again).
+	if note := m.securityAuditNote(id, "OTHERSHA00000000", false); !strings.Contains(note, "no security audit covers") {
+		t.Fatalf("a stale-sha audit should nudge, got %q", note)
+	}
+	// A blocking advisory is surfaced but explicitly did NOT block this delivery.
+	if err := review.Write(m.securityVerdictPath(id), review.Verdict{Overall: review.Block, ReviewedSHA: sha}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if note := m.securityAuditNote(id, sha, false); !strings.Contains(note, "blocking findings") || !strings.Contains(note, "did not block") {
+		t.Fatalf("blocking advisory note wrong: %q", note)
+	}
+}
+
+// TestLand_SurfacesSecurityAdvisory checks the wiring end to end: a land in a non-gated
+// mode appends the advisory security note to its summary (and does not block).
+func TestLand_SurfacesSecurityAdvisory(t *testing.T) {
+	m, repo := deliveryHarness(t, "landsec")
+	commitGateScript(t, repo, "exit 0")
+	if _, err := projectinit.Init(repo, "local"); err != nil {
+		t.Fatal(err)
+	}
+	task, err := m.Spawn("ls1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := commitFeature(t, task.Worktree, "feature.txt", "new\n")
+	if err := m.Approve("ls1", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := m.Land("ls1", false)
+	if err != nil {
+		t.Fatalf("clean local land should succeed: %v", err)
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") != head {
+		t.Fatal("default branch was not fast-forwarded")
+	}
+	// No audit recorded → the land summary carries the non-blocking advisory nudge.
+	if !strings.Contains(out, "advisory: no security audit covers") {
+		t.Fatalf("land summary should surface the security advisory, got: %q", out)
+	}
+	_, _ = m.Teardown("ls1", true)
+}

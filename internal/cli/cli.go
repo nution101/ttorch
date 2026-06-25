@@ -114,6 +114,8 @@ func Main(args []string) int {
 		return run(cmdApprove(rest))
 	case "trust":
 		return run(cmdTrust(rest))
+	case "security-review":
+		return run(cmdSecurityReview(rest))
 	case "merge-local":
 		return run(cmdMergeLocal(rest))
 	case "land":
@@ -1218,6 +1220,9 @@ Delivery:
   review-diff <id> [--stat]   show a worker's changes vs the default branch
   approve <id> [--ttl 10m]    grant a time-boxed approval (run by the lead)
   trust prep|record|show <id> prep/record/show the adversarial-review verdict
+  security-review prep|record|show <id>
+                              run the security reviewer in ANY delivery mode (advisory;
+                              does not block) — prep inputs, review, then record
   merge-local <id> [--require-verdict]
                               fast-forward the local default branch (needs approval;
                               --require-verdict also gates on a passing verdict + validate)

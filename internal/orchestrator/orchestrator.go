@@ -31,7 +31,7 @@ import (
 // requiredReviewers are the adversarial-review dimensions every trust verdict must
 // cover. It is the single source of truth for both recording (which per-dimension
 // reports to aggregate) and completeness (a missing dimension fails closed).
-var requiredReviewers = []string{"correctness", "scope", "security"}
+var requiredReviewers = []string{review.DimensionCorrectness, review.DimensionScope, review.DimensionSecurity}
 
 // Manager performs runtime operations against a tmux session and the state store.
 type Manager struct {
@@ -890,6 +890,66 @@ func (m *Manager) TrustShow(taskID string) (review.Verdict, bool) {
 	return review.Load(m.P.ReviewVerdictFile(taskID))
 }
 
+// securityVerdictPath is where the standalone, advisory security-everywhere verdict
+// lives — beside the review inputs the security reviewer reads, and DISTINCT from the
+// trust gate's ReviewVerdictFile so the two never interfere: the advisory pass can
+// never mint an approval or satisfy the trusted gate, and recording it never disturbs a
+// trust verdict.
+func (m *Manager) securityVerdictPath(taskID string) string {
+	return filepath.Join(m.P.ReviewInputsDir(taskID), "security-verdict.json")
+}
+
+// SecurityReview folds ONLY the security reviewer's report for taskID into a
+// commit-pinned verdict and persists it as an advisory result — the security-everywhere
+// pass that runs in every delivery mode, not just trusted. It reuses the same inputs
+// (materialized by TrustPrep) and the same internal/review aggregation as the trust
+// gate, but it is purely advisory: it never mints an approval, never touches the trust
+// gate's verdict or the task's gate state, and never blocks a merge. The manager
+// surfaces its findings; in non-trusted modes the human approval still governs delivery,
+// and in trusted mode the full three-dimension gate (which already includes security) is
+// unchanged.
+//
+// Like TrustRecord it is commit-pinned: the sha it covers must still be the worker's
+// HEAD (so a commit landing after the security reviewer ran is rejected rather than
+// silently passed). A missing or malformed security.json folds to a "block" advisory
+// verdict (fail closed) telling the manager to actually run the reviewer.
+func (m *Manager) SecurityReview(taskID, sha string, ttl time.Duration) (review.Verdict, error) {
+	var zero review.Verdict
+	t, err := m.Store.Load(taskID)
+	if err != nil {
+		return zero, fmt.Errorf("unknown task %q", taskID)
+	}
+	if ttl <= 0 {
+		return zero, fmt.Errorf("--ttl must be positive (got %s)", ttl)
+	}
+	head, err := worktree.Head(t.Worktree)
+	if err != nil {
+		return zero, err
+	}
+	if sha == "" {
+		sha = head
+	}
+	if sha != head {
+		return zero, fmt.Errorf("security review covers %s but the worker HEAD is now %s; re-run 'ttorch security-review prep %s' and review again", short(sha), short(head), taskID)
+	}
+	verdict, err := review.Aggregate(m.P.ReviewInputsDir(taskID), sha, []string{review.DimensionSecurity})
+	if err != nil {
+		return zero, err
+	}
+	if err := review.Write(m.securityVerdictPath(taskID), verdict, ttl); err != nil {
+		return zero, err
+	}
+	m.audit(fmt.Sprintf("security-review task=%s commit=%s verdict=%s mode=%s",
+		taskID, short(sha), verdict.Overall, projectinit.ReadMode(t.Project)))
+	return verdict, nil
+}
+
+// SecurityReviewShow returns the current valid (unexpired) advisory security verdict for
+// taskID, if any, without consuming it.
+func (m *Manager) SecurityReviewShow(taskID string) (review.Verdict, bool) {
+	return review.Load(m.securityVerdictPath(taskID))
+}
+
 // MergeLocal fast-forwards the repo's local default branch to the worker's HEAD —
 // the sole sanctioned state-changing write to a real checkout. It always requires a
 // valid approval token, the default branch checked out and clean, and a clean
@@ -1318,8 +1378,36 @@ func (m *Manager) Land(taskID string, requireVerdict bool) (string, error) {
 		rebaseNote = fmt.Sprintf("rebased %s→%s onto %s", short(preRebase), short(rebasedHead), base)
 	}
 	m.audit(fmt.Sprintf("land task=%s repo=%s mode=%s %s -> %s verified", taskID, repo, mode, def, short(landed)))
-	return fmt.Sprintf("landed %s (%s mode): %s; %s fast-forwarded to %s and verified",
-		taskID, mode, rebaseNote, def, short(defAfter)), nil
+	out := fmt.Sprintf("landed %s (%s mode): %s; %s fast-forwarded to %s and verified",
+		taskID, mode, rebaseNote, def, short(defAfter))
+	// Surface the security-everywhere audit status. This is purely ADVISORY and never
+	// blocks: a gated land (trusted / --require-verdict) already ran the full review gate
+	// — which includes security — so it needs no extra note; the other modes get a
+	// non-blocking reminder of whether a fresh security audit covers the landed commit.
+	if note := m.securityAuditNote(taskID, rebasedHead, gated); note != "" {
+		out += "\n  " + note
+	}
+	return out, nil
+}
+
+// securityAuditNote returns a one-line, ADVISORY note on the security-everywhere audit
+// for the commit being landed, or "" when none is warranted. It never blocks delivery:
+// gated lands (trusted / --require-verdict) already cleared the full review gate, so they
+// get no note; in every other mode it reports whether a fresh advisory security audit
+// covers landedSHA, nudging the manager to run one when it does not.
+func (m *Manager) securityAuditNote(taskID, landedSHA string, gated bool) string {
+	if gated {
+		return ""
+	}
+	v, ok := m.SecurityReviewShow(taskID)
+	if !ok || v.ReviewedSHA != landedSHA {
+		return fmt.Sprintf("advisory: no security audit covers %s — run 'ttorch security-review prep %s', review, then 'ttorch security-review record %s' (advisory, does not block delivery)",
+			short(landedSHA), taskID, taskID)
+	}
+	if v.Overall != review.Pass {
+		return fmt.Sprintf("advisory: security audit raised blocking findings for %s — review 'ttorch security-review show %s' (advisory, did not block this delivery)", short(landedSHA), taskID)
+	}
+	return fmt.Sprintf("advisory: security audit passed for %s", short(landedSHA))
 }
 
 // gateCoversRebased verifies the existing approval (and, when gated, a passing review

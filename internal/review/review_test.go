@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -188,6 +189,42 @@ func TestConsumeRefusesBlock(t *testing.T) {
 	}
 	if _, ok := Load(path); ok {
 		t.Fatal("the blocking verdict should still have been removed by Consume")
+	}
+}
+
+func TestDescribe(t *testing.T) {
+	// A clean verdict describes as nothing.
+	if got := Describe(Verdict{Overall: Pass}); got != nil {
+		t.Fatalf("a clean verdict should describe as nil, got %+v", got)
+	}
+
+	// Every finding is rendered (low/medium included, unlike ToResults), most severe first.
+	v := Verdict{
+		Overall: Block,
+		Findings: []Finding{
+			{Dimension: "security", Severity: SeverityLow, Reviewer: "sec", Summary: "nit"},
+			{Dimension: "security", Severity: SeverityCritical, Reviewer: "sec", Summary: "leaked key"},
+			{Dimension: "security", Severity: SeverityMedium, Summary: "hardening"},
+		},
+	}
+	lines := Describe(v)
+	if len(lines) != 3 {
+		t.Fatalf("Describe must render every finding (low/medium included), got %d: %+v", len(lines), lines)
+	}
+	if !strings.HasPrefix(lines[0], "critical") {
+		t.Fatalf("findings must be ordered most-severe first, got %q first", lines[0])
+	}
+	if !strings.Contains(lines[0], "[sec] leaked key") {
+		t.Fatalf("the reviewer label should prefix the summary, got %q", lines[0])
+	}
+	if !strings.HasPrefix(lines[2], "low") {
+		t.Fatalf("low severity should sort last, got %q", lines[2])
+	}
+
+	// An unknown/empty severity is still rendered (it blocks, so it must surface).
+	un := Describe(Verdict{Findings: []Finding{{Severity: Severity(""), Summary: "?"}}})
+	if len(un) != 1 || !strings.HasPrefix(un[0], "unknown") {
+		t.Fatalf("an empty severity should render as 'unknown', got %+v", un)
 	}
 }
 

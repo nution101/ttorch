@@ -255,3 +255,17 @@ func TestCmdSend_EmptyMessageFailsLoudly(t *testing.T) {
 		t.Fatalf("error = %q, want it to mention an empty message", err)
 	}
 }
+
+// TestCmdSecurityReview_ArgGuard pins the usage guards that run before any Manager call:
+// too few args and an unknown subcommand both fail loudly with the usage line.
+func TestCmdSecurityReview_ArgGuard(t *testing.T) {
+	for _, args := range [][]string{nil, {"prep"}, {"bogus", "id1"}} {
+		err := cmdSecurityReview(args)
+		if err == nil {
+			t.Fatalf("cmdSecurityReview(%v) must return a usage error", args)
+		}
+		if !strings.Contains(err.Error(), "security-review prep|record|show") {
+			t.Fatalf("cmdSecurityReview(%v) error = %q, want the usage line", args, err)
+		}
+	}
+}

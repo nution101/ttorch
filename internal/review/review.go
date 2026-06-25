@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/nution101/ttorch/internal/validate"
@@ -26,6 +27,16 @@ import (
 const (
 	Pass  = "pass"
 	Block = "block"
+)
+
+// The adversarial-review dimensions. The trust gate folds all three; the
+// security-everywhere pass folds only DimensionSecurity. Named constants keep the
+// dimension strings (also the per-dimension report filenames, "<dimension>.json")
+// from drifting between the gate and the standalone security audit.
+const (
+	DimensionCorrectness = "correctness"
+	DimensionScope       = "scope"
+	DimensionSecurity    = "security"
 )
 
 // Severity grades a finding. Aggregate blocks on any High (or above); an
@@ -193,6 +204,43 @@ func ToResults(v Verdict) []validate.Result {
 	}
 	if len(out) == 0 {
 		out = append(out, validate.Result{Name: "review", Passed: true})
+	}
+	return out
+}
+
+// severityRank orders findings for display, most severe first. An unknown or empty
+// severity ranks alongside the most severe (it blocks, so surface it first).
+var severityRank = map[Severity]int{
+	SeverityCritical: 0,
+	SeverityHigh:     1,
+	SeverityMedium:   2,
+	SeverityLow:      3,
+}
+
+// Describe renders every finding in v as a one-line, severity-prefixed string,
+// most-severe first, for surfacing an advisory review (e.g. the security-everywhere
+// pass) to the manager. Unlike ToResults — which renders only the blocking subset for
+// the PASS/FAIL gate printer — Describe lists low/medium advisory findings too, so a
+// non-blocking surface hides nothing. It returns nil for a verdict with no findings.
+func Describe(v Verdict) []string {
+	if len(v.Findings) == 0 {
+		return nil
+	}
+	sorted := append([]Finding(nil), v.Findings...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return severityRank[sorted[i].Severity] < severityRank[sorted[j].Severity]
+	})
+	out := make([]string, 0, len(sorted))
+	for _, f := range sorted {
+		summary := f.Summary
+		if f.Reviewer != "" {
+			summary = "[" + f.Reviewer + "] " + summary
+		}
+		sev := string(f.Severity)
+		if sev == "" {
+			sev = "unknown"
+		}
+		out = append(out, fmt.Sprintf("%-9s %s", sev, summary))
 	}
 	return out
 }
