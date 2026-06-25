@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.3.0](https://github.com/nution101/ttorch/compare/v0.2.0...v0.3.0) (2026-06-25)
+
+
+### Features
+
+* **ciparity:** reproduce a repo's actual CI run-steps locally ([7b78f6c](https://github.com/nution101/ttorch/commit/7b78f6cd3a5ab13ab4b631febcfc3ae6a999e19a))
+* **manager:** add a diagnose-from-evidence guardrail ([b84945c](https://github.com/nution101/ttorch/commit/b84945c5e2e667d845135258f9a726ec22ec397b))
+* **manager:** mirror the diagnose-from-evidence guardrail into global guidance ([3bf2e49](https://github.com/nution101/ttorch/commit/3bf2e49526ea5c8731bea2729edbee642022faeb))
+* **review:** run the security audit in every delivery mode ([bec1088](https://github.com/nution101/ttorch/commit/bec108866445f28c72de87ea79a607fd55577d34))
+
+
+### Bug Fixes
+
+* **ciparity:** broaden host-mutation skips and surface all env scopes ([544b608](https://github.com/nution101/ttorch/commit/544b60896995fa1ee96004e0b60993f5ec5d38fc))
+* **ciparity:** gate auto-run with a fail-closed allowlist ([a0674df](https://github.com/nution101/ttorch/commit/a0674df1e3251ed5824ef00681d1a5494364ba89))
+* **ciparity:** reject path-qualified executables and go exec flags ([7f06364](https://github.com/nution101/ttorch/commit/7f06364a188e90878abe603e3abe5d6f582112b7))
+* **ciparity:** treat leading inline VAR=val assignments as unknown ([a8bdafb](https://github.com/nution101/ttorch/commit/a8bdafbb69372935a312f9e1d3a9392cb9d37654))
+* **supervisor:** stop the heartbeat from poking the manager ([5d90850](https://github.com/nution101/ttorch/commit/5d90850a50729640db87dcf0988befe5ca00fa5b))
+
 ## [0.2.0](https://github.com/nution101/ttorch/compare/v0.1.10...v0.2.0) (2026-06-25)
 
 
