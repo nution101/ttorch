@@ -29,6 +29,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 
+	"github.com/nution101/ttorch/internal/livestate"
 	"github.com/nution101/ttorch/internal/paths"
 	"github.com/nution101/ttorch/internal/state"
 	"github.com/nution101/ttorch/internal/tmux"
@@ -116,7 +117,7 @@ func New(p paths.Paths) *Supervisor {
 			// rather than risk interrupting a generating manager.
 			return true, true
 		}
-		return true, Busy(out)
+		return true, livestate.Busy(out)
 	}
 	// Live-tab-coloring seams: read a worker pane to derive its state, and write its
 	// tab label. Both reach real tmux in production; tests swap them to drive state
@@ -273,7 +274,7 @@ func (s *Supervisor) scanStale() {
 		if !ok {
 			continue
 		}
-		if Busy(out) {
+		if livestate.Busy(out) {
 			s.staleCount[task.ID] = 0
 			s.paneHash[task.ID] = hash(out)
 			continue
@@ -324,7 +325,7 @@ func (s *Supervisor) scanLabels() {
 			continue // window gone or unreadable — leave its last label in place
 		}
 		glyph := glyphIdle
-		if Busy(pane) {
+		if livestate.Busy(pane) {
 			glyph = glyphWorking
 		}
 		if s.labelGlyph[task.ID] == glyph {
@@ -380,7 +381,7 @@ func (s *Supervisor) requestPoke() {
 
 // flushPoke delivers a pending poke when every guard allows it: auto-driving is on,
 // the cooldown since the last poke has elapsed (debounce), a manager window exists,
-// and it is idle — never interrupt a generating manager (reuses Busy). It is
+// and it is idle — never interrupt a generating manager (reuses livestate.Busy). It is
 // best-effort: a send-keys failure leaves the poke pending for the next tick and is
 // never propagated, so a tmux hiccup can't crash the supervisor. pokePending is
 // cleared only on a successful send, which is what coalesces a burst into one poke.
@@ -603,17 +604,4 @@ func touch(path string) error {
 func hash(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])
-}
-
-// Busy reports whether a captured pane shows a harness busy indicator (the worker
-// is mid-turn). It is the shared heuristic behind both the supervisor's
-// stale-detection and `ttorch status`, so the two never disagree.
-func Busy(pane string) bool {
-	low := strings.ToLower(pane)
-	for _, m := range []string{"esc to interrupt", "working…", "working...", "thinking", "generating"} {
-		if strings.Contains(low, m) {
-			return true
-		}
-	}
-	return false
 }

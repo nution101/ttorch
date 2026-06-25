@@ -60,6 +60,11 @@ func (p Paths) UpdateCheckFile() string { return filepath.Join(p.Home, "update-c
 // StateDir holds volatile runtime state (never touched by updates).
 func (p Paths) StateDir() string { return filepath.Join(p.Home, "state") }
 
+// StateDB is the global SQLite database — the single source of truth for all
+// orchestration state. Overridable via TTORCH_DB so tests can redirect into a
+// temp file.
+func (p Paths) StateDB() string { return envOr("TTORCH_DB", filepath.Join(p.Home, "state.db")) }
+
 // DataDir holds durable manager records (never touched by updates).
 func (p Paths) DataDir() string { return filepath.Join(p.Home, "data") }
 

@@ -16,6 +16,7 @@ import (
 
 	"github.com/nution101/ttorch/internal/approval"
 	"github.com/nution101/ttorch/internal/harness"
+	"github.com/nution101/ttorch/internal/livestate"
 	"github.com/nution101/ttorch/internal/paths"
 	"github.com/nution101/ttorch/internal/profile"
 	"github.com/nution101/ttorch/internal/projectinit"
@@ -347,13 +348,13 @@ func (m *Manager) Status() ([]state.Task, error) { return m.Store.List() }
 //   - "working": the pane shows a busy indicator (mid-turn)
 //   - "idle":    the window is live but not busy (finished / awaiting input)
 //
-// It mirrors the supervisor's stale-detection heuristic (supervisor.Busy) so
+// It mirrors the supervisor's stale-detection heuristic (livestate.Busy) so
 // `ttorch status` and the wakes the manager receives never disagree.
 func DeriveState(live bool, pane string) string {
 	if !live {
 		return "gone"
 	}
-	if supervisor.Busy(pane) {
+	if livestate.Busy(pane) {
 		return "working"
 	}
 	return "idle"
