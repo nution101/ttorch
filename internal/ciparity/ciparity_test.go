@@ -484,6 +484,13 @@ func TestClassify_AllowlistFailClosed(t *testing.T) {
 		{"go-toolexec-flag", "go build -toolexec=/tmp/evil ./..."},
 		{"go-vettool-flag", "go vet -vettool=/tmp/evil ./..."},
 		{"go-double-dash-exec", "go test --exec /tmp/evil ./..."},
+		// Leading inline VAR=val assignments are unknown (fail closed): they would otherwise
+		// inject exec flags via GOFLAGS or redirect resolution via PATH while the command
+		// still looks like a clean go build/test.
+		{"goflags-toolexec-inject", "GOFLAGS=-toolexec=/tmp/evil go build ./..."},
+		{"path-dot-inject", "PATH=. go test ./..."},
+		{"path-pwd-inject", "PATH=$PWD go test ./..."},
+		{"benign-inline-assignment", "FOO=bar go test ./..."},
 	}
 	for _, c := range skip {
 		steps, skips := parse(t, "wf.yml", wrapStep(c.run))

@@ -10,10 +10,12 @@
 // staticcheck, make build/test/lint/vet/check, npm/pnpm/yarn/bun test/lint/build) plus
 // harmless shell builtins (echo, test, set, cd, exit, …). The script is parsed into its
 // individual commands — across `;`, `&&`, `||`, `|`, newlines, grouping, and `$(…)`/backtick
-// substitutions, after stripping env assignments and absolute/relative path prefixes — and
-// ANY command that is not recognized (an unknown tool, `sudo`, a package install, a
-// pipe-to-shell, a deploy/publish, a filesystem mutation, etc.) causes the step to be
-// skipped rather than run.
+// substitutions — and ANY command that is not a bare, recognized executable causes the step
+// to be skipped rather than run: an unknown tool, `sudo`, a package install, a pipe-to-shell,
+// a deploy/publish, a filesystem mutation, a path-qualified executable (./go, bin/make), or a
+// command carrying a leading inline `VAR=val` assignment (GOFLAGS=…, PATH=…). Path prefixes
+// and inline assignments are deliberately NOT normalized away, since either could inject
+// arbitrary execution or redirect command resolution past the allowlist.
 //
 // Caveat: the allowlist guarantees the ENTRYPOINT, not its effects. An allowlisted `make`,
 // `npm run`, or `go test` still executes attacker-defined Makefile recipes, package.json
@@ -474,21 +476,18 @@ func commandSegments(run string) []string {
 	return segs
 }
 
-// executable extracts the program a command segment runs, after stripping leading VAR=val
-// environment assignments and command/exec/env-style prefixes. The executable token is
-// returned exactly as written — path qualification is NOT stripped, because a path-qualified
-// name is treated as unknown by commandAllowed (see there). It also returns the remaining
-// arguments for subcommand checks.
+// executable extracts the program a command segment runs, after stripping leading
+// command/exec/env-style prefixes. The executable token is returned exactly as written:
+// neither a path prefix nor a leading inline `VAR=val` assignment is stripped, because both
+// are treated as unknown by commandAllowed (see there). A leading inline assignment is left
+// in place precisely so it is NOT silently ignored — `GOFLAGS=-toolexec=… go build` and
+// `PATH=. go test` would otherwise look like clean go commands while injecting arbitrary
+// execution. It also returns the remaining arguments for subcommand checks.
 func executable(seg string) (string, []string) {
 	tokens := strings.Fields(seg)
 	i := 0
 	for i < len(tokens) {
-		t := tokens[i]
-		if isAssignment(t) {
-			i++
-			continue
-		}
-		switch t {
+		switch tokens[i] {
 		case "command", "exec", "env", "time", "nice", "builtin":
 			i++
 			continue
@@ -509,6 +508,12 @@ func executable(seg string) (string, []string) {
 // unknown: the repository could commit a malicious binary by a safe-looking name, so only a
 // bare, known-safe executable name is ever auto-run — never one resolved from a repo path.
 func commandAllowed(exe string, args []string) bool {
+	// A leading inline VAR=val assignment (e.g. GOFLAGS=-toolexec=… or PATH=.) is treated as
+	// unknown: it can inject arbitrary execution into, or redirect command resolution of, an
+	// otherwise safe-looking command, so a segment beginning with one is never auto-run.
+	if isAssignment(exe) {
+		return false
+	}
 	if exe != "" && strings.ContainsRune(exe, '/') {
 		return false
 	}
