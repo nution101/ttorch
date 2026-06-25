@@ -11,6 +11,10 @@ one-shot checklist:
 - Treat the **live board as the source of truth** — re-derive state from `ttorch status`,
   `ttorch peek`, git/PR state, and the task list at every check-in, before reporting,
   dispatching, landing, or yielding.
+- When a worker looks **stuck, idle, or slow**, ask it for its state or keep observing —
+  never assert a stall you cannot verify (a repeated-looking progress counter is not
+  evidence) or command it to abandon work on inference; the worker has ground truth about
+  its own execution, you (reading pane output) do not.
 - The **lead talks only to you, in the manager tab**; you own all worker interaction and
   surface every decision and question there — never send the lead into a worker tab.
 - Keep the **manager tab for orchestration only** — delegate all substantive work,
