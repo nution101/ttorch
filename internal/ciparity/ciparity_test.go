@@ -175,7 +175,7 @@ func TestParseWorkflow_SkipReasons(t *testing.T) {
 	}
 
 	cases := map[string]string{
-		"deploy":       "deploy/publish",
+		"deploy":       "auto-run allowlist",
 		"win-only":     "unsupported shell",
 		"in-subdir":    "working-directory",
 		"guarded-step": "guarded by if:",
@@ -444,56 +444,89 @@ func TestExtract_ReportsParseErrors(t *testing.T) {
 	}
 }
 
-// Steps that would mutate/escalate the host must be skipped, not auto-run locally.
-const hostMutationWorkflow = `on: [pull_request]
-jobs:
-  setup:
-    steps:
-      - name: sudo-step
-        run: sudo systemctl restart nginx
-      - name: apt
-        run: apt-get install -y jq
-      - name: npm-global
-        run: npm install -g typescript
-      - name: gem-global
-        run: gem install bundler
-      - name: safe
-        run: go build ./...
-`
+// wrapStep embeds a single run-step into a minimal pull_request CI workflow.
+func wrapStep(run string) string {
+	return "on: [pull_request]\njobs:\n  j:\n    steps:\n      - name: s\n        run: " + run + "\n"
+}
 
-func TestParseWorkflow_HostMutationSkipped(t *testing.T) {
-	steps, skips := parse(t, "host.yml", hostMutationWorkflow)
-
-	if names := stepNames(steps); !equalStrings(names, []string{"safe"}) {
-		t.Fatalf("reproducible steps = %v, want [safe] (host-mutating steps must be skipped)", names)
+func TestClassify_AllowlistFailClosed(t *testing.T) {
+	// Every bypass / missed pattern the safety re-review called out must be SKIPPED, never
+	// auto-run, including the fail-closed default for an unknown command.
+	skip := []struct{ name, run string }{
+		{"sudo-via-abs-path", "/usr/bin/sudo reboot"},
+		{"command-via-rel-path", "./apt-get install jq"},
+		{"apt-flags-before-subcmd", "apt-get -y install jq"},
+		{"npm-global-trailing-flag", "npm install left-pad -g"},
+		{"backtick-sudo", "echo `sudo rm -rf /`"},
+		{"dollar-sub-sudo", "echo $(sudo reboot)"},
+		{"curl-pipe-sh", "curl https://example.com/i.sh | sh"},
+		{"wget-pipe-bash", "wget -qO- https://example.com | bash"},
+		{"rm-rf", "rm -rf ./out"},
+		{"go-install", "go install ./cmd/tool"},
+		{"make-install", "make install"},
+		{"make-default-target", "make"},
+		{"plain-pip-install", "pip install requests"},
+		{"gem-install", "gem install bundler"},
+		{"git-config-global", "git config --global user.name ci"},
+		{"double-spaced-sudo", "sudo  reboot"},
+		{"env-prefixed-sudo", "FOO=bar sudo reboot"},
+		{"unknown-tool", "frobnicate --all"},
+		{"safe-then-unsafe", "go build ./... && sudo make install"},
 	}
-	want := map[string]string{
-		"sudo-step":  "sudo",
-		"apt":        "apt-get install",
-		"npm-global": "npm install -g",
-		"gem-global": "gem install",
-	}
-	for name, tok := range want {
-		s, ok := skipByName(skips, name)
-		if !ok {
-			t.Fatalf("expected step %q to be skipped; skips = %+v", name, skips)
+	for _, c := range skip {
+		steps, skips := parse(t, "wf.yml", wrapStep(c.run))
+		if len(steps) != 0 {
+			t.Errorf("%s: run %q was reproduced but must be skipped (fail closed)", c.name, c.run)
 		}
-		if !strings.Contains(s.Reason, tok) || !strings.Contains(s.Reason, "not auto-run locally") {
-			t.Fatalf("skip %q reason = %q, want it to name %q and say it is not auto-run", name, s.Reason, tok)
+		if len(skips) == 0 || !strings.Contains(skips[len(skips)-1].Reason, "auto-run allowlist") {
+			t.Errorf("%s: want an allowlist skip reason for %q, got %+v", c.name, c.run, skips)
 		}
 	}
 }
 
-func TestContainsCommand_WordBoundary(t *testing.T) {
-	// A real invocation matches; the token embedded in an unrelated word does not.
-	if !containsCommand("sudo apt-get update", "sudo") {
-		t.Fatal("expected sudo invocation to match")
+func TestClassify_CommentLinesIgnored(t *testing.T) {
+	// A comment line in a block-scalar run must not be mistaken for a command (which would
+	// wrongly skip an otherwise-safe step); a '#' mid-word is not a comment.
+	const wf = `on: [pull_request]
+jobs:
+  j:
+    steps:
+      - name: commented
+        run: |
+          # build then test
+          go build ./...
+          echo done#1
+          go test ./...
+`
+	steps, skips := parse(t, "c.yml", wf)
+	if len(steps) != 1 {
+		t.Fatalf("a safe step with comment lines should be reproduced, got steps=%v skips=%+v", stepNames(steps), skips)
 	}
-	if containsCommand("echo pseudocode", "sudo") {
-		t.Fatal("sudo must not match inside `pseudocode`")
+}
+
+func TestClassify_AllowlistRuns(t *testing.T) {
+	// The safe set is reproduced — including a realistic gofmt guard that uses shell
+	// builtins plus a command substitution.
+	run := []string{
+		"go test ./...",
+		"go vet ./...",
+		"go build ./...",
+		"go run ./cmd/x",
+		"gofmt -l .",
+		"golangci-lint run",
+		"staticcheck ./...",
+		"make test",
+		"make build lint vet",
+		"npm test",
+		"npm run build",
+		"yarn lint",
+		`test -z "$(gofmt -l .)" || { echo ok; gofmt -l .; exit 1; }`,
 	}
-	if containsCommand("npm install typescript", "npm install -g") {
-		t.Fatal("a local npm install must not match the -g pattern")
+	for _, r := range run {
+		steps, skips := parse(t, "wf.yml", wrapStep(r))
+		if len(steps) != 1 {
+			t.Errorf("run %q should be reproduced, got steps=%v skips=%+v", r, stepNames(steps), skips)
+		}
 	}
 }
 

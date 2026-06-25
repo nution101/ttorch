@@ -4,16 +4,24 @@
 // classifies each step as either reproducible locally or skipped — with a reason for every
 // skip, so nothing is dropped silently.
 //
-// Steps are skipped (and reported) when they cannot or should not run locally: `uses:`
-// action steps, steps in a workflow that is not a pull_request/push-branch CI workflow
-// (e.g. a tag-triggered release), jobs or steps guarded by a non-trivial `if:`, steps
-// whose script contains an unresolved GitHub Actions expression (${{ … }}, including
-// matrix/secret references), deploy/publish steps, steps that mutate or escalate host
-// state (e.g. `git config --global`, `sudo`, or global/system package installs such as
-// `apt-get install` or `npm install -g`), and steps using a non-shell `shell:` (whether set
-// on the step or inherited from `defaults.run`). Structurally unexpected jobs/steps (a
-// reusable-workflow `uses:` job, a non-mapping job or step) are reported as skips too,
-// never dropped.
+// Execution safety fails CLOSED. Because a CI-parity run auto-executes the extracted steps,
+// a step is reproduced only when EVERY command in its script is on a conservative allowlist
+// of safe build/test/lint commands (go build/test/vet/run, gofmt, golangci-lint,
+// staticcheck, make build/test/lint/vet/check, npm/pnpm/yarn/bun test/lint/build) plus
+// harmless shell builtins (echo, test, set, cd, exit, …). The script is parsed into its
+// individual commands — across `;`, `&&`, `||`, `|`, newlines, grouping, and `$(…)`/backtick
+// substitutions, after stripping env assignments and absolute/relative path prefixes — and
+// ANY command that is not recognized (an unknown tool, `sudo`, a package install, a
+// pipe-to-shell, a deploy/publish, a filesystem mutation, etc.) causes the step to be
+// skipped rather than run.
+//
+// Steps are also skipped (and reported) when they otherwise cannot or should not run
+// locally: `uses:` action steps, steps in a workflow that is not a pull_request/push-branch
+// CI workflow (e.g. a tag-triggered release), jobs or steps guarded by a non-trivial `if:`,
+// steps whose script contains an unresolved GitHub Actions expression (${{ … }}, including
+// matrix/secret references), and steps using a non-shell `shell:` (whether set on the step
+// or inherited from `defaults.run`). Structurally unexpected jobs/steps (a reusable-workflow
+// `uses:` job, a non-mapping job or step) are reported as skips too, never dropped.
 //
 // Known limitation (documented rather than silently ignored): `env:` is not injected into
 // the local run. A reproducible step carries a Note naming the workflow-, job-, and
@@ -243,11 +251,10 @@ func classifyStep(file, job string, idx int, sm *mapping, shell, workdir string)
 	case strings.Contains(run, "${{"):
 		return skip("contains a GitHub Actions expression (${{ … }}) that cannot be resolved locally")
 	}
-	if tok := publishToken(run); tok != "" {
-		return skip(fmt.Sprintf("looks like a deploy/publish step (%s)", tok))
-	}
-	if tok := hostMutationToken(run); tok != "" {
-		return skip(fmt.Sprintf("would mutate the host or require elevation (%s) — not auto-run locally", tok))
+	// Execution safety fails CLOSED: a step is auto-run only when EVERY command in it is on
+	// the safe allowlist. Any unrecognized, ambiguous, or host-mutating command skips it.
+	if seg, unsafe := unsafeCommand(run); unsafe {
+		return skip(fmt.Sprintf("not on the local auto-run allowlist (%s) — skipped (fail closed)", firstLine(seg)))
 	}
 	return &Step{Workflow: file, Job: job, Name: label, Run: run, Shell: shell}, nil
 }
@@ -371,91 +378,222 @@ func trivialIf(cond string) bool {
 	return false
 }
 
-// publishToken returns the first deploy/publish indicator found in a run script, or "".
-func publishToken(run string) string {
-	tokens := []string{
-		"gh release", "npm publish", "yarn publish", "pnpm publish",
-		"docker push", "cosign sign", "goreleaser release",
-		"aws s3", "aws deploy", "aws cloudformation", "terraform apply",
-		"kubectl apply", "helm upgrade", "helm install", "twine upload",
-	}
-	low := strings.ToLower(run)
-	for _, t := range tokens {
-		if strings.Contains(low, t) {
-			return t
+// unsafeCommand returns the first command segment in run that is NOT on the local auto-run
+// allowlist, or ok=false when every segment is allowlisted. Because ci-parity auto-executes
+// the steps it extracts, it fails CLOSED: a step is only run when every command in it is
+// recognized as a safe build/test/lint command (or a harmless shell builtin). Anything
+// unknown, ambiguous, or host-mutating — sudo, package installs, pipe-to-shell, deploy,
+// filesystem mutation — causes the step to be skipped rather than run.
+func unsafeCommand(run string) (segment string, ok bool) {
+	for _, seg := range commandSegments(run) {
+		exe, args := executable(seg)
+		if !commandAllowed(exe, args) {
+			return seg, true
 		}
 	}
-	return ""
+	return "", false
 }
 
-// hostInstallPatterns are command prefixes that install packages globally / system-wide.
-// Reproduced locally they would mutate the developer's machine (and several need sudo,
-// which would hang on an interactive password prompt), so steps that run them are skipped.
-var hostInstallPatterns = []string{
-	"apt-get install", "apt-get update", "apt-get upgrade",
-	"apt install", "apt update", "apt upgrade",
-	"brew install", "brew bundle",
-	"dnf install", "yum install", "zypper install",
-	"apk add", "pacman -S", "snap install",
-	"npm install -g", "npm install --global", "npm i -g", "npm i --global",
-	"pnpm add -g", "pnpm install -g", "yarn global add",
-	"gem install",
-	"pip install --global", "pip3 install --global",
-}
-
-// hostMutationToken returns a short description of the first host-mutating or
-// privilege-escalating command found in a run script, or "". Such commands run cleanly on
-// an ephemeral CI runner but, reproduced on a developer's machine, would clobber global
-// state, trigger an interactive sudo prompt (hanging the run), or install packages
-// system-wide. Because ci-parity auto-executes the steps it extracts, these are skipped
-// (reported, never run) rather than reproduced.
-func hostMutationToken(run string) string {
-	if containsCommand(run, "sudo") {
-		return "sudo"
-	}
-	for _, t := range []string{"git config --global", "git config --system"} {
-		if strings.Contains(run, t) {
-			return t
+// commandSegments splits a shell run script into the individual command segments that
+// would execute, descending into $(...) and `...` command substitutions so every command
+// is surfaced. It is quote-aware (operators and substitutions inside single quotes are
+// literal) so quoted arguments are not mis-split, and it over-segments on ambiguity since
+// the caller fails closed.
+func commandSegments(run string) []string {
+	var segs []string
+	var buf strings.Builder
+	flush := func() {
+		if s := strings.TrimSpace(buf.String()); s != "" {
+			segs = append(segs, s)
 		}
+		buf.Reset()
 	}
-	for _, p := range hostInstallPatterns {
-		if containsCommand(run, p) {
-			return p
-		}
-	}
-	return ""
-}
-
-// containsCommand reports whether cmd appears in run as a command invocation — at the
-// start of the script or right after a shell separator, and ending on a word boundary —
-// so it is not matched inside an unrelated word, path, or string literal.
-func containsCommand(run, cmd string) bool {
-	for idx := 0; ; {
-		i := strings.Index(run[idx:], cmd)
-		if i < 0 {
-			return false
-		}
-		pos := idx + i
-		before := pos == 0
-		if !before {
-			switch run[pos-1] {
-			case ' ', '\t', '\n', '\r', ';', '&', '|', '(', '{':
-				before = true
+	rs := []rune(run)
+	inSingle, inDouble := false, false
+	for i := 0; i < len(rs); i++ {
+		c := rs[i]
+		if inSingle {
+			if c == '\'' {
+				inSingle = false
+			} else {
+				buf.WriteRune(c)
 			}
+			continue
 		}
-		end := pos + len(cmd)
-		after := end >= len(run)
-		if !after {
-			switch run[end] {
-			case ' ', '\t', '\n', '\r', ';':
-				after = true
+		switch {
+		case c == '\\' && i+1 < len(rs):
+			i++
+			buf.WriteRune(rs[i])
+		case c == '\'' && !inDouble:
+			inSingle = true
+		case c == '"':
+			inDouble = !inDouble
+		case c == '`':
+			j := i + 1
+			for j < len(rs) && rs[j] != '`' {
+				j++
 			}
+			segs = append(segs, commandSegments(string(rs[i+1:j]))...)
+			i = j
+			buf.WriteRune(' ')
+		case c == '$' && i+1 < len(rs) && rs[i+1] == '(':
+			depth, j := 1, i+2
+			for j < len(rs) && depth > 0 {
+				switch rs[j] {
+				case '(':
+					depth++
+				case ')':
+					depth--
+				}
+				if depth == 0 {
+					break
+				}
+				j++
+			}
+			segs = append(segs, commandSegments(string(rs[i+2:j]))...)
+			i = j
+			buf.WriteRune(' ')
+		case !inDouble && c == '#' && endsWithSpaceOrEmpty(&buf):
+			// shell comment: skip to end of line so it is not mistaken for a command
+			for i+1 < len(rs) && rs[i+1] != '\n' {
+				i++
+			}
+		case !inDouble && (c == ';' || c == '\n' || c == '&' || c == '|' || c == '(' || c == ')' || c == '{' || c == '}'):
+			flush()
+		default:
+			buf.WriteRune(c)
 		}
-		if before && after {
+	}
+	flush()
+	return segs
+}
+
+// executable extracts the program a command segment runs, after stripping leading
+// VAR=val environment assignments and command/exec/env-style prefixes, and any absolute or
+// relative path prefix (so /usr/bin/sudo and ./apt-get normalize to sudo and apt-get). It
+// also returns the remaining arguments for subcommand checks.
+func executable(seg string) (string, []string) {
+	tokens := strings.Fields(seg)
+	i := 0
+	for i < len(tokens) {
+		t := tokens[i]
+		if isAssignment(t) {
+			i++
+			continue
+		}
+		switch t {
+		case "command", "exec", "env", "time", "nice", "builtin":
+			i++
+			continue
+		}
+		break
+	}
+	if i >= len(tokens) {
+		return "", nil
+	}
+	exe := tokens[i]
+	if idx := strings.LastIndexByte(exe, '/'); idx >= 0 {
+		exe = exe[idx+1:]
+	}
+	return strings.Trim(exe, `"'`), tokens[i+1:]
+}
+
+// commandAllowed reports whether a single command (its normalized executable and arguments)
+// is safe to auto-run locally. This is the heart of the fail-closed model: only the listed
+// build/test/lint entrypoints and harmless shell builtins return true; everything else,
+// including unknown tools, returns false.
+func commandAllowed(exe string, args []string) bool {
+	switch exe {
+	case "":
+		return true // a bare VAR=val assignment or empty segment runs nothing
+	case "echo", "printf", "test", "[", "true", "false", ":", "exit",
+		"set", "cd", "pwd", "export", "unset", "pushd", "popd":
+		return true
+	case "gofmt", "goimports", "golangci-lint", "staticcheck":
+		return true
+	case "go":
+		switch firstNonFlag(args) {
+		case "build", "test", "vet", "run", "fmt":
 			return true
 		}
-		idx = pos + 1
+		return false
+	case "make":
+		return makeTargetsSafe(args)
+	case "npm", "pnpm", "yarn", "bun":
+		return jsRunnerSafe(args)
 	}
+	return false
+}
+
+// makeTargetsSafe reports whether a make invocation runs only safe targets: every non-flag,
+// non-assignment argument must be a known-safe target, and there must be at least one (a
+// bare `make` runs an unknown default target, so it fails closed).
+func makeTargetsSafe(args []string) bool {
+	safe := map[string]bool{"build": true, "test": true, "lint": true, "vet": true, "check": true, "fmt": true}
+	found := false
+	for _, a := range args {
+		if strings.HasPrefix(a, "-") || isAssignment(a) {
+			continue
+		}
+		if !safe[a] {
+			return false
+		}
+		found = true
+	}
+	return found
+}
+
+// jsRunnerSafe reports whether an npm/pnpm/yarn/bun invocation runs only a safe script
+// (test/lint/build), directly or via `run`.
+func jsRunnerSafe(args []string) bool {
+	scripts := map[string]bool{"test": true, "lint": true, "build": true}
+	first, rest := "", args
+	for idx, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			first, rest = a, args[idx+1:]
+			break
+		}
+	}
+	if scripts[first] {
+		return true
+	}
+	if first == "run" {
+		return scripts[firstNonFlag(rest)]
+	}
+	return false
+}
+
+// endsWithSpaceOrEmpty reports whether the current segment buffer is empty or ends in
+// whitespace — i.e. a '#' here begins a shell comment rather than continuing a word.
+func endsWithSpaceOrEmpty(b *strings.Builder) bool {
+	s := b.String()
+	return len(s) == 0 || s[len(s)-1] == ' ' || s[len(s)-1] == '\t'
+}
+
+func firstNonFlag(args []string) string {
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			return a
+		}
+	}
+	return ""
+}
+
+// isAssignment reports whether a token is a shell environment assignment (NAME=value).
+func isAssignment(t string) bool {
+	eq := strings.IndexByte(t, '=')
+	if eq <= 0 {
+		return false
+	}
+	for i, r := range t[:eq] {
+		switch {
+		case r == '_', r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z':
+		case i > 0 && r >= '0' && r <= '9':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // runDefaults returns the shell and working-directory declared under a mapping's
