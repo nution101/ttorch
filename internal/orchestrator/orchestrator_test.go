@@ -2269,8 +2269,14 @@ func TestSecurityReview_RefusesStaleSha(t *testing.T) {
 	if _, err := m.Spawn("ss1", repo, false, "sleep 60"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.SecurityReview("ss1", "deadbeefdeadbeef", time.Minute); err == nil {
+	_, err := m.SecurityReview("ss1", "deadbeefdeadbeef", time.Minute)
+	if err == nil {
 		t.Fatal("security-review must refuse a sha that is not the worker HEAD")
+	}
+	// It must fail specifically because the sha is stale (not, say, a missing report or an
+	// unknown task), so the message names the commit pin.
+	if !strings.Contains(err.Error(), "the worker HEAD is now") || !strings.Contains(err.Error(), "deadbeefdead") {
+		t.Fatalf("want the stale-sha commit-pin error naming the requested sha, got: %v", err)
 	}
 	_, _ = m.Teardown("ss1", true)
 }

@@ -1,10 +1,11 @@
 ---
 name: ttorch-reviewer-security
 description: >
-  Adversarial trust-gate reviewer for the SECURITY & COMPLIANCE dimension. Reviews a
-  worker's diff for secrets, injection, broken authn/authz, missing audit logging, and
+  Adversarial reviewer for the SECURITY & COMPLIANCE dimension. Reviews a worker's diff
+  for secrets, injection, broken authn/authz, missing audit logging, and
   finance-compliance risks, biasing to high on uncertainty, and writes a commit-pinned
-  findings report. Dispatched by the ttorch-review gate; never edits code.
+  findings report. Dispatched by the trusted-mode trust gate AND by the advisory security
+  audit that runs in every delivery mode (pr/local/validated); never edits code.
 metadata:
   managed-by: ttorch
 ---
