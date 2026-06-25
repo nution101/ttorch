@@ -15,6 +15,12 @@
 // pipe-to-shell, a deploy/publish, a filesystem mutation, etc.) causes the step to be
 // skipped rather than run.
 //
+// Caveat: the allowlist guarantees the ENTRYPOINT, not its effects. An allowlisted `make`,
+// `npm run`, or `go test` still executes attacker-defined Makefile recipes, package.json
+// scripts, or repository test code — ci-parity extends the same trust in a repository's own
+// checks that internal/validate does (only run CI-parity against repos and worker output you
+// trust).
+//
 // Steps are also skipped (and reported) when they otherwise cannot or should not run
 // locally: `uses:` action steps, steps in a workflow that is not a pull_request/push-branch
 // CI workflow (e.g. a tag-triggered release), jobs or steps guarded by a non-trivial `if:`,
@@ -468,10 +474,11 @@ func commandSegments(run string) []string {
 	return segs
 }
 
-// executable extracts the program a command segment runs, after stripping leading
-// VAR=val environment assignments and command/exec/env-style prefixes, and any absolute or
-// relative path prefix (so /usr/bin/sudo and ./apt-get normalize to sudo and apt-get). It
-// also returns the remaining arguments for subcommand checks.
+// executable extracts the program a command segment runs, after stripping leading VAR=val
+// environment assignments and command/exec/env-style prefixes. The executable token is
+// returned exactly as written — path qualification is NOT stripped, because a path-qualified
+// name is treated as unknown by commandAllowed (see there). It also returns the remaining
+// arguments for subcommand checks.
 func executable(seg string) (string, []string) {
 	tokens := strings.Fields(seg)
 	i := 0
@@ -491,18 +498,20 @@ func executable(seg string) (string, []string) {
 	if i >= len(tokens) {
 		return "", nil
 	}
-	exe := tokens[i]
-	if idx := strings.LastIndexByte(exe, '/'); idx >= 0 {
-		exe = exe[idx+1:]
-	}
-	return strings.Trim(exe, `"'`), tokens[i+1:]
+	return strings.Trim(tokens[i], `"'`), tokens[i+1:]
 }
 
-// commandAllowed reports whether a single command (its normalized executable and arguments)
-// is safe to auto-run locally. This is the heart of the fail-closed model: only the listed
-// build/test/lint entrypoints and harmless shell builtins return true; everything else,
-// including unknown tools, returns false.
+// commandAllowed reports whether a single command (its executable and arguments) is safe to
+// auto-run locally. This is the heart of the fail-closed model: only the listed build/test/
+// lint entrypoints and harmless shell builtins return true; everything else returns false.
+//
+// A path-qualified executable (e.g. ./go, bin/make, /usr/bin/sudo) is always treated as
+// unknown: the repository could commit a malicious binary by a safe-looking name, so only a
+// bare, known-safe executable name is ever auto-run — never one resolved from a repo path.
 func commandAllowed(exe string, args []string) bool {
+	if exe != "" && strings.ContainsRune(exe, '/') {
+		return false
+	}
 	switch exe {
 	case "":
 		return true // a bare VAR=val assignment or empty segment runs nothing
@@ -514,7 +523,7 @@ func commandAllowed(exe string, args []string) bool {
 	case "go":
 		switch firstNonFlag(args) {
 		case "build", "test", "vet", "run", "fmt":
-			return true
+			return goFlagsSafe(args)
 		}
 		return false
 	case "make":
@@ -523,6 +532,26 @@ func commandAllowed(exe string, args []string) bool {
 		return jsRunnerSafe(args)
 	}
 	return false
+}
+
+// goFlagsSafe reports whether a go command is free of flags that run an arbitrary external
+// program: -exec, -toolexec, and -vettool (in any -/-- and =value form). Their presence
+// means the step would execute an attacker-chosen binary, so it must be skipped.
+func goFlagsSafe(args []string) bool {
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			continue
+		}
+		name := strings.TrimLeft(a, "-")
+		if eq := strings.IndexByte(name, '='); eq >= 0 {
+			name = name[:eq]
+		}
+		switch name {
+		case "exec", "toolexec", "vettool":
+			return false
+		}
+	}
+	return true
 }
 
 // makeTargetsSafe reports whether a make invocation runs only safe targets: every non-flag,

@@ -472,6 +472,18 @@ func TestClassify_AllowlistFailClosed(t *testing.T) {
 		{"env-prefixed-sudo", "FOO=bar sudo reboot"},
 		{"unknown-tool", "frobnicate --all"},
 		{"safe-then-unsafe", "go build ./... && sudo make install"},
+		// Path-qualified executables are unknown: a repo could commit a malicious binary
+		// by a safe-looking name, so a path-resolved tool must never auto-run.
+		{"rel-path-go", "./go test ./..."},
+		{"abs-path-make", "/tmp/make build"},
+		{"bin-path-go", "bin/go test ./..."},
+		{"exec-prefix-path-go", "exec ./go test ./..."},
+		// go flags that run an arbitrary external program.
+		{"go-exec-flag", "go test -exec /tmp/evil ./..."},
+		{"go-exec-eq-flag", "go test -exec=/tmp/evil ./..."},
+		{"go-toolexec-flag", "go build -toolexec=/tmp/evil ./..."},
+		{"go-vettool-flag", "go vet -vettool=/tmp/evil ./..."},
+		{"go-double-dash-exec", "go test --exec /tmp/evil ./..."},
 	}
 	for _, c := range skip {
 		steps, skips := parse(t, "wf.yml", wrapStep(c.run))
@@ -509,6 +521,7 @@ func TestClassify_AllowlistRuns(t *testing.T) {
 	// builtins plus a command substitution.
 	run := []string{
 		"go test ./...",
+		"go test -race -count=1 ./...", // benign flags must not trip the exec-flag guard
 		"go vet ./...",
 		"go build ./...",
 		"go run ./cmd/x",
