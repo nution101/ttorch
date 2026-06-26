@@ -33,8 +33,10 @@ The binary lives in the user-owned `~/.ttorch/bin/ttorch` with a PATH symlink at
 `~/.local/bin/ttorch`. Make sure `~/.local/bin` is on your `PATH`.
 
 Release downloads are sha256-checked against the release's `checksums.txt` during
-install; the checksums are also cosign-signed — see **Verifying a release** in the
-README to confirm a download independently.
+install, and the checksums are cosign-signed. When `cosign` is installed the installer
+verifies that signature **strictly** — a missing or invalid signature refuses the install
+rather than downgrading to sha256 only (set `TTORCH_INSTALL_ALLOW_UNSIGNED=1` to opt out).
+See **Verifying a release** in the README to confirm a download independently.
 
 ## 3. First run
 

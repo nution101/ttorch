@@ -49,12 +49,19 @@ cosign verify-blob \
 shasum -a 256 -c checksums.txt --ignore-missing   # then verify your tarball
 ```
 
-The `install.sh` installer runs this same `cosign verify-blob` automatically when `cosign`
-is present, confirming the checksums came from this repo's release workflow before trusting
-them. Without `cosign` (or for a release that predates signing) it prints a warning and
-verifies only the sha256 — which confirms the download is internally consistent but does
-**not** prove it came from this repo; install `cosign` for that provenance guarantee. The
-commands above let you verify a release by hand.
+The `install.sh` installer runs this same `cosign verify-blob` automatically. When `cosign`
+is installed it verifies **strictly**: a missing or invalid signature is fatal and the
+install is refused — it never silently downgrades to a sha256-only check, which an attacker
+could otherwise force by stripping the signature from a tampered download. Every release
+from v0.1.0 on is signed, so this never blocks a real release. Set
+`TTORCH_INSTALL_ALLOW_UNSIGNED=1` to opt out for the rare case that must proceed without a
+verifiable signature (an air-gapped mirror, or a genuinely unsigned release): a *missing*
+signature then degrades to a loud warning plus the sha256 check, while a signature that is
+present but fails verification stays fatal. When `cosign` is **not** installed, provenance
+cannot be verified at all, so the installer warns and verifies only the sha256 — which
+confirms the download is internally consistent but does **not** prove it came from this
+repo; install `cosign` for that provenance guarantee. The commands above let you verify a
+release by hand.
 
 ## Commands
 

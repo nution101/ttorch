@@ -49,9 +49,21 @@ curl -fsSL "${BASE}/checksums.txt" -o "${TMP}/checksums.txt"
 
 # Verify the provenance of checksums.txt with cosign (Sigstore keyless) before
 # trusting any checksum in it. The release workflow signs checksums.txt and
-# attaches checksums.txt.cosign.bundle alongside it. When cosign is unavailable
-# (or no signature is published) we warn and fall back to the sha256 check below
-# rather than failing the install; when cosign IS present a bad signature is fatal.
+# attaches checksums.txt.cosign.bundle alongside it.
+#
+# Strict by default: when cosign is installed, a missing OR invalid signature is
+# fatal. We never silently downgrade to a sha256-only check — an attacker who can
+# tamper with the download could simply strip the bundle, and sha256 alone proves
+# only that the download is internally consistent, not that it came from this repo.
+# Every ttorch release from v0.1.0 on is signed, so strict mode never blocks a real
+# release.
+#
+# Opt out with TTORCH_INSTALL_ALLOW_UNSIGNED=1 for the rare case that must proceed
+# without a verifiable signature (an air-gapped mirror, or a genuinely unsigned
+# release): a MISSING bundle then degrades to a loud warning + sha256 fallback. A
+# bundle that is present but FAILS verification is always fatal regardless — that is
+# an active tampering signal, not a missing-signature one. When cosign is absent we
+# cannot verify provenance at all, so we fall back to sha256 with a clear warning.
 if command -v cosign >/dev/null 2>&1; then
   if curl -fsSL "${BASE}/checksums.txt.cosign.bundle" -o "${TMP}/checksums.txt.cosign.bundle" 2>/dev/null; then
     echo "Verifying checksums signature with cosign (keyless)..."
@@ -62,10 +74,18 @@ if command -v cosign >/dev/null 2>&1; then
       "${TMP}/checksums.txt"; then
       echo "cosign signature verification FAILED for ${VERSION}; refusing to install."; exit 1
     fi
+  elif [ "${TTORCH_INSTALL_ALLOW_UNSIGNED:-}" = "1" ]; then
+    echo "WARNING: cosign is installed but no signature bundle was found for ${VERSION}, and"
+    echo "         TTORCH_INSTALL_ALLOW_UNSIGNED=1 is set. Provenance could NOT be verified"
+    echo "         (the release may predate signing, or the bundle may have been stripped)."
+    echo "         Falling back to the sha256 check only."
   else
-    echo "WARNING: cosign is installed but no signature was found for ${VERSION}."
-    echo "         Provenance could NOT be verified (the release may predate signing, or the"
-    echo "         signature may have been stripped). Falling back to sha256 only."
+    echo "ERROR: cosign is installed but no signature bundle was found for ${VERSION}."
+    echo "       Refusing to install: a missing signature can mean the download was tampered"
+    echo "       with in transit (the bundle stripped to force a weaker check). Every ttorch"
+    echo "       release from v0.1.0 on is signed. To proceed anyway (air-gapped mirror or a"
+    echo "       genuinely unsigned release), re-run with TTORCH_INSTALL_ALLOW_UNSIGNED=1."
+    exit 1
   fi
 else
   echo "Warning: cosign not installed; skipping signature verification."
