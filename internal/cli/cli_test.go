@@ -290,3 +290,17 @@ func TestCmdSecurityReview_ArgGuard(t *testing.T) {
 		}
 	}
 }
+
+// TestCmdQAReview_ArgGuard mirrors the security-review guard: too few args and an unknown
+// subcommand both fail loudly with the qa-review usage line.
+func TestCmdQAReview_ArgGuard(t *testing.T) {
+	for _, args := range [][]string{nil, {"prep"}, {"bogus", "id1"}} {
+		err := cmdQAReview(args)
+		if err == nil {
+			t.Fatalf("cmdQAReview(%v) must return a usage error", args)
+		}
+		if !strings.Contains(err.Error(), "qa-review prep|record|show") {
+			t.Fatalf("cmdQAReview(%v) error = %q, want the usage line", args, err)
+		}
+	}
+}

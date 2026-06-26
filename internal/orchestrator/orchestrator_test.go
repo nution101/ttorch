@@ -2661,6 +2661,144 @@ func TestSecurityReview_RefusesStaleSha(t *testing.T) {
 	_, _ = m.Teardown("ss1", true)
 }
 
+// --- ttorch qa-review (the optional test-adequacy advisory pass) ---
+
+// writeQAReport drops ONLY the QA reviewer's report into dir (the manager ran just the QA
+// reviewer, not the full three-dimension gate), as the qa-review pass expects.
+func writeQAReport(t *testing.T, dir, sha string, findings []review.Finding) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(review.Report{Dimension: review.DimensionQA, ReviewedSHA: sha, Findings: findings})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "qa.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestQAReview_AdvisoryAndIndependentOfReviewPaths is the headline guard: a QA audit folds the
+// QA reviewer's report into a verdict but is purely ADVISORY — it never mints an approval,
+// never writes the trust gate's verdict file or the security audit's verdict file, and never
+// touches the task's gate state. Only the QA reviewer's report need be present.
+func TestQAReview_AdvisoryAndIndependentOfReviewPaths(t *testing.T) {
+	m, repo := deliveryHarness(t, "qarev")
+	task, err := m.Spawn("qv1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := commitFeature(t, task.Worktree, "feature.txt", "new\n")
+
+	writeQAReport(t, m.P.ReviewInputsDir("qv1"), head, nil) // clean
+	v, err := m.QAReview("qv1", "", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Overall != review.Pass {
+		t.Fatalf("a clean qa report should pass, got %q", v.Overall)
+	}
+	// Advisory: no approval minted, and neither the trust gate's verdict file nor the
+	// security audit's verdict file is written (the three paths use distinct files).
+	if approval.Valid(m.P.ApprovalFile("qv1")) {
+		t.Fatal("qa-review must NOT mint an approval token")
+	}
+	if _, ok := review.Load(m.P.ReviewVerdictFile("qv1")); ok {
+		t.Fatal("qa-review must NOT write the trust gate's verdict file")
+	}
+	if _, ok := m.SecurityReviewShow("qv1"); ok {
+		t.Fatal("qa-review must NOT write the security audit's verdict file")
+	}
+	// Task gate state is untouched (the advisory pass is side-effect-free on it).
+	reloaded, _, _ := m.Store.GetTask(context.Background(), "qv1")
+	if reloaded.GatePassed || reloaded.ReviewedSHA != "" || reloaded.ApprovedBy != "" {
+		t.Fatalf("qa-review must not touch the task's gate state: %+v", reloaded)
+	}
+	// QAReviewShow returns the recorded advisory verdict.
+	got, ok := m.QAReviewShow("qv1")
+	if !ok || got.ReviewedSHA != head {
+		t.Fatalf("QAReviewShow = %+v ok=%v, want the recorded verdict pinned to %s", got, ok, head)
+	}
+	_, _ = m.Teardown("qv1", true)
+}
+
+// TestQAReview_BlockingFindingStaysAdvisory pins that a high QA finding yields a "block"
+// verdict for the manager to surface, yet it never gates delivery: the normal approval-gated
+// merge still proceeds. QA is advisory in every mode and is not part of the trusted gate.
+func TestQAReview_BlockingFindingStaysAdvisory(t *testing.T) {
+	m, repo := deliveryHarness(t, "qablock")
+	task, err := m.Spawn("qb1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := commitFeature(t, task.Worktree, "feature.txt", "new\n")
+
+	writeQAReport(t, m.P.ReviewInputsDir("qb1"), head, []review.Finding{
+		{Severity: review.SeverityHigh, Reviewer: "ttorch-reviewer-qa", Summary: "new failure path has no test"},
+	})
+	v, err := m.QAReview("qb1", "", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Overall != review.Block {
+		t.Fatalf("a high finding should yield a block verdict, got %q", v.Overall)
+	}
+	if approval.Valid(m.P.ApprovalFile("qb1")) {
+		t.Fatal("a blocking advisory must not mint an approval")
+	}
+	// The blocking advisory does NOT gate a non-trusted merge: approve + merge still works.
+	if err := m.Approve("qb1", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.MergeLocal("qb1", false); err != nil {
+		t.Fatalf("a blocking qa advisory must not block a non-trusted merge: %v", err)
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") != head {
+		t.Fatal("default branch was not fast-forwarded despite a clean approval")
+	}
+	_, _ = m.Teardown("qb1", true)
+}
+
+// TestQAReview_MissingReportFailsClosed: recording before the QA reviewer ran (no qa.json)
+// folds to a "block" advisory verdict, not a silent pass.
+func TestQAReview_MissingReportFailsClosed(t *testing.T) {
+	m, repo := deliveryHarness(t, "qamiss")
+	task, err := m.Spawn("qm1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitFeature(t, task.Worktree, "feature.txt", "new\n")
+
+	v, err := m.QAReview("qm1", "", time.Minute)
+	if err != nil {
+		t.Fatalf("a missing report must fold to a block verdict, not error: %v", err)
+	}
+	if v.Overall != review.Block {
+		t.Fatalf("a missing qa report must fail closed to block, got %q", v.Overall)
+	}
+	_, _ = m.Teardown("qm1", true)
+}
+
+// TestQAReview_RefusesStaleSha mirrors the trust-record commit pin: a report covering a sha
+// that is no longer the worker HEAD is refused rather than silently accepted.
+func TestQAReview_RefusesStaleSha(t *testing.T) {
+	m, repo := deliveryHarness(t, "qastale")
+	if _, err := m.Spawn("qs1", repo, false, "sleep 60"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := m.QAReview("qs1", "deadbeefdeadbeef", time.Minute)
+	if err == nil {
+		t.Fatal("qa-review must refuse a sha that is not the worker HEAD")
+	}
+	// It must fail specifically because the sha is stale (not a missing report or unknown
+	// task), so the message names the commit pin.
+	if !strings.Contains(err.Error(), "the worker HEAD is now") || !strings.Contains(err.Error(), "deadbeefdead") {
+		t.Fatalf("want the stale-sha commit-pin error naming the requested sha, got: %v", err)
+	}
+	_, _ = m.Teardown("qs1", true)
+}
+
 // TestSecurityAuditNote covers the advisory note `ttorch land` appends in non-gated modes.
 // It never blocks; it just reports whether a fresh security audit covers the landed commit.
 func TestSecurityAuditNote(t *testing.T) {

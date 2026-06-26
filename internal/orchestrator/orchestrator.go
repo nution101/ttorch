@@ -1174,6 +1174,75 @@ func (m *Manager) SecurityReviewShow(taskID string) (review.Verdict, bool) {
 	return review.Load(m.securityVerdictPath(taskID))
 }
 
+// qaVerdictPath is where the standalone, advisory test-adequacy (QA) verdict lives — beside
+// the review inputs the QA reviewer reads, and DISTINCT from both the trust gate's
+// ReviewVerdictFile and the security audit's verdict, so none of the three interfere: the QA
+// pass can never mint an approval or satisfy the trusted gate, and recording it never
+// disturbs a trust or security verdict.
+func (m *Manager) qaVerdictPath(taskID string) string {
+	return filepath.Join(m.P.ReviewInputsDir(taskID), "qa-verdict.json")
+}
+
+// QAReview folds ONLY the QA reviewer's report for taskID into a commit-pinned verdict and
+// persists it as an advisory result — the optional test-adequacy audit. It reuses the same
+// inputs (materialized by TrustPrep) and the same internal/review aggregation as the trust
+// gate, but it is purely advisory: it never mints an approval, never touches the trust gate's
+// verdict or the task's gate state, and never blocks a merge. The manager surfaces its
+// findings; delivery is still governed by the human approval (or, in trusted mode, the
+// unchanged three-dimension gate, which does not include QA).
+//
+// Like TrustRecord it is commit-pinned: the sha it covers must still be the worker's HEAD (so
+// a commit landing after the QA reviewer ran is rejected rather than silently passed). A
+// missing or malformed qa.json folds to a "block" advisory verdict (fail closed) telling the
+// manager to actually run the reviewer.
+func (m *Manager) QAReview(taskID, sha string, ttl time.Duration) (review.Verdict, error) {
+	var zero review.Verdict
+	t, ok, err := m.Store.GetTask(context.Background(), taskID)
+	if err != nil || !ok {
+		return zero, fmt.Errorf("unknown task %q", taskID)
+	}
+	if ttl <= 0 {
+		return zero, fmt.Errorf("--ttl must be positive (got %s)", ttl)
+	}
+	head, err := worktree.Head(t.Worktree)
+	if err != nil {
+		return zero, err
+	}
+	if sha == "" {
+		sha = head
+	}
+	if sha != head {
+		return zero, fmt.Errorf("qa review covers %s but the worker HEAD is now %s; re-run 'ttorch qa-review prep %s' and review again", short(sha), short(head), taskID)
+	}
+	verdict, err := review.Aggregate(m.P.ReviewInputsDir(taskID), sha, []string{review.DimensionQA})
+	if err != nil {
+		return zero, err
+	}
+	if err := review.Write(m.qaVerdictPath(taskID), verdict, ttl); err != nil {
+		return zero, err
+	}
+	// Record a typed, manager-authored, non-actionable 'qa_recorded' event (§3.4). Like the
+	// security audit it is a PURE event append — NOT RecordDelivery — because the QA pass is
+	// advisory and must never touch the task's gate state (gate_passed/approved_by/
+	// reviewed_sha); it only notes that the audit ran and its outcome. Best-effort: the
+	// verdict is already persisted, so a failed append must not mask it.
+	if _, err := m.Store.AppendEvent(context.Background(), db.Event{
+		EntityType: db.EntityTypeTask, EntityID: taskID, Type: db.EventQARecorded, Actor: db.ActorManager,
+		Payload: fmt.Sprintf("verdict=%s sha=%s", verdict.Overall, short(sha)),
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "ttorch: could not record the qa_recorded event for %s: %v\n", taskID, err)
+	}
+	m.audit(fmt.Sprintf("qa-review task=%s commit=%s verdict=%s mode=%s",
+		taskID, short(sha), verdict.Overall, projectinit.ReadMode(t.Project)))
+	return verdict, nil
+}
+
+// QAReviewShow returns the current valid (unexpired) advisory QA verdict for taskID, if any,
+// without consuming it.
+func (m *Manager) QAReviewShow(taskID string) (review.Verdict, bool) {
+	return review.Load(m.qaVerdictPath(taskID))
+}
+
 // recordDelivered marks a task delivered and appends a typed, manager-authored,
 // non-actionable delivery event in one transaction (§3.4): `delivered` for a local
 // fast-forward (MergeLocal, standalone or via Land's local/validated/trusted path) and
