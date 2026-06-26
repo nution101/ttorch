@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.4.0](https://github.com/nution101/ttorch/compare/v0.3.0...v0.4.0) (2026-06-26)
+
+
+### Features
+
+* **cli:** DB-backed query surfaces (inc4) ([55b0a60](https://github.com/nution101/ttorch/commit/55b0a605d5edbf4bd25728c72db2b380e46ed99b))
+* **cli:** worker-reporting commands + spawn task identity ([b79aa96](https://github.com/nution101/ttorch/commit/b79aa96df18d6190dd6becca2f985191aa214385))
+* **db:** add SQLite state-store foundation and relocate Busy ([7dcc600](https://github.com/nution101/ttorch/commit/7dcc600b8b35862daa01b3af169124bc011c293a))
+* **db:** flip persistence to the SQLite store + legacy import ([df09c08](https://github.com/nution101/ttorch/commit/df09c0839236884606b74f6d4a11a25c8c0d5d6e))
+* **lifecycle:** record typed lifecycle events + db/teardown cleanups (inc5) ([4390fd0](https://github.com/nution101/ttorch/commit/4390fd09a19b05c4d91d4ae60c9e7719323c6aed))
+* **manager:** rewrite the protocol to the event-driven watch loop (inc7) ([d1e5bfb](https://github.com/nution101/ttorch/commit/d1e5bfb99ebf76be7835b1b27cf78f9b419b6267))
+* **supervisor:** retire the daemon, wake-queue, and manager injection (inc6) ([dead982](https://github.com/nution101/ttorch/commit/dead9828cb8375c83e82e705b0e53e9aa03b0624))
+* **watch:** event-driven `ttorch watch` (inc3) ([5cd4e12](https://github.com/nution101/ttorch/commit/5cd4e126dc82c6b490a58fe4c727ba66776d5dfc))
+
+
+### Bug Fixes
+
+* **cli:** make worker audit attribution unforgeable ([fd54f42](https://github.com/nution101/ttorch/commit/fd54f42ec429b87b6a6c8d876691936fc25742b7))
+* **cli:** status shows only spawned workers, not pending backlog ([f1dfc78](https://github.com/nution101/ttorch/commit/f1dfc788c7e7a608b10a75e3623c5a52fb29ac6e))
+
 ## [0.3.0](https://github.com/nution101/ttorch/compare/v0.2.0...v0.3.0) (2026-06-25)
 
 
