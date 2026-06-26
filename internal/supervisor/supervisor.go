@@ -591,7 +591,12 @@ func Start(p paths.Paths) (pid int, started bool, err error) {
 	}
 	defer logf.Close()
 	c := exec.Command(exe, "daemon", "run")
-	c.Env = append(os.Environ(), "TTORCH_DAEMON=1")
+	// Disable the legacy supervisor→manager poke for the SQLite-watcher transition
+	// (incs 3–6, §8 row 3) through the existing TTORCH_NO_AUTODRIVE seam, so the
+	// manager-owned `ttorch watch` is the SINGLE wake mechanism and nothing types into
+	// the manager window. The supervisor still queues wakes and runs its other scans;
+	// it (and this line) are removed entirely when the supervisor is retired in inc 6.
+	c.Env = append(os.Environ(), "TTORCH_DAEMON=1", "TTORCH_NO_AUTODRIVE=1")
 	c.Stdout = logf
 	c.Stderr = logf
 	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}

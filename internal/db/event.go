@@ -112,6 +112,45 @@ func (s *Store) MaxActionableEventID(ctx context.Context) (int64, error) {
 	return max, err
 }
 
+// HasActionableEventForTask reports whether a task has an actionable event at or
+// after the cutoff timestamp (a nil cutoff means "any actionable event, ever").
+// The watcher's liveness net uses it to exclude a task that is already surfaced /
+// unresolved (§4.4): a worker-actor transition into needs_input/blocked/done, or a
+// previously emitted window_gone / idle_unreported, leaves an actionable event on
+// the row, so the net does not re-flag a worker the manager has already been told
+// about. Passing the task's last_progress_at as the cutoff makes a fresh worker
+// progress report (which advances last_progress_at) clear the exclusion.
+func (s *Store) HasActionableEventForTask(ctx context.Context, taskID string, cutoff *time.Time) (bool, error) {
+	query := `SELECT EXISTS(SELECT 1 FROM events
+		WHERE entity_type = 'task' AND entity_id = ? AND actionable = 1`
+	args := []any{taskID}
+	if cutoff != nil {
+		query += ` AND ts >= ?`
+		args = append(args, formatTime(*cutoff))
+	}
+	query += `)`
+	var exists int64
+	if err := s.db.QueryRowContext(ctx, query, args...).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists != 0, nil
+}
+
+// HasEventType reports whether a task already has an event of the given type. The
+// watcher uses it to record an external transition exactly once — e.g. a merged PR
+// is appended as pr_merged only if no pr_merged event exists yet (§4.4), the durable
+// replacement for the retired supervisor's in-memory dedup map.
+func (s *Store) HasEventType(ctx context.Context, taskID, eventType string) (bool, error) {
+	var exists int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM events WHERE entity_type = 'task' AND entity_id = ? AND type = ?)`,
+		taskID, eventType).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists != 0, nil
+}
+
 const noteColumns = `id, ts, task_id, author, body`
 
 func scanNote(sc rowScanner) (Note, error) {

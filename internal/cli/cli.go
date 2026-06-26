@@ -39,8 +39,10 @@ import (
 	"github.com/nution101/ttorch/internal/selfupdate"
 	"github.com/nution101/ttorch/internal/skills"
 	"github.com/nution101/ttorch/internal/supervisor"
+	"github.com/nution101/ttorch/internal/tmux"
 	"github.com/nution101/ttorch/internal/validate"
 	"github.com/nution101/ttorch/internal/wake"
+	"github.com/nution101/ttorch/internal/watch"
 	"github.com/nution101/ttorch/internal/worktree"
 )
 
@@ -127,6 +129,10 @@ func Main(args []string) int {
 		return run(cmdWake(rest))
 	case "wait":
 		return run(cmdWait(rest))
+	case "watch":
+		return run(cmdWatch(rest))
+	case "await-lead":
+		return run(cmdAwaitLead(rest))
 	case "validate":
 		return run(cmdValidate(rest))
 	case "ci-parity":
@@ -1144,6 +1150,84 @@ func cmdWait(args []string) error {
 	}
 }
 
+// cmdWatch arms the event-driven watcher (§4): it blocks on actionable DB
+// transitions and, when one occurs, prints the coalesced batch + WATCH_WATERMARK and
+// exits 0 so the harness re-invokes the manager through its background-task-completion
+// channel — no keystroke ever reaches the manager window. It is short-lived only in
+// the sense that it returns on the first wake; until then it holds its store and the
+// singleton flock for its lifetime. `--reset` reaps an orphan watcher instead of
+// watching (manager restart, §4.5).
+func cmdWatch(args []string) error {
+	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
+	since := fs.Int64("since", -1, "only surface events with id greater than this (default: manager.watch_watermark)")
+	timeout := fs.Duration("timeout", 0, "give up after this long with WATCH_TIMEOUT (0 = block forever)")
+	coalesce := fs.Duration("coalesce", 750*time.Millisecond, "wait this long after the first actionable event to absorb a burst")
+	reset := fs.Bool("reset", false, "reap an orphan watcher and confirm the singleton is free, then return")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	p := paths.Default()
+	store, err := db.Open(p.StateDB())
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+
+	// SIGTERM (how `--reset` reaps an orphan) and Ctrl-C cancel the loop; the deferred
+	// flock release then frees the singleton, which is what lets a reset proceed.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	w := watch.New(store, p, tmux.SessionName())
+	if *reset {
+		return w.Reset(ctx)
+	}
+	// Arming the watcher means the manager is back in the loop — clear the
+	// awaiting-lead backstop (§4.6: "cleared on the next watch arm"). The protocol
+	// only arms watch when NOT awaiting the lead, so this never races the backstop.
+	if err := store.SetAwaitingLead(ctx, false); err != nil {
+		return err
+	}
+	w.Since = *since
+	w.Timeout = *timeout
+	w.Coalesce = *coalesce
+	if _, err := w.Run(ctx); err != nil {
+		// A clean cancel/SIGTERM (e.g. a reset reaping us) is a normal exit, not an error.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// cmdAwaitLead sets (or, with --clear, clears) manager.awaiting_lead — the silent
+// backstop in §4.6. While set, a still-running watcher keeps blocking instead of
+// surfacing, so an actionable event can never pull the manager off a decision it has
+// put to the lead. The manager sets it as it surfaces a decision and clears it when
+// the lead returns (re-arming `ttorch watch` also clears it).
+func cmdAwaitLead(args []string) error {
+	fs := flag.NewFlagSet("await-lead", flag.ContinueOnError)
+	clear := fs.Bool("clear", false, "clear the flag — the lead has returned; the watcher may be re-armed")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	store, err := db.Open(paths.Default().StateDB())
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if err := store.SetAwaitingLead(context.Background(), !*clear); err != nil {
+		return err
+	}
+	if *clear {
+		fmt.Println("awaiting-lead cleared — the watcher may be re-armed")
+	} else {
+		fmt.Println("awaiting-lead set — waiting for the lead; do not arm the watcher")
+	}
+	return nil
+}
+
 func cmdValidate(args []string) error {
 	if len(args) < 1 {
 		return errors.New("usage: ttorch validate <task-id>")
@@ -1614,6 +1698,13 @@ Worker reporting (run by a worker about its own task; resolves the task from
                           file a child task into the backlog (does not spawn)
 
 Supervision:
+  watch                   block until an actionable DB event, print the coalesced
+    [--since n]             batch + WATCH_WATERMARK, then exit (the manager arms this
+    [--timeout d]           as a background task each non-blocking turn; --since
+    [--coalesce d]          defaults to the stored watermark; --timeout 0 blocks)
+  watch --reset           reap an orphan watcher and confirm the singleton is free
+  await-lead [--clear]    mark the manager as awaiting the lead (the watcher stays
+                          silent and never surfaces); --clear when the lead returns
   supervise               ensure the background supervisor is running
   daemon run|start|stop|status   manage the supervisor process
   wake drain              print and clear pending supervision events

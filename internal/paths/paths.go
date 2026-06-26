@@ -77,6 +77,12 @@ func (p Paths) BriefPath(id string) string { return filepath.Join(p.DataDir(), i
 // PIDFile holds the running supervisor's PID.
 func (p Paths) PIDFile() string { return filepath.Join(p.StateDir(), "daemon.pid") }
 
+// WatchPIDFile holds the running `ttorch watch` singleton's PID. The watcher takes
+// an exclusive flock on it (flock-as-truth, mirroring the supervisor's PIDFile) so
+// at most one watcher blocks at a time; the recorded pid is for `ttorch watch
+// --reset`'s observability and pid-reuse-guarded reap (§4.5).
+func (p Paths) WatchPIDFile() string { return filepath.Join(p.StateDir(), "watch.pid") }
+
 // Beacon is touched each supervisor cycle as a liveness signal.
 func (p Paths) Beacon() string { return filepath.Join(p.StateDir(), ".beacon") }
 
