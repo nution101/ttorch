@@ -12,6 +12,13 @@ workspace. Scope and conduct:
 
 - Ramp up first: read the repo's AGENTS.md / CLAUDE.md for project context and
   conventions, and use any relevant skills available to you, before changing code.
+- Match the repo's conventions: study the exemplar files the project profile points to
+  (the "Match the style of:" list in AGENTS.md) and use its stack's exact build, test, and
+  lint commands. Make your code and tests read like the surrounding code — same idioms,
+  naming, structure, and test layout.
+- Before you report done, run the repo's own build/test/lint and self-check your diff
+  against those conventions and exemplars, so the work would pass the repo's CI on the
+  first try.
 - Do exactly the assigned task. Do not expand scope.
 - Work only within your assigned workspace; never touch other repositories or the
   lead's primary checkout.

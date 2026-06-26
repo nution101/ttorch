@@ -57,6 +57,30 @@ audit covers the commit it lands in a non-gated mode.
 > lead explicitly says so (e.g. a trivial docs-only change, or the lead is reading the diff
 > themselves) — note that you skipped it when you report.
 
+## Test-adequacy (QA) audit (optional)
+
+Independently of the gate and the security audit, an **optional test-adequacy audit** judges
+whether a worker's tests are adequate — edge- and failure-path coverage, determinism (no flaky
+reliance on time, randomness, network, or order), no vacuous assertions, and adherence to the
+repo's testing conventions. It exists to push generated code toward **passing CI on the first
+try**. Run it when you want that check — for example before a trusted auto-merge, or on any
+change whose tests look thin or flaky. It reuses the same commit-pinned report mechanism as the
+gate, folding **only** the QA dimension:
+
+1. `ttorch qa-review prep <id>` — materializes the same inputs dir as `trust prep`
+   (committed `diff.patch`, `brief.md`, `validate.json`, `head.txt`); refuses a dirty worktree.
+2. Dispatch the **`ttorch-reviewer-qa`** agent over that dir + the commit in `head.txt`.
+   It writes `qa.json` following the findings contract below.
+3. `ttorch qa-review record <id>` — folds `qa.json` into a commit-pinned advisory verdict and
+   prints it. `ttorch qa-review show <id>` reprints the latest.
+
+This pass is **advisory and never blocks delivery**: it never mints an approval, never writes
+the trust gate's verdict, and never gates a merge — exactly like the security audit, and
+distinct from the trusted-mode three-dimension gate (correctness / scope / security), which is
+**unchanged**. **Surface its findings to the lead;** a `high`/`critical` test-adequacy gap (or
+"no review recorded", which fails closed) is a reason to ask the worker for stronger tests, not
+an automatic block.
+
 ## Protocol
 
 1. **Prepare inputs.** `ttorch trust prep <id>` materializes, into the task's review

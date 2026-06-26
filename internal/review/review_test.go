@@ -133,6 +133,61 @@ func TestAggregate(t *testing.T) {
 	})
 }
 
+// TestAggregateQADimension pins the standalone test-adequacy (QA) audit's fold: like the
+// security-everywhere pass it aggregates a single dimension (DimensionQA) into its own
+// verdict, with the same fail-closed and commit-pin semantics. The QA verdict is advisory
+// — the orchestrator never lets it mint an approval or gate a merge — but the Aggregate
+// contract it relies on is identical to every other dimension.
+func TestAggregateQADimension(t *testing.T) {
+	const sha = "abc123def456"
+	qa := []string{DimensionQA}
+
+	t.Run("a clean qa report passes", func(t *testing.T) {
+		dir := t.TempDir()
+		writeReport(t, dir, DimensionQA, sha, nil)
+		v, err := Aggregate(dir, sha, qa)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v.Overall != Pass {
+			t.Fatalf("want pass, got %q (findings: %+v)", v.Overall, v.Findings)
+		}
+	})
+
+	t.Run("a high qa finding blocks", func(t *testing.T) {
+		dir := t.TempDir()
+		writeReport(t, dir, DimensionQA, sha, []Finding{
+			{Severity: SeverityHigh, Reviewer: "qa", Summary: "new transfer path has no failure-case test"},
+		})
+		v, err := Aggregate(dir, sha, qa)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v.Overall != Block {
+			t.Fatalf("a high qa finding must block, got %q", v.Overall)
+		}
+	})
+
+	t.Run("a missing qa report fails closed", func(t *testing.T) {
+		dir := t.TempDir()
+		v, err := Aggregate(dir, sha, qa)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v.Overall != Block {
+			t.Fatalf("a missing qa report must fail closed to block, got %q", v.Overall)
+		}
+	})
+
+	t.Run("a qa report pinned to another commit errors", func(t *testing.T) {
+		dir := t.TempDir()
+		writeReport(t, dir, DimensionQA, "OTHERSHA00000", nil)
+		if _, err := Aggregate(dir, sha, qa); err == nil {
+			t.Fatal("a qa report recorded against a different commit must error")
+		}
+	})
+}
+
 func TestWriteLoadConsume(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "t1.verdict")
 

@@ -32,6 +32,7 @@ const (
 	EventValidated        = "validated"
 	EventReviewRecorded   = "review_recorded"
 	EventSecurityRecorded = "security_recorded"
+	EventQARecorded       = "qa_recorded"
 	EventApproved         = "approved"
 	EventMerged           = "merged"
 	EventDelivered        = "delivered"
@@ -224,7 +225,7 @@ type Delivery struct {
 	GatePassed  bool
 	ApprovedBy  string // "" | human | auto
 	ReviewedSHA string
-	EventType   string // review_recorded | security_recorded | …
+	EventType   string // review_recorded | security_recorded | qa_recorded | …
 	Actor       string
 	Payload     string
 }

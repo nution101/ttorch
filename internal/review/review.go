@@ -29,14 +29,17 @@ const (
 	Block = "block"
 )
 
-// The adversarial-review dimensions. The trust gate folds all three; the
-// security-everywhere pass folds only DimensionSecurity. Named constants keep the
-// dimension strings (also the per-dimension report filenames, "<dimension>.json")
-// from drifting between the gate and the standalone security audit.
+// The adversarial-review dimensions. The trust gate folds correctness, scope, and
+// security; the security-everywhere pass folds only DimensionSecurity, and the
+// test-adequacy (QA) audit folds only DimensionQA — each standalone audit into its own
+// advisory verdict that never mints an approval or gates a merge. Named constants keep
+// the dimension strings (also the per-dimension report filenames, "<dimension>.json")
+// from drifting between the gate and the standalone audits.
 const (
 	DimensionCorrectness = "correctness"
 	DimensionScope       = "scope"
 	DimensionSecurity    = "security"
+	DimensionQA          = "qa"
 )
 
 // Severity grades a finding. Aggregate blocks on any High (or above); an
