@@ -2015,9 +2015,11 @@ func writeBriefStub(path, id, kind string) error {
 Ramp up first: read this repo's AGENTS.md / CLAUDE.md for project context and
 conventions, and use any relevant skills available to you, before changing code.
 
-The manager has not written a detailed brief yet. Wait for instructions, or ask
-the manager via your window. Work only within this worktree; commit on a feature
-branch. Do not address the lead directly.
+Your full task brief is on its way — the manager sends it via `+"`ttorch send`"+` moments
+after spawn. Wait for it, ramping up (as above) in the meantime. Do NOT report needs-input
+asking for the brief — it is coming, and a premature ping is a false alarm that wakes the
+manager for nothing. Work only within this worktree; commit on a feature branch. Do not
+address the lead directly.
 
 ## Reporting (mandatory — this is how the manager sees you)
 
