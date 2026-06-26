@@ -100,25 +100,37 @@ session id, so it can later be resumed to the exact conversation it had.
 Restore is best-effort: if a worker's worktree is gone its tab is skipped (noted),
 and one window that fails to rebuild never aborts the rest.
 
-## Project setup (opt-in)
+## Project setup (automatic)
 
-Spawning a worker — and starting the manager — is **read-only with respect to your
-checkout**: ttorch never writes a tracked file you didn't ask it to. When a repo hasn't
-been set up yet, ttorch reads the delivery mode (defaulting to `pr`) and prints a one-line
-notice instead of editing anything:
+On first use ttorch sets a repo up for you: both bare `ttorch` (starting the manager) and
+`ttorch spawn` write the AGENTS.md managed block, the `CLAUDE.md` symlink, and the project
+profile, so a worker always has project memory to read without you running `ttorch init`
+first. The default delivery mode is `pr`. When it sets a repo up, it says so:
+
+```
+ttorch: set up /path/to/repo for ttorch (set TTORCH_NO_AUTOINIT=1 to skip)
+```
+
+Auto-init is **tracked-file-safe**: it writes only when doing so changes no git-tracked
+file. The convention files it creates are untracked, which a clean local fast-forward
+tolerates. If your repo already commits `AGENTS.md` or `CLAUDE.md`, ttorch declines to
+touch it — injecting the block would dirty your checkout and block a local merge — and
+prints a one-line nudge toward explicit setup instead:
 
 ```
 ttorch: /path/to/repo not ttorch-init'd; using delivery-mode=pr (run "ttorch init" to persist).
 ```
 
-To persist a delivery mode and the project profile, set the repo up explicitly. This writes
-the AGENTS.md managed block (+ the `CLAUDE.md` symlink) and the project profile so workers
-have project memory to read. It's clobber-safe (your AGENTS.md content is preserved),
-idempotent, and a no-op outside a git repo:
+The writes are clobber-safe (your own AGENTS.md content is preserved), idempotent, and a
+no-op outside a git repo or on a repo that's already set up. Opt out entirely with
+`TTORCH_NO_AUTOINIT=1`.
+
+To choose a delivery mode other than `pr`, or to force setup on a repo that already tracks
+`AGENTS.md` (where auto-init declines), set it up explicitly:
 
 ```sh
 ttorch init [--mode pr|local|validated|trusted]   # set up the repo in your current dir
-ttorch spawn <id> <repo> --init                   # set the repo up, then dispatch a worker
+ttorch spawn <id> <repo> --init                   # force first-use setup, then dispatch a worker
 ```
 
 ## Session effort

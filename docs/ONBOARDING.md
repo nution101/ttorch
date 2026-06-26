@@ -84,9 +84,17 @@ You direct; the manager dispatches and supervises:
 Need an ad-hoc Claude session the manager can see? `cc` (or `ttorch cc`) opens one inside
 the team session; `cc --isolated` gives it its own worktree.
 
-## 5. Delivery modes
+## 5. Project setup & delivery modes
 
-Set a repo's delivery mode once:
+On first use ttorch sets a repo up automatically: both bare `ttorch` and `ttorch spawn`
+write an `AGENTS.md` managed block, symlink `CLAUDE.md → AGENTS.md`, and derive a project
+profile, so workers have project memory without a manual step. It uses the default delivery
+mode, `pr`. This is **tracked-file-safe** — ttorch writes only untracked files, so if your
+repo already commits `AGENTS.md`/`CLAUDE.md` it declines and nudges you to run `ttorch init`
+instead (committing the block yourself). Opt out with `TTORCH_NO_AUTOINIT=1`.
+
+Run `ttorch init` explicitly to pick a different delivery mode, or to set up a repo that
+already tracks `AGENTS.md`:
 ```sh
 ttorch init --mode pr        # propose work as a pull request (default)
 ttorch init --mode local     # fast-forward the local default branch after approval
@@ -130,8 +138,11 @@ Workers get more effective when they start informed:
 
 ## 8. Approvals & safety
 
-- The manager is **read-only** over your real checkouts; all changes happen in
-  disposable worktrees.
+- The manager never touches **tracked** files in your real checkouts; a worker's code
+  changes all happen in disposable worktrees. The only write to a real checkout is
+  zero-config auto-init on first use, which creates just **untracked** convention files
+  (`AGENTS.md`, the `CLAUDE.md` symlink, the project profile) and declines if those are
+  already tracked (see §5; `TTORCH_NO_AUTOINIT=1` to skip).
 - `merge-local` requires an approval **bound to the reviewed commit**: if the worker's
   HEAD changed after you approved, the merge is refused and you must re-review.
 - Approvals are time-boxed (`--ttl`, default 10m), single-use, and recorded in
@@ -165,6 +176,7 @@ the WSL distribution (`ttorch doctor` will).
 | `TTORCH_TMUX_SESSION` | `ttorch` | tmux session name |
 | `TTORCH_MAX_WORKTREES` | `16` | worktree pool size per repository |
 | `TTORCH_VALIDATE_TIMEOUT` | `10m` | per-check timeout for `ttorch validate` |
+| `TTORCH_NO_AUTOINIT` | unset | set to any value to disable zero-config auto-init on first use (see §5) |
 | `TTORCH_WORKER_TABS` | enabled | macOS-only: native-terminal behavior — open a native terminal tab/window viewing each new worker, and (with iTerm2) open the manager in a new iTerm2 window; set `0`/`off`/`false`/`no` to disable all of it (workers still run as tmux windows) |
 | `TTORCH_TERMINAL` | `auto` | which terminal to use for worker views: `auto` (iTerm then Terminal.app), `iterm`, or `terminal` |
 | `TTORCH_REPO` | `nution101/ttorch` | release source for install/update |
