@@ -689,28 +689,41 @@ func cmdStatus() error {
 	if err != nil {
 		return err
 	}
+	// status reports spawned/live workers — every task that carries a tmux window —
+	// and derives each one's working/idle/gone STATE (§3.3). Pending backlog (task
+	// add / follow-on, no window) is excluded here; it belongs in `ttorch tasks`,
+	// which lists the full hierarchy including backlog.
+	tasks = windowedTasks(tasks)
 	if len(tasks) == 0 {
 		fmt.Println("no active workers. dispatch with: ttorch spawn <task-id> <repo-path>")
 		return nil
 	}
 	rows := make([]statusRow, len(tasks))
 	for i, t := range tasks {
-		// STATE is the LIVE tmux state (working/idle/gone via DeriveState) — derived
-		// only for a task that has a window. A backlog task (task add / follow-on) has
-		// no window yet, so it shows "-" rather than a misleading "gone" (§3.3). The
-		// row set and the lifecycle columns (STATUS/STAGE/OWNER) come from the DB.
-		state := "-"
-		if t.Window != "" {
-			state = m.TaskState(t)
-		}
+		// The row set and lifecycle columns (STATUS/STAGE/OWNER) come from the DB;
+		// STATE is derived live from the task's tmux window.
 		rows[i] = statusRow{
-			ID: t.ID, Kind: t.Kind, State: state,
+			ID: t.ID, Kind: t.Kind, State: m.TaskState(t),
 			Status: t.Status, Stage: t.Stage, Owner: t.Owner,
 			Window: t.Window, Project: t.Project, Footprint: t.Footprint,
 		}
 	}
 	renderStatus(os.Stdout, rows)
 	return nil
+}
+
+// windowedTasks keeps only tasks that were spawned — those carrying a tmux window.
+// ttorch status reports spawned/live workers (deriving working/idle/gone from the
+// window); a pending backlog task has no window and is surfaced by `ttorch tasks`
+// instead (§3.3).
+func windowedTasks(tasks []db.Task) []db.Task {
+	var out []db.Task
+	for _, t := range tasks {
+		if t.Window != "" {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // statusRow is one worker's line in `ttorch status`: its LIVE tmux state plus the

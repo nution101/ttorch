@@ -64,23 +64,60 @@ func TestDash(t *testing.T) {
 	}
 }
 
-// TestRenderStatusColumns: the table now carries the DB-backed STATUS/STAGE/OWNER
-// columns alongside the live STATE; an empty stage renders as "-".
+// TestRenderStatusColumns: the table carries the DB-backed STATUS/STAGE/OWNER
+// columns alongside the live STATE; an empty stage/owner renders as "-". Both rows
+// are spawned workers (status only ever renders windowed tasks).
 func TestRenderStatusColumns(t *testing.T) {
 	var b strings.Builder
 	renderStatus(&b, []statusRow{
 		{ID: "a", Kind: "ship", State: "working", Status: "active", Stage: "implementing", Owner: "worker:a", Window: "wk-a", Project: "/repo"},
-		{ID: "b", Kind: "ship", State: "-", Status: "pending", Stage: "", Owner: "", Window: "", Project: "/repo"},
+		{ID: "b", Kind: "ship", State: "gone", Status: "active", Stage: "", Owner: "", Window: "wk-b", Project: "/repo"},
 	})
 	out := b.String()
-	for _, want := range []string{"STATUS", "STAGE", "OWNER", "active", "implementing", "worker:a", "pending"} {
+	for _, want := range []string{"STATUS", "STAGE", "OWNER", "active", "implementing", "worker:a"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("status table missing %q, got:\n%s", want, out)
 		}
 	}
-	// Row b's empty stage/owner/window collapse to dashes.
+	// Row b's empty stage/owner collapse to dashes.
 	if !strings.Contains(out, "-") {
 		t.Fatalf("a sparse row should show a dash, got:\n%s", out)
+	}
+}
+
+// TestStatusExcludesBacklog proves the spec split (§3.3): a pending backlog task is
+// listed by `ttorch tasks` but EXCLUDED from `ttorch status`, which shows only
+// spawned/windowed workers.
+func TestStatusExcludesBacklog(t *testing.T) {
+	dbPath := withSeedDB(t, func(ctx context.Context, s *db.Store) {
+		p, _ := s.UpsertProject(ctx, "/r", "r")
+		if _, err := s.CreateTask(ctx, db.Task{ID: "wkr", ProjectID: p.ID, Status: db.StatusActive, Window: "wk-wkr", Owner: "worker:wkr"}, db.ActorManager); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.CreateTask(ctx, db.Task{ID: "backlog", ProjectID: p.ID, Status: db.StatusPending}, db.ActorManager); err != nil {
+			t.Fatal(err)
+		}
+	})
+	store := reopen(t, dbPath)
+	// `ttorch tasks` (unfiltered ListTasks) lists everything, backlog included.
+	all, _ := store.ListTasks(context.Background(), db.TaskFilter{})
+	if !containsTask(all, "wkr") || !containsTask(all, "backlog") {
+		t.Fatalf("ttorch tasks should list both spawned + backlog, got %v", taskIDs(all))
+	}
+	// `ttorch status` applies windowedTasks: only the spawned worker survives.
+	live := windowedTasks(all)
+	if !containsTask(live, "wkr") {
+		t.Fatalf("status should include the spawned worker, got %v", taskIDs(live))
+	}
+	if containsTask(live, "backlog") {
+		t.Fatalf("status must EXCLUDE the pending backlog task, got %v", taskIDs(live))
+	}
+}
+
+func TestWindowedTasksFilter(t *testing.T) {
+	got := windowedTasks([]db.Task{{ID: "a", Window: "wk-a"}, {ID: "b"}, {ID: "c", Window: "wk-c"}})
+	if len(got) != 2 || got[0].ID != "a" || got[1].ID != "c" {
+		t.Fatalf("windowedTasks = %v, want [a c]", taskIDs(got))
 	}
 }
 
@@ -501,6 +538,23 @@ func TestCmdEpicPhaseLifecycle(t *testing.T) {
 // --- helpers -----------------------------------------------------------------
 
 func itoa(v int64) string { return fmtID(v) }
+
+func taskIDs(ts []db.Task) []string {
+	out := make([]string, len(ts))
+	for i, x := range ts {
+		out[i] = x.ID
+	}
+	return out
+}
+
+func containsTask(ts []db.Task, id string) bool {
+	for _, x := range ts {
+		if x.ID == id {
+			return true
+		}
+	}
+	return false
+}
 
 // initGitRepo creates a throwaway git repo so worktree.RepoRoot (git rev-parse
 // --show-toplevel) resolves. No commits are needed for show-toplevel.
