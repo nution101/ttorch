@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.5.0](https://github.com/nution101/ttorch/compare/v0.4.0...v0.5.0) (2026-06-26)
+
+
+### Features
+
+* **cli:** wire the advisory qa-review audit (orchestrator + CLI) ([aa90808](https://github.com/nution101/ttorch/commit/aa908084bbb218e865dbc792a27221b6f264b0af))
+* **install:** cosign-verify release checksums in install.sh ([95dfa52](https://github.com/nution101/ttorch/commit/95dfa52f2fd2dec3b4dc957a0a830aab3b590e3d))
+* **orchestrator:** restore auto-init by default, tracked-file-safe ([b885488](https://github.com/nution101/ttorch/commit/b885488953bfb7ae642d09a9db10ccf07ede4848))
+* **review:** add advisory QA test-adequacy reviewer and convention worker guidance ([b75f91d](https://github.com/nution101/ttorch/commit/b75f91db206264dcd89b74924e70dd47cf060458))
+
+
+### Bug Fixes
+
+* **watch:** isolate tests from an ambient TTORCH_DB ([f70dfe8](https://github.com/nution101/ttorch/commit/f70dfe8b90342d5ed681d6c93f46f51b4072361a))
+
 ## [0.4.0](https://github.com/nution101/ttorch/compare/v0.3.0...v0.4.0) (2026-06-26)
 
 
