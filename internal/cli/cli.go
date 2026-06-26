@@ -408,10 +408,18 @@ func parseTouches(s string) []string {
 //
 // report/stage/note/follow-on let the CALLING worker write to its OWN task without
 // the orchestrator/tmux machinery: each is short-lived (one db.Open + defer Close),
-// mutates exactly one task, and validates its input. The task is resolved by --task →
-// $TTORCH_TASK_ID → the worktree's .ttorch/task (cwd walk-up); the DB by $TTORCH_DB →
-// that file's db → the default StateDB(). The actor is worker:<id>, so transitioning
-// into done/blocked/needs-input — and only that — wakes the manager (§1.3).
+// mutates exactly one task, and validates its input.
+//
+// The audit ACTOR is the real calling worker's identity — resolved from
+// $TTORCH_TASK_ID, then the worktree's .ttorch/task (cwd walk-up), both written by the
+// manager at spawn — and is NEVER derived from the caller-supplied --task. That keeps
+// attribution unforgeable: a worker cannot pass --task <other> to record an event as
+// another worker, and the mutation is scoped to its own task (a --task naming a
+// different task is rejected). A caller with no worker identity is the manager/lead
+// context: it may target any task with --task, attributed to the manager. The actor is
+// worker:<id>, so transitioning into done/blocked/needs-input — and only that — wakes
+// the manager (§1.3); manager-authored events are non-actionable by construction.
+// The DB is resolved by $TTORCH_DB → the .ttorch/task file's db → the default StateDB().
 
 const reportUsage = `usage: ttorch report <done|blocked|needs-input|active> [--task <id>] [-m "msg"]`
 
@@ -424,12 +432,12 @@ func cmdReport(args []string) error {
 		return fmt.Errorf("report: unknown status %q\n%s", args[0], reportUsage)
 	}
 	fs := flag.NewFlagSet("report", flag.ContinueOnError)
-	taskFlag := fs.String("task", "", "task id (default: $TTORCH_TASK_ID or the worktree's .ttorch/task)")
+	taskFlag := fs.String("task", "", "your own task id (default: $TTORCH_TASK_ID or the worktree's .ttorch/task)")
 	msg := fs.String("m", "", "note recorded with the status change (also carried on the event)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
-	taskID, dbPath, err := resolveWorkerTarget(*taskFlag)
+	taskID, dbPath, actor, err := resolveWorkerAuth(*taskFlag)
 	if err != nil {
 		return err
 	}
@@ -438,7 +446,7 @@ func cmdReport(args []string) error {
 		return err
 	}
 	defer store.Close()
-	ev, err := store.ReportStatus(context.Background(), taskID, status, workerActor(taskID), *msg)
+	ev, err := store.ReportStatus(context.Background(), taskID, status, actor, *msg)
 	if err != nil {
 		return err
 	}
@@ -477,7 +485,7 @@ func cmdStage(args []string) error {
 	if stage == "" {
 		return errors.New(stageUsage)
 	}
-	taskID, dbPath, err := resolveWorkerTarget(taskFlag)
+	taskID, dbPath, actor, err := resolveWorkerAuth(taskFlag)
 	if err != nil {
 		return err
 	}
@@ -486,7 +494,7 @@ func cmdStage(args []string) error {
 		return err
 	}
 	defer store.Close()
-	if _, err := store.SetStage(context.Background(), taskID, stage, workerActor(taskID)); err != nil {
+	if _, err := store.SetStage(context.Background(), taskID, stage, actor); err != nil {
 		return err
 	}
 	fmt.Printf("%s stage: %s\n", taskID, stage)
@@ -509,7 +517,7 @@ func cmdNote(args []string) error {
 	if body == "" {
 		return errors.New("note: empty message — nothing to record")
 	}
-	taskID, dbPath, err := resolveWorkerTarget(taskFlag)
+	taskID, dbPath, actor, err := resolveWorkerAuth(taskFlag)
 	if err != nil {
 		return err
 	}
@@ -518,7 +526,7 @@ func cmdNote(args []string) error {
 		return err
 	}
 	defer store.Close()
-	if err := store.AddNote(context.Background(), taskID, workerActor(taskID), body); err != nil {
+	if err := store.AddNote(context.Background(), taskID, actor, body); err != nil {
 		return err
 	}
 	fmt.Printf("noted on %s\n", taskID)
@@ -535,14 +543,14 @@ func cmdFollowOn(args []string) error {
 	fs := flag.NewFlagSet("follow-on", flag.ContinueOnError)
 	title := fs.String("title", "", "one-line title for the follow-on task (required)")
 	touches := fs.String("touches", "", "comma-separated files/prefixes the follow-on will touch")
-	taskFlag := fs.String("task", "", "parent task id (default: $TTORCH_TASK_ID or the worktree's .ttorch/task)")
+	taskFlag := fs.String("task", "", "parent task id — your own task (default: $TTORCH_TASK_ID or the worktree's .ttorch/task)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
 	if strings.TrimSpace(*title) == "" {
 		return errors.New("follow-on: --title is required")
 	}
-	parentID, dbPath, err := resolveWorkerTarget(*taskFlag)
+	parentID, dbPath, actor, err := resolveWorkerAuth(*taskFlag)
 	if err != nil {
 		return err
 	}
@@ -564,8 +572,8 @@ func cmdFollowOn(args []string) error {
 	} else if exists {
 		return fmt.Errorf("follow-on: task %q already exists", newID)
 	}
-	actor := workerActor(parentID)
-	// A pending backlog child OF the parent, created BY the worker, filed atomically:
+	// A pending backlog child OF the parent, created BY the caller (worker:<id> or the
+	// manager), filed atomically:
 	// db.CreateFollowOn writes the row, its canonical 'created' event, and the typed
 	// follow_on_created event in ONE transaction (the §1.4 fix tracked from inc2 —
 	// previously this path used two separate transactions). Both events are
@@ -608,33 +616,66 @@ func extractTaskFlag(args []string) (taskFlag string, rest []string, err error) 
 	return taskFlag, rest, nil
 }
 
-// resolveWorkerTarget determines the calling worker's task id and the DB to write it
-// to (§3.1). Task id precedence: --task → $TTORCH_TASK_ID → the .ttorch/task file
-// found by walking up from cwd. DB precedence: $TTORCH_DB → that file's db → the
-// default StateDB(). The cwd walk-up always runs so the file's db can serve as a
-// fallback even when the id came from a flag or the environment.
-func resolveWorkerTarget(taskFlag string) (taskID, dbPath string, err error) {
-	fileTaskID, fileDB := findTaskFile()
-	switch {
-	case taskFlag != "":
-		taskID = taskFlag
-	case os.Getenv("TTORCH_TASK_ID") != "":
-		taskID = os.Getenv("TTORCH_TASK_ID")
-	default:
-		taskID = fileTaskID
+// resolveWorkerAuth resolves, for the worker-facing verbs (§3.1), the TARGET task to
+// mutate, the DB to write it to, and the audit ACTOR — and enforces that attribution is
+// not forgeable.
+//
+// The actor is derived from the REAL caller identity (callerIdentity: $TTORCH_TASK_ID →
+// the worktree's .ttorch/task, NEVER --task):
+//
+//   - Worker context (an identity resolves): the actor is worker:<callerID> and the
+//     mutation is scoped to that task. --task may be omitted (defaults to the caller's
+//     own id) or must equal it; a --task naming a different task is rejected, so a
+//     worker can neither forge another worker's attribution nor touch its row.
+//   - Manager/lead context (no identity — not a spawned worker): the actor is the
+//     manager and --task selects any task. --task is required here, since there is no
+//     own-task default. Manager-authored events are non-actionable by construction
+//     (§1.3), so a manager actor cannot be abused to wake the watcher.
+//
+// DB precedence: $TTORCH_DB → the .ttorch/task file's db → the default StateDB().
+func resolveWorkerAuth(taskFlag string) (taskID, dbPath, actor string, err error) {
+	callerID, fileDB := callerIdentity()
+	dbPath = resolveDBPath(fileDB)
+	taskFlag = strings.TrimSpace(taskFlag)
+	if callerID == "" {
+		// Manager/lead context: target any task, attributed to the manager.
+		if taskFlag == "" {
+			return "", "", "", errors.New("could not resolve the task: pass --task <id>, set TTORCH_TASK_ID, or run inside a worktree containing .ttorch/task")
+		}
+		return taskFlag, dbPath, db.ActorManager, nil
 	}
-	if taskID == "" {
-		return "", "", errors.New("could not resolve the task: pass --task <id>, set TTORCH_TASK_ID, or run inside a worktree containing .ttorch/task")
+	// Worker context: a worker may write only its own task.
+	if taskFlag != "" && taskFlag != callerID {
+		return "", "", "", fmt.Errorf("refusing to write task %q: a worker may report only its own task (%s) — drop --task or pass --task %s", taskFlag, callerID, callerID)
 	}
+	return callerID, dbPath, workerActor(callerID), nil
+}
+
+// callerIdentity resolves the REAL caller's worker identity — what the manager wrote at
+// spawn — from $TTORCH_TASK_ID first, then the worktree's .ttorch/task (cwd walk-up). It
+// deliberately ignores --task, so identity (and thus the audit actor) is never
+// caller-supplied. An empty id means the caller is not a spawned worker: the
+// manager/lead context. The file's recorded DB path is returned too, to serve as the DB
+// fallback even when the id came from the environment.
+func callerIdentity() (callerID, fileDB string) {
+	fileID, fileDB := findTaskFile()
+	if env := strings.TrimSpace(os.Getenv("TTORCH_TASK_ID")); env != "" {
+		return env, fileDB
+	}
+	return fileID, fileDB
+}
+
+// resolveDBPath picks the state DB: $TTORCH_DB → the .ttorch/task file's db → the
+// default StateDB() (§3.1).
+func resolveDBPath(fileDB string) string {
 	switch {
 	case os.Getenv("TTORCH_DB") != "":
-		dbPath = os.Getenv("TTORCH_DB")
+		return os.Getenv("TTORCH_DB")
 	case fileDB != "":
-		dbPath = fileDB
+		return fileDB
 	default:
-		dbPath = paths.Default().StateDB()
+		return paths.Default().StateDB()
 	}
-	return taskID, dbPath, nil
 }
 
 // findTaskFile walks up from cwd to the first .ttorch/task file, returning its
@@ -1511,7 +1552,7 @@ Team:
                           conversation; otherwise a new manager starts in this folder
   resume                  force a rebuild of the manager + all worker tabs, then attach
   reset [--yes]           discard the saved session for a clean start (keeps worktrees)
-  stop                    stop the manager session + supervisor (resumable: run 'ttorch')
+  stop                    stop the manager session (resumable: run 'ttorch')
   cc [--isolated]         open a Claude session attached to the team
   spawn <id> <repo>       start a worker on a task in an isolated worktree
                           (read-only w.r.t. the repo's tracked files)

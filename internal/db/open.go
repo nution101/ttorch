@@ -98,6 +98,15 @@ func Open(path string) (*Store, error) {
 			}
 		}
 	}
+	// Own the db file at 0600 BEFORE migrations run, so the schema DDL — and every byte
+	// after it — lands in an already-private file. (Previously the file was tightened
+	// only AFTER Migrate, leaving a brief window where the audit store's DDL was written
+	// world-readable.) A zero-length file is a valid empty SQLite database, which sqlite
+	// then opens in place and fills, preserving these perms. The main file MUST be
+	// private — an unsecured audit store is a finding — so this chmod must succeed.
+	if err := createPrivateFile(path); err != nil {
+		return nil, fmt.Errorf("db: securing %s: %w", path, err)
+	}
 	sdb, err := sql.Open("sqlite", dsn(path))
 	if err != nil {
 		return nil, err
@@ -111,19 +120,30 @@ func Open(path string) (*Store, error) {
 		_ = sdb.Close()
 		return nil, err
 	}
-	// Migrate has created the db file (and, under WAL, its -wal/-shm sidecars), but so
-	// far only schema DDL has been written. Restrict it to 0600 BEFORE any task/event
-	// data lands. The main file must succeed (an unsecured audit store is a finding);
-	// the sidecars carry the same data, so tighten them too — best-effort, since they
-	// may not exist at this instant.
-	if err := os.Chmod(path, 0o600); err != nil {
-		_ = sdb.Close()
-		return nil, fmt.Errorf("db: securing %s: %w", path, err)
-	}
+	// The -wal/-shm sidecars carry the same data and are created by sqlite during Open;
+	// when the main file is already 0600 sqlite mints them 0600 too, but tighten them
+	// defensively — best-effort, since they may not exist at this instant.
 	for _, suffix := range []string{"-wal", "-shm"} {
 		_ = os.Chmod(path+suffix, 0o600)
 	}
 	return s, nil
+}
+
+// createPrivateFile ensures path exists as a 0600 file owned by us, creating an empty
+// one if absent. O_CREATE leaves an existing file's contents untouched; the explicit
+// Chmod then forces 0600 regardless of the process umask (which can only clear bits, so
+// a pathological umask could otherwise leave even O_CREATE's 0600 too restrictive to
+// write). Called before the DB is opened so migrations never run on a world-readable
+// file.
+func createPrivateFile(path string) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600)
 }
 
 // Close releases the underlying connection pool.

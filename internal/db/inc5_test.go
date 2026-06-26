@@ -180,4 +180,16 @@ func TestOpen_RestrictivePerms(t *testing.T) {
 	if perm := fi.Mode().Perm(); perm != 0o600 {
 		t.Errorf("state.db perms = %o, want 600", perm)
 	}
+	// The file is owned at 0600 BEFORE migrations run, so its DDL never lands
+	// world-readable; the WAL/SHM sidecars sqlite mints during Open inherit that and
+	// must not be group/world-readable either.
+	for _, suffix := range []string{"-wal", "-shm"} {
+		si, statErr := os.Stat(path + suffix)
+		if statErr != nil {
+			continue // sidecar may not exist at this instant
+		}
+		if perm := si.Mode().Perm(); perm&0o077 != 0 {
+			t.Errorf("state.db%s perms = %o, must not be group/world-accessible", suffix, perm)
+		}
+	}
 }

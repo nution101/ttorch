@@ -11,14 +11,16 @@ import (
 )
 
 // newWorkerDB creates an isolated SQLite store with one task in the given status,
-// points $TTORCH_DB at it, and returns the db path + task id. The package TestMain
-// also pins TTORCH_HOME at a temp dir, so the worker commands can never resolve to
-// the real ~/.ttorch (the db.Open guard is the final backstop).
+// points $TTORCH_DB at it, and pins $TTORCH_TASK_ID to that task — simulating a spawned
+// worker whose unforgeable identity IS its own task (what the manager sets at spawn,
+// §3.1). The worker-facing commands therefore attribute to worker:<taskID> and scope
+// their mutation to it. Returns the db path + task id. The package TestMain also pins
+// TTORCH_HOME at a temp dir, so the worker commands can never resolve to the real
+// ~/.ttorch (the db.Open guard is the final backstop).
 func newWorkerDB(t *testing.T, status string) (dbPath, taskID string) {
 	t.Helper()
 	dbPath = filepath.Join(t.TempDir(), "state.db")
 	t.Setenv("TTORCH_DB", dbPath)
-	t.Setenv("TTORCH_TASK_ID", "")
 	store, err := db.Open(dbPath)
 	if err != nil {
 		t.Fatal(err)
@@ -34,7 +36,22 @@ func newWorkerDB(t *testing.T, status string) (dbPath, taskID string) {
 	}, db.ActorManager); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("TTORCH_TASK_ID", taskID)
 	return dbPath, taskID
+}
+
+// addTask inserts a second task the test's worker does NOT own (its victim), inheriting
+// the existing task's project, and returns its id.
+func addTask(t *testing.T, dbPath, id, status string) string {
+	t.Helper()
+	s := reopen(t, dbPath)
+	proj := mustTask(t, s, "wt1").ProjectID
+	if _, err := s.CreateTask(context.Background(), db.Task{
+		ID: id, ProjectID: proj, Status: status, Owner: "worker:" + id,
+	}, db.ActorManager); err != nil {
+		t.Fatal(err)
+	}
+	return id
 }
 
 func reopen(t *testing.T, dbPath string) *db.Store {
@@ -127,6 +144,87 @@ func TestReport_RejectsUnknownStatus(t *testing.T) {
 	_, id := newWorkerDB(t, db.StatusActive)
 	if err := cmdReport([]string{"finished", "--task", id}); err == nil {
 		t.Fatal("an unknown status verb must be rejected")
+	}
+}
+
+// --- attribution hardening (§3.1): the audit actor is the REAL caller, never --task ---
+
+// TestReport_WorkerOwnTaskNoFlag: a worker reporting WITHOUT --task targets its own task
+// (resolved from $TTORCH_TASK_ID) and is attributed to worker:<id>.
+func TestReport_WorkerOwnTaskNoFlag(t *testing.T) {
+	dbPath, id := newWorkerDB(t, db.StatusActive)
+	if err := cmdReport([]string{"done"}); err != nil { // no --task
+		t.Fatal(err)
+	}
+	s := reopen(t, dbPath)
+	if task := mustTask(t, s, id); task.Status != db.StatusDone {
+		t.Fatalf("status = %q, want done", task.Status)
+	}
+	actionable, _ := s.EventsSince(context.Background(), 0, true)
+	if len(actionable) != 1 || actionable[0].Actor != "worker:"+id || actionable[0].EntityID != id {
+		t.Fatalf("want one actionable event by worker:%s on %s, got %+v", id, id, actionable)
+	}
+}
+
+// TestReport_RejectsForgedAttribution is the core of the hardening: a worker (identity A)
+// passing --task B is rejected — B's row is untouched and no event is forged against it
+// under either worker's name.
+func TestReport_RejectsForgedAttribution(t *testing.T) {
+	dbPath, _ := newWorkerDB(t, db.StatusActive) // identity A = wt1, pinned by TTORCH_TASK_ID
+	victim := addTask(t, dbPath, "victim", db.StatusActive)
+	if err := cmdReport([]string{"done", "--task", victim}); err == nil {
+		t.Fatal("a worker reporting another worker's task must be rejected")
+	}
+	s := reopen(t, dbPath)
+	if vt := mustTask(t, s, victim); vt.Status != db.StatusActive {
+		t.Fatalf("victim status = %q, want active (must be untouched)", vt.Status)
+	}
+	all, _ := s.EventsSince(context.Background(), 0, false)
+	for _, e := range all {
+		if e.EntityID == victim && e.Type == db.EventStatusChanged {
+			t.Fatalf("a forged status_changed leaked onto the victim: %+v", e)
+		}
+		if e.Actor == "worker:"+victim {
+			t.Fatalf("an event was forged under the victim's identity: %+v", e)
+		}
+	}
+	if actionable, _ := s.EventsSince(context.Background(), 0, true); len(actionable) != 0 {
+		t.Fatalf("a forged report must wake no watcher, got %+v", actionable)
+	}
+}
+
+// TestReport_ManagerContextActorIsManager: with no worker identity the caller is the
+// manager — it may target any task via --task, but the event is attributed to the manager
+// and is therefore non-actionable (§1.3), so it cannot be abused to wake the watcher.
+func TestReport_ManagerContextActorIsManager(t *testing.T) {
+	dbPath, id := newWorkerDB(t, db.StatusActive)
+	t.Setenv("TTORCH_TASK_ID", "") // drop the worker identity → manager context
+	t.Chdir(t.TempDir())           // and ensure no .ttorch/task is found up the tree
+	if err := cmdReport([]string{"done", "--task", id}); err != nil {
+		t.Fatal(err)
+	}
+	s := reopen(t, dbPath)
+	if task := mustTask(t, s, id); task.Status != db.StatusDone {
+		t.Fatalf("status = %q, want done", task.Status)
+	}
+	var saw bool
+	all, _ := s.EventsSince(context.Background(), 0, false)
+	for _, e := range all {
+		if e.Type == db.EventStatusChanged && e.EntityID == id {
+			saw = true
+			if e.Actor != db.ActorManager {
+				t.Fatalf("manager-context actor = %q, want manager", e.Actor)
+			}
+			if e.Actionable {
+				t.Fatalf("a manager-authored status change must be non-actionable: %+v", e)
+			}
+		}
+	}
+	if !saw {
+		t.Fatal("the manager's status change was not recorded")
+	}
+	if actionable, _ := s.EventsSince(context.Background(), 0, true); len(actionable) != 0 {
+		t.Fatalf("manager-context report must wake no watcher, got %+v", actionable)
 	}
 }
 
@@ -269,36 +367,46 @@ func TestFollowOn_RejectsDuplicateAndMissingParent(t *testing.T) {
 		t.Fatal("a duplicate follow-on id must be rejected")
 	}
 	t.Setenv("TTORCH_DB", dbPath)
+	// The missing-parent check lives past the identity gate, which a worker can only
+	// reach for its OWN task — so exercise it from the manager context (no
+	// TTORCH_TASK_ID), where --task may name any (here non-existent) parent.
+	t.Setenv("TTORCH_TASK_ID", "")
 	if err := cmdFollowOn([]string{"orphan", "--title", "x", "--task", "no-such-parent"}); err == nil {
 		t.Fatal("a follow-on for a missing parent must be rejected")
 	}
 }
 
-// --- resolution: task id + DB discovery (§3.1) ---
+// --- resolution + attribution: who is calling, which task they may write (§3.1) ---
 
-func TestResolveWorkerTarget_FlagBeatsEnv(t *testing.T) {
-	t.Setenv("TTORCH_TASK_ID", "envid")
+// TestResolveWorkerAuth_WorkerOwnTask: a worker's identity comes from $TTORCH_TASK_ID;
+// it may omit --task (defaults to its own id) or pass its own id, and is attributed to
+// worker:<id> either way.
+func TestResolveWorkerAuth_WorkerOwnTask(t *testing.T) {
+	t.Setenv("TTORCH_TASK_ID", "A")
 	t.Setenv("TTORCH_DB", "/env/db")
-	id, dbp, err := resolveWorkerTarget("flagid")
-	if err != nil || id != "flagid" || dbp != "/env/db" {
-		t.Fatalf("got (%q,%q,%v), want (flagid,/env/db,nil)", id, dbp, err)
+	for _, flag := range []string{"", "A"} {
+		id, dbp, actor, err := resolveWorkerAuth(flag)
+		if err != nil || id != "A" || actor != "worker:A" || dbp != "/env/db" {
+			t.Fatalf("flag=%q: got (%q,%q,%q,%v), want (A,/env/db,worker:A,nil)", flag, id, dbp, actor, err)
+		}
 	}
 }
 
-func TestResolveWorkerTarget_EnvBeatsFile(t *testing.T) {
-	t.Setenv("TTORCH_TASK_ID", "envid")
-	t.Setenv("TTORCH_DB", "")
-	dir := t.TempDir()
-	writeTaskFile(t, dir, "fileid", "/file/db")
-	t.Chdir(dir)
-	id, dbp, err := resolveWorkerTarget("")
-	// env supplies the id; with TTORCH_DB unset the file's db is the fallback.
-	if err != nil || id != "envid" || dbp != "/file/db" {
-		t.Fatalf("got (%q,%q,%v), want (envid,/file/db,nil)", id, dbp, err)
+// TestResolveWorkerAuth_RejectsForeignTask: the forgery the hardening closes — a worker
+// (identity A) may not target another task B via --task, and the actor is never derived
+// from --task.
+func TestResolveWorkerAuth_RejectsForeignTask(t *testing.T) {
+	t.Setenv("TTORCH_TASK_ID", "A")
+	t.Setenv("TTORCH_DB", "/env/db")
+	if _, _, _, err := resolveWorkerAuth("B"); err == nil {
+		t.Fatal("a worker targeting another task via --task must be rejected")
 	}
 }
 
-func TestResolveWorkerTarget_CwdWalkUp(t *testing.T) {
+// TestResolveWorkerAuth_FileIdentity: with no env, the identity (and thus the actor) come
+// from the worktree's .ttorch/task found by walking up from cwd — never from --task — and
+// a file-identified worker still cannot forge a foreign target.
+func TestResolveWorkerAuth_FileIdentity(t *testing.T) {
 	t.Setenv("TTORCH_TASK_ID", "")
 	t.Setenv("TTORCH_DB", "")
 	root := t.TempDir()
@@ -308,30 +416,55 @@ func TestResolveWorkerTarget_CwdWalkUp(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Chdir(sub)
-	id, dbp, err := resolveWorkerTarget("")
-	if err != nil || id != "fileid" || dbp != "/file/db" {
-		t.Fatalf("walk-up got (%q,%q,%v), want (fileid,/file/db,nil)", id, dbp, err)
+	id, dbp, actor, err := resolveWorkerAuth("")
+	if err != nil || id != "fileid" || actor != "worker:fileid" || dbp != "/file/db" {
+		t.Fatalf("got (%q,%q,%q,%v), want (fileid,/file/db,worker:fileid,nil)", id, dbp, actor, err)
+	}
+	if _, _, _, err := resolveWorkerAuth("other"); err == nil {
+		t.Fatal("a file-identified worker must not target another task")
 	}
 }
 
-func TestResolveWorkerTarget_DBEnvBeatsFile(t *testing.T) {
+// TestResolveWorkerAuth_EnvBeatsFileForIdentity: $TTORCH_TASK_ID outranks the file for
+// the identity; with TTORCH_DB unset the file's db is still the fallback.
+func TestResolveWorkerAuth_EnvBeatsFileForIdentity(t *testing.T) {
+	t.Setenv("TTORCH_TASK_ID", "envid")
+	t.Setenv("TTORCH_DB", "")
+	dir := t.TempDir()
+	writeTaskFile(t, dir, "fileid", "/file/db")
+	t.Chdir(dir)
+	id, dbp, actor, err := resolveWorkerAuth("")
+	if err != nil || id != "envid" || actor != "worker:envid" || dbp != "/file/db" {
+		t.Fatalf("got (%q,%q,%q,%v), want (envid,/file/db,worker:envid,nil)", id, dbp, actor, err)
+	}
+}
+
+// TestResolveWorkerAuth_DBEnvBeatsFile: $TTORCH_DB outranks the file's recorded db.
+func TestResolveWorkerAuth_DBEnvBeatsFile(t *testing.T) {
 	t.Setenv("TTORCH_TASK_ID", "")
 	t.Setenv("TTORCH_DB", "/env/db")
 	dir := t.TempDir()
 	writeTaskFile(t, dir, "fileid", "/file/db")
 	t.Chdir(dir)
-	_, dbp, err := resolveWorkerTarget("")
+	_, dbp, _, err := resolveWorkerAuth("")
 	if err != nil || dbp != "/env/db" {
 		t.Fatalf("db got (%q,%v), want (/env/db,nil)", dbp, err)
 	}
 }
 
-func TestResolveWorkerTarget_Unresolvable(t *testing.T) {
+// TestResolveWorkerAuth_ManagerContext: with no worker identity (no env, no file) the
+// caller is the manager/lead — it may target any task via --task and is attributed to the
+// manager; without --task there is nothing to resolve.
+func TestResolveWorkerAuth_ManagerContext(t *testing.T) {
 	t.Setenv("TTORCH_TASK_ID", "")
-	t.Setenv("TTORCH_DB", "")
+	t.Setenv("TTORCH_DB", "/env/db")
 	t.Chdir(t.TempDir()) // no .ttorch/task anywhere up the tree
-	if _, _, err := resolveWorkerTarget(""); err == nil {
-		t.Fatal("with no flag, env, or file the task must be unresolvable")
+	id, _, actor, err := resolveWorkerAuth("anytask")
+	if err != nil || id != "anytask" || actor != db.ActorManager {
+		t.Fatalf("got (%q,%q,%v), want (anytask,manager,nil)", id, actor, err)
+	}
+	if _, _, _, err := resolveWorkerAuth(""); err == nil {
+		t.Fatal("the manager context with no --task must be unresolvable")
 	}
 }
 
