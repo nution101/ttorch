@@ -295,14 +295,24 @@ func TestPollLiveness_WindowGone(t *testing.T) {
 
 // TestPollLiveness_IdleUnreportedAfterTwoSweeps: an unchanged, not-busy pane emits
 // idle_unreported only once it has been stable for idleStaleSweeps sweeps; the per-
-// sweep count is persisted on the task row.
+// sweep count is persisted on the task row. The wall-clock dwell is satisfied here (the
+// fake clock is positioned past it) so this test isolates the sweep-count guard; the
+// dwell gate itself is covered by TestPollLiveness_DwellSuppressesWithinTolerance /
+// TestPollLiveness_DwellFlagsBeyondTolerance.
 func TestPollLiveness_IdleUnreportedAfterTwoSweeps(t *testing.T) {
-	w, s, _, _ := newWatcher(t)
+	w, s, _, clk := newWatcher(t)
 	ctx := context.Background()
 	seedActiveTask(t, s, "idle", "wk-idle")
 	w.capture = func(string) paneObservation {
 		return paneObservation{present: true, captured: true, pane: "$ waiting at the prompt"}
 	}
+	// This task never reported, so the dwell is anchored on its creation time; put the
+	// fake clock past the dwell so dwellElapsed is satisfied for every sweep.
+	gt, _, err := s.GetTask(ctx, "idle")
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	clk.t = gt.Created.Add(w.dwell() + time.Minute)
 
 	// First sweeps record the unchanged pane but must not flag it yet.
 	for i := 0; i < idleStaleSweeps; i++ {
@@ -322,18 +332,97 @@ func TestPollLiveness_IdleUnreportedAfterTwoSweeps(t *testing.T) {
 	}
 }
 
+// TestPollLiveness_DwellSuppressesWithinTolerance: a worker idle-waiting on its own
+// long-running background shell — not busy, pane static, but quiet for LESS than the
+// dwell — must NOT be flagged idle_unreported, no matter how many sweeps accumulate.
+// This is the false positive the wall-clock dwell exists to prevent (a multi-minute
+// `make test` the worker spawned): the poll-cadence-sensitive sweep count would trip in
+// seconds, but the dwell holds the flag back until the worker has truly been quiet.
+func TestPollLiveness_DwellSuppressesWithinTolerance(t *testing.T) {
+	w, s, _, clk := newWatcher(t)
+	ctx := context.Background()
+	seedActiveTask(t, s, "bg", "wk-bg")
+	// The worker staged progress, then went quiet to wait on its background test.
+	if _, err := s.SetStage(ctx, "bg", "running make test", "worker:bg"); err != nil {
+		t.Fatalf("SetStage: %v", err)
+	}
+	gt, _, err := s.GetTask(ctx, "bg")
+	if err != nil || gt.LastProgressAt == nil {
+		t.Fatalf("GetTask: lp=%v err=%v", gt.LastProgressAt, err)
+	}
+	// Quiet for less than the dwell ⇒ within tolerance.
+	clk.t = gt.LastProgressAt.Add(w.dwell() - time.Minute)
+	w.capture = func(string) paneObservation {
+		return paneObservation{present: true, captured: true, pane: "$ idle while a background make test runs"}
+	}
+	for i := 0; i < idleStaleSweeps+3; i++ {
+		if err := w.pollLiveness(ctx); err != nil {
+			t.Fatalf("pollLiveness sweep %d: %v", i, err)
+		}
+	}
+	if has, _ := s.HasEventType(ctx, "bg", db.EventIdleUnreported); has {
+		t.Fatal("a worker quiet for less than the dwell must not be flagged idle_unreported")
+	}
+}
+
+// TestPollLiveness_DwellFlagsBeyondTolerance: once a worker has been quiet (no
+// report/stage, pane static, not busy) for LONGER than the dwell, it IS flagged — the
+// net still catches a genuinely stalled worker; the dwell only delays the flag, it never
+// removes it. Complements the never-reported (creation-anchored) path above by
+// exercising the last_progress_at anchor.
+func TestPollLiveness_DwellFlagsBeyondTolerance(t *testing.T) {
+	w, s, _, clk := newWatcher(t)
+	ctx := context.Background()
+	seedActiveTask(t, s, "stalled", "wk-stalled")
+	if _, err := s.SetStage(ctx, "stalled", "running make test", "worker:stalled"); err != nil {
+		t.Fatalf("SetStage: %v", err)
+	}
+	gt, _, err := s.GetTask(ctx, "stalled")
+	if err != nil || gt.LastProgressAt == nil {
+		t.Fatalf("GetTask: lp=%v err=%v", gt.LastProgressAt, err)
+	}
+	// Quiet for longer than the dwell ⇒ beyond tolerance.
+	clk.t = gt.LastProgressAt.Add(w.dwell() + time.Minute)
+	w.capture = func(string) paneObservation {
+		return paneObservation{present: true, captured: true, pane: "$ stalled at the prompt"}
+	}
+	// Below the sweep threshold it must still hold off, even past the dwell.
+	for i := 0; i < idleStaleSweeps; i++ {
+		if err := w.pollLiveness(ctx); err != nil {
+			t.Fatalf("pollLiveness sweep %d: %v", i, err)
+		}
+		if has, _ := s.HasEventType(ctx, "stalled", db.EventIdleUnreported); has {
+			t.Fatalf("idle_unreported fired before the sweep threshold, after %d sweeps", i+1)
+		}
+	}
+	// The sweep that reaches the threshold, now that the dwell has elapsed, flags it.
+	if err := w.pollLiveness(ctx); err != nil {
+		t.Fatalf("pollLiveness threshold sweep: %v", err)
+	}
+	if has, err := s.HasEventType(ctx, "stalled", db.EventIdleUnreported); err != nil || !has {
+		t.Fatalf("expected idle_unreported past the dwell + threshold (has=%v err=%v)", has, err)
+	}
+}
+
 // TestPollLiveness_ReFiresAfterOvershoot: a worker whose persisted idle_sweeps has
 // climbed past the threshold (e.g. an out-of-band progress update cleared the
 // surfaced exclusion without changing the pane) must still be flagged — the
 // threshold test is `>=`, not exact equality.
 func TestPollLiveness_ReFiresAfterOvershoot(t *testing.T) {
-	w, s, _, _ := newWatcher(t)
+	w, s, _, clk := newWatcher(t)
 	ctx := context.Background()
 	seedActiveTask(t, s, "stranded", "wk-stranded")
 	pane := "$ still idle at the prompt"
 	w.capture = func(string) paneObservation {
 		return paneObservation{present: true, captured: true, pane: pane}
 	}
+	// Past the wall-clock dwell (anchored on creation time, never reported) so the
+	// overshoot path is what's exercised here, not the dwell gate.
+	gt, _, err := s.GetTask(ctx, "stranded")
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	clk.t = gt.Created.Add(w.dwell() + time.Minute)
 	// Strand the counter past the threshold with the current pane already recorded,
 	// as if a prior episode had overshot and the exclusion since cleared.
 	if err := s.SetLiveness(ctx, "stranded", hashPane(pane), idleStaleSweeps+3); err != nil {

@@ -41,10 +41,11 @@ const (
 	defaultCoalesce  = 750 * time.Millisecond // §4.3: absorb a burst before surfacing
 	defaultPoll      = 1 * time.Second        // steady-state detection interval (§4.2)
 	defaultStaleHold = 60 * time.Second       // a task must be quiet this long before liveness inspects its pane (§4.4)
+	defaultDwell     = 5 * time.Minute        // a worker must be quiet (no report/stage) this long, in WALL-CLOCK time, before idle_unreported can fire (§4.4)
 	defaultPRCheck   = 60 * time.Second       // rate-limit on `gh pr view` (was supervisor.checkEvery)
 	mgrAbsentSweeps  = 3                      // self-exit after this many consecutive manager-absent sweeps (§4.5)
 	captureLines     = 6                      // trailing pane lines liveness reads (matches the supervisor)
-	idleStaleSweeps  = 2                      // unchanged + not-busy sweeps before idle_unreported (matches scanStale)
+	idleStaleSweeps  = 2                      // secondary guard: require this many unchanged + not-busy observations before idle_unreported (the dwell is the dominant wall-clock gate)
 )
 
 // paneObservation is one liveness reading of a worker's tmux window. present=false
@@ -71,7 +72,8 @@ type Watcher struct {
 	Timeout  time.Duration // 0 ⇒ block forever
 	Coalesce time.Duration
 	Poll     time.Duration
-	Stale    time.Duration // liveness last_progress_at quiet threshold (§4.4)
+	Stale    time.Duration // liveness last_progress_at quiet threshold gating pane inspection (§4.4); <0 ⇒ disabled
+	Dwell    time.Duration // minimum wall-clock idle duration before idle_unreported fires (§4.4); 0 ⇒ default, <0 ⇒ disabled
 	PRCheck  time.Duration
 
 	// Seams (nil ⇒ the production default).
@@ -108,6 +110,7 @@ func New(store *db.Store, p paths.Paths, session string) *Watcher {
 		Coalesce: defaultCoalesce,
 		Poll:     defaultPoll,
 		Stale:    defaultStaleHold,
+		Dwell:    defaultDwell,
 		PRCheck:  defaultPRCheck,
 	}
 	w.now = time.Now
@@ -196,6 +199,41 @@ func (w *Watcher) prCheckEvery() time.Duration {
 		return defaultPRCheck
 	}
 	return w.PRCheck
+}
+
+// dwell is the minimum wall-clock duration a worker must be quiet before liveness may
+// flag it idle_unreported (§4.4). Mirrors staleHold's tri-state: <0 disables the gate
+// (flag on the sweep count alone — the pre-dwell behavior, for tests), 0 ⇒ the default.
+func (w *Watcher) dwell() time.Duration {
+	if w.Dwell < 0 {
+		return 0
+	}
+	if w.Dwell == 0 {
+		return defaultDwell
+	}
+	return w.Dwell
+}
+
+// dwellElapsed reports whether the task has been quiet for at least the dwell, in
+// WALL-CLOCK time — the poll-cadence-independent gate that keeps the liveness net from
+// flagging a worker that is merely idle-waiting on its own long-running background shell
+// (e.g. a multi-minute `make test`): such a worker is not busy and its pane is static,
+// so the sweep count alone (≈2s under a 1s poll, and unbounded across short watch
+// invocations) trips far too early. The anchor is last_progress_at — the last time the
+// worker did something DB-visible (report/stage) — so a worker that stages before a long
+// operation gets the full dwell from that point. A worker that never reported has no
+// last_progress_at; fall back to its creation time so it is still flaggable once quiet
+// for the dwell since spawn. A zero/disabled dwell imposes no wall-clock requirement.
+func (w *Watcher) dwellElapsed(now time.Time, t db.Task) bool {
+	d := w.dwell()
+	if d <= 0 {
+		return true
+	}
+	anchor := t.Created
+	if t.LastProgressAt != nil {
+		anchor = *t.LastProgressAt
+	}
+	return now.Sub(anchor) >= d
 }
 
 // Run acquires the watch singleton flock, then blocks on actionable events until one
@@ -356,9 +394,15 @@ func (w *Watcher) pollArmedPRs(ctx context.Context) error {
 // pollLiveness is the stale/gone safety net (replaces supervisor.scanStale, §4.4).
 // It is scoped to status='active', non-cc tasks whose last_progress_at is stale and
 // which are not already surfaced (no open unresolved actionable event). A gone window
-// emits window_gone; an unchanged, not-busy pane across idleStaleSweeps sweeps emits
-// idle_unreported. The per-task sweep count is persisted (SetLiveness) so it survives
-// across short-lived watch invocations; a pane change resets it.
+// emits window_gone immediately (a gone worker is definitive — not dwell-gated). An
+// unchanged, not-busy pane emits idle_unreported only once it has BOTH been observed
+// stable for idleStaleSweeps sweeps AND been quiet for the wall-clock dwell
+// (dwellElapsed): the dwell is what keeps a worker idle-waiting on its own multi-minute
+// background shell (e.g. `make test`) from being mistaken for a stall, since the sweep
+// count alone is poll-cadence-sensitive and trips in seconds. The per-task sweep count
+// is persisted (SetLiveness) so it survives across short-lived watch invocations; a pane
+// change resets it. A busy pane (livestate.Busy) is always treated as live and resets
+// the count, so a worker mid-turn is never flagged regardless of the dwell.
 func (w *Watcher) pollLiveness(ctx context.Context) error {
 	tasks, err := w.Store.ListTasks(ctx, db.TaskFilter{
 		Status:      []string{db.StatusActive},
@@ -412,13 +456,19 @@ func (w *Watcher) pollLiveness(ctx context.Context) error {
 		h := hashPane(obs.pane)
 		if t.LastPaneHash == h {
 			sweeps := t.IdleSweeps + 1
-			// `>=`, not `==`: the already-surfaced gate above masks re-fires within one
-			// idle episode (the idle_unreported event is newer than last_progress_at),
-			// so this only re-fires after that exclusion clears — e.g. an out-of-band
-			// progress update advanced last_progress_at without changing the pane,
-			// leaving idle_sweeps stranded past the threshold. An exact-equality test
-			// would leave such a worker permanently un-flaggable until its pane changed.
-			if sweeps >= idleStaleSweeps {
+			// Two gates must BOTH hold to flag idle_unreported:
+			//   • the wall-clock dwell (dwellElapsed) — the dominant gate that tolerates a
+			//     worker idle-waiting on its own long-running background shell; and
+			//   • the sweep count — the secondary "seen-stable-at-least-twice" guard.
+			// `>=`, not `==`, on the sweep count: the already-surfaced gate above masks
+			// re-fires within one idle episode (the idle_unreported event is newer than
+			// last_progress_at), so this only re-fires after that exclusion clears — e.g.
+			// an out-of-band progress update advanced last_progress_at without changing
+			// the pane, leaving idle_sweeps stranded past the threshold. An exact-equality
+			// test would leave such a worker permanently un-flaggable until its pane
+			// changed. The sweep count is still accumulated below even when the dwell has
+			// not yet elapsed, so once it does the threshold is already satisfied.
+			if sweeps >= idleStaleSweeps && w.dwellElapsed(now, t) {
 				if _, err := w.Store.AppendEvent(ctx, db.Event{
 					EntityType: db.EntityTypeTask, EntityID: t.ID, Type: db.EventIdleUnreported,
 					Actor: db.ActorSystem, Actionable: true, Payload: t.Window,
