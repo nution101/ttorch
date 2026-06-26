@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -14,11 +15,20 @@ import (
 	"github.com/nution101/ttorch/internal/paths"
 )
 
-// TestMain pins TTORCH_HOME at a throwaway dir for the whole package (only-if-unset,
-// matching the supervisor's TestMain) so a test that resolves paths.StateDB() /
-// WatchPIDFile() can never reach the real ~/.ttorch. Each test also t.Setenv's its
-// own temp home; the db.Open guard is the final fail-closed backstop.
+// TestMain isolates the whole package from the caller's environment so a test that
+// resolves paths.StateDB() / WatchPIDFile() can never reach the real ~/.ttorch.
+// TTORCH_HOME is pinned at a throwaway dir (only-if-unset, matching the supervisor's
+// TestMain); each test also t.Setenv's its own temp home, and the db.Open guard is
+// the final fail-closed backstop.
+//
+// TTORCH_DB is cleared up front: a worker shell exports TTORCH_DB=~/.ttorch/state.db,
+// and it OUTRANKS TTORCH_HOME in paths.StateDB() (envOr prefers it), so an inherited
+// value would defeat the per-test TTORCH_HOME isolation and steer every db.Open at the
+// real home — where the guard then (correctly) refuses, failing the suite. Unsetting it
+// package-wide lets each test's TTORCH_HOME govern StateDB(), so `go test ./internal/watch/`
+// passes whether or not the calling shell has TTORCH_DB set.
 func TestMain(m *testing.M) {
+	os.Unsetenv("TTORCH_DB")
 	if os.Getenv("TTORCH_HOME") == "" {
 		home, err := os.MkdirTemp("", "ttorch-watch-test-home-*")
 		if err != nil {
@@ -43,7 +53,13 @@ func (c *fakeClock) now() time.Time { return c.t }
 // readable idle pane. Tests override individual seams as needed.
 func newWatcher(t *testing.T) (*Watcher, *db.Store, *bytes.Buffer, *fakeClock) {
 	t.Helper()
-	t.Setenv("TTORCH_HOME", t.TempDir())
+	home := t.TempDir()
+	t.Setenv("TTORCH_HOME", home)
+	// Pin TTORCH_DB at this test's own temp home as well: it outranks TTORCH_HOME in
+	// paths.StateDB(), so without an explicit per-test value an ambient TTORCH_DB (a
+	// worker shell exports one) would steer db.Open away from the isolated home.
+	// TestMain also clears it package-wide; this keeps the helper correct on its own.
+	t.Setenv("TTORCH_DB", filepath.Join(home, "state.db"))
 	s, err := db.Open(paths.Default().StateDB())
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
