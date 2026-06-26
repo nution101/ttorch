@@ -25,7 +25,6 @@ import (
 	"github.com/nution101/ttorch/internal/profile"
 	"github.com/nution101/ttorch/internal/projectinit"
 	"github.com/nution101/ttorch/internal/review"
-	"github.com/nution101/ttorch/internal/supervisor"
 	"github.com/nution101/ttorch/internal/termtab"
 	"github.com/nution101/ttorch/internal/tmux"
 	"github.com/nution101/ttorch/internal/validate"
@@ -229,19 +228,15 @@ func (m *Manager) SpawnWithFootprint(taskID, projectPath string, scout bool, raw
 	h := harness.Resolve()
 	// Assign a stable session id so a later restore resumes this exact conversation.
 	sid := harness.NewSessionID()
-	// Install the turn-end hook so the supervisor can detect this worker's turns,
+	// Write the worker's trimmed Claude settings (no AI co-author trailer on commits)
 	// and pre-accept the harness's folder-trust prompt so the worker runs autonomously.
-	_ = harness.InstallTurnEndHook(h, wt, m.P.TurnEndMarker(taskID))
+	_ = harness.WriteWorkerSettings(h, wt)
 	harness.TrustWorktree(h, repo, wt)
 	// Give the worker its task identity (§3.1): a git-excluded <worktree>/.ttorch/task
 	// file so `ttorch report/stage/note/follow-on` resolve the task + DB by walking up
-	// from cwd even after a resume drops the launch env. Best-effort, like the hook.
+	// from cwd even after a resume drops the launch env. Best-effort, like the settings.
 	dbPath := m.P.StateDB()
 	_ = harness.WriteWorkerTaskFile(wt, taskID, dbPath)
-	// The turn-end hook is useless without something reading it: make sure the
-	// background supervisor is up so this worker's turn boundaries and idle become
-	// wakes the manager is told about.
-	m.ensureSupervisor()
 	harnessLaunch := rawCmd == ""
 	cmd := rawCmd
 	if cmd == "" {
@@ -417,25 +412,6 @@ func (m *Manager) abortSpawn(window, repo, wt string) {
 	}
 }
 
-// ensureSupervisor starts the background supervisor if it isn't already running,
-// so the manager is told when a worker ends a turn or goes idle. It reuses the
-// shared start path (supervisor.Start) and is best-effort: a failure is reported
-// to stderr but never fails the spawn. Set TTORCH_NO_SUPERVISOR=1 to manage the
-// supervisor yourself.
-func (m *Manager) ensureSupervisor() {
-	if os.Getenv("TTORCH_NO_SUPERVISOR") != "" {
-		return
-	}
-	_, started, err := supervisor.Start(m.P)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "ttorch: could not start the supervisor (run 'ttorch supervise'): %v\n", err)
-		return
-	}
-	if started {
-		fmt.Fprintln(os.Stderr, "ttorch: started the background supervisor to watch for turn-end/idle")
-	}
-}
-
 // Live reports whether a task's tmux window is still present.
 func (m *Manager) Live(t db.Task) bool {
 	return tmux.WindowExists(m.Session, t.Window)
@@ -451,8 +427,9 @@ func (m *Manager) Status() ([]db.Task, error) { return m.liveTasks(), nil }
 //   - "working": the pane shows a busy indicator (mid-turn)
 //   - "idle":    the window is live but not busy (finished / awaiting input)
 //
-// It mirrors the supervisor's stale-detection heuristic (livestate.Busy) so
-// `ttorch status` and the wakes the manager receives never disagree.
+// It shares the busy-detection heuristic (livestate.Busy) with the watcher's
+// liveness sweeps so `ttorch status` and the events the manager receives never
+// disagree about whether a worker is mid-turn.
 func DeriveState(live bool, pane string) string {
 	if !live {
 		return "gone"
@@ -767,9 +744,9 @@ func (m *Manager) Reset() ([]string, error) {
 	return notes, nil
 }
 
-// StopSession tears down the ttorch tmux session (and all its windows). The
-// supervisor is stopped separately by the caller. It does NOT clear state, so the
-// session can be resumed later with `ttorch` or `ttorch resume`.
+// StopSession tears down the ttorch tmux session (and all its windows). It does
+// NOT clear state, so the session can be resumed later with `ttorch` or
+// `ttorch resume`.
 func (m *Manager) StopSession() ([]string, error) {
 	if !tmux.Available() || !tmux.HasSession(m.Session) {
 		return []string{"no ttorch session was running"}, nil

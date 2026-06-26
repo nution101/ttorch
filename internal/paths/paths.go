@@ -74,29 +74,11 @@ func (p Paths) Worktrees() string { return filepath.Join(p.Home, "worktrees") }
 // BriefPath is where a task's brief lives.
 func (p Paths) BriefPath(id string) string { return filepath.Join(p.DataDir(), id, "brief.md") }
 
-// PIDFile holds the running supervisor's PID.
-func (p Paths) PIDFile() string { return filepath.Join(p.StateDir(), "daemon.pid") }
-
 // WatchPIDFile holds the running `ttorch watch` singleton's PID. The watcher takes
-// an exclusive flock on it (flock-as-truth, mirroring the supervisor's PIDFile) so
-// at most one watcher blocks at a time; the recorded pid is for `ttorch watch
-// --reset`'s observability and pid-reuse-guarded reap (§4.5).
+// an exclusive flock on it (flock-as-truth) so at most one watcher blocks at a time;
+// the recorded pid is for `ttorch watch --reset`'s observability and pid-reuse-guarded
+// reap (§4.5).
 func (p Paths) WatchPIDFile() string { return filepath.Join(p.StateDir(), "watch.pid") }
-
-// Beacon is touched each supervisor cycle as a liveness signal.
-func (p Paths) Beacon() string { return filepath.Join(p.StateDir(), ".beacon") }
-
-// WakeQueue is the durable, append-only queue the supervisor writes and the
-// manager drains.
-func (p Paths) WakeQueue() string { return filepath.Join(p.StateDir(), "wake-queue") }
-
-// DaemonLog captures detached supervisor output.
-func (p Paths) DaemonLog() string { return filepath.Join(p.Home, "daemon.log") }
-
-// TurnEndMarker is touched by a worker's harness at each turn boundary.
-func (p Paths) TurnEndMarker(id string) string {
-	return filepath.Join(p.StateDir(), id+".turn-ended")
-}
 
 // ApprovalFile holds a short-lived approval token authorizing a merge for a task.
 func (p Paths) ApprovalFile(id string) string {

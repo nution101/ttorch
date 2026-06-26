@@ -22,11 +22,9 @@ import (
 // TestMain disables native worker terminal views for the whole package. The
 // integration tests below exercise Spawn, which best-effort opens a terminal tab
 // or window on macOS; without this, running these tests would spawn real GUI
-// windows on a developer's Mac. It also disables the auto-ensure of the background
-// supervisor so a Spawn test never detaches a stray `daemon run` process.
+// windows on a developer's Mac.
 func TestMain(m *testing.M) {
 	os.Setenv("TTORCH_WORKER_TABS", "off")
-	os.Setenv("TTORCH_NO_SUPERVISOR", "1")
 	// Safety net: point TTORCH_HOME at a throwaway dir for the whole package so a
 	// test that forgets its own t.Setenv can never resolve the DB to the real
 	// ~/.ttorch — where db.Open would create state.db and ImportLegacy would rename

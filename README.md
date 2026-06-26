@@ -8,9 +8,9 @@ writing and reviewing every line by hand.
 [![Release](https://img.shields.io/github/v/release/nution101/ttorch?sort=semver)](https://github.com/nution101/ttorch/releases/latest)
 
 > ttorch installs/updates safely, ships a global Claude Code surface, dispatches workers
-> into isolated tmux worktrees, runs a zero-token supervisor, gates delivery behind
-> review + validation + your explicit approval, and learns each repo's conventions over
-> time.
+> into isolated tmux worktrees, watches them with a zero-token, event-driven watcher,
+> gates delivery behind review + validation + your explicit approval, and learns each
+> repo's conventions over time.
 >
 > **New here? Start with [`docs/ONBOARDING.md`](docs/ONBOARDING.md).** Architecture and
 > roadmap live in `TTORCH_PLAN.md`.
@@ -59,15 +59,13 @@ additionally confirm those checksums came from this repo's release workflow.
 | `ttorch` | Start/attach the manager (persistent; a new one starts in the current folder) |
 | `ttorch resume` | Force a rebuild of the manager + all worker tabs from saved state, then attach |
 | `ttorch reset [--yes]` | Discard the saved session for a clean start (worktrees/branches are kept) |
-| `ttorch stop` | Stop the manager session + supervisor (resumable: run `ttorch` to come back) |
+| `ttorch stop` | Stop the manager session (resumable: run `ttorch` to come back) |
 | `ttorch cc [--isolated]` | Open a Claude session attached to the team |
 | `ttorch spawn <id> <repo> [--scout]` | Start a worker on a task in an isolated worktree |
 | `ttorch status` | List active workers |
 | `ttorch peek <id> [lines]` | Read recent output from a worker |
 | `ttorch send <id> <text>` | Type a message into a worker |
 | `ttorch teardown <id> [--force]` | Finish a worker (returns its worktree to the pool) |
-| `ttorch supervise` / `ttorch daemon …` | Run the background supervisor |
-| `ttorch wake drain` | Print and clear pending supervision events |
 | `ttorch install` / `update` / `uninstall` | Manage the installed content |
 | `ttorch doctor [--yes]` | Detect and install missing dependencies |
 | `ttorch skills [install]` | List/install recommended agent skills (e.g. axi) |
@@ -87,8 +85,8 @@ session id, so it can later be resumed to the exact conversation it had.
   it rebuilds the **manager window** and **every worker tab**, each resumed to its
   prior Claude conversation (`--resume`), then attaches you. If there's no saved
   session, it starts a fresh manager in the current folder.
-- **`ttorch stop`** — a *resumable pause*. It ends the tmux session and the
-  supervisor but keeps your saved session, so `ttorch` brings everything back.
+- **`ttorch stop`** — a *resumable pause*. It ends the tmux session but keeps your
+  saved session, so `ttorch` brings everything back.
 - **`ttorch resume`** — force a rebuild of the manager + all worker tabs from saved
   state (useful if a window was closed), then attach.
 - **`ttorch reset [--yes]`** — discard the saved session for a clean start. It kills
@@ -143,9 +141,9 @@ TTORCH_MANAGER_EFFORT=ultracode ttorch # opt the manager back into ultracode
 
 ## Worker visibility
 
-Every worker runs as a window in a shared tmux session (default name `ttorch`). The
-zero-token supervisor, `ttorch status`, `ttorch peek`, `ttorch send`, and `ttorch teardown`
-all drive those windows, and you can navigate between them inside tmux with `Ctrl-b w`.
+Every worker runs as a window in a shared tmux session (default name `ttorch`).
+`ttorch status`, `ttorch peek`, `ttorch send`, and `ttorch teardown` all drive those
+windows, and you can navigate between them inside tmux with `Ctrl-b w`.
 
 On macOS, ttorch additionally opens a **native terminal tab or window** that *attaches a
 view* onto each new worker's tmux window, so you can watch a worker without leaving tmux.

@@ -66,8 +66,8 @@ func TestReadWorkerTaskFileLenient(t *testing.T) {
 }
 
 // TestWriteWorkerTaskFileExcludesFromGit proves the identity file is kept out of
-// git's view (same mechanism as the Stop hook), so a worker's tree never shows it as
-// untracked or commits it.
+// git's view (same mechanism as the worker settings file), so a worker's tree never
+// shows it as untracked or commits it.
 func TestWriteWorkerTaskFileExcludesFromGit(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")

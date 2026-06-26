@@ -228,38 +228,27 @@ func shq(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-// InstallTurnEndHook arranges for the harness to touch markerPath at each turn
-// boundary, so the supervisor can detect activity. For Claude Code this writes a
-// worktree-local Stop hook and keeps it out of git's view. Other harnesses are
-// no-ops for now.
-func InstallTurnEndHook(kind, worktree, markerPath string) error {
+// WriteWorkerSettings writes a worktree-local Claude Code settings file that
+// disables the AI co-author trailer, so a worker's commits are authored as the
+// repo's git user. For Claude Code it writes <worktree>/.claude/settings.local.json
+// and keeps it out of git's view. Other harnesses are no-ops for now.
+//
+// Workers report their turn boundaries and status through the DB (`ttorch report`),
+// so no Stop hook is installed; this file carries only the co-author setting.
+func WriteWorkerSettings(kind, worktree string) error {
 	if kind != "claude" {
 		return nil
-	}
-	type hookCmd struct {
-		Type    string `json:"type"`
-		Command string `json:"command"`
-	}
-	type hookEntry struct {
-		Hooks []hookCmd `json:"hooks"`
 	}
 	type settings struct {
 		// IncludeCoAuthoredBy=false stops the agent from adding an AI co-author
 		// trailer to commits — work is authored as the repo's git user, not the agent.
-		IncludeCoAuthoredBy bool                   `json:"includeCoAuthoredBy"`
-		Hooks               map[string][]hookEntry `json:"hooks"`
-	}
-	cfg := settings{
-		IncludeCoAuthoredBy: false,
-		Hooks: map[string][]hookEntry{
-			"Stop": {{Hooks: []hookCmd{{Type: "command", Command: "touch " + quote(markerPath)}}}},
-		},
+		IncludeCoAuthoredBy bool `json:"includeCoAuthoredBy"`
 	}
 	dir := filepath.Join(worktree, ".claude")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	b, err := json.MarshalIndent(cfg, "", "  ")
+	b, err := json.MarshalIndent(settings{IncludeCoAuthoredBy: false}, "", "  ")
 	if err != nil {
 		return err
 	}

@@ -17,7 +17,6 @@ import (
 // fail-closed backstop.
 func TestMain(m *testing.M) {
 	os.Setenv("TTORCH_WORKER_TABS", "off")
-	os.Setenv("TTORCH_NO_SUPERVISOR", "1")
 	home, err := os.MkdirTemp("", "ttorch-cli-test-home-*")
 	if err != nil {
 		panic(err)

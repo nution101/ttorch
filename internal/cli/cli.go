@@ -21,8 +21,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
-
 	ttorchembed "github.com/nution101/ttorch"
 	"github.com/nution101/ttorch/internal/buildinfo"
 	"github.com/nution101/ttorch/internal/db"
@@ -38,10 +36,8 @@ import (
 	"github.com/nution101/ttorch/internal/review"
 	"github.com/nution101/ttorch/internal/selfupdate"
 	"github.com/nution101/ttorch/internal/skills"
-	"github.com/nution101/ttorch/internal/supervisor"
 	"github.com/nution101/ttorch/internal/tmux"
 	"github.com/nution101/ttorch/internal/validate"
-	"github.com/nution101/ttorch/internal/wake"
 	"github.com/nution101/ttorch/internal/watch"
 	"github.com/nution101/ttorch/internal/worktree"
 )
@@ -131,12 +127,6 @@ func Main(args []string) int {
 		return run(cmdSend(rest))
 	case "teardown":
 		return run(cmdTeardown(rest))
-	case "daemon":
-		return run(cmdDaemon(rest))
-	case "supervise":
-		return run(cmdSupervise())
-	case "wake":
-		return run(cmdWake(rest))
 	case "wait":
 		return run(cmdWait(rest))
 	case "watch":
@@ -972,29 +962,7 @@ func cmdCC(args []string) error {
 	return m.OpenCC(*isolated)
 }
 
-func cmdDaemon(args []string) error {
-	sub := "status"
-	if len(args) > 0 {
-		sub = args[0]
-	}
-	switch sub {
-	case "run":
-		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-		defer stop()
-		return supervisor.New(paths.Default()).Run(ctx)
-	case "start":
-		return daemonStart()
-	case "stop":
-		return daemonStop()
-	case "status":
-		return daemonStatus()
-	default:
-		return errors.New("usage: ttorch daemon run|start|stop|status")
-	}
-}
-
 func cmdStop() error {
-	_ = daemonStop() // stop the supervisor (prints its own line)
 	m, err := mgr()
 	if err != nil {
 		return err
@@ -1065,111 +1033,14 @@ func confirm(out io.Writer, in io.Reader, prompt string) bool {
 	}
 }
 
-func cmdSupervise() error {
-	if pid, ok := supervisor.Running(paths.Default()); ok {
-		fmt.Printf("supervisor already running (pid %d)\n", pid)
-		return nil
-	}
-	return daemonStart()
-}
-
-func cmdWake(args []string) error {
-	if len(args) == 0 || args[0] != "drain" {
-		return errors.New("usage: ttorch wake drain")
-	}
-	ws, err := (wake.Queue{Path: paths.Default().WakeQueue()}).Drain()
-	if err != nil {
-		return err
-	}
-	if len(ws) == 0 {
-		fmt.Println("no pending wakes")
-		return nil
-	}
-	printWakes(ws)
+// cmdWait is a retired alias. The supervisor wake-queue it used to drain is gone;
+// the manager now arms `ttorch watch` (event-driven on the DB, zero injection into
+// any session). It is kept as a thin shim — rather than dropped to an "unknown
+// command" — so a manager session resumed from before the retirement, or a habit of
+// typing `ttorch wait`, gets a clear pointer to the replacement. It takes no action.
+func cmdWait(_ []string) error {
+	fmt.Println("`ttorch wait` is retired; use `ttorch watch` (event-driven on the DB, zero injection).")
 	return nil
-}
-
-// printWakes renders drained wakes in the shared `wake drain` / `wait` format.
-func printWakes(ws []wake.Wake) {
-	fmt.Printf("%d wake(s):\n", len(ws))
-	for _, w := range ws {
-		key := w.Key
-		if key == "" {
-			key = "-"
-		}
-		fmt.Printf("  %-9s %-14s %s\n", w.Kind, key, w.Payload)
-	}
-}
-
-// cmdWait blocks until a relevant supervision event is queued, then drains and
-// prints it (same format as `wake drain`). With --task it returns only for that
-// task's wakes; any other task's wakes that it drains while waiting are put back on
-// the queue so they are never lost. It blocks efficiently via fsnotify on the state
-// dir, with a periodic poll fallback, and is cancellable with Ctrl-C or --timeout.
-func cmdWait(args []string) error {
-	fs := flag.NewFlagSet("wait", flag.ContinueOnError)
-	task := fs.String("task", "", "only return for wakes belonging to this task")
-	timeout := fs.Duration("timeout", 0, "give up after this long (0 = wait forever)")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	p := paths.Default()
-	q := wake.Queue{Path: p.WakeQueue()}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	if *timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, *timeout)
-		defer cancel()
-	}
-
-	// Wakes for other tasks are drained but not consumed; return them to the queue
-	// on the way out (normal return, timeout, or Ctrl-C) so no other task's wake is
-	// dropped. Held in memory rather than re-appended each loop to avoid waking
-	// ourselves on our own write.
-	var held []wake.Wake
-	defer func() {
-		for _, w := range held {
-			_ = q.Append(w.Kind, w.Key, w.Payload)
-		}
-	}()
-
-	// fsnotify lets a queue write wake us instantly; if it can't start we degrade to
-	// the poll ticker alone.
-	var events chan fsnotify.Event
-	var errs chan error
-	if w, err := fsnotify.NewWatcher(); err == nil {
-		defer w.Close()
-		_ = os.MkdirAll(p.StateDir(), 0o755)
-		if err := w.Add(p.StateDir()); err == nil {
-			events = w.Events
-			errs = w.Errors
-		}
-	}
-	poll := time.NewTicker(time.Second)
-	defer poll.Stop()
-
-	for {
-		ws, err := q.Drain()
-		if err != nil {
-			return err
-		}
-		matched, rest := wake.Filter(*task, ws)
-		held = append(held, rest...)
-		if len(matched) > 0 {
-			printWakes(matched)
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			fmt.Println("no pending wakes")
-			return nil
-		case <-events:
-		case <-errs:
-		case <-poll.C:
-		}
-	}
 }
 
 // cmdWatch arms the event-driven watcher (§4): it blocks on actionable DB
@@ -1602,53 +1473,6 @@ func cmdLearnings(args []string) error {
 	return nil
 }
 
-func daemonStart() error {
-	p := paths.Default()
-	pid, started, err := supervisor.Start(p)
-	if err != nil {
-		return err
-	}
-	if !started {
-		fmt.Printf("supervisor already running (pid %d)\n", pid)
-		return nil
-	}
-	fmt.Printf("supervisor started (pid %d); logging to %s\n", pid, p.DaemonLog())
-	return nil
-}
-
-func daemonStop() error {
-	p := paths.Default()
-	pid, ok := supervisor.PID(p)
-	if !ok || !supervisor.Alive(pid) {
-		fmt.Println("supervisor not running")
-		_ = os.Remove(p.PIDFile())
-		return nil
-	}
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return err
-	}
-	if err := proc.Signal(syscall.SIGTERM); err != nil {
-		return err
-	}
-	fmt.Printf("sent stop to supervisor (pid %d)\n", pid)
-	return nil
-}
-
-func daemonStatus() error {
-	p := paths.Default()
-	pid, ok := supervisor.Running(p)
-	if !ok {
-		fmt.Println("supervisor not running")
-		return nil
-	}
-	fmt.Printf("supervisor running (pid %d)\n", pid)
-	if fi, err := os.Stat(p.Beacon()); err == nil {
-		fmt.Printf("  last beat: %s ago\n", time.Since(fi.ModTime()).Round(time.Second))
-	}
-	return nil
-}
-
 func reapplyContent(p paths.Paths) error {
 	res, err := installer.Apply(ttorchembed.Content, p, buildinfo.CurrentVersion())
 	if err != nil {
@@ -1745,11 +1569,6 @@ Supervision:
   watch --reset           reap an orphan watcher and confirm the singleton is free
   await-lead [--clear]    mark the manager as awaiting the lead (the watcher stays
                           silent and never surfaces); --clear when the lead returns
-  supervise               ensure the background supervisor is running
-  daemon run|start|stop|status   manage the supervisor process
-  wake drain              print and clear pending supervision events
-  wait [--task id]        block until the next supervision event, then print it
-    --timeout d             give up after this long (0 = wait forever)
 
 Delivery:
   validate <id>               run the repo's build/test/lint checks on a worker
@@ -1771,7 +1590,7 @@ Delivery:
                               landed tip matches the validated commit, and fast-forward
                               the local default
   promote <id>                turn a scout task into a ship task
-  pr-check <id> <url>         watch a PR and wake when it merges
+  pr-check <id> <url>         arm a PR-merge check (surfaced by 'ttorch watch')
   fleet-sync [dir]            refresh local default from origin; prune gone branches
   recovery                    reconcile tracked tasks against live windows
   learn [--task id] "<msg>"   record a durable repo lesson (auto-promotes when recurring)

@@ -51,7 +51,7 @@ re-attaches to the same one. To work on other repos, just tell the manager their
 one manager tracks them all. When you're done (or want to move it to a different folder):
 
 ```sh
-ttorch stop            # stop the manager session + supervisor (resumable)
+ttorch stop            # stop the manager session (resumable)
 ```
 
 `ttorch stop` is a *resumable pause*, not a teardown: your team state, worktrees, and
@@ -68,8 +68,8 @@ You direct; the manager dispatches and supervises:
 2. **Dispatch** — `ttorch spawn <id> <repo>` starts a worker in its own isolated
    worktree (add `--scout` for investigation-only tasks that produce a report, not code).
 3. **Supervise** — `ttorch status` lists workers; `ttorch peek <id>` reads a worker's
-   output; `ttorch send <id> "<message>"` steers one. The background supervisor wakes the
-   manager on real events, so an idle team costs nothing. On macOS, each spawned worker
+   output; `ttorch send <id> "<message>"` steers one. The manager's event-driven watcher
+   wakes it on real worker events, so an idle team costs nothing. On macOS, each spawned worker
    also opens a native terminal tab/window viewing its tmux window (see §11); inside tmux,
    `Ctrl-b w` still navigates between worker windows. With iTerm2 installed (recommended;
    `ttorch doctor` can install it), bare `ttorch` opens the manager in a new iTerm2 window
@@ -171,11 +171,8 @@ the WSL distribution (`ttorch doctor` will).
 ## 12. Troubleshooting
 
 - `ttorch doctor` — missing dependencies, package manager, WSL status.
-- `ttorch daemon status` — is the supervisor running? `ttorch supervise` (re)starts it;
-  `ttorch daemon stop` stops it.
 - `ttorch status` — active workers and their state. `ttorch recovery` reconciles tracked
   tasks against live tmux windows after a crash or restart.
-- `ttorch wake drain` — pending supervision events (the manager drains these each turn).
 
 ## 13. Uninstall
 

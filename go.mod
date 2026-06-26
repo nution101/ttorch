@@ -2,10 +2,7 @@ module github.com/nution101/ttorch
 
 go 1.25.0
 
-require (
-	github.com/fsnotify/fsnotify v1.10.1
-	modernc.org/sqlite v1.53.0
-)
+require modernc.org/sqlite v1.53.0
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect

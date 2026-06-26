@@ -26,8 +26,8 @@ import (
 )
 
 // noGlobalHooksEnv opts out of global settings/hook management entirely, in line
-// with the other TTORCH_NO_* opt-outs (autotrust, supervisor, autoinit). It is an
-// install-time switch: set it and ttorch neither merges nor removes any settings.
+// with the other TTORCH_NO_* opt-outs (autotrust, autoinit). It is an install-time
+// switch: set it and ttorch neither merges nor removes any settings.
 const noGlobalHooksEnv = "TTORCH_NO_GLOBAL_HOOKS"
 
 // promptReminderScript is the shipped UserPromptSubmit hook (see content/hooks).
