@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.5.1](https://github.com/nution101/ttorch/compare/v0.5.0...v0.5.1) (2026-06-26)
+
+
+### Bug Fixes
+
+* **install:** verify cosign signatures strictly by default ([403d27c](https://github.com/nution101/ttorch/commit/403d27c115a49287da5c38783b30b4c3552a2064))
+* **spawn,teardown:** guard committed-but-unmerged work; add spawn --brief-file ([082492a](https://github.com/nution101/ttorch/commit/082492a822754aae150ba9d8df2a65f36d4da621))
+* **watch:** gate idle_unreported on a wall-clock dwell ([d75a4c4](https://github.com/nution101/ttorch/commit/d75a4c4a5ba5751e56e961e2150f3d5c797a58b6))
+* **worker:** wait silently for the brief during the spawn gap ([bf22f84](https://github.com/nution101/ttorch/commit/bf22f845f6a09fd1b0564ea01f17303b7d357a6a))
+
 ## [0.5.0](https://github.com/nution101/ttorch/compare/v0.4.0...v0.5.0) (2026-06-26)
 
 
