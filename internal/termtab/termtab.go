@@ -199,10 +199,17 @@ func viewName(window string) string {
 // `do script` / `write text`), so every interpolated operand is single-quoted
 // with shq to neutralize shell metacharacters — the session and window names are
 // untrusted (window = "wk-"+taskID, session = $TTORCH_TMUX_SESSION).
+//
+// It `exec`s tmux so the tmux client REPLACES the interactive shell rather than
+// running as its child. This is what makes Close (which kills the view session)
+// actually close the tab: when the view session ends, the exec'd tmux exits cleanly
+// and the tab's only process is gone, so the terminal closes the tab on its standard
+// "close on clean exit" behavior. Without exec, the shell survived tmux and the lead
+// was left with a dead zsh tab — the zombie-tab bug Teardown must not leave behind.
 func viewCommand(session, window string) string {
 	view := viewName(window)
 	return fmt.Sprintf(
-		"tmux new-session -A -s %s -t %s \\; set-option -t %s destroy-unattached on \\; set-option -t %s set-titles on \\; set-option -t %s set-titles-string %s \\; select-window -t %s:%s",
+		"exec tmux new-session -A -s %s -t %s \\; set-option -t %s destroy-unattached on \\; set-option -t %s set-titles on \\; set-option -t %s set-titles-string %s \\; select-window -t %s:%s",
 		shq(view), shq(session), shq(view), shq(view), shq(view), shq(tmux.TitleFormat), shq(view), shq(window),
 	)
 }

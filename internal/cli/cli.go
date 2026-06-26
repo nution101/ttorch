@@ -575,29 +575,17 @@ func cmdFollowOn(args []string) error {
 		return fmt.Errorf("follow-on: task %q already exists", newID)
 	}
 	actor := workerActor(parentID)
-	// A pending backlog child OF the parent, created BY the worker. CreateTask writes
-	// the canonical 'created' event; the follow_on_created event is the typed signal
-	// the manager surfaces on its next re-derive. Both are non-actionable — a follow-on
-	// is backlog, never an interrupt (the lead's decision, §9).
-	//
-	// These are two transactions (CreateTask, then AppendEvent), not the single tx §1.4
-	// prescribes for "create follow-on task + append event": inc2's footprint excludes
-	// internal/db, so an atomic db.CreateFollowOn (insert + both events in one withTx) is
-	// deferred to inc5 (lifecycle recording, where internal/db is in scope). The task row
-	// commits first, so even if the second write is lost to a crash the child still surfaces
-	// in the manager's pending-backlog re-derive (§7) — only the typed audit event is at
-	// risk in that narrow window.
-	if _, err := store.CreateTask(ctx, db.Task{
+	// A pending backlog child OF the parent, created BY the worker, filed atomically:
+	// db.CreateFollowOn writes the row, its canonical 'created' event, and the typed
+	// follow_on_created event in ONE transaction (the §1.4 fix tracked from inc2 —
+	// previously this path used two separate transactions). Both events are
+	// non-actionable: a follow-on is backlog the manager surfaces on its next re-derive,
+	// never an interrupt (the lead's decision, §9).
+	if _, err := store.CreateFollowOn(ctx, db.Task{
 		ID: newID, ProjectID: parent.ProjectID, ParentTaskID: &parentID,
 		CreatedBy: actor, Title: *title, Kind: db.KindShip,
 		Status: db.StatusPending, Footprint: parseTouches(*touches),
-	}, actor); err != nil {
-		return err
-	}
-	if _, err := store.AppendEvent(ctx, db.Event{
-		EntityType: db.EntityTypeTask, EntityID: newID, Type: db.EventFollowOnCreated,
-		Actor: actor, Payload: *title,
-	}); err != nil {
+	}, actor, *title); err != nil {
 		return err
 	}
 	fmt.Printf("filed follow-on %s (parent %s)\n", newID, parentID)

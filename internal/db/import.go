@@ -45,6 +45,14 @@ type legacyManager struct {
 	SessionID string `json:"sessionId"`
 }
 
+// importWarnf surfaces a record the importer could not migrate. Anything that cannot
+// be imported is LOGGED, never silently dropped (the source is also preserved under
+// state.migrated/ for inspection). It is a package var so a test can capture what was
+// surfaced; production writes a one-line note to stderr.
+var importWarnf = func(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "ttorch: legacy import: "+format+"\n", args...)
+}
+
 // ImportLegacy is the one-shot, idempotent migration of ttorch's pre-SQLite JSON
 // state into the DB (§2.5). It runs at startup after Migrate.
 //
@@ -116,13 +124,18 @@ func ImportLegacy(ctx context.Context, s *Store, stateDir string, windowLive fun
 	for _, name := range metaFiles {
 		lt, err := readLegacyTask(filepath.Join(stateDir, name))
 		if err != nil {
-			// Mirror the old state.List(), which silently dropped unloadable files
-			// rather than failing the whole read.
+			// Surface an unloadable record rather than dropping it silently. The file
+			// is preserved under state.migrated/ for inspection (step 4).
+			importWarnf("skipped %s: cannot parse legacy record: %v", name, err)
 			continue
 		}
 		proj, err := s.UpsertProject(ctx, lt.Project, "")
 		if err != nil {
-			return imported, fmt.Errorf("import %s: upsert project: %w", name, err)
+			// A single bad record must not abort the whole migration and strand the rest
+			// (the DB would then be non-pristine and a re-run would skip them forever —
+			// the silent partial-import the inc1 finding flagged). Surface and continue.
+			importWarnf("skipped %s: upsert project %q: %v", name, lt.Project, err)
+			continue
 		}
 		status := StatusTornDown
 		if windowLive != nil && windowLive(lt.Window) {
@@ -143,21 +156,29 @@ func ImportLegacy(ctx context.Context, s *Store, stateDir string, windowLive fun
 			ReviewedSHA: lt.ReviewedSHA,
 			Footprint:   lt.Footprint,
 			Status:      status,
+			// created_by=system records that the import (not a human or the manager)
+			// materialized the row, matching the 'created' event's system actor below.
+			CreatedBy: ActorSystem,
 		}
 		// actor=system so the 'created' event records that the import (not a human or
 		// the manager) materialized the row (§2.5 step 2).
 		if _, err := s.CreateTask(ctx, task, ActorSystem); err != nil {
-			return imported, fmt.Errorf("import %s: create task: %w", name, err)
+			importWarnf("skipped %s: create task %q: %v", name, lt.ID, err)
+			continue
 		}
 		imported++
 	}
 
-	// (3) Import the manager record and seed the watermark.
+	// (3) Import the manager record and seed the watermark. A bad/unwritable manager
+	// record is surfaced (not silently swallowed, as it was before) and the import
+	// continues — manager.json is preserved under state.migrated/ and its dir/session
+	// are re-derivable, so this never aborts an otherwise-good task migration.
 	if hasManager {
-		if lm, err := readLegacyManager(filepath.Join(stateDir, legacyManagerFile)); err == nil {
-			if err := s.SetManager(ctx, Manager{Dir: lm.Dir, SessionID: lm.SessionID}); err != nil {
-				return imported, fmt.Errorf("import manager: %w", err)
-			}
+		lm, err := readLegacyManager(filepath.Join(stateDir, legacyManagerFile))
+		if err != nil {
+			importWarnf("skipped %s: cannot parse legacy manager record: %v", legacyManagerFile, err)
+		} else if err := s.SetManager(ctx, Manager{Dir: lm.Dir, SessionID: lm.SessionID}); err != nil {
+			importWarnf("skipped %s: %v", legacyManagerFile, err)
 		}
 	}
 	maxActionable, err := s.MaxActionableEventID(ctx)

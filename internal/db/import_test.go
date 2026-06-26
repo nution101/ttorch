@@ -3,8 +3,10 @@ package db
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -274,6 +276,124 @@ func TestOpenAndImportRefuseRealHomeUnderTest(t *testing.T) {
 		t.Fatalf("Open of a temp path should succeed: %v", err)
 	}
 	_ = s.Close()
+}
+
+// TestImportLegacy_FullFieldRoundTrip proves EVERY legacy task field migrates intact
+// (no silent drop) and that the imported row records created_by=system (Part D).
+func TestImportLegacy_FullFieldRoundTrip(t *testing.T) {
+	s, _ := newTestStoreClock(t)
+	ctx := context.Background()
+
+	home := t.TempDir()
+	stateDir := filepath.Join(home, "state")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	created := time.Date(2025, 3, 4, 5, 6, 7, 0, time.UTC)
+	want := legacyTask{
+		ID: "full", Window: "wk-full", Worktree: "/wt/full", Project: "/repo/full",
+		Harness: "claude", Kind: KindScout, Created: created, PR: "https://example/pr/42",
+		SessionID: "sid-full", GatePassed: true, ApprovedBy: "auto", ReviewedSHA: "cafef00d",
+		Footprint: []string{"internal/a", "internal/b", "cmd/x"},
+	}
+	writeLegacyTask(t, stateDir, want)
+
+	n, err := ImportLegacy(ctx, s, stateDir, func(w string) bool { return w == "wk-full" })
+	if err != nil {
+		t.Fatalf("ImportLegacy: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("imported %d, want 1", n)
+	}
+	got, ok, err := s.GetTask(ctx, "full")
+	if err != nil || !ok {
+		t.Fatalf("GetTask: ok=%v err=%v", ok, err)
+	}
+	// Every carried field, checked individually so a future dropped field fails loudly.
+	checks := []struct {
+		name      string
+		got, want any
+	}{
+		{"ID", got.ID, want.ID},
+		{"Window", got.Window, want.Window},
+		{"Worktree", got.Worktree, want.Worktree},
+		{"Project", got.Project, want.Project},
+		{"Harness", got.Harness, want.Harness},
+		{"Kind", got.Kind, want.Kind},
+		{"PR", got.PR, want.PR},
+		{"SessionID", got.SessionID, want.SessionID},
+		{"GatePassed", got.GatePassed, want.GatePassed},
+		{"ApprovedBy", got.ApprovedBy, want.ApprovedBy},
+		{"ReviewedSHA", got.ReviewedSHA, want.ReviewedSHA},
+		{"Status (live window)", got.Status, StatusActive},
+		{"CreatedBy", got.CreatedBy, ActorSystem},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s = %v, want %v", c.name, c.got, c.want)
+		}
+	}
+	if !got.Created.Equal(created) {
+		t.Errorf("Created = %s, want %s", got.Created, created)
+	}
+	if strings.Join(got.Footprint, ",") != strings.Join(want.Footprint, ",") {
+		t.Errorf("Footprint = %v, want %v", got.Footprint, want.Footprint)
+	}
+	if a := createdEventActor(t, s, "full"); a != ActorSystem {
+		t.Errorf("created-event actor = %q, want system", a)
+	}
+}
+
+// TestImportLegacy_SurfacesUnparseableRecord proves a record that cannot be parsed is
+// SURFACED (logged), never silently dropped, that a single bad record does not abort
+// the rest of the migration, and that the bad source is preserved for inspection
+// (Part D — the inc1 silent-incompleteness finding).
+func TestImportLegacy_SurfacesUnparseableRecord(t *testing.T) {
+	s, _ := newTestStoreClock(t)
+	ctx := context.Background()
+
+	var warnings []string
+	orig := importWarnf
+	importWarnf = func(format string, args ...any) { warnings = append(warnings, fmt.Sprintf(format, args...)) }
+	t.Cleanup(func() { importWarnf = orig })
+
+	home := t.TempDir()
+	stateDir := filepath.Join(home, "state")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A valid record and a corrupt one (invalid JSON).
+	writeLegacyTask(t, stateDir, legacyTask{ID: "good", Window: "wk-good", Project: "/repo/a", Kind: KindShip})
+	if err := os.WriteFile(filepath.Join(stateDir, "bad"+legacyTaskSuffix), []byte("{ this is not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := ImportLegacy(ctx, s, stateDir, func(string) bool { return false })
+	if err != nil {
+		t.Fatalf("a single bad record must not fail the whole import: %v", err)
+	}
+	// The good record still imported; the bad one did not.
+	if n != 1 {
+		t.Fatalf("imported %d, want 1 (the good record)", n)
+	}
+	if _, ok, _ := s.GetTask(ctx, "good"); !ok {
+		t.Error("the valid record must import despite a corrupt sibling")
+	}
+	// The bad record was surfaced, not silently dropped.
+	surfaced := false
+	for _, w := range warnings {
+		if strings.Contains(w, "bad"+legacyTaskSuffix) {
+			surfaced = true
+		}
+	}
+	if !surfaced {
+		t.Fatalf("the unparseable record must be surfaced via importWarnf; warnings=%v", warnings)
+	}
+	// And its source is preserved (renamed, never deleted) for inspection.
+	migrated := filepath.Join(home, migratedDirName)
+	if _, err := os.Stat(filepath.Join(migrated, "bad"+legacyTaskSuffix)); err != nil {
+		t.Errorf("the corrupt record must be preserved under %s: %v", migratedDirName, err)
+	}
 }
 
 func TestImportLegacy_NoStateDir(t *testing.T) {

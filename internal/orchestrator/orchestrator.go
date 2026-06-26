@@ -330,6 +330,16 @@ func (m *Manager) SpawnWithFootprint(taskID, projectPath string, scout bool, raw
 			t = refreshed
 		}
 	}
+	// Record the spawn as a typed, manager-authored, non-actionable event (§3.4). The
+	// worker is already live and persisted, and the events row is a best-effort audit
+	// mirror, so a failed append must not fail the spawn (which would strand a running
+	// worker) — surface it and carry on.
+	if _, err := m.Store.AppendEvent(ctx, db.Event{
+		EntityType: db.EntityTypeTask, EntityID: taskID, Type: db.EventSpawned, Actor: db.ActorManager,
+		Payload: fmt.Sprintf("kind=%s window=%s", kind, window),
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "ttorch: could not record the spawned event for %s: %v\n", taskID, err)
+	}
 	return t, nil
 }
 
@@ -486,8 +496,16 @@ func (m *Manager) Send(taskID, text string) error {
 	return tmux.SendLine(m.Session, t.Window, text)
 }
 
-// Teardown finishes a task: it refuses to discard a worktree with uncommitted
-// changes unless force is set, then kills the window and returns the worktree.
+// closeTermTab closes a worker's native terminal view tab on teardown. It is a
+// package-level seam (like landIntegrate) so a test can confirm Teardown closes the
+// tab without driving real macOS GUI scripting (which termtab.Close gates off under
+// test anyway).
+var closeTermTab = termtab.Close
+
+// Teardown finishes a task: it refuses to discard a worktree with uncommitted changes
+// unless force is set, then kills the worker's tmux window, closes its native terminal
+// view tab, returns the worktree to the pool, and retains the row as torn_down with its
+// worktree blanked (§3.4).
 func (m *Manager) Teardown(taskID string, force bool) ([]string, error) {
 	t, ok, err := m.Store.GetTask(context.Background(), taskID)
 	if err != nil || !ok {
@@ -499,9 +517,13 @@ func (m *Manager) Teardown(taskID string, force bool) ([]string, error) {
 			return nil, fmt.Errorf("task %q has uncommitted changes; review it, then 'ttorch teardown %s --force'", taskID, taskID)
 		}
 	}
+	// Kill the worker's tmux window AND close its native terminal view tab so teardown
+	// leaves no zombie tab behind (Part B). closeTermTab tears down the view session;
+	// the view's exec'd tmux (see termtab.viewCommand) then exits and the terminal
+	// closes the now-empty tab.
 	m.killPaneProcesses(t.Window)
 	_ = tmux.KillWindow(m.Session, t.Window)
-	termtab.Close(t.Window)
+	closeTermTab(t.Window)
 	if t.Project != "" && t.Worktree != "" {
 		if err := m.Pool.Release(t.Project, t.Worktree); err != nil {
 			notes = append(notes, "worktree: "+err.Error())
@@ -510,9 +532,16 @@ func (m *Manager) Teardown(taskID string, force bool) ([]string, error) {
 		}
 	}
 	// The DB retains the row (rows are never hard-deleted, §3.4/§7): mark it torn_down
-	// so it drops out of the live fleet (liveTasks) while its history is preserved.
-	// (Increment 5 adds the worktree-blanking refinement on Pool.Release.)
-	if _, err := m.Store.ReportStatus(context.Background(), taskID, db.StatusTornDown, db.ActorManager, ""); err != nil {
+	// with a typed, non-actionable event so it drops out of the live fleet (liveTasks)
+	// while its history is preserved, and BLANK the worktree so the retained row never
+	// aliases a worktree the pool may reassign (§3.4). Status + worktree-blank + event
+	// commit atomically in one transaction.
+	fields := db.TaskFields{}
+	if t.Worktree != "" {
+		blank := ""
+		fields.Worktree = &blank
+	}
+	if _, err := m.Store.RecordTransition(context.Background(), taskID, db.StatusTornDown, fields, db.EventTornDown, db.ActorManager, ""); err != nil {
 		notes = append(notes, "state: "+err.Error())
 	}
 	return notes, nil
@@ -837,7 +866,8 @@ func (m *Manager) ReviewDiff(taskID string, stat bool) (string, error) {
 // Validate runs the worktree's detected checks for a task. It returns nil results
 // when no checks are detected (the caller reports that distinctly from a pass).
 func (m *Manager) Validate(taskID string) ([]validate.Result, error) {
-	t, ok, err := m.Store.GetTask(context.Background(), taskID)
+	ctx := context.Background()
+	t, ok, err := m.Store.GetTask(ctx, taskID)
 	if err != nil || !ok {
 		return nil, fmt.Errorf("unknown task %q", taskID)
 	}
@@ -845,7 +875,18 @@ func (m *Manager) Validate(taskID string) ([]validate.Result, error) {
 	if len(steps) == 0 {
 		return nil, nil
 	}
-	return validate.Run(t.Worktree, steps), nil
+	results := validate.Run(t.Worktree, steps)
+	// Record a typed, manager-authored, non-actionable 'validated' event carrying the
+	// pass/fail tally (§3.4). Best-effort: the results are already produced for the
+	// caller, so a failed audit append must not mask them.
+	passed := len(results) - len(validate.Failures(results))
+	if _, err := m.Store.AppendEvent(ctx, db.Event{
+		EntityType: db.EntityTypeTask, EntityID: taskID, Type: db.EventValidated, Actor: db.ActorManager,
+		Payload: fmt.Sprintf("%d/%d checks passed", passed, len(results)),
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "ttorch: could not record the validated event for %s: %v\n", taskID, err)
+	}
+	return results, nil
 }
 
 // Approve grants a short-lived approval token authorizing a merge for taskID.
@@ -1076,6 +1117,17 @@ func (m *Manager) SecurityReview(taskID, sha string, ttl time.Duration) (review.
 	if err := review.Write(m.securityVerdictPath(taskID), verdict, ttl); err != nil {
 		return zero, err
 	}
+	// Record a typed, manager-authored, non-actionable 'security_recorded' event (§3.4).
+	// It is a PURE event append — NOT RecordDelivery — because the security-everywhere
+	// pass is advisory and must never touch the task's gate state (gate_passed/
+	// approved_by/reviewed_sha); it only notes that the audit ran and its outcome.
+	// Best-effort: the verdict is already persisted, so a failed append must not mask it.
+	if _, err := m.Store.AppendEvent(context.Background(), db.Event{
+		EntityType: db.EntityTypeTask, EntityID: taskID, Type: db.EventSecurityRecorded, Actor: db.ActorManager,
+		Payload: fmt.Sprintf("verdict=%s sha=%s", verdict.Overall, short(sha)),
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "ttorch: could not record the security_recorded event for %s: %v\n", taskID, err)
+	}
 	m.audit(fmt.Sprintf("security-review task=%s commit=%s verdict=%s mode=%s",
 		taskID, short(sha), verdict.Overall, projectinit.ReadMode(t.Project)))
 	return verdict, nil
@@ -1085,6 +1137,19 @@ func (m *Manager) SecurityReview(taskID, sha string, ttl time.Duration) (review.
 // taskID, if any, without consuming it.
 func (m *Manager) SecurityReviewShow(taskID string) (review.Verdict, bool) {
 	return review.Load(m.securityVerdictPath(taskID))
+}
+
+// recordDelivered marks a task delivered and appends a typed, manager-authored,
+// non-actionable delivery event in one transaction (§3.4): `delivered` for a local
+// fast-forward (MergeLocal, standalone or via Land's local/validated/trusted path) and
+// `merged` for a PR merge (Land's pr path). It is best-effort by design: the merge has
+// already happened and is irreversible, and the events row is only a best-effort mirror
+// of the must-succeed audit.log (whose abort-on-failure semantics, §1105, are unchanged),
+// so a failed append is surfaced — never allowed to fail a completed merge.
+func (m *Manager) recordDelivered(taskID, eventType, payload string) {
+	if _, err := m.Store.RecordTransition(context.Background(), taskID, db.StatusDelivered, db.TaskFields{}, eventType, db.ActorManager, payload); err != nil {
+		fmt.Fprintf(os.Stderr, "ttorch: could not record the %s event for %s: %v\n", eventType, taskID, err)
+	}
 }
 
 // MergeLocal fast-forwards the repo's local default branch to the worker's HEAD —
@@ -1213,6 +1278,7 @@ func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error)
 			return "", err
 		}
 		m.audit(fmt.Sprintf("merge-local task=%s repo=%s %s -> %s", taskID, repo, def, short(workerHead)))
+		m.recordDelivered(taskID, db.EventDelivered, fmt.Sprintf("%s -> %s", def, short(workerHead)))
 		return fmt.Sprintf("fast-forwarded %s to %s for task %s", def, short(workerHead), taskID), nil
 	}
 	// Consume the verdict beside the approval and pin it to the merged commit — the
@@ -1245,6 +1311,7 @@ func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error)
 	if err := worktree.MergeFastForward(repo, workerHead); err != nil {
 		return "", err
 	}
+	m.recordDelivered(taskID, db.EventDelivered, fmt.Sprintf("%s -> %s gate=verdict approver=%s", def, short(workerHead), approver))
 	return fmt.Sprintf("fast-forwarded %s to %s for task %s", def, short(workerHead), taskID), nil
 }
 
@@ -1621,6 +1688,10 @@ func (m *Manager) integratePR(t db.Task, def, rebasedHead string) (string, error
 	if err := worktree.MergeFastForward(repo, "origin/"+def); err != nil {
 		return "", fmt.Errorf("land: fast-forwarding local %s to origin/%s after the PR merge failed: %w", def, def, err)
 	}
+	// The PR merged and the local default fast-forwarded: record the delivery as a
+	// typed, non-actionable `merged` event (the PR-path counterpart of MergeLocal's
+	// `delivered`, §3.4). Best-effort — the merge is already irreversible.
+	m.recordDelivered(t.ID, db.EventMerged, fmt.Sprintf("pr merged: %s -> %s", branch, def))
 	return worktree.Head(repo)
 }
 
@@ -1711,19 +1782,22 @@ func (m *Manager) Promote(taskID string) error {
 	if t.Kind != "scout" {
 		return fmt.Errorf("task %q is not a scout task", taskID)
 	}
-	// Flip the kind (a plain field write, no event); the 'promoted' event is layered
-	// on in increment 5 (§3.4). The CHECK constraint validates the new kind.
+	// Flip the kind to ship and record the manager-authored, non-actionable 'promoted'
+	// event in one transaction (§3.4). The CHECK constraint validates the new kind.
 	ship := db.KindShip
-	return m.Store.SetTaskFields(context.Background(), taskID, db.TaskFields{Kind: &ship})
+	_, err = m.Store.RecordTransition(context.Background(), taskID, "", db.TaskFields{Kind: &ship}, db.EventPromoted, db.ActorManager, "scout -> ship")
+	return err
 }
 
-// ArmPRCheck records a PR URL on a task so the supervisor polls for its merge.
+// ArmPRCheck records a PR URL on a task so the watcher polls for its merge (§4.4).
 func (m *Manager) ArmPRCheck(taskID, url string) error {
 	if _, ok, err := m.Store.GetTask(context.Background(), taskID); err != nil || !ok {
 		return fmt.Errorf("unknown task %q", taskID)
 	}
-	// Record the PR url (no event in increment 1; §3.4 adds pr_armed in increment 5).
-	return m.Store.SetTaskFields(context.Background(), taskID, db.TaskFields{PR: &url})
+	// Record the PR url and the manager-authored, non-actionable 'pr_armed' event in one
+	// transaction (§3.4).
+	_, err := m.Store.RecordTransition(context.Background(), taskID, "", db.TaskFields{PR: &url}, db.EventPRArmed, db.ActorManager, url)
+	return err
 }
 
 // FleetSync refreshes a repo's local default branch from origin when safe and

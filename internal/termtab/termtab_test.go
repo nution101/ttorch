@@ -52,6 +52,17 @@ func TestViewCommand(t *testing.T) {
 	}
 }
 
+// TestViewCommandExecsTmux pins the dead-zsh fix (Part B): the view tab `exec`s tmux,
+// so the tmux client REPLACES the interactive shell. When Close kills the view session,
+// the exec'd tmux exits and the tab has no surviving zsh — the terminal closes the now-
+// empty tab instead of leaving a zombie shell behind.
+func TestViewCommandExecsTmux(t *testing.T) {
+	cmd := viewCommand("ttorch", "wk-42")
+	if !strings.HasPrefix(cmd, "exec tmux ") {
+		t.Errorf("view command must exec tmux so no shell survives the view, got %q", cmd)
+	}
+}
+
 func TestViewCommandUsesSanitizedView(t *testing.T) {
 	cmd := viewCommand("ttorch", "wk.bad:name")
 	if !strings.Contains(cmd, "-s 'ttv-wkbadname'") {

@@ -159,6 +159,47 @@ func (s *Store) CreateTask(ctx context.Context, t Task, actor string) (Task, err
 	return out, nil
 }
 
+// CreateFollowOn atomically files a follow-on (child) task: it inserts the row and
+// appends BOTH its 'created' event and the typed 'follow_on_created' event in ONE
+// transaction (§1.4), so an observer never sees the child without its provenance and
+// a crash leaves neither (the §1.4 fix tracked from inc2, where internal/db was out
+// of scope and the CLI did this as two separate transactions). Both events are
+// non-actionable — a follow-on is backlog the manager surfaces on its next re-derive,
+// never an interrupt (§3.1/§9). title is recorded on the follow_on_created payload.
+// Returns the canonical stored child row.
+func (s *Store) CreateFollowOn(ctx context.Context, child Task, actor, title string) (Task, error) {
+	s.applyTaskDefaults(&child)
+	var out Task
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		if err := s.insertTaskTx(ctx, tx, child); err != nil {
+			return err
+		}
+		to := child.Status
+		if _, err := appendEvent(ctx, tx, s.now(), Event{
+			EntityType: EntityTypeTask, EntityID: child.ID, Type: EventCreated, Actor: actor, ToStatus: &to,
+		}); err != nil {
+			return err
+		}
+		if _, err := appendEvent(ctx, tx, s.now(), Event{
+			EntityType: EntityTypeTask, EntityID: child.ID, Type: EventFollowOnCreated, Actor: actor, Payload: title,
+		}); err != nil {
+			return err
+		}
+		var ok bool
+		var err error
+		if out, ok, err = getTask(ctx, tx, child.ID); err != nil {
+			return err
+		} else if !ok {
+			return fmt.Errorf("follow-on %s vanished after insert", child.ID)
+		}
+		return nil
+	})
+	if err != nil {
+		return Task{}, err
+	}
+	return out, nil
+}
+
 // UpsertTask inserts the task if absent (== CreateTask: insert + 'created' event),
 // or, if its id already exists, syncs the runtime/coupling fields onto the existing
 // row WITHOUT changing lifecycle state or emitting an event (§2.2/§3.4). This is
@@ -281,9 +322,12 @@ func (s *Store) ListChildren(ctx context.Context, parentID string) ([]Task, erro
 	return s.ListTasks(ctx, TaskFilter{ParentID: parentID})
 }
 
-// SetTaskFields applies a partial update of a task's runtime/coupling fields. It
-// writes no event (§2.2); updated_at always advances.
-func (s *Store) SetTaskFields(ctx context.Context, id string, f TaskFields) error {
+// taskFieldsAssignments turns a partial TaskFields into parallel `col = ?` clauses
+// and their bind args (no updated_at, no WHERE — callers append those). Column names
+// are fixed literals, never caller text, so they cannot inject SQL. It is shared by
+// SetTaskFields (s.db) and RecordTransition (a *sql.Tx) so both build the SET list
+// identically (§2.3).
+func taskFieldsAssignments(f TaskFields) ([]string, []any, error) {
 	var set []string
 	var args []any
 	add := func(col string, v any) { set = append(set, col+" = ?"); args = append(args, v) }
@@ -320,17 +364,92 @@ func (s *Store) SetTaskFields(ctx context.Context, id string, f TaskFields) erro
 	if f.Footprint != nil {
 		fp, err := marshalFootprint(*f.Footprint)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
 		add("footprint", fp)
 	}
-	add("updated_at", formatTime(s.now()))
-	args = append(args, id)
+	return set, args, nil
+}
+
+// SetTaskFields applies a partial update of a task's runtime/coupling fields. It
+// writes no event (§2.2); updated_at always advances.
+func (s *Store) SetTaskFields(ctx context.Context, id string, f TaskFields) error {
+	set, args, err := taskFieldsAssignments(f)
+	if err != nil {
+		return err
+	}
+	set = append(set, "updated_at = ?")
+	args = append(args, formatTime(s.now()), id)
 	res, err := s.db.ExecContext(ctx, `UPDATE tasks SET `+strings.Join(set, ", ")+` WHERE id = ?`, args...)
 	if err != nil {
 		return err
 	}
 	return requireRows(res, "task "+id)
+}
+
+// RecordTransition applies a manager-authored lifecycle change in one transaction
+// (§1.4/§2.3): it optionally moves the task to newStatus (when non-empty), applies
+// any partial TaskFields, and appends ONE typed event (eventType) attributed to
+// actor — all atomically, so an observer never sees the change without its event and
+// a crash leaves neither. When the status changes, the event records from/to status.
+//
+// The event is ALWAYS non-actionable. These are manager-authored lifecycle events
+// (spawned/validated/.../delivered/merged/promoted/pr_armed/torn_down, §1.3) that
+// must NEVER self-trigger the watcher; a worker-actor transition that may wake the
+// manager goes through ReportStatus instead. This hard-coded actionable=0 is the
+// enforcement point for the §1.3 actionability invariant on these verbs. Returns the
+// appended event.
+func (s *Store) RecordTransition(ctx context.Context, id, newStatus string, fields TaskFields, eventType, actor, payload string) (Event, error) {
+	now := s.now()
+	storedTS, _ := parseTime(formatTime(now))
+	var ev Event
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		// Read the current status: it both confirms the task exists (an UPDATE of a
+		// missing id would silently affect 0 rows) and supplies the event's from-status.
+		var from string
+		err := tx.QueryRowContext(ctx, `SELECT status FROM tasks WHERE id = ?`, id).Scan(&from)
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("task %s not found", id)
+		}
+		if err != nil {
+			return err
+		}
+		set, args, err := taskFieldsAssignments(fields)
+		if err != nil {
+			return err
+		}
+		if newStatus != "" {
+			// Prepend status to both lists so the SET clause and its args stay aligned.
+			set = append([]string{"status = ?"}, set...)
+			args = append([]any{newStatus}, args...)
+		}
+		set = append(set, "updated_at = ?")
+		args = append(args, formatTime(now), id)
+		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET `+strings.Join(set, ", ")+` WHERE id = ?`, args...); err != nil {
+			return err
+		}
+		var fromPtr, toPtr *string
+		if newStatus != "" {
+			f, to := from, newStatus
+			fromPtr, toPtr = &f, &to
+		}
+		eid, err := appendEvent(ctx, tx, now, Event{
+			EntityType: EntityTypeTask, EntityID: id, Type: eventType, Actor: actor,
+			FromStatus: fromPtr, ToStatus: toPtr, Actionable: false, Payload: payload,
+		})
+		if err != nil {
+			return err
+		}
+		ev = Event{
+			ID: eid, TS: storedTS, EntityType: EntityTypeTask, EntityID: id, Type: eventType,
+			Actor: actor, FromStatus: fromPtr, ToStatus: toPtr, Actionable: false, Payload: payload,
+		}
+		return nil
+	})
+	if err != nil {
+		return Event{}, err
+	}
+	return ev, nil
 }
 
 // ReportStatus sets a task's status, touches last_progress_at, and appends a

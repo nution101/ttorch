@@ -83,9 +83,19 @@ func Open(path string) (*Store, error) {
 	if err := guardRealHomeUnderTest(path); err != nil {
 		return nil, err
 	}
+	// The DB is a finance-grade audit store: keep its directory and files private
+	// (0700 dir / 0600 file) so the audit trail is never group/world-readable. Only a
+	// directory WE create is tightened — a pre-existing home is left exactly as the
+	// user/installer configured it.
 	if dir := filepath.Dir(path); dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return nil, err
+		if _, statErr := os.Stat(dir); os.IsNotExist(statErr) {
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				return nil, err
+			}
+			// Defeat a permissive umask on the leaf dir we just created.
+			if err := os.Chmod(dir, 0o700); err != nil {
+				return nil, err
+			}
 		}
 	}
 	sdb, err := sql.Open("sqlite", dsn(path))
@@ -100,6 +110,18 @@ func Open(path string) (*Store, error) {
 	if err := s.Migrate(context.Background()); err != nil {
 		_ = sdb.Close()
 		return nil, err
+	}
+	// Migrate has created the db file (and, under WAL, its -wal/-shm sidecars), but so
+	// far only schema DDL has been written. Restrict it to 0600 BEFORE any task/event
+	// data lands. The main file must succeed (an unsecured audit store is a finding);
+	// the sidecars carry the same data, so tighten them too — best-effort, since they
+	// may not exist at this instant.
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = sdb.Close()
+		return nil, fmt.Errorf("db: securing %s: %w", path, err)
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		_ = os.Chmod(path+suffix, 0o600)
 	}
 	return s, nil
 }
