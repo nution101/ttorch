@@ -49,8 +49,12 @@ cosign verify-blob \
 shasum -a 256 -c checksums.txt --ignore-missing   # then verify your tarball
 ```
 
-The installer already checks the sha256 against `checksums.txt`; the signature lets you
-additionally confirm those checksums came from this repo's release workflow.
+The `install.sh` installer runs this same `cosign verify-blob` automatically when `cosign`
+is present, confirming the checksums came from this repo's release workflow before trusting
+them. Without `cosign` (or for a release that predates signing) it prints a warning and
+verifies only the sha256 — which confirms the download is internally consistent but does
+**not** prove it came from this repo; install `cosign` for that provenance guarantee. The
+commands above let you verify a release by hand.
 
 ## Commands
 

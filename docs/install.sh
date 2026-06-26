@@ -47,6 +47,33 @@ echo "Downloading ttorch ${VERSION} for ${OS}/${ARCH}..."
 curl -fsSL "${BASE}/${ASSET}" -o "${TMP}/${ASSET}"
 curl -fsSL "${BASE}/checksums.txt" -o "${TMP}/checksums.txt"
 
+# Verify the provenance of checksums.txt with cosign (Sigstore keyless) before
+# trusting any checksum in it. The release workflow signs checksums.txt and
+# attaches checksums.txt.cosign.bundle alongside it. When cosign is unavailable
+# (or no signature is published) we warn and fall back to the sha256 check below
+# rather than failing the install; when cosign IS present a bad signature is fatal.
+if command -v cosign >/dev/null 2>&1; then
+  if curl -fsSL "${BASE}/checksums.txt.cosign.bundle" -o "${TMP}/checksums.txt.cosign.bundle" 2>/dev/null; then
+    echo "Verifying checksums signature with cosign (keyless)..."
+    if ! cosign verify-blob \
+      --bundle "${TMP}/checksums.txt.cosign.bundle" \
+      --certificate-identity-regexp "^https://github.com/${REPO}/\.github/workflows/.+" \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      "${TMP}/checksums.txt"; then
+      echo "cosign signature verification FAILED for ${VERSION}; refusing to install."; exit 1
+    fi
+  else
+    echo "WARNING: cosign is installed but no signature was found for ${VERSION}."
+    echo "         Provenance could NOT be verified (the release may predate signing, or the"
+    echo "         signature may have been stripped). Falling back to sha256 only."
+  fi
+else
+  echo "Warning: cosign not installed; skipping signature verification."
+  echo "         The sha256 check below confirms the download is internally consistent but"
+  echo "         does NOT prove it came from this repo. Install cosign for that guarantee:"
+  echo "         https://github.com/sigstore/cosign"
+fi
+
 # Verify sha256.
 EXPECTED="$(grep " \*\{0,1\}${ASSET}\$" "${TMP}/checksums.txt" | awk '{print $1}' | head -n1)"
 if [ -z "$EXPECTED" ]; then

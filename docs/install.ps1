@@ -23,6 +23,9 @@ if (-not (Test-Wsl)) {
 }
 
 Write-Host "Installing ttorch inside WSL2..."
+# install.sh (run inside WSL) verifies the sha256 checksum and, when cosign is
+# present in the WSL distribution, additionally cosign-verifies the release —
+# so there is no separate artifact to verify on the Windows side.
 wsl.exe -e bash -lc "curl -fsSL $url | sh"
 Write-Host ""
 Write-Host "Done. Use ttorch from inside WSL (open your distribution, or 'wsl')."
