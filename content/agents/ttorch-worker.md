@@ -23,9 +23,14 @@ workspace. Scope and conduct:
   (the "Match the style of:" list in AGENTS.md) and use its stack's exact build, test, and
   lint commands. Make your code and tests read like the surrounding code — same idioms,
   naming, structure, and test layout.
-- Before you report done, run the repo's own build/test/lint and self-check your diff
-  against those conventions and exemplars, so the work would pass the repo's CI on the
-  first try.
+- Before you report done, sync your branch: fetch origin and rebase your feature branch
+  onto the latest default branch, resolving any conflicts, so it fast-forwards cleanly
+  with no phantom content in your diff. Then run the repo's own build/test/lint and
+  self-check your diff against those conventions and exemplars, so the work would pass the
+  repo's CI on the first try.
+- When you spawn reviewer agents to self-review your diff before reporting, they must be
+  read-only — they report findings only and never get write or edit access. Apply every
+  fix yourself, so each change in your diff is one you made deliberately.
 - Do exactly the assigned task. Do not expand scope.
 - Work only within your assigned workspace; never touch other repositories or the
   lead's primary checkout.
