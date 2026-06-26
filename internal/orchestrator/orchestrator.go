@@ -244,10 +244,7 @@ func (m *Manager) SpawnWithFootprint(taskID, projectPath string, scout bool, raw
 	harnessLaunch := rawCmd == ""
 	cmd := rawCmd
 	if cmd == "" {
-		brief := m.P.BriefPath(taskID)
-		if _, err := os.Stat(brief); os.IsNotExist(err) {
-			_ = writeBriefStub(brief, taskID, kind)
-		}
+		brief := m.briefForLaunch(taskID, kind)
 		// Prepend TTORCH_TASK_ID/TTORCH_DB so the worker's reporting commands resolve
 		// their task + DB from the launch env (the .ttorch/task file is the durable
 		// fallback that also survives a resume). §3.1.
@@ -483,19 +480,51 @@ func (m *Manager) Send(taskID, text string) error {
 // test anyway).
 var closeTermTab = termtab.Close
 
-// Teardown finishes a task: it refuses to discard a worktree with uncommitted changes
-// unless force is set, then kills the worker's tmux window, closes its native terminal
-// view tab, returns the worktree to the pool, and retains the row as torn_down with its
-// worktree blanked (§3.4).
+// Teardown finishes a task: it refuses to discard UNLANDED work — a worktree with
+// uncommitted changes OR a task branch with commits not yet merged into the default
+// branch — unless force is set, then kills the worker's tmux window, closes its native
+// terminal view tab, returns the worktree to the pool, and retains the row as torn_down
+// with its worktree blanked (§3.4). On --force, any committed-but-unmerged work is first
+// stashed under a recovery ref so a forced teardown is never an unrecoverable delete.
 func (m *Manager) Teardown(taskID string, force bool) ([]string, error) {
 	t, ok, err := m.Store.GetTask(context.Background(), taskID)
 	if err != nil || !ok {
 		return nil, fmt.Errorf("unknown task %q", taskID)
 	}
 	var notes []string
+	// The git dir to evaluate the task branch from: prefer the repo (stable across the
+	// teardown), fall back to the live worktree. Both share one ref store, so the task
+	// branch (ttorch/<id>) and the default branch resolve from either.
+	gitDir := t.Project
+	if gitDir == "" {
+		gitDir = t.Worktree
+	}
+	branch := taskBranch(taskID)
 	if !force {
 		if dirty, _ := worktree.IsDirty(t.Worktree); dirty {
 			return nil, fmt.Errorf("task %q has uncommitted changes; review it, then 'ttorch teardown %s --force'", taskID, taskID)
+		}
+		// Committed-but-unmerged work is as destructible as uncommitted work: a clean
+		// worktree can still hold commits on ttorch/<id> that no merge target contains,
+		// and Pool.Release deletes the task branch — so without this guard those commits
+		// are lost. Refuse, naming the commits; --force (which stashes a recovery ref
+		// below) is the explicit override.
+		if gitDir != "" && worktree.RefExists(gitDir, branch) {
+			def := worktree.DefaultBranch(gitDir)
+			unmerged, uerr := worktree.UnmergedCommits(gitDir, branch, def, "origin/"+def)
+			if uerr != nil {
+				return nil, fmt.Errorf("task %q: could not verify %s is merged into %s (%v); review it, then 'ttorch teardown %s --force' to discard", taskID, branch, def, uerr, taskID)
+			}
+			if len(unmerged) > 0 {
+				return nil, fmt.Errorf("task %q has %d committed change(s) on %s not merged into %s:\n  %s\nmerge or land them, then 'ttorch teardown %s --force' to discard (the discarded commits are saved to a recovery ref)",
+					taskID, len(unmerged), branch, def, strings.Join(unmerged, "\n  "), taskID)
+			}
+		}
+	} else if gitDir != "" && worktree.RefExists(gitDir, branch) {
+		// --force: stash any committed-but-unmerged work under a recovery ref BEFORE the
+		// branch is deleted, so a forced discard stays recoverable.
+		if note := m.stashDiscardedBranch(gitDir, taskID, branch); note != "" {
+			notes = append(notes, note)
 		}
 	}
 	// Kill the worker's tmux window AND close its native terminal view tab so teardown
@@ -526,6 +555,41 @@ func (m *Manager) Teardown(taskID string, force bool) ([]string, error) {
 		notes = append(notes, "state: "+err.Error())
 	}
 	return notes, nil
+}
+
+// stashDiscardedBranch saves a task branch's committed-but-unmerged commits under a
+// recovery ref (refs/ttorch/discarded/<id>-<sha>) before a forced teardown deletes the
+// branch, returning a human note describing where they went (or the failure). It returns
+// "" ONLY when the branch is provably fully merged/landed (its commits live on a base
+// ref) — nothing to preserve. The unmerged set is computed against the same bases the
+// non-force guard uses, so the two paths agree on what counts as unlanded. Crucially,
+// when merge status CANNOT be determined (UnmergedCommits errors), it still preserves the
+// branch tip and warns: the feature's whole purpose is that a forced teardown is never an
+// unrecoverable delete, so an "unknown" status must fail safe toward preservation — the
+// mirror of the non-force path, which refuses on that same error.
+func (m *Manager) stashDiscardedBranch(gitDir, taskID, branch string) string {
+	def := worktree.DefaultBranch(gitDir)
+	unmerged, err := worktree.UnmergedCommits(gitDir, branch, def, "origin/"+def)
+	if err == nil && len(unmerged) == 0 {
+		return "" // provably merged/landed — its commits live on a base ref already
+	}
+	// Either the branch holds unique commits, or merge status is undeterminable: preserve
+	// the tip rather than risk discarding committed work unrecoverably. If even the tip
+	// cannot be resolved, surface that loudly (mirroring the SetRef-failure path) rather
+	// than returning "" — a silent "" reads as "nothing to preserve" and the branch is
+	// then deleted, the exact unrecoverable delete this feature exists to prevent.
+	tip, rerr := worktree.ResolveRef(gitDir, branch)
+	if rerr != nil {
+		return "could not save discarded commits: " + rerr.Error()
+	}
+	ref := "refs/ttorch/discarded/" + taskID + "-" + short(tip)
+	if serr := worktree.SetRef(gitDir, ref, tip); serr != nil {
+		return "could not save discarded commits: " + serr.Error()
+	}
+	if err != nil {
+		return fmt.Sprintf("could not verify %s is merged (%v); saved its tip to %s (recover with: git -C %s log %s)", branch, err, ref, gitDir, ref)
+	}
+	return fmt.Sprintf("saved %d discarded commit(s) to %s (recover with: git -C %s log %s)", len(unmerged), ref, gitDir, ref)
 }
 
 // uninitNotice returns the one-line nudge to print when path is inside a git repo that
@@ -2006,10 +2070,36 @@ func cwd() string {
 	return "."
 }
 
-func writeBriefStub(path, id, kind string) error {
+// briefForLaunch returns the path to the brief the worker launch command reads,
+// writing the generic stub there first ONLY when no brief already exists. A brief the
+// manager supplied via `spawn --brief/--brief-file` (written by WriteBrief before the
+// spawn) is therefore used as the worker's initial prompt instead of the stub, and a
+// resume/respawn keeps the original brief rather than clobbering it.
+func (m *Manager) briefForLaunch(taskID, kind string) string {
+	path := m.P.BriefPath(taskID)
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		_ = writeBriefStub(path, taskID, kind)
+	}
+	return path
+}
+
+// WriteBrief stores content as task taskID's brief (paths.BriefPath) so the next Spawn
+// launches the worker with it as the initial prompt rather than the generic stub. It
+// creates the data dir and overwrites any existing brief for the id. `ttorch spawn
+// --brief/--brief-file` calls it before spawning.
+func (m *Manager) WriteBrief(taskID, content string) error {
+	return writeBrief(m.P.BriefPath(taskID), content)
+}
+
+// writeBrief writes body to path as a task brief, creating its parent directory.
+func writeBrief(path, body string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
+	return os.WriteFile(path, []byte(body), 0o644)
+}
+
+func writeBriefStub(path, id, kind string) error {
 	body := fmt.Sprintf(`# Task %s (%s)
 
 Ramp up first: read this repo's AGENTS.md / CLAUDE.md for project context and
@@ -2037,5 +2127,5 @@ resolve your task automatically):
 - `+"`ttorch follow-on <new-id> --title \"…\" [--touches \"a,b\"]`"+` to file a child
   task for out-of-scope work you discover; it lands in the backlog, it does not spawn.
 `, id, kind)
-	return os.WriteFile(path, []byte(body), 0o644)
+	return writeBrief(path, body)
 }

@@ -168,6 +168,52 @@ func TestResolveSendMessage_EmptyMessageFileResolvesEmpty(t *testing.T) {
 	}
 }
 
+// TestResolveBrief covers `ttorch spawn --brief / --brief-file`: neither flag yields ""
+// (the worker gets the generic stub), --brief is verbatim, --brief-file is its contents,
+// and a bad invocation (both flags, or an unreadable/empty file) is a loud error rather
+// than a silent fall-back to the stub.
+func TestResolveBrief(t *testing.T) {
+	const body = "# Real brief\n\nImplement parts A and B.\n"
+	file := filepath.Join(t.TempDir(), "brief.md")
+	if err := os.WriteFile(file, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	empty := filepath.Join(t.TempDir(), "empty.md")
+	if err := os.WriteFile(empty, []byte("  \n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name             string
+		brief, briefFile string
+		want             string
+		wantErr          bool
+	}{
+		{name: "neither sets stub fallback", want: ""},
+		{name: "inline brief verbatim", brief: body, want: body},
+		{name: "brief file contents", briefFile: file, want: body},
+		{name: "both flags is ambiguous", brief: body, briefFile: file, wantErr: true},
+		{name: "missing file errors", briefFile: filepath.Join(t.TempDir(), "nope.md"), wantErr: true},
+		{name: "empty file errors", briefFile: empty, wantErr: true},
+	}
+	for _, c := range cases {
+		got, err := resolveBrief(c.brief, c.briefFile)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("%s: expected an error, got nil", c.name)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: unexpected error: %v", c.name, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("%s: brief = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
 func TestParseTouches(t *testing.T) {
 	cases := []struct {
 		in   string

@@ -342,16 +342,24 @@ func cmdSpawn(args []string) error {
 	// Task id and repo are the first two positionals; flags follow (the stdlib
 	// flag parser stops at the first positional, so parse the remainder).
 	if len(args) < 2 {
-		return errors.New(`usage: ttorch spawn <task-id> <repo-path> [--scout] [--init] [--touches "a,b"] [--force-overlap] [--cmd "..."]`)
+		return errors.New(`usage: ttorch spawn <task-id> <repo-path> [--scout] [--init] [--touches "a,b"] [--brief-file <path> | --brief "..."] [--force-overlap] [--cmd "..."]`)
 	}
 	id, repo := args[0], args[1]
 	fs := flag.NewFlagSet("spawn", flag.ContinueOnError)
 	scout := fs.Bool("scout", false, "investigation task: report only, no code changes")
 	doInit := fs.Bool("init", false, "force first-use setup (AGENTS.md block + CLAUDE.md symlink) even when the repo tracks AGENTS.md, which auto-init declines; plain spawn auto-inits only when tracked-file-safe (TTORCH_NO_AUTOINIT=1 to skip)")
 	touches := fs.String("touches", "", `comma-separated file paths/prefixes this task will touch; refuses to dispatch onto files a live worker already holds`)
+	briefFile := fs.String("brief-file", "", "path to a file whose contents become the worker's initial prompt (the full brief), instead of the generic stub")
+	brief := fs.String("brief", "", "inline brief text used as the worker's initial prompt, instead of the generic stub")
 	forceOverlap := fs.Bool("force-overlap", false, "dispatch even if the footprint overlaps a live worker (override the conflict refusal)")
 	raw := fs.String("cmd", "", "raw command to run instead of the default harness launch")
 	if err := fs.Parse(args[2:]); err != nil {
+		return err
+	}
+	// Resolve the brief before any side effect so a bad --brief/--brief-file fails the
+	// spawn loudly rather than silently launching the worker on the generic stub.
+	briefContent, err := resolveBrief(*brief, *briefFile)
+	if err != nil {
 		return err
 	}
 	m, err := mgr()
@@ -366,6 +374,14 @@ func cmdSpawn(args []string) error {
 		}
 		for _, n := range notes {
 			fmt.Println("  " + n)
+		}
+	}
+	// Write the manager-supplied brief to the task's brief path BEFORE launching, so the
+	// worker starts with the full brief as its initial prompt (Spawn reads this file and
+	// only falls back to the stub when it is absent).
+	if briefContent != "" {
+		if err := m.WriteBrief(id, briefContent); err != nil {
+			return fmt.Errorf("spawn: writing brief for %q: %w", id, err)
 		}
 	}
 	footprint := parseTouches(*touches)
@@ -404,6 +420,27 @@ func parseTouches(s string) []string {
 		out = append(out, f)
 	}
 	return out
+}
+
+// resolveBrief returns the brief content from the spawn --brief / --brief-file flags,
+// or "" when neither is set (the worker then gets the generic stub). It errors if both
+// are set (ambiguous) or if --brief-file is unreadable or empty, so a bad invocation
+// fails before the spawn rather than silently launching the worker on the stub.
+func resolveBrief(brief, briefFile string) (string, error) {
+	if brief != "" && briefFile != "" {
+		return "", errors.New("spawn: pass only one of --brief or --brief-file")
+	}
+	if briefFile != "" {
+		b, err := os.ReadFile(briefFile)
+		if err != nil {
+			return "", fmt.Errorf("spawn: reading --brief-file: %w", err)
+		}
+		if strings.TrimSpace(string(b)) == "" {
+			return "", fmt.Errorf("spawn: --brief-file %q is empty", briefFile)
+		}
+		return string(b), nil
+	}
+	return brief, nil
 }
 
 // --- worker-facing reporting (§3.1) -----------------------------------------
@@ -1564,6 +1601,9 @@ Team:
                             symlink) even when the repo tracks AGENTS.md
     --touches "a,b"         file paths/prefixes this task will touch; refuses to
                             dispatch onto files a live worker already holds
+    --brief-file <path>     launch the worker with this file's contents as its
+                            initial prompt (the full brief) instead of the stub
+    --brief "..."           launch the worker with this inline text as its brief
     --force-overlap         dispatch anyway when --touches overlaps a live worker
     --cmd "..."             run a raw command instead of the default harness
   status                  list active workers (live tmux state + DB status/stage/owner)

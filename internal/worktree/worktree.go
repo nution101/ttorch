@@ -305,6 +305,40 @@ func IsAncestor(repo, a, b string) bool {
 	return err == nil
 }
 
+// UnmergedCommits returns the one-line summaries (most-recent first) of commits
+// reachable from branch but from NONE of bases (`git log branch --not base...`). An
+// empty result means every commit on branch already lives on a base — the branch was
+// just cut from one, or its work has landed — so discarding branch loses nothing.
+//
+// Teardown's data-loss guard uses it to detect a worker's own COMMITTED-but-unmerged
+// work (a clean worktree can still hold commits that were never merged). The caller
+// passes BOTH the local default branch and origin/<default> as bases: a fresh worker's
+// branch is cut from origin/<default> (see StartBranch/defaultBase), so comparing only
+// against the local default would wrongly flag an untouched worker whenever origin is
+// ahead of local — and a worker whose work landed via the remote must read as merged.
+// Bases that do not resolve are skipped; with no resolvable base it errors rather than
+// list a branch's entire history.
+func UnmergedCommits(repo, branch string, bases ...string) ([]string, error) {
+	var exclude []string
+	for _, b := range bases {
+		if b != "" && RefExists(repo, b) {
+			exclude = append(exclude, b)
+		}
+	}
+	if len(exclude) == 0 {
+		return nil, fmt.Errorf("no default-branch ref to compare %s against", branch)
+	}
+	args := append([]string{"-C", repo, "log", "--oneline", "--no-decorate", branch, "--not"}, exclude...)
+	out, err := git(args...)
+	if err != nil {
+		return nil, err
+	}
+	if out = strings.TrimSpace(out); out != "" {
+		return strings.Split(out, "\n"), nil
+	}
+	return nil, nil
+}
+
 // ShowFile returns the contents of repoPath as it exists at ref in repo
 // (`git show <ref>:<repoPath>`), and whether that file exists there. It is read-only
 // and never touches any working tree — the trust gate uses it to read the gate
@@ -416,6 +450,16 @@ func RefExists(repo, ref string) bool {
 // ResolveRef returns the commit sha that ref points to in repo.
 func ResolveRef(repo, ref string) (string, error) {
 	return git("-C", repo, "rev-parse", ref)
+}
+
+// SetRef points refName at commit (`git update-ref`), creating or moving it. refName
+// must be a fully-qualified ref (e.g. refs/ttorch/discarded/<id>-<sha>). Teardown's
+// --force path uses it to stash a discarded task branch under refs/ttorch/discarded/
+// before the branch is deleted, so committed-but-unmerged work stays recoverable
+// (`git log <refName>`) instead of being lost outright.
+func SetRef(repo, refName, commit string) error {
+	_, err := git("-C", repo, "update-ref", refName, commit)
+	return err
 }
 
 // Rebase replays the commits in dir's current HEAD onto onto (`git rebase onto`),
