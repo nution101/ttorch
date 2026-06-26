@@ -238,6 +238,10 @@ func (s *Store) ListTasks(ctx context.Context, filter TaskFilter) ([]Task, error
 		where = append(where, `t.project_id = ?`)
 		args = append(args, filter.ProjectID)
 	}
+	if filter.EpicID != 0 {
+		where = append(where, `t.epic_id = ?`)
+		args = append(args, filter.EpicID)
+	}
 	if filter.Owner != "" {
 		where = append(where, `t.owner = ?`)
 		args = append(args, filter.Owner)

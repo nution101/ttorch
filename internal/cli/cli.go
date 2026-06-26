@@ -113,6 +113,16 @@ func Main(args []string) int {
 		return run(cmdFollowOn(rest))
 	case "status":
 		return run(cmdStatus())
+	case "tasks":
+		return run(cmdTasks(rest))
+	case "project":
+		return run(cmdProject(rest))
+	case "epic":
+		return run(cmdEpic(rest))
+	case "phase":
+		return run(cmdPhase(rest))
+	case "task":
+		return run(cmdTask(rest))
 	case "check-overlap":
 		return run(cmdCheckOverlap(rest))
 	case "peek":
@@ -685,8 +695,17 @@ func cmdStatus() error {
 	}
 	rows := make([]statusRow, len(tasks))
 	for i, t := range tasks {
+		// STATE is the LIVE tmux state (working/idle/gone via DeriveState) — derived
+		// only for a task that has a window. A backlog task (task add / follow-on) has
+		// no window yet, so it shows "-" rather than a misleading "gone" (§3.3). The
+		// row set and the lifecycle columns (STATUS/STAGE/OWNER) come from the DB.
+		state := "-"
+		if t.Window != "" {
+			state = m.TaskState(t)
+		}
 		rows[i] = statusRow{
-			ID: t.ID, Kind: t.Kind, State: m.TaskState(t),
+			ID: t.ID, Kind: t.Kind, State: state,
+			Status: t.Status, Stage: t.Stage, Owner: t.Owner,
 			Window: t.Window, Project: t.Project, Footprint: t.Footprint,
 		}
 	}
@@ -694,12 +713,13 @@ func cmdStatus() error {
 	return nil
 }
 
-// statusRow is one worker's line in `ttorch status`, with its declared footprint.
-// Split from cmdStatus so the rendering (the footprint display + summary line) is
-// unit-testable without tmux.
+// statusRow is one worker's line in `ttorch status`: its LIVE tmux state plus the
+// DB-backed lifecycle columns (status/stage/owner) and declared footprint. Split
+// from cmdStatus so the rendering (the columns, footprint display, and summary
+// line) is unit-testable without tmux.
 type statusRow struct {
-	ID, Kind, State, Window, Project string
-	Footprint                        []string
+	ID, Kind, State, Status, Stage, Owner, Window, Project string
+	Footprint                                              []string
 }
 
 // renderStatus prints the worker table — each worker's declared footprint on an
@@ -709,10 +729,11 @@ type statusRow struct {
 // conflict gate, which ignores gone workers; a gone worker's footprint still shows
 // on its row for context.
 func renderStatus(w io.Writer, rows []statusRow) {
-	fmt.Fprintf(w, "%-16s %-6s %-8s %-12s %s\n", "TASK", "KIND", "STATE", "WINDOW", "PROJECT")
+	const format = "%-16s %-6s %-8s %-12s %-14s %-16s %-10s %s\n"
+	fmt.Fprintf(w, format, "TASK", "KIND", "STATE", "STATUS", "STAGE", "OWNER", "WINDOW", "PROJECT")
 	var live, idle, declared int
 	for _, r := range rows {
-		fmt.Fprintf(w, "%-16s %-6s %-8s %-12s %s\n", r.ID, r.Kind, r.State, r.Window, r.Project)
+		fmt.Fprintf(w, format, r.ID, r.Kind, r.State, dash(r.Status), dash(r.Stage), dash(r.Owner), dash(r.Window), r.Project)
 		if len(r.Footprint) > 0 {
 			fmt.Fprintf(w, "%-16s touches: %s\n", "", strings.Join(r.Footprint, ", "))
 		}
@@ -1676,7 +1697,7 @@ Team:
                             dispatch onto files a live worker already holds
     --force-overlap         dispatch anyway when --touches overlaps a live worker
     --cmd "..."             run a raw command instead of the default harness
-  status                  list active workers (with footprints + idle-slot summary)
+  status                  list active workers (live tmux state + DB status/stage/owner)
   check-overlap "<paths>" show which live workers a proposed footprint conflicts
     [--repo dir]            with, to plan disjoint parallel dispatch (scopes to the
                             cwd's repo, or --repo)
@@ -1696,6 +1717,24 @@ Worker reporting (run by a worker about its own task; resolves the task from
                           record freeform activity (does not wake the manager)
   follow-on <new-id> --title "…" [--touches "a,b"]
                           file a child task into the backlog (does not spawn)
+
+Backlog & planning (read the DB; includes pending backlog tasks):
+  tasks                   list tasks (DB-backed), with filters and views
+    [--project id]          scope to a project (see 'project ls')
+    [--epic id]             scope to an epic (see 'epic ls')
+    [--status s[,s…]]       comma-separated statuses, e.g. active,blocked,done
+    [--tree]                print the projects→epics→phases→tasks hierarchy
+    [--timeline <task-id>]  print one task's events ∪ notes by time
+  project add <repo> [--name n]   register a repo (caches its delivery mode for display)
+  project ls              list registered projects
+  epic add --project <id> --title "…"     create an epic under a project
+  epic ls [--project id]                  list epics
+  epic set-status <id> <status>           planned|in_progress|blocked|done|cancelled
+  phase add --epic <id> --title "…"       create a phase under an epic
+  phase ls [--epic id]                    list phases
+  phase set-status <id> <status>          planned|in_progress|blocked|done|cancelled
+  task add <id> --project <id> [--epic id] [--phase id] [--title "…"] [--touches "a,b"]
+                          create a pending backlog task (does not spawn)
 
 Supervision:
   watch                   block until an actionable DB event, print the coalesced

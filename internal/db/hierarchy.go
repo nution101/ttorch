@@ -71,6 +71,19 @@ func (s *Store) ListProjects(ctx context.Context) ([]Project, error) {
 	return out, rows.Err()
 }
 
+// GetProject loads a project by id. The bool reports existence.
+func (s *Store) GetProject(ctx context.Context, id int64) (Project, bool, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+projectColumns+` FROM projects WHERE id = ?`, id)
+	p, err := scanProject(row)
+	if err == sql.ErrNoRows {
+		return Project{}, false, nil
+	}
+	if err != nil {
+		return Project{}, false, err
+	}
+	return p, true, nil
+}
+
 // SetProjectMode updates the cached delivery_mode for display (§0.3/§3.4). This is
 // a DISPLAY CACHE ONLY — the merge/land gates always resolve the authoritative
 // mode from AGENTS.md, never from this column.
@@ -130,6 +143,46 @@ func (s *Store) CreateEpic(ctx context.Context, projectID int64, title, desc str
 	return epic, nil
 }
 
+// ListEpics returns epics, oldest-meaningful-order first: manual position then id.
+// A non-zero projectID scopes to that project; 0 returns every project's epics
+// (ordered by project so a flat listing groups naturally).
+func (s *Store) ListEpics(ctx context.Context, projectID int64) ([]Epic, error) {
+	query := `SELECT ` + epicColumns + ` FROM epics`
+	var args []any
+	if projectID != 0 {
+		query += ` WHERE project_id = ?`
+		args = append(args, projectID)
+	}
+	query += ` ORDER BY project_id ASC, position ASC, id ASC`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Epic
+	for rows.Next() {
+		e, err := scanEpic(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// GetEpic loads an epic by id. The bool reports existence.
+func (s *Store) GetEpic(ctx context.Context, id int64) (Epic, bool, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+epicColumns+` FROM epics WHERE id = ?`, id)
+	e, err := scanEpic(row)
+	if err == sql.ErrNoRows {
+		return Epic{}, false, nil
+	}
+	if err != nil {
+		return Epic{}, false, err
+	}
+	return e, true, nil
+}
+
 const phaseColumns = `id, epic_id, title, description, status, owner, position, created_at, updated_at`
 
 func scanPhase(sc rowScanner) (Phase, error) {
@@ -174,6 +227,46 @@ func (s *Store) CreatePhase(ctx context.Context, epicID int64, title, desc strin
 		return Phase{}, err
 	}
 	return phase, nil
+}
+
+// ListPhases returns phases ordered by manual position then id. A non-zero epicID
+// scopes to that epic; 0 returns every epic's phases (ordered by epic so a flat
+// listing groups naturally).
+func (s *Store) ListPhases(ctx context.Context, epicID int64) ([]Phase, error) {
+	query := `SELECT ` + phaseColumns + ` FROM phases`
+	var args []any
+	if epicID != 0 {
+		query += ` WHERE epic_id = ?`
+		args = append(args, epicID)
+	}
+	query += ` ORDER BY epic_id ASC, position ASC, id ASC`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Phase
+	for rows.Next() {
+		p, err := scanPhase(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// GetPhase loads a phase by id. The bool reports existence.
+func (s *Store) GetPhase(ctx context.Context, id int64) (Phase, bool, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+phaseColumns+` FROM phases WHERE id = ?`, id)
+	p, err := scanPhase(row)
+	if err == sql.ErrNoRows {
+		return Phase{}, false, nil
+	}
+	if err != nil {
+		return Phase{}, false, err
+	}
+	return p, true, nil
 }
 
 // entityTable maps an EntityKind to its (table, entity_type) via a fixed switch —

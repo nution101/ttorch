@@ -191,6 +191,7 @@ type Manager struct {
 type TaskFilter struct {
 	Status      []string // status IN (?,…)
 	ProjectID   int64    // 0 ⇒ any
+	EpicID      int64    // 0 ⇒ any (a non-zero id excludes tasks with NULL epic_id)
 	Owner       string   // "" ⇒ any
 	ParentID    string   // "" ⇒ any
 	ExcludeKind []string // kind NOT IN (?,…), e.g. exclude "cc"
