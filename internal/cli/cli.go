@@ -345,7 +345,7 @@ func cmdSpawn(args []string) error {
 	id, repo := args[0], args[1]
 	fs := flag.NewFlagSet("spawn", flag.ContinueOnError)
 	scout := fs.Bool("scout", false, "investigation task: report only, no code changes")
-	doInit := fs.Bool("init", false, "set the repo up for ttorch first (writes AGENTS.md block + CLAUDE.md symlink); plain spawn never modifies tracked files")
+	doInit := fs.Bool("init", false, "force first-use setup (AGENTS.md block + CLAUDE.md symlink) even when the repo tracks AGENTS.md, which auto-init declines; plain spawn auto-inits only when tracked-file-safe (TTORCH_NO_AUTOINIT=1 to skip)")
 	touches := fs.String("touches", "", `comma-separated file paths/prefixes this task will touch; refuses to dispatch onto files a live worker already holds`)
 	forceOverlap := fs.Bool("force-overlap", false, "dispatch even if the footprint overlaps a live worker (override the conflict refusal)")
 	raw := fs.String("cmd", "", "raw command to run instead of the default harness launch")
@@ -1555,10 +1555,11 @@ Team:
   stop                    stop the manager session (resumable: run 'ttorch')
   cc [--isolated]         open a Claude session attached to the team
   spawn <id> <repo>       start a worker on a task in an isolated worktree
-                          (read-only w.r.t. the repo's tracked files)
+                          (auto-inits the repo when tracked-file-safe;
+                          TTORCH_NO_AUTOINIT=1 to skip)
     --scout                 investigation only (report, no code changes)
-    --init                  set the repo up for ttorch first (AGENTS.md block +
-                            CLAUDE.md symlink); otherwise spawn never writes them
+    --init                  force first-use setup (AGENTS.md block + CLAUDE.md
+                            symlink) even when the repo tracks AGENTS.md
     --touches "a,b"         file paths/prefixes this task will touch; refuses to
                             dispatch onto files a live worker already holds
     --force-overlap         dispatch anyway when --touches overlaps a live worker

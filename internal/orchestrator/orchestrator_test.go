@@ -17,6 +17,7 @@ import (
 	"github.com/nution101/ttorch/internal/projectinit"
 	"github.com/nution101/ttorch/internal/review"
 	"github.com/nution101/ttorch/internal/tmux"
+	"github.com/nution101/ttorch/internal/worktree"
 )
 
 // TestMain disables native worker terminal views for the whole package. The
@@ -36,6 +37,12 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	os.Setenv("TTORCH_HOME", home)
+	// StateDB() honors TTORCH_DB ahead of TTORCH_HOME, so an inherited TTORCH_DB — as a
+	// ttorch-managed worktree exports, pointing at the real ~/.ttorch/state.db — would
+	// otherwise redirect the DB back into the real home despite the pin above (the db.Open
+	// guard then fails the run). Clear it so TTORCH_HOME and each test's own
+	// t.Setenv("TTORCH_HOME", ...) fully govern where state resolves.
+	os.Unsetenv("TTORCH_DB")
 	code := m.Run()
 	_ = os.RemoveAll(home)
 	os.Exit(code)
@@ -180,6 +187,46 @@ func TestSpawn_RefusesFootprintOverlap(t *testing.T) {
 
 	for _, id := range []string{"a1", "c1", "d1"} {
 		_, _ = m.Teardown(id, true)
+	}
+}
+
+// TestSpawn_RefusedOverlapDoesNotAutoInit proves auto-init runs only for a spawn that
+// actually proceeds: a spawn refused by the overlap gate must leave the lead's checkout
+// untouched, the read-only-on-refusal invariant auto-init must not regress. The first
+// worker is spawned with auto-init opted out so the repo stays uninitialized; the opt-out
+// is then cleared, so the ONLY thing that could initialize the repo is the refused second
+// spawn's auto-init — which must not run because the overlap gate returns first.
+func TestSpawn_RefusedOverlapDoesNotAutoInit(t *testing.T) {
+	m, repo := deliveryHarness(t, "refuseautoinit")
+
+	// First worker holds a footprint; opt out so it does NOT auto-init the repo.
+	t.Setenv("TTORCH_NO_AUTOINIT", "1")
+	if _, err := m.SpawnWithFootprint("a1", repo, false, "sleep 30", []string{"internal/cli"}, false); err != nil {
+		t.Fatalf("first spawn: %v", err)
+	}
+	t.Cleanup(func() { _, _ = m.Teardown("a1", true) })
+	if projectinit.Initialized(repo) {
+		t.Fatal("opted-out first spawn must not initialize the repo")
+	}
+
+	// Clear the opt-out: now a pre-gate auto-init on the refused spawn WOULD write.
+	t.Setenv("TTORCH_NO_AUTOINIT", "")
+	_, err := m.SpawnWithFootprint("b1", repo, false, "sleep 30", []string{"internal/cli/cli.go"}, false)
+	if err == nil {
+		t.Fatal("an overlapping spawn must be refused")
+	}
+
+	// The refused spawn must have left the checkout untouched: no auto-init, no files.
+	if projectinit.Initialized(repo) {
+		t.Fatal("a refused spawn must not auto-init the repo (auto-init must run after the refusal gates)")
+	}
+	for _, f := range []string{"AGENTS.md", "CLAUDE.md"} {
+		if _, err := os.Stat(filepath.Join(repo, f)); err == nil {
+			t.Fatalf("a refused spawn must not write %s", f)
+		}
+	}
+	if st := gitIn(t, repo, "status", "--porcelain"); st != "" {
+		t.Fatalf("a refused spawn must leave the checkout clean, got %q", st)
 	}
 }
 
@@ -1563,10 +1610,10 @@ func TestTrustRecord_TrustedBlocksHighFinding(t *testing.T) {
 	_, _ = m.Teardown("tb1", true)
 }
 
-// TestUninitNotice pins the read-only-on-spawn decision: an uninitialized git repo
-// gets a notice naming the default delivery mode and how to persist one, while an
-// already-initialized repo and a non-git path get none (so initialized repos behave
-// exactly as before, with no spurious output). Neither case writes any file — the
+// TestUninitNotice pins the nudge helper auto-init falls back to when it declines to
+// write (a repo that tracks AGENTS.md/CLAUDE.md): an uninitialized git repo gets a
+// notice naming the default delivery mode and how to persist one, while an already-
+// initialized repo and a non-git path get none. Neither case writes any file — the
 // helper only reads.
 func TestUninitNotice(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
@@ -1649,39 +1696,39 @@ func TestInitRepo(t *testing.T) {
 	}
 }
 
-// TestSpawnDoesNotModifyTrackedFiles is the regression guard for the spawn-ux fix:
-// dispatching a worker to an uninitialized repo must leave the lead's checkout
-// untouched — no managed block, no AGENTS.md/CLAUDE.md, no tracked-file changes (the
-// exact condition that previously blocked a clean fast-forward merge) — and the
-// delivery mode falls back to the documented default of "pr".
-func TestSpawnDoesNotModifyTrackedFiles(t *testing.T) {
-	m, repo := deliveryHarness(t, "noinit")
+// TestSpawnAutoInitsUntrackedRepo proves the restored auto-init for the common case: a
+// repo that does NOT commit AGENTS.md gets set up on first spawn (managed block +
+// CLAUDE.md symlink + profile) so a worker always has AGENTS.md to read — and crucially,
+// the writes are UNTRACKED, so the checkout has no tracked-file changes and merge-local's
+// HasTrackedChanges gate stays clear. Mode reads from the freshly written block.
+func TestSpawnAutoInitsUntrackedRepo(t *testing.T) {
+	m, repo := deliveryHarness(t, "autoinit")
 
 	if projectinit.Initialized(repo) {
 		t.Fatal("fresh repo should not be initialized")
 	}
-	if st := gitIn(t, repo, "status", "--porcelain"); st != "" {
-		t.Fatalf("fresh repo should be clean, got %q", st)
-	}
 
-	if _, err := m.Spawn("ni1", repo, false, "sleep 60"); err != nil {
+	if _, err := m.Spawn("ai1", repo, false, "sleep 60"); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { m.Teardown("ni1", true) })
+	t.Cleanup(func() { m.Teardown("ai1", true) })
 
-	if projectinit.Initialized(repo) {
-		t.Fatal("spawn must not initialize the repo")
+	if !projectinit.Initialized(repo) {
+		t.Fatal("spawn should auto-init an untracked repo")
 	}
 	for _, f := range []string{"AGENTS.md", "CLAUDE.md"} {
-		if _, err := os.Stat(filepath.Join(repo, f)); err == nil {
-			t.Fatalf("spawn must not create %s in the lead's checkout", f)
+		if _, err := os.Stat(filepath.Join(repo, f)); err != nil {
+			t.Fatalf("spawn should create %s in the lead's checkout: %v", f, err)
 		}
 	}
-	if st := gitIn(t, repo, "status", "--porcelain"); st != "" {
-		t.Fatalf("spawn must not change tracked files, git status: %q", st)
+	// The whole point: auto-init's writes are untracked, so the merge-local clean gate
+	// (HasTrackedChanges) stays clear. The new files show only as untracked.
+	if changed, err := worktree.HasTrackedChanges(repo); err != nil || changed {
+		t.Fatalf("auto-init must not produce tracked-file changes (err=%v changed=%v); status: %q",
+			err, changed, gitIn(t, repo, "status", "--porcelain"))
 	}
 	if mode := projectinit.ReadMode(repo); mode != "pr" {
-		t.Fatalf("uninitialized repo should default to pr, got %q", mode)
+		t.Fatalf("auto-init writes delivery-mode=pr, got %q", mode)
 	}
 }
 
@@ -1718,6 +1765,274 @@ func TestSpawnLeavesInitializedRepoUnchanged(t *testing.T) {
 	}
 	if mode := projectinit.ReadMode(repo); mode != "validated" {
 		t.Fatalf("ReadMode = %q, want validated (read from the committed block)", mode)
+	}
+}
+
+// newRepoWithTrackedAgents builds a git repo that COMMITS a hand-written AGENTS.md (so
+// AGENTS.md is git-tracked) but has never been `ttorch init`'d. This is the exact shape
+// that broke merge-local before a848c1c: the original auto-init injected the managed
+// block into this tracked file, dirtying the working tree. It returns the repo path and
+// the committed AGENTS.md bytes.
+func newRepoWithTrackedAgents(t *testing.T) (string, []byte) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	repo := t.TempDir()
+	gitIn(t, repo, "init", "-b", "main", "-q")
+	body := []byte("# Project guidance\n\nhand-written, committed by the developer.\n")
+	if err := os.WriteFile(filepath.Join(repo, "AGENTS.md"), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("hi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "-A")
+	gitIn(t, repo, "commit", "-q", "-m", "init with tracked AGENTS.md")
+	return repo, body
+}
+
+// TestAutoInit_UntrackedRepo is the common-case proof, tmux-free: a repo that does NOT
+// commit AGENTS.md gets fully set up by auto-init (managed block + CLAUDE.md + profile),
+// and because those writes are untracked, the checkout has no tracked-file changes — so
+// merge-local's HasTrackedChanges gate stays clear.
+func TestAutoInit_UntrackedRepo(t *testing.T) {
+	repo := newRepoMain(t) // commits f.txt only; no AGENTS.md
+
+	autoInit(repo)
+
+	if !projectinit.Initialized(repo) {
+		t.Fatal("auto-init should set up a repo that does not track AGENTS.md")
+	}
+	for _, f := range []string{"AGENTS.md", "CLAUDE.md"} {
+		if _, err := os.Stat(filepath.Join(repo, f)); err != nil {
+			t.Fatalf("auto-init should create %s: %v", f, err)
+		}
+	}
+	if mode := projectinit.ReadMode(repo); mode != "pr" {
+		t.Fatalf("auto-init writes delivery-mode=pr, got %q", mode)
+	}
+	// The merge-local gate: tracked changes must be empty (the new files are untracked).
+	if changed, err := worktree.HasTrackedChanges(repo); err != nil || changed {
+		t.Fatalf("auto-init must not produce tracked-file changes (err=%v changed=%v); status: %q",
+			err, changed, gitIn(t, repo, "status", "--porcelain"))
+	}
+}
+
+// TestAutoInit_DeclinesOnTrackedAGENTS is the a848c1c regression proof, tmux-free and the
+// heart of this change: auto-init MUST NOT leave a state that blocks merge-local. On a
+// repo that tracks AGENTS.md, auto-init declines to write (it would dirty the tracked
+// file), leaving AGENTS.md byte-identical and the checkout with NO tracked-file changes —
+// i.e. worktree.HasTrackedChanges is false, the exact predicate MergeLocal gates on.
+func TestAutoInit_DeclinesOnTrackedAGENTS(t *testing.T) {
+	repo, before := newRepoWithTrackedAgents(t)
+
+	autoInit(repo)
+
+	if projectinit.Initialized(repo) {
+		t.Fatal("auto-init must decline on a tracked AGENTS.md, not inject the managed block")
+	}
+	after, err := os.ReadFile(filepath.Join(repo, "AGENTS.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("auto-init must not modify a tracked AGENTS.md\n before: %q\n after:  %q", before, after)
+	}
+	// The regression itself: tracked changes must be empty, so merge-local would not be
+	// blocked with "repo has uncommitted changes to tracked files".
+	if changed, err := worktree.HasTrackedChanges(repo); err != nil || changed {
+		t.Fatalf("auto-init left tracked-file changes — the exact a848c1c regression (err=%v changed=%v); status: %q",
+			err, changed, gitIn(t, repo, "status", "--porcelain"))
+	}
+	// And it declined cleanly: it did not even leave an untracked CLAUDE.md behind.
+	if st := gitIn(t, repo, "status", "--porcelain"); st != "" {
+		t.Fatalf("auto-init declined but left the checkout dirty: %q", st)
+	}
+}
+
+// TestAutoInit_DeclinesOnTrackedCLAUDE pins the OTHER arm of the tracksConventionFile OR:
+// a repo that tracks CLAUDE.md (but not AGENTS.md) must also be declined, because
+// projectinit.Init's ensureSymlink would replace the tracked CLAUDE.md and dirty the tree.
+func TestAutoInit_DeclinesOnTrackedCLAUDE(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	repo := t.TempDir()
+	gitIn(t, repo, "init", "-b", "main", "-q")
+	if err := os.WriteFile(filepath.Join(repo, "CLAUDE.md"), []byte("# hand-written CLAUDE.md\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "-A")
+	gitIn(t, repo, "commit", "-q", "-m", "init with tracked CLAUDE.md")
+
+	autoInit(repo)
+
+	if projectinit.Initialized(repo) {
+		t.Fatal("auto-init must decline when CLAUDE.md is tracked, even with no AGENTS.md")
+	}
+	if changed, err := worktree.HasTrackedChanges(repo); err != nil || changed {
+		t.Fatalf("auto-init left tracked-file changes on a tracked CLAUDE.md (err=%v changed=%v); status: %q",
+			err, changed, gitIn(t, repo, "status", "--porcelain"))
+	}
+	if st := gitIn(t, repo, "status", "--porcelain"); st != "" {
+		t.Fatalf("auto-init declined but left the checkout dirty: %q", st)
+	}
+}
+
+// TestAutoInit_NoOpsAndOptOut covers the remaining contract: TTORCH_NO_AUTOINIT=1 is a
+// full opt-out even on a writable repo; a non-git path is a silent no-op; and a second
+// call on an already-initialized repo is idempotent.
+func TestAutoInit_NoOpsAndOptOut(t *testing.T) {
+	// Opt-out: a repo auto-init would otherwise set up is left untouched.
+	optOut := newRepoMain(t)
+	t.Setenv("TTORCH_NO_AUTOINIT", "1")
+	autoInit(optOut)
+	if projectinit.Initialized(optOut) {
+		t.Fatal("TTORCH_NO_AUTOINIT=1 must disable auto-init")
+	}
+	if st := gitIn(t, optOut, "status", "--porcelain"); st != "" {
+		t.Fatalf("opt-out must leave the checkout clean, got %q", st)
+	}
+
+	// Non-git path: no panic, no write — the directory stays empty and uninitialized.
+	nonGit := t.TempDir()
+	autoInit(nonGit)
+	if projectinit.Initialized(nonGit) {
+		t.Fatal("auto-init must not initialize a non-git path")
+	}
+	if entries, err := os.ReadDir(nonGit); err != nil || len(entries) != 0 {
+		t.Fatalf("auto-init must not write into a non-git path (err=%v entries=%d)", err, len(entries))
+	}
+
+	// Idempotent: with the opt-out cleared, the first call initializes and the second is a
+	// no-op (Initialized short-circuits before any write).
+	t.Setenv("TTORCH_NO_AUTOINIT", "")
+	repo := newRepoMain(t)
+	autoInit(repo)
+	if !projectinit.Initialized(repo) {
+		t.Fatal("auto-init should have initialized the repo once opt-out is cleared")
+	}
+	gitIn(t, repo, "add", "-A")
+	gitIn(t, repo, "commit", "-q", "-m", "ttorch init")
+	before := gitIn(t, repo, "rev-parse", "HEAD")
+	autoInit(repo)
+	if after := gitIn(t, repo, "rev-parse", "HEAD"); after != before {
+		t.Fatalf("second auto-init must be a no-op (HEAD %s -> %s)", before, after)
+	}
+	if st := gitIn(t, repo, "status", "--porcelain"); st != "" {
+		t.Fatalf("second auto-init must leave the checkout clean, got %q", st)
+	}
+}
+
+// TestAutoInit_DoesNotTouchRealTtorchHome is the test-isolation proof: TestMain pins
+// TTORCH_HOME at a throwaway dir, so a representative auto-init plus Manager construction
+// resolves all ttorch state under the temp home and never creates or mutates the real
+// ~/.ttorch — guarding `make test` against clobbering a developer's live session.
+func TestAutoInit_DoesNotTouchRealTtorchHome(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no home dir")
+	}
+	realTtorch := filepath.Join(home, ".ttorch")
+
+	// The package-wide pin must be in effect: the resolved ttorch home is NOT the real one.
+	if got := paths.Default().Home; got == realTtorch {
+		t.Fatalf("test isolation broken: resolved TTORCH_HOME %q is the real ~/.ttorch", got)
+	}
+
+	// Snapshot the real ~/.ttorch (it may or may not exist on a given machine).
+	snapshot := func() (bool, []string) {
+		entries, rderr := os.ReadDir(realTtorch)
+		if rderr != nil {
+			return false, nil
+		}
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		return true, names
+	}
+	existedBefore, before := snapshot()
+
+	// A representative operation: auto-init a fresh repo and build a Manager (db.Open).
+	t.Setenv("TTORCH_HOME", t.TempDir())
+	repo := newRepoMain(t)
+	autoInit(repo)
+	m, err := New(paths.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+
+	// The actual write target — the SQLite DB — must resolve outside the real home too.
+	// StateDB() prefers TTORCH_DB over TTORCH_HOME, so this also pins that an inherited
+	// TTORCH_DB cannot redirect a `make test` run into ~/.ttorch (TestMain clears it).
+	if db := m.P.StateDB(); strings.HasPrefix(db, realTtorch+string(os.PathSeparator)) || db == realTtorch {
+		t.Fatalf("test isolation broken: state DB %q resolves under the real ~/.ttorch", db)
+	}
+
+	existsAfter, after := snapshot()
+	if !existedBefore && existsAfter {
+		t.Fatalf("a ttorch operation created the real ~/.ttorch at %q", realTtorch)
+	}
+	if existedBefore && strings.Join(before, "\x00") != strings.Join(after, "\x00") {
+		t.Fatalf("the real ~/.ttorch changed during tests:\n before: %v\n after:  %v", before, after)
+	}
+}
+
+// TestSpawnAutoInit_DoesNotBlockMergeLocal drives the regression end to end through the
+// real runtime: on a repo that tracks AGENTS.md, a worker spawns (auto-init declines, so
+// the checkout stays clean), commits a change, the lead approves, and merge-local MUST
+// fast-forward — the precise flow the original auto-init broke. Requires tmux + git.
+func TestSpawnAutoInit_DoesNotBlockMergeLocal(t *testing.T) {
+	if !tmux.Available() {
+		t.Skip("tmux not installed")
+	}
+	repo, before := newRepoWithTrackedAgents(t)
+	session := fmt.Sprintf("ttorch-aimerge-%d", os.Getpid())
+	t.Setenv("TTORCH_HOME", t.TempDir())
+	t.Setenv("TTORCH_TMUX_SESSION", session)
+	t.Cleanup(func() { exec.Command("tmux", "kill-session", "-t", session).Run() })
+	m, err := New(paths.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+
+	task, err := m.Spawn("aim1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { m.Teardown("aim1", true) })
+
+	// Auto-init declined on the tracked AGENTS.md: byte-identical, clean checkout.
+	if projectinit.Initialized(repo) {
+		t.Fatal("auto-init must decline on a tracked AGENTS.md")
+	}
+	if after, _ := os.ReadFile(filepath.Join(repo, "AGENTS.md")); string(before) != string(after) {
+		t.Fatal("auto-init must not rewrite a tracked AGENTS.md")
+	}
+	if changed, err := worktree.HasTrackedChanges(repo); err != nil || changed {
+		t.Fatalf("spawn left tracked-file changes (a848c1c regression): err=%v changed=%v status=%q",
+			err, changed, gitIn(t, repo, "status", "--porcelain"))
+	}
+
+	// The worker commits; the lead approves; merge-local must fast-forward cleanly.
+	wt := task.Worktree
+	if err := os.WriteFile(filepath.Join(wt, "feature.txt"), []byte("new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, wt, "add", "-A")
+	gitIn(t, wt, "commit", "-q", "-m", "add feature")
+	if err := m.Approve("aim1", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.MergeLocal("aim1", false); err != nil {
+		t.Fatalf("merge-local must succeed after auto-init on a tracked-AGENTS.md repo (a848c1c regression): %v", err)
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") != gitIn(t, wt, "rev-parse", "HEAD") {
+		t.Fatal("default branch was not fast-forwarded to the worker HEAD")
 	}
 }
 
@@ -2181,8 +2496,11 @@ func TestLand_PRModeRequiresOrigin(t *testing.T) {
 }
 
 // TestLand_RefusesUninitializedRepo: land must not guess a delivery mode — an uninitialized
-// repo is refused with an actionable message rather than silently routed to pr.
+// repo is refused with an actionable message rather than silently routed to pr. Auto-init
+// is disabled here so spawn leaves the repo uninitialized (its whole point); the refusal
+// being tested is Land's, not auto-init's.
 func TestLand_RefusesUninitializedRepo(t *testing.T) {
+	t.Setenv("TTORCH_NO_AUTOINIT", "1")
 	m, repo := deliveryHarness(t, "landuninit")
 	task, err := m.Spawn("u1", repo, false, "sleep 60")
 	if err != nil {

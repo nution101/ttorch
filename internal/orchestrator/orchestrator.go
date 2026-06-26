@@ -181,10 +181,6 @@ func (m *Manager) SpawnWithFootprint(taskID, projectPath string, scout bool, raw
 	if err != nil {
 		return zero, fmt.Errorf("%s is not inside a git repository", projectPath)
 	}
-	// Read-only with respect to the lead's checkout: announce the delivery mode and
-	// never write tracked files. First-use setup (AGENTS.md managed block + CLAUDE.md
-	// symlink + profile) is opt-in via `ttorch init` or `ttorch spawn --init`.
-	noticeDeliveryMode(repo)
 
 	window := "wk-" + taskID
 	if tmux.WindowExists(m.Session, window) {
@@ -203,6 +199,14 @@ func (m *Manager) SpawnWithFootprint(taskID, projectPath string, scout bool, raw
 			return zero, ConflictError(footprint, conflicts)
 		}
 	}
+
+	// Zero-config first-use setup so a worker always has AGENTS.md to read. autoInit is
+	// safe by construction: it writes the managed block / CLAUDE.md symlink / profile only
+	// when that introduces no tracked-file change, and otherwise nudges toward `ttorch
+	// init` — so it can never re-break merge-local (a848c1c). Opt out with TTORCH_NO_AUTOINIT.
+	// Placed AFTER the window and overlap refusal gates so a refused spawn — like the
+	// read-only notice it replaced — leaves the lead's checkout untouched.
+	autoInit(repo)
 
 	wt, err := m.Pool.Acquire(repo, m.inUseWorktrees(repo))
 	if err != nil {
@@ -524,15 +528,12 @@ func (m *Manager) Teardown(taskID string, force bool) ([]string, error) {
 	return notes, nil
 }
 
-// uninitNotice returns the one-line notice to print on spawn (and manager start) when
-// path is inside a git repo that has not been `ttorch init`'d, or "" when no notice is
-// warranted — a non-git path or an already-initialized repo. Splitting the decision
-// from the printing keeps the read-only-on-spawn contract testable without tmux.
-//
-// It is strictly read-only: it never writes AGENTS.md, the CLAUDE.md symlink, or the
-// project profile. Setup is opt-in via `ttorch init` or `ttorch spawn --init`
-// (see InitRepo). The mode reported is whatever projectinit.ReadMode resolves, which
-// defaults to "pr" for an uninitialized repo.
+// uninitNotice returns the one-line nudge to print when path is inside a git repo that
+// has not been `ttorch init`'d AND auto-init declined to write it (because the repo
+// tracks AGENTS.md/CLAUDE.md — see autoInit), or "" when no nudge is warranted (a non-git
+// path or an already-initialized repo). Splitting the decision from the printing keeps it
+// testable without tmux. The mode reported is whatever projectinit.ReadMode resolves,
+// which defaults to "pr" for an uninitialized repo. It is strictly read-only.
 func uninitNotice(path string) string {
 	repo, err := worktree.RepoRoot(path)
 	if err != nil || projectinit.Initialized(repo) {
@@ -542,12 +543,69 @@ func uninitNotice(path string) string {
 		repo, projectinit.ReadMode(repo))
 }
 
-// noticeDeliveryMode prints the uninitNotice for path to stderr, if any. It is the
-// non-destructive replacement for the former auto-init: spawn and manager start tell
-// the lead which delivery mode is in effect without ever mutating their checkout.
-func noticeDeliveryMode(path string) {
-	if msg := uninitNotice(path); msg != "" {
-		fmt.Fprintln(os.Stderr, "ttorch: "+msg)
+// tracksConventionFile reports whether the repo git-tracks AGENTS.md or CLAUDE.md. When
+// it does, auto-init must NOT write: both projectinit.Init and profile.Apply upsert a
+// managed block into AGENTS.md (and Init re-links CLAUDE.md), so writing would modify a
+// tracked file, dirtying the checkout and tripping merge-local's HasTrackedChanges gate —
+// the exact regression that retired the original auto-init (a848c1c). `git ls-files`
+// lists only tracked paths, so a non-empty result for either means it is tracked. A git
+// error fails safe (treated as tracked): decline to write rather than risk dirtying.
+func tracksConventionFile(repo string) bool {
+	out, err := exec.Command("git", "-C", repo, "ls-files", "--", "AGENTS.md", "CLAUDE.md").Output()
+	if err != nil {
+		return true
+	}
+	return strings.TrimSpace(string(out)) != ""
+}
+
+// autoInit restores ttorch's zero-config first-use setup for the repo containing path:
+// it writes the AGENTS.md managed block, the CLAUDE.md symlink, and the project profile
+// so a worker always has AGENTS.md to read, without the lead having to run `ttorch init`.
+//
+// It is safe by construction — it writes ONLY when doing so introduces no change to a
+// git-tracked file. The original auto-init (removed in a848c1c) injected the managed
+// block into a tracked, committed AGENTS.md, which left the lead's checkout with an
+// uncommitted tracked-file change and blocked merge-local's clean fast-forward
+// (worktree.HasTrackedChanges). Here, when the repo tracks AGENTS.md/CLAUDE.md, auto-init
+// declines to write and instead prints the one-line nudge directing the lead to
+// `ttorch init` (which they then commit themselves). For the common case — a repo that
+// does not commit these convention files — the new AGENTS.md/CLAUDE.md are untracked,
+// which the merge gate explicitly tolerates (see MergeLocal). The write itself is
+// clobber-safe and idempotent (projectinit.Init preserves developer content).
+//
+// It no-ops outside a git repo, on an already-initialized repo, and when
+// TTORCH_NO_AUTOINIT is set.
+func autoInit(path string) {
+	if os.Getenv("TTORCH_NO_AUTOINIT") != "" {
+		return
+	}
+	repo, err := worktree.RepoRoot(path)
+	if err != nil || projectinit.Initialized(repo) {
+		return
+	}
+	// Safety gate: never modify a tracked file (the a848c1c regression). If the repo
+	// commits AGENTS.md/CLAUDE.md, decline and nudge the lead toward explicit `ttorch
+	// init` rather than dirtying the tree and breaking merge-local.
+	if tracksConventionFile(repo) {
+		if msg := uninitNotice(repo); msg != "" {
+			fmt.Fprintln(os.Stderr, "ttorch: "+msg)
+		}
+		return
+	}
+	notes, err := projectinit.Init(repo, "pr")
+	if err != nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "ttorch: set up %s for ttorch (set TTORCH_NO_AUTOINIT=1 to skip)\n", repo)
+	for _, n := range notes {
+		fmt.Fprintln(os.Stderr, "  "+n)
+	}
+	if p, err := profile.Apply(repo); err == nil {
+		stack := p.Stack
+		if stack == "" {
+			stack = "unknown"
+		}
+		fmt.Fprintf(os.Stderr, "  wrote project profile (stack: %s)\n", stack)
 	}
 }
 
@@ -610,7 +668,7 @@ func (m *Manager) StartManager() error {
 	if err := m.Store.SetManager(context.Background(), db.Manager{Dir: dir, SessionID: sid}); err != nil {
 		return err
 	}
-	noticeDeliveryMode(dir) // read-only: never mutate the launch dir's tracked files
+	autoInit(dir) // zero-config first-use setup of the launch dir; tracked-file-safe (a848c1c)
 	if err := m.newWindow("manager", dir, "manager"); err != nil {
 		return err
 	}

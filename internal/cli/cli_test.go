@@ -22,6 +22,10 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	os.Setenv("TTORCH_HOME", home)
+	// Clear any inherited TTORCH_DB (a ttorch-managed worktree exports one pointing at the
+	// real ~/.ttorch/state.db); StateDB() prefers it over TTORCH_HOME, so leaving it set
+	// would resolve the DB back into the real home despite the pin above.
+	os.Unsetenv("TTORCH_DB")
 	code := m.Run()
 	_ = os.RemoveAll(home)
 	os.Exit(code)
