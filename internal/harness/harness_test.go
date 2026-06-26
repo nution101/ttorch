@@ -260,6 +260,25 @@ func collapseSpaces(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
+// TestManagerCharterWatchLoop pins the inc7 event-driven loop into the launch-time
+// manager charter: rule (5) arms `ttorch watch` and, when surfacing a decision, cancels
+// any in-flight watcher and does not re-arm — and the retired supervisor/wake-queue
+// vocabulary is gone. Cross-encoding sync with the skill + global template is covered by
+// TestManagerOperatingRulesInSync; this guards the charter const's own wording.
+func TestManagerCharterWatchLoop(t *testing.T) {
+	low := strings.ToLower(managerCharter)
+	for _, want := range []string{"ttorch watch", "cancel any in-flight watcher", "do not re-arm"} {
+		if !strings.Contains(low, want) {
+			t.Errorf("managerCharter is missing required phrase %q", want)
+		}
+	}
+	for _, banned := range []string{"supervisor", "daemon", "wake drain", "wake queue"} {
+		if strings.Contains(low, banned) {
+			t.Errorf("managerCharter still references retired %q", banned)
+		}
+	}
+}
+
 func TestBriefCommandCarriesSessionID(t *testing.T) {
 	t.Setenv("TTORCH_EFFORT", "off")
 	cmd := BriefCommand("claude", "/tmp/b.md", "wk-sid")

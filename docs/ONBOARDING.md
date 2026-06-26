@@ -68,8 +68,9 @@ You direct; the manager dispatches and supervises:
 2. **Dispatch** — `ttorch spawn <id> <repo>` starts a worker in its own isolated
    worktree (add `--scout` for investigation-only tasks that produce a report, not code).
 3. **Supervise** — `ttorch status` lists workers; `ttorch peek <id>` reads a worker's
-   output; `ttorch send <id> "<message>"` steers one. The manager's event-driven watcher
-   wakes it on real worker events, so an idle team costs nothing. On macOS, each spawned worker
+   output; `ttorch send <id> "<message>"` steers one. The manager arms an event-driven
+   watcher that wakes it on real worker events, so an idle team costs nothing; while it is
+   waiting on a decision from you it stays silent until you reply. On macOS, each spawned worker
    also opens a native terminal tab/window viewing its tmux window (see §11); inside tmux,
    `Ctrl-b w` still navigates between worker windows. With iTerm2 installed (recommended;
    `ttorch doctor` can install it), bare `ttorch` opens the manager in a new iTerm2 window
@@ -168,13 +169,38 @@ the WSL distribution (`ttorch doctor` will).
 | `TTORCH_TERMINAL` | `auto` | which terminal to use for worker views: `auto` (iTerm then Terminal.app), `iterm`, or `terminal` |
 | `TTORCH_REPO` | `nution101/ttorch` | release source for install/update |
 
-## 12. Troubleshooting
+## 12. Picker-safety validation (one-time)
+
+The manager puts decisions to you through Claude Code's `AskUserQuestion` picker. ttorch
+removed every path that types into the manager session — the watcher wakes the manager
+through the harness's own background-task-completion channel, never a keystroke — so an
+open picker cannot be disturbed by a watcher firing. Confirm that once, on a real install,
+before relying on pickers:
+
+1. In a live manager session, open an `AskUserQuestion` picker (ask the manager to put a
+   decision to you).
+2. From another shell, insert an actionable event — e.g.
+   `ttorch report blocked --task <id>` — and, separately, arm `ttorch watch` and let it
+   fire.
+3. Confirm the watcher's background completion **does not auto-select or dismiss the
+   picker** (it cannot: completion is the harness's own notification, not stdin or
+   keystrokes).
+4. Test the mid-generation case too: let `ttorch watch` exit while the manager is actively
+   generating, and confirm the completion is queued and surfaced at the next turn boundary
+   with no disruption.
+5. Record the result where the team can see it (e.g. the PR that lands the watcher).
+
+**Prose-only fallback.** If a watcher firing ever disturbs an open picker, the manager
+switches to plain-text questions (no picker) while awaiting your decision. See
+`docs/design/sqlite-event-architecture.md` §4.6 for the full rationale.
+
+## 13. Troubleshooting
 
 - `ttorch doctor` — missing dependencies, package manager, WSL status.
 - `ttorch status` — active workers and their state. `ttorch recovery` reconciles tracked
   tasks against live tmux windows after a crash or restart.
 
-## 13. Uninstall
+## 14. Uninstall
 
 ```sh
 ttorch uninstall            # remove managed files (keeps anything you edited)

@@ -249,3 +249,65 @@ func TestPromptHook_LargePromptIsFast(t *testing.T) {
 func jsonPrompt(prompt string) string {
 	return `{"hook_event_name":"UserPromptSubmit","prompt":"` + prompt + `"}`
 }
+
+// TestManagerProtocolContent pins the inc7 event-driven manager protocol into the two
+// durable, shipped encodings the manager actually reloads: the ttorch-manager skill and
+// the global managed-block template installed to ~/.claude/AGENTS.md. It asserts each file
+// still carries its managed marker, describes the arm-`ttorch watch` /
+// cancel-on-awaiting-lead loop with the DB as the source of truth, and no longer mentions
+// the retired supervisor daemon or wake-queue. Reading the embedded payload keeps the test
+// hermetic — it never touches a real ~/.ttorch or ~/.claude. (The charter encoding is
+// guarded in internal/harness; the design doc under docs/design legitimately recounts the
+// retired components as history and is intentionally not scanned here.)
+func TestManagerProtocolContent(t *testing.T) {
+	read := func(name string) string {
+		t.Helper()
+		b, err := Content.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		return string(b)
+	}
+	const (
+		skillPath  = "content/skills/ttorch-manager/SKILL.md"
+		globalPath = "content/assets/AGENTS.global.md"
+	)
+	skill := read(skillPath)
+	global := read(globalPath)
+
+	// Managed markers are intact, so the installer's block-wrapping and the
+	// cross-encoding drift guards still recognize each file as the managed protocol.
+	for _, want := range []string{"name: ttorch-manager", "managed-by: ttorch"} {
+		if !strings.Contains(skill, want) {
+			t.Errorf("%s: missing managed marker %q", skillPath, want)
+		}
+	}
+	if !strings.Contains(global, "This block is managed by `ttorch`") {
+		t.Errorf("%s: missing the managed-block notice", globalPath)
+	}
+
+	files := []struct{ path, text string }{{skillPath, skill}, {globalPath, global}}
+
+	// The event-driven loop (arm `ttorch watch`; cancel the watcher and do not re-arm when
+	// awaiting the lead) and the DB source of truth are present in both durable encodings.
+	required := []string{"ttorch watch", "ttorch tasks", "cancel any in-flight watcher", "do not re-arm"}
+	for _, f := range files {
+		low := strings.ToLower(f.text)
+		for _, want := range required {
+			if !strings.Contains(low, want) {
+				t.Errorf("%s: missing required phrase %q", f.path, want)
+			}
+		}
+	}
+
+	// No retired supervisor / daemon / wake-queue vocabulary survives in either encoding.
+	banned := []string{"supervisor", "daemon", "wake drain", "wake queue"}
+	for _, f := range files {
+		low := strings.ToLower(f.text)
+		for _, b := range banned {
+			if strings.Contains(low, b) {
+				t.Errorf("%s: still references retired %q", f.path, b)
+			}
+		}
+	}
+}

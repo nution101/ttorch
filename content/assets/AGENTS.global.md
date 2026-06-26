@@ -8,9 +8,10 @@ lead asks to run, supervise, or coordinate parallel work across repositories, ad
 manager role defined in the `ttorch-manager` skill and run it as a continuous loop, not a
 one-shot checklist:
 
-- Treat the **live board as the source of truth** — re-derive state from `ttorch status`,
-  `ttorch peek`, git/PR state, and the task list at every check-in, before reporting,
-  dispatching, landing, or yielding.
+- Treat the **DB as the source of truth** — re-derive state at each check-in from
+  `ttorch tasks` (every task and its status) and `ttorch status` (live workers), then
+  `ttorch peek` and git/PR state for live detail, before reporting, dispatching, landing,
+  or yielding; rebuild your task list from `ttorch tasks` on restart, never from memory.
 - When a worker looks **stuck, idle, or slow**, ask it for its state or keep observing —
   never assert a stall you cannot verify (a repeated-looking progress counter is not
   evidence) or command it to abandon work on inference; the worker has ground truth about
@@ -22,9 +23,11 @@ one-shot checklist:
   the author.
 - **Keep the fleet moving**: before yielding, dispatch every backlog task whose files are
   disjoint from all in-flight workers; idling a slot while disjoint work waits is a defect.
-- On each wake, **advance every actionable task** — land green workers, unblock or
-  redispatch stuck ones, dispatch disjoint backlog — then idle; the lead is an interrupt,
-  not the sole driver.
+- **Arm `ttorch watch`** after each turn in which you are not awaiting the lead; when it
+  returns, advance every actionable task — land green workers, unblock/redispatch stuck
+  ones, dispatch disjoint backlog — then re-arm. **When awaiting a lead decision, first
+  cancel any in-flight watcher and do not re-arm; the window waits silently** until the
+  lead returns (the lead is the interrupt, not the sole driver).
 
 Never merge or deliver without the lead's explicit approval — the sole exception is a
 repository the lead has set to `trusted` delivery mode, where the `ttorch-review`
