@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.5.2](https://github.com/nution101/ttorch/compare/v0.5.1...v0.5.2) (2026-06-27)
+
+
+### Bug Fixes
+
+* **trust:** refuse a stale base and stage a three-dot review diff in trust prep ([12b5df9](https://github.com/nution101/ttorch/commit/12b5df9951616ff5f553740de994081f67376911))
+* **watch:** reap an orphan holding the singleton instead of exiting blind ([b8c06f1](https://github.com/nution101/ttorch/commit/b8c06f18ed4a20e8c85cc88e9527834019166707))
+* **worktree:** base pooled worktrees on the fresh origin default ([a22f043](https://github.com/nution101/ttorch/commit/a22f0434578e6f6b89b1607b4f40fe6a1077f746))
+
+
+### Performance Improvements
+
+* **review:** trust-gate reviewers trust the staged validate.json ([74596b7](https://github.com/nution101/ttorch/commit/74596b7998c10e2d2f8770bd1996e1984b66bf31))
+
 ## [0.5.1](https://github.com/nution101/ttorch/compare/v0.5.0...v0.5.1) (2026-06-26)
 
 
