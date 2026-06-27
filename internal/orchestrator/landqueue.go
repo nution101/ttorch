@@ -43,8 +43,15 @@ type LandResult struct {
 //   - Tasks in the SAME repo with DISJOINT footprints overlap all of their prep and serialize
 //     only the fast-forward. When an earlier sibling advances the default, a later one finds
 //     its prep stale, re-rebases onto the new tip (clean, because the files are disjoint) and
-//     carries its verdict forward with no re-review — then lands. The validate re-runs, but in
-//     concurrent prep, off the lock.
+//     carries its VERDICT forward with no re-review — its reviewed diff is unchanged. Its
+//     VALIDATE, however, re-runs: the re-rebased tree now also contains the sibling's change,
+//     and two individually-green disjoint changes can still be red together (a moved symbol an
+//     importer depends on, a go.mod bump), so the combined tree that actually lands must be
+//     re-validated — carrying a stale green forward would risk landing a broken default. That
+//     re-validation runs in concurrent prep, off the lock, so the suites still overlap across
+//     tasks; the trade is extra validate passes (one per advance a task rebases over — up to
+//     ~N per task in a fully-contended batch of N) bought in exchange for never landing an
+//     unverified tree. The fast-forward itself stays the only serialized, and cheap, step.
 //   - Tasks in the same repo touching the SAME files (same package) cannot both fast-forward a
 //     linear history: the later one's re-rebase onto the earlier one's change conflicts (or
 //     changes its reviewed diff), so it falls back to the existing re-gate path. Same-package
