@@ -223,8 +223,18 @@ func TestRun_TimeoutPrintsWatchTimeout(t *testing.T) {
 // TestRun_AwaitingLeadKeepsBlocking: with awaiting_lead set, a pending actionable
 // event is NOT surfaced — the watcher keeps blocking (the §4.6 backstop) until
 // cancelled, never printing a batch or WATCH_TIMEOUT.
+//
+// The loop is driven through a deterministic sweep handshake rather than a wall-clock
+// sleep: w.wait blocks until the test releases each sweep (advancing the fake clock by
+// the poll interval as it goes), so there is no real sleeping and no timing window to
+// race. Each sweep advances the fake clock, so the loop crosses its own Timeout horizon
+// long before the test releases it — a regression that let the timeout branch fire while
+// awaiting_lead would surface here as an early TimedOut return. Cancellation is the only
+// thing that releases the backstop. The time.After guards below are generous deadlock
+// failsafes (they fire only if the watcher stops sweeping or hangs on cancel — a real
+// bug), never load-bearing timing assertions.
 func TestRun_AwaitingLeadKeepsBlocking(t *testing.T) {
-	w, s, buf, _ := newWatcher(t)
+	w, s, buf, clk := newWatcher(t)
 	ctx := context.Background()
 	seedActiveTask(t, s, "delta", "wk-delta")
 	report(t, s, "delta", db.StatusBlocked, "an urgent blocker") // actionable, but must stay silent
@@ -232,17 +242,23 @@ func TestRun_AwaitingLeadKeepsBlocking(t *testing.T) {
 		t.Fatalf("SetAwaitingLead: %v", err)
 	}
 	w.Timeout = 20 * time.Millisecond // would fire if the loop reached the timeout branch
-	// Use a real (tiny) wait so the goroutine does not hot-spin; honor cancellation.
+	w.Poll = 10 * time.Millisecond
+
+	// swept announces each loop iteration; the watcher parks here between sweeps until the
+	// test receives, then advances the fake clock and continues (or returns on cancel).
+	swept := make(chan struct{})
 	w.wait = func(ctx context.Context, d time.Duration) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(2 * time.Millisecond):
+		case swept <- struct{}{}:
 		}
-		return nil
+		clk.t = clk.t.Add(d)
+		return ctx.Err()
 	}
 
 	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	resCh := make(chan Result, 1)
 	errCh := make(chan error, 1)
 	go func() {
@@ -251,17 +267,24 @@ func TestRun_AwaitingLeadKeepsBlocking(t *testing.T) {
 		errCh <- err
 	}()
 
-	// Let it sweep well past its timeout; it must still be blocking and silent.
-	time.Sleep(80 * time.Millisecond)
-	select {
-	case <-resCh:
-		t.Fatalf("watcher surfaced/returned while awaiting the lead; output:\n%s", buf.String())
-	default:
+	// Step the loop through many sweeps — well past its Timeout in fake-clock time (each
+	// sweep advances the clock by the poll interval). It must keep blocking: never
+	// surfacing the pending blocked event, never timing out.
+	const observeSweeps = 10
+	for i := 0; i < observeSweeps; i++ {
+		select {
+		case <-swept:
+		case res := <-resCh:
+			t.Fatalf("watcher returned while awaiting the lead at sweep %d: %+v\noutput:\n%s", i, res, buf.String())
+		case <-time.After(10 * time.Second):
+			t.Fatalf("watcher did not sweep within the failsafe deadline (sweep %d)", i)
+		}
 	}
 	if buf.Len() != 0 {
 		t.Fatalf("watcher must stay silent while awaiting the lead, printed:\n%s", buf.String())
 	}
 
+	// Only cancellation releases the backstop.
 	cancel()
 	select {
 	case res := <-resCh:
@@ -271,7 +294,7 @@ func TestRun_AwaitingLeadKeepsBlocking(t *testing.T) {
 		if err := <-errCh; !errors.Is(err, context.Canceled) {
 			t.Fatalf("expected context.Canceled, got %v", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("watcher did not return after cancel")
 	}
 }
