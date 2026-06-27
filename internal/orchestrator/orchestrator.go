@@ -1020,13 +1020,46 @@ func (m *Manager) Approve(taskID string, ttl time.Duration) error {
 	return nil
 }
 
+// gitOut runs `git -C dir <args...>` and returns its raw stdout, enriching the error with
+// git's stderr on failure. The trust-prep path uses it to shell `git rev-list` and `git
+// diff` directly: the equivalent reads live in internal/worktree, but a sibling change owns
+// that file, so the trust gate runs these here rather than collide with it.
+func gitOut(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, msg)
+		}
+		return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+	}
+	return string(out), nil
+}
+
+// mergeBaseDiff returns the COMMITTED three-dot diff `git diff base...rev`: the diff from
+// the merge-base of base and rev to rev, i.e. ONLY rev's own changes. The trust gate stages
+// this for the reviewers so any lead base gained since rev was cut never appears — a two-dot
+// `git diff base rev` renders that lead as phantom reverts, which burned a full
+// three-reviewer pass and nearly masked a real bug (the cosign-strict / liveness-dwell
+// near-miss). Reads committed objects only, never a working tree.
+func mergeBaseDiff(dir, base, rev string) (string, error) {
+	return gitOut(dir, "diff", base+"..."+rev)
+}
+
 // TrustPrep materializes the inputs the adversarial reviewers read for taskID into
-// ReviewInputsDir: the COMMITTED diff against the default branch (diff.patch), the brief
-// (brief.md, if one was written), a fresh validate of the committed sha (validate.json),
-// and the reviewed HEAD (head.txt). It refuses a dirty worktree and reads only committed
-// objects, so the reviewers see exactly the commit that will fast-forward — a worker
-// cannot present a benign working tree while a different commit merges. It returns the
-// inputs dir.
+// ReviewInputsDir: the COMMITTED three-dot diff against the default branch (diff.patch),
+// the brief (brief.md, if one was written), a fresh validate of the committed sha
+// (validate.json), and the reviewed HEAD (head.txt). It refuses a dirty worktree and reads
+// only committed objects, so the reviewers see exactly the commit that will fast-forward —
+// a worker cannot present a benign working tree while a different commit merges.
+//
+// It also refuses a STALE BASE up front: if the default branch carries commits the worker's
+// HEAD lacks, prep fails (staging nothing) and tells the manager to rebase the worker first.
+// Reviewing a stale-base branch diffs against a base that no longer matches what merges, the
+// merge gate would refuse the fast-forward anyway, and the diff would otherwise surface the
+// default's own lead as phantom reverts. It returns the inputs dir.
 func (m *Manager) TrustPrep(taskID string) (string, error) {
 	t, ok, err := m.Store.GetTask(context.Background(), taskID)
 	if err != nil || !ok {
@@ -1040,12 +1073,35 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	def := worktree.DefaultBranch(t.Project)
+
+	// Stale-base guard — run BEFORE staging any inputs or dispatching reviewers. If the
+	// default branch carries commits the worker's HEAD lacks, the branch was cut from an
+	// older base: the merge gate would refuse the fast-forward anyway, and a base-relative
+	// review diff would render the default's own lead as phantom reverts — which burned a
+	// full three-reviewer pass and nearly masked a real bug (the cosign-strict /
+	// liveness-dwell near-miss). `git rev-list <head>..<def>` lists exactly the commits the
+	// default has that the worker lacks; any output means the base is stale. Fail loudly so
+	// the manager rebases the worker onto the current default first, and stage nothing.
+	behind, err := gitOut(t.Worktree, "rev-list", head+".."+def)
+	if err != nil {
+		return "", fmt.Errorf("trust prep %q: could not check whether the branch is based on the current %s: %w", taskID, def, err)
+	}
+	if behind = strings.TrimSpace(behind); behind != "" {
+		return "", fmt.Errorf("trust prep: the branch for %q is %d commit(s) behind %s and its base is stale; have the worker rebase onto the current %s before review, then re-run 'ttorch trust prep %s'", taskID, len(strings.Split(behind, "\n")), def, def, taskID)
+	}
+
 	dir := m.P.ReviewInputsDir(taskID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	// The reviewers' diff is the COMMITTED diff (base..HEAD), never the working tree.
-	diff, err := worktree.DiffCommitted(t.Worktree, worktree.DefaultBranch(t.Project), head)
+	// The reviewers' diff is the COMMITTED three-dot diff `git diff <def>...<head>` (the
+	// merge-base diff), so it contains ONLY the branch's own changes — never any lead the
+	// default gained since the branch was cut. The stale-base guard above makes <def> an
+	// ancestor of <head> here, but the three-dot form is the correct, intent-revealing way
+	// to diff a branch against its base, and is defense in depth against a phantom-revert
+	// diff. Reads committed objects only, never the working tree.
+	diff, err := mergeBaseDiff(t.Worktree, def, head)
 	if err != nil {
 		return "", err
 	}

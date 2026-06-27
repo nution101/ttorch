@@ -790,6 +790,111 @@ func TestTrustPrep(t *testing.T) {
 	_, _ = m.Teardown("pp1", true)
 }
 
+// TestTrustPrep_RefusesStaleBase: when the default branch has advanced past the worker's
+// base (the worker's HEAD lacks commits the default now has), trust prep must FAIL with a
+// rebase message and stage NOTHING — never run the reviewers against a stale-base diff
+// whose phantom reverts of the default's lead waste a full review pass.
+func TestTrustPrep_RefusesStaleBase(t *testing.T) {
+	m, repo := deliveryHarness(t, "stalebase")
+	task, err := m.Spawn("sb1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The worker commits its own change on the base it was cut from.
+	_ = commitFeature(t, task.Worktree, "worker.txt", "worker change\n")
+	// Meanwhile the default branch advances with an INDEPENDENT commit the worker lacks.
+	if err := os.WriteFile(filepath.Join(repo, "main_lead.txt"), []byte("lead\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "-A")
+	gitIn(t, repo, "commit", "-q", "-m", "default advances")
+
+	_, err = m.TrustPrep("sb1")
+	if err == nil {
+		t.Fatal("trust prep must refuse a stale-base branch")
+	}
+	if msg := err.Error(); !strings.Contains(msg, "stale") || !strings.Contains(msg, "rebase") {
+		t.Fatalf("stale-base refusal must name the staleness and tell the manager to rebase, got: %v", err)
+	}
+	// Nothing staged: the guard runs before any inputs are materialized.
+	if _, statErr := os.Stat(filepath.Join(m.P.ReviewInputsDir("sb1"), "diff.patch")); statErr == nil {
+		t.Fatal("a refused stale-base prep must NOT stage diff.patch")
+	}
+	_, _ = m.Teardown("sb1", true)
+}
+
+// TestTrustPrep_UpToDateAfterRebaseSucceeds: once the worker rebases onto the advanced
+// default, its base is current again, so prep succeeds — and the staged diff carries ONLY
+// the worker's own change, never the default's lead (no phantom reverts).
+func TestTrustPrep_UpToDateAfterRebaseSucceeds(t *testing.T) {
+	m, repo := deliveryHarness(t, "rebased")
+	task, err := m.Spawn("rb1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := task.Worktree
+	_ = commitFeature(t, wt, "worker.txt", "worker change\n")
+	// Advance the default, then rebase the worker onto it so its base is current.
+	if err := os.WriteFile(filepath.Join(repo, "main_lead.txt"), []byte("lead\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "-A")
+	gitIn(t, repo, "commit", "-q", "-m", "default advances")
+	gitIn(t, wt, "rebase", "main")
+
+	dir, err := m.TrustPrep("rb1")
+	if err != nil {
+		t.Fatalf("prep on an up-to-date (rebased) branch should succeed: %v", err)
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "diff.patch"))
+	if !strings.Contains(string(b), "worker.txt") {
+		t.Fatalf("staged diff must contain the worker's own change: %s", b)
+	}
+	if strings.Contains(string(b), "main_lead.txt") {
+		t.Fatalf("staged diff must NOT contain the default's lead (no phantom revert): %s", b)
+	}
+	_, _ = m.Teardown("rb1", true)
+}
+
+// TestTrustPrep_ReviewDiffIsThreeDotNoPhantomReverts is the headline diff-form guard: the
+// trust gate stages the three-dot (merge-base) diff, so even against a default that has
+// advanced it shows ONLY the branch's own changes — never the default's lead as phantom
+// reverts. It exercises the diff computation directly because the stale-base guard refuses
+// to stage in this state; the two-dot diff is asserted as the contrast it replaced.
+func TestTrustPrep_ReviewDiffIsThreeDotNoPhantomReverts(t *testing.T) {
+	m, repo := deliveryHarness(t, "threedot")
+	task, err := m.Spawn("td1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := task.Worktree
+	head := commitFeature(t, wt, "worker.txt", "worker change\n")
+	// The default advances with a commit the worker's HEAD lacks (a stale base).
+	if err := os.WriteFile(filepath.Join(repo, "main_lead.txt"), []byte("lead\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "-A")
+	gitIn(t, repo, "commit", "-q", "-m", "default advances")
+
+	// Three-dot (what the gate stages): only the branch's own change.
+	threeDot, err := mergeBaseDiff(wt, "main", head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(threeDot, "worker.txt") {
+		t.Fatalf("three-dot diff must contain the branch's change: %s", threeDot)
+	}
+	if strings.Contains(threeDot, "main_lead.txt") {
+		t.Fatalf("three-dot diff must NOT surface the default's lead as a phantom revert: %s", threeDot)
+	}
+	// The two-dot form it replaced WOULD surface the default's lead as a phantom revert —
+	// the exact bug (cosign-strict / liveness-dwell) this change closes.
+	if twoDot := gitIn(t, wt, "diff", "main", head); !strings.Contains(twoDot, "main_lead.txt") {
+		t.Fatalf("sanity: the old two-dot diff should have shown the phantom revert, got: %s", twoDot)
+	}
+	_, _ = m.Teardown("td1", true)
+}
+
 func TestTrustRecord_RefusesStaleSha(t *testing.T) {
 	m, repo := deliveryHarness(t, "stale")
 	if _, err := m.Spawn("sr1", repo, false, "sleep 60"); err != nil {
