@@ -42,6 +42,7 @@ const (
 	EventPRMerged         = "pr_merged"
 	EventWindowGone       = "window_gone"
 	EventIdleUnreported   = "idle_unreported"
+	EventAutoResumed      = "auto_resumed" // watcher nudged an API-stalled worker to continue (§4.4); non-actionable
 )
 
 // Task kinds (§1.1 CHECK; = state.Task.Kind).
