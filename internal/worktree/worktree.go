@@ -408,14 +408,6 @@ func ChangedFiles(path, base, rev string) ([]string, error) {
 	return strings.Split(out, "\n"), nil
 }
 
-// DiffCommitted returns the diff between base and a COMMITTED rev (`git diff base rev`),
-// i.e. the changes in the committed object — NOT the working tree. The trust gate shows
-// reviewers this so a worker cannot present a benign working tree while a different
-// commit is what actually fast-forwards.
-func DiffCommitted(path, base, rev string) (string, error) {
-	return git("-C", path, "diff", base, rev)
-}
-
 // AddDetached creates a temporary linked worktree at dir checked out (detached) to rev,
 // materializing exactly that committed tree in isolation from any live worktree, so it
 // can be validated free of mutation by a running worker. The caller must RemoveWorktree
