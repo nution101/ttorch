@@ -31,9 +31,11 @@ const (
 // path, held until the returned *os.File is closed. It mirrors the supervisor's
 // flock-as-truth pattern (the kernel arbitrates; the lock — not the file contents —
 // is the truth, so there is no pid-reuse hazard and a crashed holder's lock is freed
-// automatically). It records this process's pid in the file purely for observability
-// and for `--reset` to find the orphan. On contention it returns errLockHeld.
-func acquireFlock(path string) (*os.File, error) {
+// automatically). It records this process's pid and the session token in the file
+// purely for observability and for the orphan reap (`--reset` and the self-healing
+// arm path in Run) to tell a live holder from a stale one. On contention it returns
+// errLockHeld.
+func acquireFlock(path, token string) (*os.File, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
@@ -59,7 +61,7 @@ func acquireFlock(path string) (*os.File, error) {
 			_ = f.Close()
 			return nil, err
 		}
-		if _, err := f.WriteAt([]byte(strconv.Itoa(os.Getpid())), 0); err != nil {
+		if _, err := f.WriteAt([]byte(formatWatchRecord(os.Getpid(), token)), 0); err != nil {
 			_ = f.Close()
 			return nil, err
 		}
@@ -97,17 +99,56 @@ func lockedLiveFile(f *os.File, path string) bool {
 	return os.SameFile(held, onDisk)
 }
 
-// readWatchPID returns the pid recorded in the watch pid file, if any.
-func readWatchPID(path string) (int, bool) {
+// watchRecord is what the singleton pid file holds: the holder's pid and a session
+// token identifying the manager incarnation it serves. The token is empty in a legacy
+// pid file (written before this field existed) or when the holder had no tmux to read.
+type watchRecord struct {
+	pid   int
+	token string
+}
+
+// formatWatchRecord renders a record as "<pid>[ <token>]" — the token is omitted when
+// empty so a legacy reader still parses the pid. The token never contains whitespace
+// (see Watcher.sessionToken), so the two fields stay unambiguous.
+func formatWatchRecord(pid int, token string) string {
+	s := strconv.Itoa(pid)
+	if token != "" {
+		s += " " + token
+	}
+	return s
+}
+
+// readWatchRecord parses the watch pid file. The first whitespace-separated field is
+// the holder's pid; an optional second field is its session token. A missing or
+// garbled file (or a non-positive pid) reports !ok.
+func readWatchRecord(path string) (watchRecord, bool) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return 0, false
+		return watchRecord{}, false
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	fields := strings.Fields(string(b))
+	if len(fields) == 0 {
+		return watchRecord{}, false
+	}
+	pid, err := strconv.Atoi(fields[0])
 	if err != nil || pid <= 0 {
+		return watchRecord{}, false
+	}
+	rec := watchRecord{pid: pid}
+	if len(fields) > 1 {
+		rec.token = fields[1]
+	}
+	return rec, true
+}
+
+// readWatchPID returns just the pid recorded in the watch pid file (the reap target
+// and the release-time ownership guard), if any.
+func readWatchPID(path string) (int, bool) {
+	rec, ok := readWatchRecord(path)
+	if !ok {
 		return 0, false
 	}
-	return pid, true
+	return rec.pid, true
 }
 
 // processAlive reports whether a process is running (signal 0 probe).
@@ -156,23 +197,150 @@ func commandLineIsWatch(psLine string) bool {
 	return false
 }
 
-// acquireBriefly claims the flock, retrying briefly on contention so a slow orphan
-// release (the moment between an old watcher's SIGTERM and its defer) never drops a
-// wake. If the lock is still held after the brief grace it returns errLockHeld and
-// the caller exits quietly — the live holder owns the wake (§4.5).
-func (w *Watcher) acquireBriefly(ctx context.Context) (*os.File, error) {
-	return w.retryAcquire(ctx, time.Now().Add(briefAcquireGrace))
+// acquire claims the watch singleton, self-healing past an orphan holder. It first
+// retries briefly (a slow orphan RELEASE between an old watcher's SIGTERM and its
+// defer must never drop a wake). If the lock is still held after the brief grace it
+// inspects the holder: a watcher serving the CURRENT manager session instance owns the
+// wake, so this arm has no work and gets errLockHeld (the caller exits quietly, §4.5);
+// but an ORPHAN — a holder whose pid is dead, or whose manager session instance is gone
+// (a restarted manager reused the constant session name) — is reaped (pid-reuse-guarded
+// SIGTERM, as `--reset`) and this arm then takes the lock, instead of exiting blind and
+// leaving the manager deaf to events. Returns the locked file, errLockHeld for a live
+// holder, or a ctx/other error.
+func (w *Watcher) acquire(ctx context.Context) (*os.File, error) {
+	live := w.token()
+	f, err := w.retryAcquire(ctx, time.Now().Add(w.briefGraceOr()), live)
+	if err != errLockHeld {
+		return f, err // success, ctx cancellation, or a non-contention error
+	}
+	orphan, ok := w.holderIsOrphan(live)
+	if !ok {
+		return nil, errLockHeld // a live watcher for the current session — don't double-arm
+	}
+	// Reap the EXACT record we classified — not "whatever the file says now". Between the
+	// classification above and the signal below the orphan may release and a NEW
+	// current-session watcher win the lock and rewrite the record (its own pid + a LIVE
+	// token); reapHolderIfMatches re-reads and signals only if the (pid, token) is still
+	// the orphan's, so this self-heal can never SIGTERM that live successor (TOCTOU).
+	w.reapHolderIfMatches(orphan)
+	// The orphan was SIGTERMed (or is already dead, or a successor took over); block longer
+	// for the lock to free, then take over. A holder we could not reap (pid-reuse guard, or
+	// a successor we declined to kill) falls back to errLockHeld here — the quiet exit,
+	// exactly as before this self-heal existed.
+	return w.retryAcquire(ctx, time.Now().Add(w.resetGraceOr()), live)
 }
 
-// retryAcquire repeatedly attempts acquireFlock until it succeeds, a non-contention
-// error occurs, ctx is cancelled, or the real-time deadline passes (then errLockHeld).
-func (w *Watcher) retryAcquire(ctx context.Context, deadline time.Time) (*os.File, error) {
+// holderIsOrphan reads the current singleton holder's record and reports whether it is
+// an orphan this arm may reap, given the live session token; it returns the record it
+// read so the caller can pin the reap to exactly that (pid, token) — see acquire's
+// TOCTOU note. A holder is an orphan when its recorded pid is dead, or when the manager
+// session INSTANCE it served is gone — detected by its recorded token differing from the
+// live one. The manager's tmux session NAME is a constant ("ttorch"), so a restarted
+// manager reuses it and a name check cannot tell the new manager from the dead prior one;
+// the instance token (Watcher.sessionToken) can. It fails CLOSED: an unidentifiable
+// holder, a legacy file with no recorded token, or an indeterminate live token (no tmux)
+// all report not-an-orphan, so a genuinely live watcher is never reaped.
+func (w *Watcher) holderIsOrphan(live string) (watchRecord, bool) {
+	rec, ok := readWatchRecord(w.P.WatchPIDFile())
+	if !ok || rec.pid == os.Getpid() {
+		return rec, false
+	}
+	if !w.alive(rec.pid) {
+		return rec, true
+	}
+	if rec.token == "" || live == "" {
+		return rec, false
+	}
+	return rec, rec.token != live
+}
+
+// reapHolderIfMatches SIGTERMs the recorded holder so it releases the lock — but ONLY if
+// the pid file still names the exact (pid, token) record `want` the caller classified as
+// an orphan, AND that pid is alive, is not this process, and still looks like a
+// `ttorch watch` (the pid-reuse guard). Re-verifying the record immediately before
+// signalling closes the classify→reap TOCTOU: if a successor rewrote the record in the
+// gap (a different pid, or the same pid carrying a now-live token), the match fails and
+// nothing is signalled, so a live current-session watcher is never killed. Returns true
+// iff it signalled.
+func (w *Watcher) reapHolderIfMatches(want watchRecord) bool {
+	rec, ok := readWatchRecord(w.P.WatchPIDFile())
+	if !ok || rec.pid != want.pid || rec.token != want.token {
+		return false // a successor took over (or the slot cleared) — never signal it
+	}
+	if rec.pid == os.Getpid() || !w.alive(rec.pid) || !w.isWatchProc(rec.pid) {
+		return false
+	}
+	w.reapSignal(rec.pid)
+	return true
+}
+
+// reapHolder SIGTERMs the recorded singleton holder unconditionally (still behind the
+// not-self / alive / pid-reuse guards) so it releases the lock. It is the FORCED reap
+// used by Reset (`ttorch watch --reset`), which runs on manager restart before any
+// current-session watcher is armed — so there is no live successor to protect and no
+// token to pin to. The self-healing arm path uses reapHolderIfMatches instead.
+func (w *Watcher) reapHolder() {
+	if pid, ok := readWatchPID(w.P.WatchPIDFile()); ok && pid != os.Getpid() && w.alive(pid) && w.isWatchProc(pid) {
+		w.reapSignal(pid)
+	}
+}
+
+// reapSignal sends the reap signal to pid (nil seam ⇒ the real SIGTERM).
+func (w *Watcher) reapSignal(pid int) {
+	if w.kill != nil {
+		w.kill(pid)
+		return
+	}
+	defaultKill(pid)
+}
+
+// defaultKill is the production reap signal: SIGTERM, which a `ttorch watch` process traps
+// to cancel its loop and release the flock (see cmdWatch). Tests swap the seam for a spy.
+func defaultKill(pid int) { _ = syscall.Kill(pid, syscall.SIGTERM) }
+
+// briefGraceOr / resetGraceOr resolve the flock-acquisition grace windows, honoring a
+// per-Watcher override (tests set tiny values so the contention paths run without real
+// waits) and otherwise the package defaults.
+func (w *Watcher) briefGraceOr() time.Duration {
+	if w.briefGrace > 0 {
+		return w.briefGrace
+	}
+	return briefAcquireGrace
+}
+
+func (w *Watcher) resetGraceOr() time.Duration {
+	if w.resetGrace > 0 {
+		return w.resetGrace
+	}
+	return resetAcquireGrace
+}
+
+// token returns the current live session token (nil seam ⇒ "", i.e. indeterminate).
+func (w *Watcher) token() string {
+	if w.sessionToken != nil {
+		return w.sessionToken()
+	}
+	return ""
+}
+
+// alive reports whether pid is running (nil seam ⇒ the real signal-0 probe).
+func (w *Watcher) alive(pid int) bool {
+	if w.procAlive != nil {
+		return w.procAlive(pid)
+	}
+	return processAlive(pid)
+}
+
+// retryAcquire repeatedly attempts acquireFlock (recording token on success) until it
+// succeeds, a non-contention error occurs, ctx is cancelled, or the real-time deadline
+// passes (then errLockHeld).
+func (w *Watcher) retryAcquire(ctx context.Context, deadline time.Time, token string) (*os.File, error) {
 	interval := w.lockRetry
 	if interval <= 0 {
 		interval = 50 * time.Millisecond
 	}
 	for {
-		f, err := acquireFlock(w.P.WatchPIDFile())
+		f, err := acquireFlock(w.P.WatchPIDFile(), token)
 		if err == nil {
 			return f, nil
 		}
@@ -199,10 +367,8 @@ func (w *Watcher) retryAcquire(ctx context.Context, deadline time.Time) (*os.Fil
 // again. It does not start watching.
 func (w *Watcher) Reset(ctx context.Context) error {
 	path := w.P.WatchPIDFile()
-	if pid, ok := readWatchPID(path); ok && pid != os.Getpid() && processAlive(pid) && w.isWatchProc(pid) {
-		_ = syscall.Kill(pid, syscall.SIGTERM)
-	}
-	f, err := w.retryAcquire(ctx, time.Now().Add(resetAcquireGrace))
+	w.reapHolder()
+	f, err := w.retryAcquire(ctx, time.Now().Add(w.resetGraceOr()), "")
 	if err != nil {
 		if err == errLockHeld {
 			return errors.New("watch --reset: an orphan watcher did not release the lock in time")

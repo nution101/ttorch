@@ -84,7 +84,12 @@ type Watcher struct {
 	ghAvailable    func() bool
 	prState        func(prURL string) (string, error)
 	isWatchProc    func(pid int) bool
-	lockRetry      time.Duration // flock contention retry interval
+	procAlive      func(pid int) bool // liveness probe of a recorded holder pid
+	sessionToken   func() string      // token identifying the live manager session instance
+	kill           func(pid int)      // reap signal (nil ⇒ SIGTERM); a seam so tests assert without signalling
+	lockRetry      time.Duration      // flock contention retry interval
+	briefGrace     time.Duration      // override for briefAcquireGrace (0 ⇒ default)
+	resetGrace     time.Duration      // override for resetAcquireGrace (0 ⇒ default)
 
 	lastPRCheck time.Time // PR-poll rate-limit clock
 }
@@ -148,6 +153,25 @@ func New(store *db.Store, p paths.Paths, session string) *Watcher {
 		return strings.TrimSpace(string(out)), nil
 	}
 	w.isWatchProc = isWatchProcess
+	w.procAlive = processAlive
+	w.kill = defaultKill
+	w.sessionToken = func() string {
+		// The manager session NAME is a constant ("ttorch"), so it cannot distinguish a
+		// restarted manager from the dead prior one. The manager window's pane pid is
+		// fresh per incarnation, so it identifies the live INSTANCE; the orphan reap in
+		// acquire compares the holder's recorded token against this to tell a live holder
+		// from a stale one. "" when tmux or the manager window is unavailable — then
+		// orphan-by-session is indeterminate and the holder is given the benefit of the
+		// doubt (never reaped on session grounds).
+		if !tmux.Available() {
+			return ""
+		}
+		pid := tmux.PanePID(w.Session, managerWindow)
+		if pid <= 0 {
+			return ""
+		}
+		return "pane:" + strconv.Itoa(pid)
+	}
 	return w
 }
 
@@ -242,11 +266,13 @@ func (w *Watcher) dwellElapsed(now time.Time, t db.Task) bool {
 // that flag is the §4.6 backstop it merely observes; the arming command (cmdWatch)
 // owns clearing it.
 func (w *Watcher) Run(ctx context.Context) (Result, error) {
-	lock, err := w.acquireBriefly(ctx)
+	lock, err := w.acquire(ctx)
 	if err != nil {
-		// A live watcher already owns the singleton (a slow orphan release we waited
-		// out, or a genuine duplicate): this arm has no work to do, so exit quietly —
-		// the holder will surface the wake. ctx cancellation propagates as an error.
+		// A genuinely LIVE watcher serving the current manager session already owns the
+		// singleton: this arm has no work to do, so exit quietly — the holder will
+		// surface the wake. (An ORPHAN holder — dead pid, or a dead prior session's
+		// watcher — would have been reaped by acquire so this arm could take over,
+		// rather than leaving the manager blind.) ctx cancellation propagates as an error.
 		if err == errLockHeld {
 			return Result{}, nil
 		}

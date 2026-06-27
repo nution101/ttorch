@@ -59,7 +59,10 @@ every turn, every wake, every check-in.
    disjoint backlog — then re-arm `ttorch watch`. When you surface a decision to the lead,
    **first cancel any in-flight watcher and do not re-arm one** — the window then waits
    silently until the lead returns. The lead is an **interrupt** that can retask you, not
-   the sole thing that drives you forward.
+   the sole thing that drives you forward. Arming is **self-healing**: if an orphaned
+   watcher left by a dead prior session still holds the watch singleton, the new
+   `ttorch watch` reaps it and takes over instead of exiting silently — so a restart can
+   never leave you deaf to events (it never reaps a genuinely live watcher).
 
 ## The loop: re-derive → plan → delegate → supervise → validate → land
 
@@ -69,7 +72,10 @@ task it can (rule 4):
 1. **Re-derive.** Read the DB first — `ttorch tasks` for the full task list and statuses,
    `ttorch status` for live worker state — then `ttorch peek` at anything in flight and
    check git/PR state. Form your picture of "what is true now" from that, not from memory;
-   rebuild your task list from `ttorch tasks` on every restart.
+   rebuild your task list from `ttorch tasks` on every restart. A restart needs no special
+   watcher cleanup — arming `ttorch watch` self-heals past a watcher orphaned by the prior
+   session (rule 5). `ttorch watch --reset` stays available as a manual fallback if you
+   ever want to explicitly confirm the singleton slot is free before re-arming.
 2. **Plan.** Turn the lead's intent into discrete tasks, each with clear acceptance
    criteria and a known file footprint (so you can tell which tasks are disjoint).
    Planning is the highest-leverage step: a precise brief buys long, unsupervised worker
@@ -122,7 +128,8 @@ act, then re-check.
 | `ttorch spawn <id> <repo> [--scout]` | start a worker on a task in an isolated workspace |
 | `ttorch peek <id> [lines]` | read recent output from a worker |
 | `ttorch send <id> "<text>"` | type a message into a worker (steer / unblock) |
-| `ttorch watch [--since n] [--reset]` | arm the event-driven watcher as a background task; it blocks until an actionable DB event, prints the batch, then exits to wake you |
+| `ttorch watch [--since n]` | arm the event-driven watcher as a background task; it blocks until an actionable DB event, prints the batch, then exits to wake you (self-heals past an orphan holding the singleton) |
+| `ttorch watch --reset` | manual fallback: reap any watcher orphaned by a prior session and confirm the singleton is free, then return (arming already self-heals past one) |
 | `ttorch await-lead [--clear]` | mark yourself awaiting the lead so the watcher stays silent; `--clear` when the lead returns |
 | `ttorch teardown <id> [--force]` | finish a worker; refuses to discard unlanded work |
 | `ttorch validate <id>` | run the repo's build/test/lint checks on a worker's changes |
