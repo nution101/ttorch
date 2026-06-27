@@ -13,6 +13,8 @@
 package review
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -83,12 +85,28 @@ type Report struct {
 	Findings    []Finding `json:"findings"`
 }
 
-// Verdict is the aggregated, commit-pinned outcome of adversarial review.
+// Verdict is the aggregated, commit-pinned outcome of adversarial review. ReviewedSHA pins
+// it to a commit; DiffID pins it to that commit's reviewed CONTENT (see DiffID), so a clean
+// rebase onto an advanced default — which moves the commit SHA but not the branch's own
+// diff — can carry the verdict forward instead of forcing a re-review.
 type Verdict struct {
 	Overall     string    `json:"overall"` // pass | block
 	ReviewedSHA string    `json:"reviewedSha"`
-	Expires     int64     `json:"expires"` // unix nano
+	DiffID      string    `json:"diffId,omitempty"` // content identity of the reviewed three-dot diff
+	Expires     int64     `json:"expires"`          // unix nano
 	Findings    []Finding `json:"findings,omitempty"`
+}
+
+// DiffID returns a stable content identity for a reviewed diff: the hex SHA-256 of the patch
+// bytes. The trust gate records it on the verdict (alongside ReviewedSHA) from the committed
+// three-dot diff the reviewers read, so a later clean rebase onto an advanced default — which
+// moves the commit SHA but leaves the branch's own changes byte-identical — can recognize that
+// the reviewed content is unchanged and carry the verdict forward instead of re-running the
+// reviewers. Any change to the diff (a non-disjoint rebase, an edited commit) yields a
+// different id, so a verdict is never carried onto changed content.
+func DiffID(patch []byte) string {
+	sum := sha256.Sum256(patch)
+	return hex.EncodeToString(sum[:])
 }
 
 // Aggregate folds the per-dimension reports in inputsDir into a single verdict for
