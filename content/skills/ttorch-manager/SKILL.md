@@ -136,6 +136,7 @@ act, then re-check.
 | `ttorch review-diff <id> [--stat]` | review a worker's changes before integrating |
 | `ttorch trust prep\|record\|show <id>` | run the adversarial-review gate (see the `ttorch-review` skill) |
 | `ttorch merge-local <id> [--require-verdict]` | fast-forward the local default branch (needs approval; `--require-verdict` also gates on a passing verdict + fresh validate) |
+| `ttorch land <id>… \| --all [--require-verdict]` | one atomic delivery per task (fetch, rebase, re-validate, integrate honoring the gates, verify, fast-forward); several ids or `--all` (the whole done set) land **concurrently** through the async queue — each lands as soon as it is individually ready, serializing only the per-repo fast-forward. Throughput is bounded by file-disjointness: disjoint tasks land in parallel, while same-package tasks serialize the actual fast-forward (the later one re-rebases onto the earlier and re-gates if its content changed) |
 | `ttorch promote <id>` | turn a scout task into a ship task |
 | `ttorch pr-check <id> <url>` | watch a PR and be notified when it merges |
 | `ttorch project add <repo> [--name n]` · `project ls` | register / list projects (caches delivery mode for display) |

@@ -1377,27 +1377,98 @@ func cmdMergeLocal(args []string) error {
 	return nil
 }
 
+// cmdLand delivers one task, several named tasks, or the whole done set (--all). A single
+// explicit id takes the exact single-land path; two or more tasks — or --all — go through the
+// async pipelined land queue (LandSet), which lands each as soon as it is individually ready,
+// serializing only the per-repo fast-forward. Bounded by file-disjointness: same-package tasks
+// serialize the actual landing (one re-rebases onto the other and re-gates), while disjoint
+// tasks land concurrently.
 func cmdLand(args []string) error {
-	if len(args) < 1 {
-		return errors.New("usage: ttorch land <task-id> [--require-verdict]")
+	var ids []string
+	requireVerdict, all := false, false
+	for _, a := range args {
+		switch a {
+		case "--require-verdict", "-require-verdict":
+			requireVerdict = true
+		case "--all", "-all":
+			all = true
+		default:
+			if strings.HasPrefix(a, "-") {
+				return fmt.Errorf("land: unknown flag %q; usage: ttorch land <task-id>... | --all [--require-verdict]", a)
+			}
+			ids = append(ids, a)
+		}
 	}
-	id := args[0]
-	fs := flag.NewFlagSet("land", flag.ContinueOnError)
-	requireVerdict := fs.Bool("require-verdict", false,
-		"also require a passing adversarial-review verdict + a fresh green validate (implied by trusted mode)")
-	if err := fs.Parse(args[1:]); err != nil {
-		return err
+	if all && len(ids) > 0 {
+		return errors.New("land: pass either --all or explicit task ids, not both")
+	}
+	if !all && len(ids) == 0 {
+		return errors.New("usage: ttorch land <task-id>... | --all [--require-verdict]")
 	}
 	m, err := mgr()
 	if err != nil {
 		return err
 	}
 	defer m.Close()
-	out, err := m.Land(id, *requireVerdict)
-	if err != nil {
-		return err
+
+	if all {
+		ids, err = doneTaskIDs(m)
+		if err != nil {
+			return err
+		}
+		if len(ids) == 0 {
+			fmt.Println("land --all: no done tasks to land")
+			return nil
+		}
 	}
-	fmt.Println(out)
+
+	// One explicit task keeps the single-land path verbatim (same output, no queue overhead).
+	if len(ids) == 1 && !all {
+		out, err := m.Land(ids[0], requireVerdict)
+		if err != nil {
+			return err
+		}
+		fmt.Println(out)
+		return nil
+	}
+
+	results := m.LandSet(context.Background(), ids, requireVerdict)
+	return reportLandResults(results)
+}
+
+// doneTaskIDs lists the ids of every task awaiting landing — status done, excluding ad-hoc cc
+// sessions — for `ttorch land --all`. The queue then lands each per its repo's delivery mode.
+func doneTaskIDs(m *orchestrator.Manager) ([]string, error) {
+	tasks, err := m.Store.ListTasks(context.Background(), db.TaskFilter{
+		Status:      []string{db.StatusDone},
+		ExcludeKind: []string{db.KindCC},
+	})
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(tasks))
+	for _, t := range tasks {
+		ids = append(ids, t.ID)
+	}
+	return ids, nil
+}
+
+// reportLandResults prints each task's land summary or failure in input order and returns a
+// non-nil error when any task did not land, so the exit code reflects a partial landing.
+func reportLandResults(results []orchestrator.LandResult) error {
+	landed := 0
+	for _, r := range results {
+		if r.Err != nil {
+			fmt.Printf("  %s: %v\n", r.TaskID, r.Err)
+			continue
+		}
+		landed++
+		fmt.Println("  " + strings.ReplaceAll(r.Output, "\n", "\n  "))
+	}
+	fmt.Printf("landed %d of %d task(s)\n", landed, len(results))
+	if landed < len(results) {
+		return fmt.Errorf("land: %d of %d task(s) did not land", len(results)-landed, len(results))
+	}
 	return nil
 }
 
@@ -1670,12 +1741,15 @@ Delivery:
   merge-local <id> [--require-verdict]
                               fast-forward the local default branch (needs approval;
                               --require-verdict also gates on a passing verdict + validate)
-  land <id> [--require-verdict]
+  land <id>... | --all [--require-verdict]
                               one safe atomic delivery: fetch, rebase onto the current
                               default (abort on conflict), re-validate, integrate per the
                               repo's delivery mode honoring the existing gates, verify the
                               landed tip matches the validated commit, and fast-forward
-                              the local default
+                              the local default. Pass several ids or --all (the whole done
+                              set) to land concurrently: each lands as soon as it is ready,
+                              serializing only the per-repo fast-forward — disjoint tasks
+                              land in parallel, same-package tasks serialize
   promote <id>                turn a scout task into a ship task
   pr-check <id> <url>         arm a PR-merge check (surfaced by 'ttorch watch')
   fleet-sync [dir]            refresh local default from origin; prune gone branches
