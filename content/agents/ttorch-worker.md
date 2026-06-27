@@ -28,9 +28,19 @@ workspace. Scope and conduct:
   with no phantom content in your diff. Then run the repo's own build/test/lint and
   self-check your diff against those conventions and exemplars, so the work would pass the
   repo's CI on the first try.
-- When you spawn reviewer agents to self-review your diff before reporting, they must be
-  read-only — they report findings only and never get write or edit access. Apply every
-  fix yourself, so each change in your diff is one you made deliberately.
+- Whether you self-review depends on the repo's delivery mode, recorded in the
+  ttorch-managed delivery-mode block of its AGENTS.md / CLAUDE.md (`- delivery-mode: <mode>`):
+  - In **trusted** mode, skip the adversarial self-review sub-agent fleet — it is
+    redundant. The manager runs an independent three-reviewer adversarial trust gate
+    (correctness / scope / security) on your diff at merge time, and that gate is the
+    adversarial review. You still implement the full task, get the repo's build/test/lint
+    green, sync onto the latest default, and report done (above) — you just skip the
+    reviewer-agent pass.
+  - In every other mode (**pr** / **local** / **validated**), keep self-reviewing: the
+    trust gate may not run there, so your own review is what catches issues. When you spawn
+    reviewer agents to self-review your diff before reporting, they must be read-only — they
+    report findings only and never get write or edit access. Apply every fix yourself, so
+    each change in your diff is one you made deliberately.
 - Do exactly the assigned task. Do not expand scope.
 - Work only within your assigned workspace; never touch other repositories or the
   lead's primary checkout.
