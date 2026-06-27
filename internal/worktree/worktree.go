@@ -30,6 +30,13 @@ func git(args ...string) (string, error) {
 	return s, nil
 }
 
+// warnf prints a non-fatal operational warning to stderr, where the manager that ran
+// the spawn sees it. It is a package var so tests can capture warnings instead of
+// inspecting stderr; production writes a "ttorch: " line to match the rest of the CLI.
+var warnf = func(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "ttorch: "+format+"\n", args...)
+}
+
 // RepoRoot returns the top-level directory of the git repo containing dir.
 func RepoRoot(dir string) (string, error) {
 	return git("-C", dir, "rev-parse", "--show-toplevel")
@@ -65,9 +72,13 @@ type Pool struct {
 
 func (p Pool) dir(repo string) string { return filepath.Join(p.Root, poolName(repo)) }
 
-// Acquire returns a worktree for a new task: it reuses a clean idle slot (one not
-// in inUse and free of tracked changes), resetting it to the repo's HEAD while
-// keeping untracked caches; otherwise it creates a new slot up to Max.
+// Acquire returns a worktree for a new task, based on the up-to-date default tip. It
+// first refreshes origin and resolves the fresh base once (see fetchAndBase), then
+// reuses a clean idle slot (one not in inUse and free of tracked changes), resetting it
+// to origin/<default> while keeping untracked caches; otherwise it creates a new slot at
+// that base, up to Max. Resetting a recycled slot to the lead's possibly-stale local
+// HEAD was the stale-base bug — a worker could start several commits behind origin — so
+// reuse and creation both anchor on the freshly fetched default instead.
 func (p Pool) Acquire(repo string, inUse []string) (string, error) {
 	poolDir := p.dir(repo)
 	if err := os.MkdirAll(poolDir, 0o755); err != nil {
@@ -86,6 +97,12 @@ func (p Pool) Acquire(repo string, inUse []string) (string, error) {
 		}
 	}
 
+	// Refresh origin and resolve the fresh base once, so every slot this call hands out
+	// (reused or newly created) starts from the up-to-date default rather than a stale
+	// local HEAD. Offline-safe: a failed fetch warns and falls back to the last-known
+	// default (see fetchAndBase).
+	base := fetchAndBase(repo)
+
 	slots := listSlots(poolDir)
 	for _, s := range slots {
 		abs, _ := filepath.Abs(s)
@@ -96,7 +113,7 @@ func (p Pool) Acquire(repo string, inUse []string) (string, error) {
 		if err != nil || tracked {
 			continue // skip slots with orphaned uncommitted work or unreadable state
 		}
-		if err := reset(s, repo); err != nil {
+		if err := resetTo(s, base); err != nil {
 			continue
 		}
 		return s, nil
@@ -106,7 +123,7 @@ func (p Pool) Acquire(repo string, inUse []string) (string, error) {
 		return "", fmt.Errorf("worktree pool full (max %d); tear down a worker first", p.Max)
 	}
 	s := filepath.Join(poolDir, strconv.Itoa(nextIndex(slots)))
-	if _, err := git("-C", repo, "worktree", "add", "--detach", s); err != nil {
+	if _, err := git("-C", repo, "worktree", "add", "--detach", s, base); err != nil {
 		return "", err
 	}
 	return s, nil
@@ -180,12 +197,22 @@ func IsClean(path string) (bool, error) {
 	return strings.TrimSpace(out) == "", nil
 }
 
+// reset hard-resets a slot to the repo's local HEAD. Release uses it to park a finished
+// slot clean; the next Acquire re-anchors a reused slot on the freshly fetched default
+// (resetTo + fetchAndBase), so an idle slot's local-HEAD parking is always superseded
+// before a worker starts from it.
 func reset(slot, repo string) error {
 	head, err := headCommit(repo)
 	if err != nil {
 		return err
 	}
-	_, err = git("-C", slot, "reset", "--hard", "-q", head)
+	return resetTo(slot, head)
+}
+
+// resetTo hard-resets a slot's tracked tree to ref, discarding tracked changes while
+// leaving untracked build caches in place (no `git clean`).
+func resetTo(slot, ref string) error {
+	_, err := git("-C", slot, "reset", "--hard", "-q", ref)
 	return err
 }
 
@@ -200,13 +227,11 @@ func reset(slot, repo string) error {
 // origin/<default> as its upstream when cut from a remote ref.
 //
 // The fetch is best-effort (offline, or a repo with no remote, falls back to the
-// local default branch); an unresolvable base or a failed checkout is returned as an
-// error so a stale-branch start fails loudly rather than silently reusing prior state.
+// local default branch WITH a warning, see fetchAndBase); an unresolvable base or a
+// failed checkout is returned as an error so a stale-branch start fails loudly rather
+// than silently reusing prior state.
 func StartBranch(repo, slot, branch string) error {
-	if RemoteExists(repo, "origin") {
-		_ = Fetch(repo) // refresh origin/<default>; offline keeps the last-known tip
-	}
-	base := defaultBase(repo)
+	base := fetchAndBase(repo)
 	if _, err := git("-C", slot, "checkout", "-q", "--no-track", "-B", branch, base); err != nil {
 		return fmt.Errorf("checkout %s off %s: %w", branch, base, err)
 	}
@@ -214,6 +239,23 @@ func StartBranch(repo, slot, branch string) error {
 	// checkout carried something across (untracked caches are left untouched).
 	_, err := git("-C", slot, "reset", "--hard", "-q", base)
 	return err
+}
+
+// fetchAndBase refreshes origin (when the repo has one) so origin/<default> is current,
+// then returns the ref a fresh worktree or branch should be based on (see defaultBase).
+// The fetch is best-effort and never fatal: on failure it warns and falls back to the
+// last-known base, so an offline or transient hiccup degrades to the last-known default
+// VISIBLY rather than silently starting a worker several commits behind origin. It is
+// the single fetch+base point shared by Acquire and StartBranch, so each is independently
+// safe against a stale base (the spawn path runs both; a redundant up-to-date fetch is
+// cheap).
+func fetchAndBase(repo string) string {
+	if RemoteExists(repo, "origin") {
+		if err := Fetch(repo); err != nil {
+			warnf("could not fetch origin in %s: %v; basing on the last-known default, which may be behind origin", repo, err)
+		}
+	}
+	return defaultBase(repo)
 }
 
 // defaultBase returns the ref a fresh task branch should be cut from: the remote

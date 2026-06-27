@@ -346,3 +346,198 @@ func TestPool_KeepsUntrackedCachesOnReuse(t *testing.T) {
 		t.Fatal("untracked cache should survive reuse")
 	}
 }
+
+// TestAcquire_ReusedSlotBasesOnFreshOriginWhenLocalBehind is the primary stale-base fix:
+// a reused idle pool slot is reset to the freshly fetched origin/<default> tip even when
+// this repo's LOCAL default branch is behind origin (it never pulled the advance). A
+// recycled worktree must never start from the stale local HEAD.
+func TestAcquire_ReusedSlotBasesOnFreshOriginWhenLocalBehind(t *testing.T) {
+	repo := makeRepo(t)
+	def := DefaultBranch(repo)
+
+	bare := t.TempDir()
+	gitT(t, bare, "init", "--bare", "-q")
+	gitT(t, repo, "remote", "add", "origin", bare)
+	gitT(t, repo, "push", "-q", "origin", def)
+
+	p := Pool{Root: t.TempDir(), Max: 4}
+	// Acquire then release a slot so it becomes a clean, reusable idle slot.
+	slot, err := p.Acquire(repo, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Release(repo, slot); err != nil {
+		t.Fatal(err)
+	}
+
+	// Advance origin/<default> from a detached linked worktree so the bare remote moves
+	// ahead WITHOUT advancing this repo's local <default> branch — local is now behind.
+	adv := filepath.Join(t.TempDir(), "adv")
+	if err := AddDetached(repo, adv, def); err != nil {
+		t.Fatal(err)
+	}
+	defer RemoveWorktree(repo, adv)
+	if err := os.WriteFile(filepath.Join(adv, "g.txt"), []byte("origin advance\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, adv, "add", "-A")
+	gitT(t, adv, "commit", "-q", "-m", "origin advance")
+	gitT(t, adv, "push", "-q", "origin", "HEAD:"+def)
+	originTip := gitT(t, bare, "rev-parse", "refs/heads/"+def)
+
+	localTip := gitT(t, repo, "rev-parse", "refs/heads/"+def)
+	if originTip == localTip {
+		t.Fatal("test setup: origin must be ahead of the local default")
+	}
+
+	// Reuse the idle slot: it must be reset to the fresh origin tip, not the stale local.
+	reused, err := p.Acquire(repo, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reused != slot {
+		t.Fatalf("expected reuse of the idle slot %q, got %q", slot, reused)
+	}
+	if got := gitT(t, reused, "rev-parse", "HEAD"); got != originTip {
+		t.Fatalf("reused slot should start at the fresh origin tip %s, got %s (stale local tip %s)", originTip, got, localTip)
+	}
+}
+
+// TestAcquire_PreservesInUseSlotWithCommittedWork is the pool-level guarantee behind
+// "an existing task worktree is untouched on resume": a slot held by a live (resumed)
+// worker is listed in inUse, so Acquire hands out a DIFFERENT slot and never resets it —
+// the worker's task branch and its committed-but-clean work survive. Committed work
+// leaves no tracked changes, so the inUse guard (not the cleanliness check) is what
+// protects it; resume reuses the same worktree and never re-runs Acquire/StartBranch.
+func TestAcquire_PreservesInUseSlotWithCommittedWork(t *testing.T) {
+	repo := makeRepo(t)
+	def := DefaultBranch(repo)
+	bare := t.TempDir()
+	gitT(t, bare, "init", "--bare", "-q")
+	gitT(t, repo, "remote", "add", "origin", bare)
+	gitT(t, repo, "push", "-q", "origin", def)
+
+	p := Pool{Root: t.TempDir(), Max: 4}
+	slot, err := p.Acquire(repo, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A live worker: a fresh task branch carrying a clean, committed change.
+	if err := StartBranch(repo, slot, "ttorch/live"); err != nil {
+		t.Fatalf("StartBranch: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(slot, "work.txt"), []byte("worker progress\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, slot, "add", "-A")
+	gitT(t, slot, "commit", "-q", "-m", "worker progress")
+	workTip := gitT(t, slot, "rev-parse", "HEAD")
+	if tracked, _ := HasTrackedChanges(slot); tracked {
+		t.Fatal("committed work must leave the slot with no tracked changes")
+	}
+
+	// The worker still holds the slot (a resumed task -> inUse). Acquire must not recycle it.
+	other, err := p.Acquire(repo, []string{slot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other == slot {
+		t.Fatal("Acquire must not recycle a slot held by a live worker")
+	}
+	if got := gitT(t, slot, "rev-parse", "HEAD"); got != workTip {
+		t.Fatalf("an in-use worker's committed work must be preserved: HEAD %s != %s", got, workTip)
+	}
+	if br := gitT(t, slot, "rev-parse", "--abbrev-ref", "HEAD"); br != "ttorch/live" {
+		t.Fatalf("an in-use worker's branch must be preserved, got %q", br)
+	}
+}
+
+// TestFetchAndBase_WarnsOnFetchFailureButFallsBack proves the offline-safety requirement:
+// a failed origin fetch is surfaced as a warning rather than silently leaving a stale
+// base, and it never hard-fails — the base falls back to the local default.
+func TestFetchAndBase_WarnsOnFetchFailureButFallsBack(t *testing.T) {
+	repo := makeRepo(t)
+	def := DefaultBranch(repo)
+	// An origin whose URL does not exist: `git remote get-url` succeeds (so the fetch is
+	// attempted) but the fetch itself fails.
+	gitT(t, repo, "remote", "add", "origin", filepath.Join(t.TempDir(), "absent.git"))
+
+	var warned int
+	orig := warnf
+	warnf = func(string, ...any) { warned++ }
+	defer func() { warnf = orig }()
+
+	base := fetchAndBase(repo)
+	if warned == 0 {
+		t.Fatal("a failed origin fetch must surface a warning")
+	}
+	// No origin/<default> ref was ever fetched, so the fallback is the local default.
+	if base != def {
+		t.Fatalf("offline fallback should use the local default %q, got %q", def, base)
+	}
+}
+
+// TestFetchAndBase_NoOriginSkipsWarn confirms a repo with no origin remote does not warn
+// (no fetch is attempted) and bases on the local default — the warning is reserved for an
+// actual fetch FAILURE, not the legitimate remote-less case.
+func TestFetchAndBase_NoOriginSkipsWarn(t *testing.T) {
+	repo := makeRepo(t)
+	def := DefaultBranch(repo)
+	if RemoteExists(repo, "origin") {
+		t.Fatal("a fresh repo has no origin remote")
+	}
+
+	var warned int
+	orig := warnf
+	warnf = func(string, ...any) { warned++ }
+	defer func() { warnf = orig }()
+
+	base := fetchAndBase(repo)
+	if warned != 0 {
+		t.Fatalf("a repo with no origin must not warn, warned %d time(s)", warned)
+	}
+	if base != def {
+		t.Fatalf("with no origin the base should be the local default %q, got %q", def, base)
+	}
+}
+
+// TestAcquire_NewSlotBasesOnFreshOrigin proves a freshly CREATED pool slot (no idle slot
+// to reuse) is also anchored on the up-to-date origin/<default> tip, not the stale local
+// HEAD. This is the path behind an isolated worktree (OpenCC), which has no StartBranch to
+// re-base it afterward.
+func TestAcquire_NewSlotBasesOnFreshOrigin(t *testing.T) {
+	repo := makeRepo(t)
+	def := DefaultBranch(repo)
+	bare := t.TempDir()
+	gitT(t, bare, "init", "--bare", "-q")
+	gitT(t, repo, "remote", "add", "origin", bare)
+	gitT(t, repo, "push", "-q", "origin", def)
+
+	// Advance origin/<default> ahead of the local default via a detached linked worktree,
+	// so the local branch stays behind.
+	adv := filepath.Join(t.TempDir(), "adv")
+	if err := AddDetached(repo, adv, def); err != nil {
+		t.Fatal(err)
+	}
+	defer RemoveWorktree(repo, adv)
+	if err := os.WriteFile(filepath.Join(adv, "g.txt"), []byte("origin advance\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, adv, "add", "-A")
+	gitT(t, adv, "commit", "-q", "-m", "origin advance")
+	gitT(t, adv, "push", "-q", "origin", "HEAD:"+def)
+	originTip := gitT(t, bare, "rev-parse", "refs/heads/"+def)
+	if originTip == gitT(t, repo, "rev-parse", "refs/heads/"+def) {
+		t.Fatal("test setup: origin must be ahead of the local default")
+	}
+
+	// The first acquire on an empty pool CREATES a slot; it must start at the fresh tip.
+	p := Pool{Root: t.TempDir(), Max: 4}
+	slot, err := p.Acquire(repo, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gitT(t, slot, "rev-parse", "HEAD"); got != originTip {
+		t.Fatalf("a newly created slot should start at the fresh origin tip %s, got %s", originTip, got)
+	}
+}
