@@ -19,3 +19,21 @@ func Busy(pane string) bool {
 	}
 	return false
 }
+
+// Stalled reports whether a captured pane shows the harness's mid-stream API-stall
+// error ("API Error: Response stalled mid-stream"): the model stream died and the
+// worker is now sitting idle at the prompt, recoverable by a single "continue" rather
+// than any human intervention. Matched case-insensitively on the distinctive phrase
+// (with and without the hyphen) so minor wording around it still hits. A stalled pane
+// carries no Busy marker, so the watcher's auto-resume reaches it only on an otherwise-
+// idle worker — a genuinely working one is never mistaken for stalled. Kept beside Busy
+// so every caller shares one definition of "stalled".
+func Stalled(pane string) bool {
+	low := strings.ToLower(pane)
+	for _, m := range []string{"stalled mid-stream", "stalled mid stream"} {
+		if strings.Contains(low, m) {
+			return true
+		}
+	}
+	return false
+}
