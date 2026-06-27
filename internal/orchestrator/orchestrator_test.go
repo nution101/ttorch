@@ -3291,3 +3291,67 @@ func TestMergeLocal_ReusesPrepValidateForUnchangedHead(t *testing.T) {
 	}
 	_, _ = m.Teardown("mr1", true)
 }
+
+// TestStagedGreen locks the load-bearing no-checks guard on the reuse path: a persisted
+// result set is green ONLY when at least one check ran and none failed. An empty or null
+// set (no checks detected — which trust prep can legitimately stage) must read as NOT
+// green, so an empty Failures() can never be mistaken for a pass when the gate reuses a
+// staged result. Dropping the len>0 clause would silently merge an unvalidated commit.
+func TestStagedGreen(t *testing.T) {
+	cases := []struct {
+		name    string
+		results []validate.Result
+		want    bool
+	}{
+		{"nil is a no-checks block", nil, false},
+		{"empty is a no-checks block", []validate.Result{}, false},
+		{"all passed is green", []validate.Result{{Name: "a", Passed: true}, {Name: "b", Passed: true}}, true},
+		{"any failure is not green", []validate.Result{{Name: "a", Passed: true}, {Name: "b", Passed: false}}, false},
+		{"single failure is not green", []validate.Result{{Name: "a", Passed: false}}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := stagedGreen(tc.results); got != tc.want {
+				t.Fatalf("stagedGreen(%+v) = %v, want %v", tc.results, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestValidateForMerge_ReusedEmptyResultIsNotGreen exercises the no-checks edge ON the
+// reuse path: trust prep can stage an empty/null validate.json (no checks detected) pinned
+// to the merged sha. Reuse must return that result as-is and read it as NOT green — a hard
+// block — rather than fall through to a fresh run or, worse, treat an empty result as a
+// pass. This is the reuse-path counterpart of the fresh-path no-checks hard block.
+func TestValidateForMerge_ReusedEmptyResultIsNotGreen(t *testing.T) {
+	m, repo := deliveryHarness(t, "vfmempty")
+	counter := filepath.Join(t.TempDir(), "runs")
+	countingGateScript(t, repo, counter)
+	task, err := m.Spawn("ze1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := commitFeature(t, task.Worktree, "feature.txt", "new\n")
+	// An empty (no-checks-detected) validate, pinned to the exact merged sha — exactly what
+	// prep stages for a repo with no detectable checks.
+	stageValidate(t, m.P.ReviewInputsDir("ze1"), head, nil)
+
+	c0 := gateRunCount(t, counter)
+	green, results, reused, err := m.validateForMerge(repo, "ze1", head)
+	if err != nil {
+		t.Fatalf("validateForMerge: %v", err)
+	}
+	if !reused {
+		t.Fatal("an empty result pinned to the exact sha is still a reusable pinned result")
+	}
+	if green {
+		t.Fatal("a no-checks (empty) staged result must NOT read as green — the safety guard")
+	}
+	if len(results) != 0 {
+		t.Fatalf("the empty staged result should be returned verbatim, got %+v", results)
+	}
+	if got := gateRunCount(t, counter); got != c0 {
+		t.Fatalf("reusing an empty result must not fall through to a fresh gate run: %d extra run(s)", got-c0)
+	}
+	_, _ = m.Teardown("ze1", true)
+}
