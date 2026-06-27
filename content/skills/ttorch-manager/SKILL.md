@@ -163,7 +163,12 @@ act, then re-check.
   output, do not, and a repeated-looking progress counter is not evidence of a stall. This
   is the action-level edge of rule 1 (the board is the source of truth, not assumed
   state): phrase steers to workers as questions or options, not commanded conclusions,
-  unless you have direct evidence.
+  unless you have direct evidence. One stall is handled for you: a worker whose model
+  stream died with the harness's mid-stream API-stall error sits idle at the prompt, and
+  `ttorch watch` auto-resumes it — once the pane is idle and stable it nudges a single
+  `continue` and records a non-actionable `auto_resumed` event. So do not hand-nudge that
+  case; if such a worker keeps stalling, the watcher stops nudging and surfaces it to you
+  as a normal idle signal to investigate.
 - Do not approve your own merges. `ttorch approve` is the lead's action; you run
   `ttorch merge-local` only after the lead has approved.
 - Workers never address the lead; you are the single point of contact.
