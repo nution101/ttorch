@@ -92,6 +92,7 @@ func newWatcher(t *testing.T) (*Watcher, *db.Store, *bytes.Buffer, *fakeClock) {
 	w.capture = func(string) paneObservation {
 		return paneObservation{present: true, captured: true, pane: "$ idle at the prompt"}
 	}
+	w.nudge = func(string) error { return nil } // no real tmux send in tests
 	w.isWatchProc = func(int) bool { return false }
 	w.lockRetry = time.Millisecond
 	return w, s, buf, clk
@@ -497,6 +498,139 @@ func TestPollLiveness_BusyResetsAndNeverFlags(t *testing.T) {
 	}
 	if has, _ := s.HasEventType(ctx, "busy", db.EventIdleUnreported); has {
 		t.Fatal("a busy worker must never be flagged idle_unreported")
+	}
+}
+
+// TestPollLiveness_StallAutoResumed: an idle, stable pane carrying the mid-stream
+// API-stall error is auto-resumed with a single "continue" nudge once it reaches the
+// stability threshold — without waiting out the dwell, without waking the manager
+// (no idle_unreported), and at most once per episode. The resume is recorded on the
+// audit spine as a non-actionable auto_resumed event.
+func TestPollLiveness_StallAutoResumed(t *testing.T) {
+	w, s, _, clk := newWatcher(t)
+	ctx := context.Background()
+	seedActiveTask(t, s, "stall", "wk-stall")
+	w.capture = func(string) paneObservation {
+		return paneObservation{present: true, captured: true, pane: "API Error: Response stalled mid-stream\n│ >"}
+	}
+	// Hold the clock well WITHIN the dwell so the only thing that can act is the stall
+	// fast path (which ignores the dwell) — this isolates the nudge decision from the
+	// idle_unreported net.
+	gt, _, err := s.GetTask(ctx, "stall")
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	clk.t = gt.Created.Add(time.Second)
+
+	var nudged int
+	var nudgedWindow string
+	w.nudge = func(window string) error {
+		nudged++
+		nudgedWindow = window
+		return nil
+	}
+
+	// Below the stability threshold the stall must NOT be nudged yet.
+	for i := 0; i < idleStaleSweeps; i++ {
+		if err := w.pollLiveness(ctx); err != nil {
+			t.Fatalf("pollLiveness sweep %d: %v", i, err)
+		}
+		if nudged != 0 {
+			t.Fatalf("nudged too early, after %d sweeps", i+1)
+		}
+	}
+	// The threshold sweep nudges exactly once.
+	if err := w.pollLiveness(ctx); err != nil {
+		t.Fatalf("pollLiveness threshold sweep: %v", err)
+	}
+	if nudged != 1 {
+		t.Fatalf("expected exactly one nudge at the threshold, got %d", nudged)
+	}
+	if nudgedWindow != "wk-stall" {
+		t.Fatalf("nudged window = %q, want wk-stall", nudgedWindow)
+	}
+	if has, err := s.HasEventType(ctx, "stall", db.EventAutoResumed); err != nil || !has {
+		t.Fatalf("expected an auto_resumed event (has=%v err=%v)", has, err)
+	}
+	if has, _ := s.HasEventType(ctx, "stall", db.EventIdleUnreported); has {
+		t.Fatal("auto-resume must not also wake the manager with idle_unreported")
+	}
+	// Further sweeps on the same (still-stalled) pane must not re-nudge: the fast path
+	// fires at most once per episode.
+	for i := 0; i < 3; i++ {
+		if err := w.pollLiveness(ctx); err != nil {
+			t.Fatalf("pollLiveness post-nudge sweep %d: %v", i, err)
+		}
+	}
+	if nudged != 1 {
+		t.Fatalf("nudge must fire at most once per stall episode, got %d", nudged)
+	}
+}
+
+// TestPollLiveness_HealthyNotNudged: neither a busy worker nor a healthy, idle-but-not-
+// stalled worker is ever nudged, no matter how many sweeps run (even past the dwell).
+// The auto-resume is reserved for the unambiguous stall error.
+func TestPollLiveness_HealthyNotNudged(t *testing.T) {
+	w, s, _, clk := newWatcher(t)
+	ctx := context.Background()
+	seedActiveTask(t, s, "busy", "wk-busy")
+	seedActiveTask(t, s, "idle", "wk-idle")
+	panes := map[string]string{
+		"wk-busy": "✶ Working… (esc to interrupt)",
+		"wk-idle": "$ idle at the prompt",
+	}
+	w.capture = func(window string) paneObservation {
+		return paneObservation{present: true, captured: true, pane: panes[window]}
+	}
+	// Past the dwell so the idle worker would be flagged idle_unreported — proving the
+	// no-nudge result is about the absence of a stall, not the dwell holding things back.
+	gt, _, err := s.GetTask(ctx, "idle")
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	clk.t = gt.Created.Add(w.dwell() + time.Minute)
+
+	var nudged int
+	w.nudge = func(string) error { nudged++; return nil }
+
+	for i := 0; i < idleStaleSweeps+3; i++ {
+		if err := w.pollLiveness(ctx); err != nil {
+			t.Fatalf("pollLiveness sweep %d: %v", i, err)
+		}
+	}
+	if nudged != 0 {
+		t.Fatalf("a healthy worker must never be nudged, got %d nudges", nudged)
+	}
+}
+
+// TestPollLiveness_StallNudgeFailureFallsThroughToIdle: when the resume send fails, no
+// auto_resumed event is recorded and the worker is not silently dropped — the
+// idle_unreported safety net still surfaces it to the manager once the dwell elapses.
+func TestPollLiveness_StallNudgeFailureFallsThroughToIdle(t *testing.T) {
+	w, s, _, clk := newWatcher(t)
+	ctx := context.Background()
+	seedActiveTask(t, s, "stall", "wk-stall")
+	w.capture = func(string) paneObservation {
+		return paneObservation{present: true, captured: true, pane: "API Error: Response stalled mid-stream\n│ >"}
+	}
+	w.nudge = func(string) error { return errors.New("tmux send failed") }
+	// Past the dwell so the idle net is eligible to fire once the fast path goes quiet.
+	gt, _, err := s.GetTask(ctx, "stall")
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	clk.t = gt.Created.Add(w.dwell() + time.Minute)
+
+	for i := 0; i < idleStaleSweeps+2; i++ {
+		if err := w.pollLiveness(ctx); err != nil {
+			t.Fatalf("pollLiveness sweep %d: %v", i, err)
+		}
+	}
+	if has, _ := s.HasEventType(ctx, "stall", db.EventAutoResumed); has {
+		t.Fatal("a failed nudge must not record an auto_resumed event")
+	}
+	if has, err := s.HasEventType(ctx, "stall", db.EventIdleUnreported); err != nil || !has {
+		t.Fatalf("a worker a failed nudge could not revive must still surface as idle_unreported (has=%v err=%v)", has, err)
 	}
 }
 

@@ -80,6 +80,7 @@ type Watcher struct {
 	now            func() time.Time
 	wait           func(ctx context.Context, d time.Duration) error
 	capture        func(window string) paneObservation
+	nudge          func(window string) error // type a brief resume into a worker window (§4.4 auto-resume)
 	managerPresent func() bool
 	ghAvailable    func() bool
 	prState        func(prURL string) (string, error)
@@ -140,6 +141,12 @@ func New(store *db.Store, p paths.Paths, session string) *Watcher {
 			return paneObservation{present: true}
 		}
 		return paneObservation{present: true, captured: true, pane: out}
+	}
+	w.nudge = func(window string) error {
+		// A plain "continue" turn: after an API stall the worker sits at an empty
+		// prompt, and submitting that resumes it. SendLine types + Enters with a settle
+		// delay; it is not a slash-command, so the short delay applies.
+		return tmux.SendLine(w.Session, window, "continue")
 	}
 	w.managerPresent = func() bool {
 		return tmux.Available() && tmux.WindowExists(w.Session, managerWindow)
@@ -428,7 +435,10 @@ func (w *Watcher) pollArmedPRs(ctx context.Context) error {
 // count alone is poll-cadence-sensitive and trips in seconds. The per-task sweep count
 // is persisted (SetLiveness) so it survives across short-lived watch invocations; a pane
 // change resets it. A busy pane (livestate.Busy) is always treated as live and resets
-// the count, so a worker mid-turn is never flagged regardless of the dwell.
+// the count, so a worker mid-turn is never flagged regardless of the dwell. As a fast
+// path, an idle pane carrying the harness's mid-stream API-stall error (livestate.Stalled)
+// is auto-resumed with a "continue" nudge once stable, instead of waiting out the dwell —
+// see the inline note where it fires.
 func (w *Watcher) pollLiveness(ctx context.Context) error {
 	tasks, err := w.Store.ListTasks(ctx, db.TaskFilter{
 		Status:      []string{db.StatusActive},
@@ -482,6 +492,35 @@ func (w *Watcher) pollLiveness(ctx context.Context) error {
 		h := hashPane(obs.pane)
 		if t.LastPaneHash == h {
 			sweeps := t.IdleSweeps + 1
+			// API-stall auto-resume: a worker showing the harness's "Response stalled
+			// mid-stream" error on an otherwise-idle, stable pane is dead in the water but
+			// trivially recoverable — nudge it to continue rather than burning the full
+			// dwell and waking the manager for a self-healing condition. The stall string is
+			// unambiguous (and absent from any busy pane, already filtered above), so this
+			// needs no wall-clock dwell; it does reuse the idleStaleSweeps stability gate so
+			// a transient mid-render capture is never nudged. It fires at most once per
+			// episode — keyed to the exact threshold sweep: a landed nudge changes the pane
+			// (the typed reply, then a busy indicator), which resets the counter; if the
+			// nudge does not revive the worker the counter climbs past the threshold, this
+			// path falls silent, and the idle_unreported net below still surfaces the worker
+			// to the manager once the dwell elapses. The resume is recorded non-actionably so
+			// it lands on the audit spine without itself waking the manager.
+			if sweeps == idleStaleSweeps && livestate.Stalled(obs.pane) {
+				if err := w.nudge(t.Window); err == nil {
+					if _, err := w.Store.AppendEvent(ctx, db.Event{
+						EntityType: db.EntityTypeTask, EntityID: t.ID, Type: db.EventAutoResumed,
+						Actor: db.ActorSystem, Actionable: false, Payload: t.Window,
+					}); err != nil {
+						return err
+					}
+				}
+				// Whether or not the send landed, advance the count so the nudge fires at most
+				// once; a failed send simply falls through to idle_unreported later.
+				if err := w.setLiveness(ctx, t, h, sweeps); err != nil {
+					return err
+				}
+				continue
+			}
 			// Two gates must BOTH hold to flag idle_unreported:
 			//   • the wall-clock dwell (dwellElapsed) — the dominant gate that tolerates a
 			//     worker idle-waiting on its own long-running background shell; and
