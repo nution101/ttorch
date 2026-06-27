@@ -95,7 +95,11 @@ an automatic block.
    `ttorch-reviewer-correctness`, `ttorch-reviewer-scope`, and `ttorch-reviewer-security`
    agents. Give each the inputs dir path and the commit from `head.txt`. Each reads the
    inputs, reviews **only** its dimension, and writes `<dimension>.json` into the inputs
-   dir following the findings contract below. Reviewers never edit code.
+   dir following the findings contract below. Reviewers never edit code, and they **trust
+   the green `validate.json`** that prep staged rather than re-running the suite themselves
+   — review is a static read of the diff (a green `validate.json` already proves the repo's
+   build/lint and full test suite pass at the pinned commit), with at most one targeted check, only
+   to probe a specific gap a reviewer names.
 
 3. **Record the verdict.** `ttorch trust record <id>` aggregates the three reports into a
    single commit-pinned, time-boxed verdict (Go owns the verdict body, so a missing or

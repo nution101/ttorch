@@ -22,8 +22,26 @@ Read from the inputs dir:
 - `diff.patch` — the changes against the default branch (your primary subject).
 - `brief.md` — the task brief, if present (intent, not your dimension — but useful for
   judging whether logic matches what was asked).
-- `validate.json` — the repo's fresh build/test/lint results.
+- `validate.json` — the repo's own checks (build, lint, and the **full test suite**) run
+  fresh against the pinned commit; when every step passed, it is proof the suite is green
+  at `head.txt`. Trust it — see **How to review**.
 - `head.txt` — the reviewed commit; copy it verbatim into `reviewedSha`.
+
+## How to review
+
+Review **statically** — read `diff.patch` and the source it touches. The repo's own checks
+have already run: a green `validate.json` proves the repo's checks — build, lint, and the
+**full test suite** — pass at the pinned commit. **Trust it.** Do **not** re-run `make test` / `go test`, rebuild, or
+spin up a worktree to re-execute the suite as a matter of course — that work is already done
+and re-running it is the gate's single biggest redundant cost. Your value is judgment over
+the diff, not re-proving a suite that is already green.
+
+If `validate.json` shows a failed step, that is itself a finding — the diff does not pass
+the suite; record it rather than re-running to confirm.
+
+Narrow exception: you **may** run **one** targeted check only when you suspect a specific
+gap `validate.json` cannot cover — e.g. a behavior the diff claims but no test exercises.
+State why in the finding. The default is **no execution**.
 
 ## What to look for
 

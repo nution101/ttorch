@@ -22,8 +22,23 @@ Read from the inputs dir:
 - `brief.md` — the task brief and its acceptance criteria. This is your yardstick. If no
   brief is present, say so in a finding and judge against the manager-stated intent.
 - `diff.patch` — the changes against the default branch.
-- `validate.json` — the repo's fresh build/test/lint results.
+- `validate.json` — the repo's own checks (build, lint, and the **full test suite**) run
+  fresh against the pinned commit; when every step passed, it is proof the suite is green
+  at `head.txt`. Trust it — see **How to review**.
 - `head.txt` — the reviewed commit; copy it verbatim into `reviewedSha`.
+
+## How to review
+
+Review **statically** — read `diff.patch` against `brief.md`, plus the source it touches.
+The repo's own checks have already run: a green `validate.json` proves the repo's checks —
+build, lint, and the **full test suite** — pass at the pinned commit. **Trust it.** Do **not** re-run `make test`
+/ `go test`, rebuild, or spin up a worktree to re-execute the suite — that work is already
+done and re-running it is the gate's single biggest redundant cost. Scope is a judgment over
+the diff vs the brief, not an execution task.
+
+Narrow exception: you **may** run **one** targeted check only when you suspect a specific
+gap `validate.json` cannot cover, and you state why in the finding. The default is **no
+execution**.
 
 ## What to look for
 
