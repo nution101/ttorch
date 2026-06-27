@@ -2577,6 +2577,148 @@ func TestLand_RebaseMovedRequiresReapproval(t *testing.T) {
 	_, _ = m.Teardown("m1", true)
 }
 
+// TestLand_FastLandCarriesVerdictOnCleanRebase is the headline verdict-portable fast-land
+// case: in trusted mode a worker is reviewed and auto-approved, then the default advances with
+// an unrelated (disjoint) commit. Land rebases the worker onto the advanced default — moving
+// its commit sha — but the worker's own three-dot diff is byte-identical to what the reviewers
+// cleared, so the verdict is carried forward (re-pinned to the rebased commit) and the land
+// completes in ONE command WITHOUT re-running trust prep or the reviewers.
+func TestLand_FastLandCarriesVerdictOnCleanRebase(t *testing.T) {
+	m, repo := deliveryHarness(t, "fastland")
+	commitGateScript(t, repo, "exit 0") // passing gate on the default branch
+	if _, err := projectinit.Init(repo, "trusted"); err != nil {
+		t.Fatal(err)
+	}
+	task, err := m.Spawn("fl1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := task.Worktree
+	feat := commitFeature(t, wt, "feature.txt", "new\n")
+	writeReviewReports(t, m.P.ReviewInputsDir("fl1"), feat, nil) // clean → pass
+	if _, err := m.TrustRecord("fl1", "", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	// The verdict pins both the reviewed commit AND its diff content identity; the trusted gate
+	// auto-minted the approval.
+	if v, ok := m.TrustShow("fl1"); !ok || v.ReviewedSHA != feat || v.DiffID == "" {
+		t.Fatalf("recorded verdict should pin the reviewed sha and a diff identity: %+v ok=%v", v, ok)
+	}
+	if !approval.Valid(m.P.ApprovalFile("fl1")) {
+		t.Fatal("trusted pass + green validate should auto-mint an approval")
+	}
+
+	// The default branch advances non-conflictingly (a DIFFERENT file) after review.
+	if err := os.WriteFile(filepath.Join(repo, "other.txt"), []byte("concurrent\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "other.txt")
+	gitIn(t, repo, "commit", "-q", "-m", "concurrent landing")
+
+	// One land: the rebase moves the worker's sha, but its diff is unchanged, so the verdict is
+	// carried forward and the land succeeds with no manual re-gate.
+	out, err := m.Land("fl1", false)
+	if err != nil {
+		t.Fatalf("fast-land should carry the verdict over a clean rebase: %v", err)
+	}
+	rebased := gitIn(t, wt, "rev-parse", "HEAD")
+	if rebased == feat {
+		t.Fatal("the rebase should have moved the worker onto the advanced default")
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") != rebased {
+		t.Fatal("the default branch must fast-forward to the rebased commit")
+	}
+	if !strings.Contains(out, "landed fl1") || !strings.Contains(out, "verified") {
+		t.Fatalf("unexpected land summary: %q", out)
+	}
+	for _, f := range []string{"feature.txt", "other.txt"} {
+		if _, err := os.Stat(filepath.Join(repo, f)); err != nil {
+			t.Fatalf("%s should be present on the landed default branch: %v", f, err)
+		}
+	}
+	// The audit proves the verdict was CARRIED (not re-reviewed) and that the merge still went
+	// through the trust gate as an auto-approved verdict merge.
+	auditLog, _ := os.ReadFile(m.P.AuditLog())
+	if want := fmt.Sprintf("fast-land task=fl1 carried verdict %s->%s", short(feat), short(rebased)); !strings.Contains(string(auditLog), want) {
+		t.Fatalf("audit log missing the fast-land carry record (%q):\n%s", want, auditLog)
+	}
+	if !strings.Contains(string(auditLog), "gate=verdict approver=auto") {
+		t.Fatalf("the carried-forward merge must still record a gated auto-merge: %s", auditLog)
+	}
+	// trust-record ran exactly once (at setup) — the fast-land did NOT re-gate the task.
+	if n := strings.Count(string(auditLog), "trust-record task=fl1"); n != 1 {
+		t.Fatalf("fast-land must not re-record the verdict; trust-record count = %d:\n%s", n, auditLog)
+	}
+	// Both tokens are consumed by the merge.
+	if _, ok := m.TrustShow("fl1"); ok {
+		t.Fatal("the carried verdict must be consumed by the merge")
+	}
+	if approval.Valid(m.P.ApprovalFile("fl1")) {
+		t.Fatal("the carried approval must be consumed by the merge")
+	}
+	_, _ = m.Teardown("fl1", true)
+}
+
+// TestLand_FastLandRefusesOnChangedContent is the trust-boundary counterpart: when the rebase
+// is NOT clean/disjoint — the default advanced by editing the SAME file the worker touched, so
+// the worker's own three-dot diff changes after the rebase — the recorded verdict must NOT be
+// carried onto the changed content. Land refuses with a re-gate instruction, leaves the default
+// branch untouched, and leaves the verdict pinned to the original (now stale) commit.
+func TestLand_FastLandRefusesOnChangedContent(t *testing.T) {
+	m, repo := deliveryHarness(t, "fastlandchanged")
+	commitGateScript(t, repo, "exit 0")
+	if _, err := projectinit.Init(repo, "trusted"); err != nil {
+		t.Fatal(err)
+	}
+	// A shared, multi-line file both the worker and the default will edit — on DIFFERENT lines,
+	// so the rebase auto-merges (no conflict) yet the worker's three-dot diff still changes.
+	if err := os.WriteFile(filepath.Join(repo, "shared.txt"), []byte("l1\nl2\nl3\nl4\nl5\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "shared.txt")
+	gitIn(t, repo, "commit", "-q", "-m", "seed shared.txt")
+
+	task, err := m.Spawn("fc1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := task.Worktree
+	feat := commitFeature(t, wt, "shared.txt", "l1\nl2\nl3\nl4\nl5-worker\n") // worker edits the last line
+	writeReviewReports(t, m.P.ReviewInputsDir("fc1"), feat, nil)
+	if _, err := m.TrustRecord("fc1", "", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	// The default advances by editing a NEARBY line of the SAME file — no conflict, but the
+	// worker's three-dot diff (its surrounding context and base blob) changes after the rebase.
+	if err := os.WriteFile(filepath.Join(repo, "shared.txt"), []byte("l1\nl2\nl3-main\nl4\nl5\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "shared.txt")
+	gitIn(t, repo, "commit", "-q", "-m", "default edits shared.txt")
+	defBefore := gitIn(t, repo, "rev-parse", "HEAD")
+
+	_, err = m.Land("fc1", false)
+	if err == nil {
+		t.Fatal("fast-land must refuse to carry a verdict onto changed content")
+	}
+	if !strings.Contains(err.Error(), "changed its reviewed diff") || !strings.Contains(err.Error(), "trust prep") {
+		t.Fatalf("expected a re-gate instruction naming the changed diff, got: %v", err)
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") != defBefore {
+		t.Fatal("the default branch must not move when the verdict cannot be carried")
+	}
+	rebased := gitIn(t, wt, "rev-parse", "HEAD")
+	if rebased == feat {
+		t.Fatal("the rebase should have moved the worker onto the advanced default")
+	}
+	// The verdict was NOT carried: it still pins the ORIGINAL reviewed commit, not the rebased one.
+	if v, ok := m.TrustShow("fc1"); !ok || v.ReviewedSHA != feat {
+		t.Fatalf("the verdict must remain pinned to the original commit (not carried): %+v ok=%v", v, ok)
+	}
+	_, _ = m.Teardown("fc1", true)
+}
+
 // TestLand_PRModeRejectsRequireVerdict: --require-verdict has no local merge to gate in pr
 // mode, so it is rejected loudly rather than silently dropped.
 func TestLand_PRModeRejectsRequireVerdict(t *testing.T) {
