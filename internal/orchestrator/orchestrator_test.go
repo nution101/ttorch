@@ -17,6 +17,7 @@ import (
 	"github.com/nution101/ttorch/internal/projectinit"
 	"github.com/nution101/ttorch/internal/review"
 	"github.com/nution101/ttorch/internal/tmux"
+	"github.com/nution101/ttorch/internal/validate"
 	"github.com/nution101/ttorch/internal/worktree"
 )
 
@@ -3131,4 +3132,162 @@ func TestLand_SurfacesSecurityAdvisory(t *testing.T) {
 		t.Fatalf("land summary should surface the security advisory, got: %q", out)
 	}
 	_, _ = m.Teardown("ls1", true)
+}
+
+// countingGateScript commits a default-branch .ttorch/validate.sh that appends one byte to
+// counter (an absolute path) on every run and then exits 0, so a test can tell exactly how
+// many times the gate's fresh validate actually executed. Returns the default-branch HEAD.
+func countingGateScript(t *testing.T, repo, counter string) string {
+	t.Helper()
+	return commitGateScript(t, repo, fmt.Sprintf("printf x >> '%s'\nexit 0", counter))
+}
+
+// gateRunCount reports how many times countingGateScript ran (one byte appended per run); a
+// missing counter file means it never ran.
+func gateRunCount(t *testing.T, counter string) int {
+	t.Helper()
+	b, err := os.ReadFile(counter)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0
+		}
+		t.Fatal(err)
+	}
+	return len(b)
+}
+
+// stageValidate writes the head.txt / validate.json pair into a task's review-inputs dir
+// exactly as trust prep does, pinning results to sha — letting a test set up the reuse
+// (sha matches) and re-validate (sha differs) cases deterministically.
+func stageValidate(t *testing.T, dir, sha string, results []validate.Result) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(results)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "validate.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "head.txt"), []byte(sha+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestValidateForMerge_ReusesPinnedPrepValidate: when trust prep staged a green validate
+// pinned to the exact sha being merged, validateForMerge returns that staged result and
+// does NOT re-run the gate — the redundant full-suite run is skipped.
+func TestValidateForMerge_ReusesPinnedPrepValidate(t *testing.T) {
+	m, repo := deliveryHarness(t, "vfmreuse")
+	counter := filepath.Join(t.TempDir(), "runs")
+	countingGateScript(t, repo, counter)
+	task, err := m.Spawn("rz1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := commitFeature(t, task.Worktree, "feature.txt", "new\n")
+	// A green, commit-pinned validate already staged for this exact sha.
+	stageValidate(t, m.P.ReviewInputsDir("rz1"), head, []validate.Result{{Name: "gate", Passed: true}})
+
+	c0 := gateRunCount(t, counter)
+	green, results, reused, err := m.validateForMerge(repo, "rz1", head)
+	if err != nil {
+		t.Fatalf("validateForMerge: %v", err)
+	}
+	if !reused {
+		t.Fatal("a validate pinned to the exact merged sha must be reused, not re-run")
+	}
+	if !green || len(results) != 1 || !results[0].Passed {
+		t.Fatalf("reused result should be the staged green validate, got green=%v results=%+v", green, results)
+	}
+	if got := gateRunCount(t, counter); got != c0 {
+		t.Fatalf("reuse must not run the gate again: gate ran %d extra time(s)", got-c0)
+	}
+	_, _ = m.Teardown("rz1", true)
+}
+
+// TestValidateForMerge_RevalidatesWhenHeadMoved: when the staged validate pins to an older
+// sha than the one being merged, validateForMerge ignores the stale (here deliberately
+// failing) result and runs a fresh validate of the CURRENT sha — preserving the safety
+// property that the merged commit is validated, never trusting a result for a different
+// commit.
+func TestValidateForMerge_RevalidatesWhenHeadMoved(t *testing.T) {
+	m, repo := deliveryHarness(t, "vfmreval")
+	counter := filepath.Join(t.TempDir(), "runs")
+	countingGateScript(t, repo, counter)
+	task, err := m.Spawn("rv1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	head1 := commitFeature(t, task.Worktree, "a.txt", "1\n")
+	head2 := commitFeature(t, task.Worktree, "b.txt", "2\n")
+	if head1 == head2 {
+		t.Fatal("the two commits must differ for this test")
+	}
+	// Stale validate pinned to head1 AND failing: reusing it would both pin the wrong commit
+	// and wrongly block — re-validation of head2 must override both.
+	stageValidate(t, m.P.ReviewInputsDir("rv1"), head1, []validate.Result{{Name: "gate", Passed: false}})
+
+	c0 := gateRunCount(t, counter)
+	green, results, reused, err := m.validateForMerge(repo, "rv1", head2)
+	if err != nil {
+		t.Fatalf("validateForMerge: %v", err)
+	}
+	if reused {
+		t.Fatal("a validate pinned to a different sha must NOT be reused")
+	}
+	if got := gateRunCount(t, counter); got != c0+1 {
+		t.Fatalf("a moved HEAD must trigger exactly one fresh validate, got %d extra run(s)", got-c0)
+	}
+	if !green || len(validate.Failures(results)) != 0 {
+		t.Fatalf("the fresh validate of head2 should be green, got green=%v results=%+v", green, results)
+	}
+	_, _ = m.Teardown("rv1", true)
+}
+
+// TestMergeLocal_ReusesPrepValidateForUnchangedHead is the headline behavior: in a trusted
+// auto-merge whose committed sha is unchanged since trust prep validated it, the merge
+// reuses prep's commit-pinned validate.json instead of re-running the identical suite — yet
+// still fast-forwards (the merged commit remains backed by a green, pinned validate).
+func TestMergeLocal_ReusesPrepValidateForUnchangedHead(t *testing.T) {
+	m, repo := deliveryHarness(t, "mlreuse")
+	counter := filepath.Join(t.TempDir(), "runs")
+	countingGateScript(t, repo, counter)
+	if _, err := projectinit.Init(repo, "trusted"); err != nil {
+		t.Fatal(err)
+	}
+	task, err := m.Spawn("mr1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := commitFeature(t, task.Worktree, "feature.txt", "new\n")
+
+	dir, err := m.TrustPrep("mr1") // validates head once, staging validate.json + head.txt
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeReviewReports(t, dir, head, nil) // clean → pass
+	if _, err := m.TrustRecord("mr1", "", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if !approval.Valid(m.P.ApprovalFile("mr1")) {
+		t.Fatal("trusted + pass + green must auto-mint an approval")
+	}
+
+	before := gateRunCount(t, counter)
+	if before == 0 {
+		t.Fatal("prep/record should have run the counting gate at least once")
+	}
+	if _, err := m.MergeLocal("mr1", false); err != nil {
+		t.Fatalf("trusted merge should succeed reusing prep's validate: %v", err)
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") != head {
+		t.Fatal("the merged commit must be fast-forwarded onto the default branch")
+	}
+	if after := gateRunCount(t, counter); after != before {
+		t.Fatalf("merge re-ran the gate %d extra time(s); it should reuse prep's commit-pinned validate", after-before)
+	}
+	_, _ = m.Teardown("mr1", true)
 }
