@@ -345,17 +345,34 @@ func TestSpawnPeekTeardown(t *testing.T) {
 	_, _ = m.Teardown("t2", true)
 }
 
-// TestSpawn_WaitsForLaunchBeforeReturning proves Spawn does not return — and so does
-// not let a brief be sent — until the launched command has actually taken over the
-// pane. If it returned early the foreground would still be the bare shell.
+// TestSpawn_WaitsForLaunchBeforeReturning proves Spawn hands back a window that is
+// running the launched command, not a bare shell that would silently drop a brief.
+//
+// It polls for the command to take over rather than sampling the foreground once. A
+// worker's login shell sources its startup files before it runs the (type-ahead-
+// buffered) command, and waitForLaunch returns on the FIRST non-shell foreground it
+// sees; on a machine whose shell startup briefly forks a non-shell helper (e.g. a
+// version-manager shim like fnm) that is not in the shell denylist, waitForLaunch can
+// return on that helper a moment before `sleep` is foreground. A single un-retried
+// read then races that startup window and reds the suite intermittently. Waiting for
+// the command to actually take over still catches the real failure — a bare shell that
+// never runs the command leaves the foreground a shell until the poll times out below —
+// without coupling the assertion to one transient instant.
 func TestSpawn_WaitsForLaunchBeforeReturning(t *testing.T) {
 	m, repo := deliveryHarness(t, "ready")
 	task, err := m.Spawn("r1", repo, false, "sleep 30")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cmd := tmux.PaneCurrentCommand(m.Session, task.Window); cmd != "sleep" {
-		t.Fatalf("foreground command right after spawn = %q, want %q (Spawn returned before the worker came up)", cmd, "sleep")
+	var cmd string
+	for i := 0; i < 100; i++ { // up to ~2s, well past a login shell's startup
+		if cmd = tmux.PaneCurrentCommand(m.Session, task.Window); cmd == "sleep" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if cmd != "sleep" {
+		t.Fatalf("the worker command never took over the pane: foreground = %q, want %q", cmd, "sleep")
 	}
 	_, _ = m.Teardown("r1", true)
 }
