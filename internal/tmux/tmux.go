@@ -66,26 +66,39 @@ func HasSession(session string) bool {
 	return err == nil
 }
 
-// applyTitleOptions turns on terminal-title reporting for a session ttorch owns
-// and points it at TitleFormat. set-titles/-string are per-session options, so
-// they are applied to every session ttorch attaches (this shared session, and the
-// view sessions in package termtab). Best-effort: a failure never blocks a spawn.
-func applyTitleOptions(session string) {
+// applySessionOptions applies the per-session options ttorch needs on a session it
+// owns. set-option is per-session, so these are (re)applied to every session ttorch
+// attaches (this shared session, and the view sessions in package termtab).
+// Best-effort: a failure never blocks a spawn.
+//
+// It first pins destroy-unattached off: this shared session holds every worker's
+// window, so it must NEVER self-destruct when no client is attached. A client
+// disconnect (e.g. the lead's remote tmux client dropping) leaves the session
+// momentarily unattached, and without this pin a global "destroy-unattached on"
+// inherited from the user's tmux config would tear the session down, exit the
+// server, and kill every live worker along with its uncommitted work. Pinning off
+// at the session level overrides any such global default. It then turns on
+// terminal-title reporting and points it at TitleFormat so the terminal tab shows a
+// window's friendly display label (the @ttorch_label window option set by
+// LabelWindow), falling back to the window's tmux name.
+func applySessionOptions(session string) {
+	_, _ = run("set-option", "-t", session, "destroy-unattached", "off")
 	_, _ = run("set-option", "-t", session, "set-titles", "on")
 	_, _ = run("set-option", "-t", session, "set-titles-string", TitleFormat)
 }
 
 // EnsureSession creates the session detached if it does not exist. It (re)applies
-// ttorch's title options each call so a pre-existing session also reports titles.
+// ttorch's session options each call so a pre-existing session also pins
+// destroy-unattached off and reports titles.
 func EnsureSession(session string) error {
 	if HasSession(session) {
-		applyTitleOptions(session)
+		applySessionOptions(session)
 		return nil
 	}
 	if _, err := run("new-session", "-d", "-s", session); err != nil {
 		return err
 	}
-	applyTitleOptions(session)
+	applySessionOptions(session)
 	return nil
 }
 

@@ -178,6 +178,7 @@ func TestEnsureSession_New(t *testing.T) {
 	want := [][]string{
 		{"has-session", "-t", "s"},
 		{"new-session", "-d", "-s", "s"},
+		{"set-option", "-t", "s", "destroy-unattached", "off"},
 		{"set-option", "-t", "s", "set-titles", "on"},
 		{"set-option", "-t", "s", "set-titles-string", TitleFormat},
 	}
@@ -198,9 +199,43 @@ func TestEnsureSession_Existing(t *testing.T) {
 			t.Fatalf("new-session called for an existing session: %v", inv)
 		}
 	}
-	// title options are still (re)applied.
-	if len(inv) != 3 {
-		t.Fatalf("invocations = %v, want has-session + 2 set-option", inv)
+	// session options are still (re)applied: destroy-unattached off + 2 title options.
+	if len(inv) != 4 {
+		t.Fatalf("invocations = %v, want has-session + 3 set-option", inv)
+	}
+}
+
+// TestEnsureSessionPinsDestroyUnattachedOff guards the disconnect-crash fix: the
+// shared session ttorch owns must pin destroy-unattached off so a client disconnect
+// (or an inherited global "destroy-unattached on") can never tear it down. Losing
+// this session — which holds every worker's window — exits the server and kills the
+// whole fleet. Covers both the freshly-created and the pre-existing paths.
+func TestEnsureSessionPinsDestroyUnattachedOff(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		hasExit string // FAKE_HAS_SESSION_EXIT: "1" => create, "0" => already exists
+	}{
+		{"new", "1"},
+		{"existing", "0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			log := installFakeTmux(t)
+			t.Setenv("FAKE_HAS_SESSION_EXIT", tc.hasExit)
+			if err := EnsureSession("s"); err != nil {
+				t.Fatalf("EnsureSession: %v", err)
+			}
+			want := []string{"set-option", "-t", "s", "destroy-unattached", "off"}
+			found := false
+			for _, call := range readInvocations(t, log) {
+				if reflect.DeepEqual(call, want) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("EnsureSession(%s path) did not pin destroy-unattached off", tc.name)
+			}
+		})
 	}
 }
 
