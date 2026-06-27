@@ -1166,6 +1166,15 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 	if err != nil {
 		return zero, err
 	}
+	// Pin the reviewed diff's content identity onto the verdict (the committed three-dot diff
+	// the reviewers read) so a later clean rebase onto an advanced default can carry the
+	// verdict forward without re-running the reviewers — see carryVerdictForward. Computed from
+	// committed objects, so it is independent of the worktree state.
+	patch, derr := mergeBaseDiff(t.Worktree, worktree.DefaultBranch(t.Project), sha)
+	if derr != nil {
+		return zero, fmt.Errorf("trust record %q: could not compute the reviewed diff identity: %w", taskID, derr)
+	}
+	verdict.DiffID = review.DiffID([]byte(patch))
 	if err := review.Write(m.P.ReviewVerdictFile(taskID), verdict, ttl); err != nil {
 		return zero, err
 	}
@@ -1780,6 +1789,16 @@ func (m *Manager) Land(taskID string, requireVerdict bool) (string, error) {
 	// remains the consuming authority), so the lead reviews the rebased diff, re-approves,
 	// and re-runs land; a no-op rebase keeps the existing approval valid and lands at once.
 	if mode != "pr" {
+		// Verdict-portable fast-land: when the rebase moved the worker onto an advanced default
+		// but its own three-dot diff is byte-identical to what the reviewers cleared, carry the
+		// passing verdict forward to the rebased commit (re-pinning it, and the auto-minted
+		// approval, to rebasedHead) instead of forcing a full re-gate. A rebase that changed the
+		// reviewed content is never carried — carryVerdictForward returns a loud re-gate error.
+		if gated && rebasedHead != preRebase {
+			if _, err := m.carryVerdictForward(t, base, rebasedHead); err != nil {
+				return "", err
+			}
+		}
 		if err := m.gateCoversRebased(t, rebasedHead, gated); err != nil {
 			return "", err
 		}
@@ -1836,6 +1855,72 @@ func (m *Manager) securityAuditNote(taskID, landedSHA string, gated bool) string
 		return fmt.Sprintf("advisory: security audit raised blocking findings for %s — review 'ttorch security-review show %s' (advisory, did not block this delivery)", short(landedSHA), taskID)
 	}
 	return fmt.Sprintf("advisory: security audit passed for %s", short(landedSHA))
+}
+
+// carryVerdictForward implements verdict-portable fast-land. When a gated land has rebased the
+// worker onto an advanced default — moving the commit SHA the verdict was pinned to — it
+// carries the existing PASSING verdict forward to the rebased commit, re-pinning the verdict
+// (and, when the gate auto-minted it, the approval token) to rebasedHead WITHOUT re-running
+// trust prep or the three reviewers — but ONLY when the worker's own three-dot diff against
+// the rebase base is byte-identical to the diff the reviewers cleared, matched by the verdict's
+// recorded content identity (review.DiffID). This is the throughput fix that stops re-gating a
+// task every time an unrelated merge advances the default beneath it.
+//
+// A content change — anything but a clean, disjoint rebase — is NEVER carried: re-pinning a
+// verdict onto changed content would be a trust hole, so it returns a loud re-gate error
+// instead. When there is no passing verdict to carry, or one predating content identities (an
+// empty DiffID), it carries nothing and returns (false, nil), letting gateCoversRebased issue
+// the usual re-gate demand. The verdict expiry, findings, and content identity are preserved so
+// a subsequent rebase can carry it again; the merge gate in MergeLocal re-validates and
+// re-consumes the re-pinned tokens, so carry-forward is an optimization, never the authority.
+func (m *Manager) carryVerdictForward(t db.Task, base, rebasedHead string) (bool, error) {
+	v, ok := review.Load(m.P.ReviewVerdictFile(t.ID))
+	if !ok || v.Overall != review.Pass {
+		return false, nil // no carryable verdict — gateCoversRebased demands a fresh one
+	}
+	if v.ReviewedSHA == rebasedHead {
+		return false, nil // already covers the rebased commit (e.g. a no-op re-run)
+	}
+	if v.DiffID == "" {
+		return false, nil // a verdict recorded before content identities — fail safe to re-gate
+	}
+	patch, err := mergeBaseDiff(t.Worktree, base, rebasedHead)
+	if err != nil {
+		return false, fmt.Errorf("land: could not compute the rebased diff for %q to carry its verdict forward: %w", t.ID, err)
+	}
+	if review.DiffID([]byte(patch)) != v.DiffID {
+		// The rebase onto the advanced default was not clean/disjoint: it changed the worker's
+		// own diff, so the recorded verdict no longer covers what would merge. Never carry a
+		// verdict onto changed content — force a full re-gate.
+		return false, fmt.Errorf("land: rebasing %q onto the advanced %s changed its reviewed diff, so the recorded verdict no longer covers the rebased commit %s; re-run 'ttorch trust prep %s', review, and 'ttorch trust record %s', then re-run 'ttorch land %s'",
+			t.ID, base, short(rebasedHead), t.ID, t.ID, t.ID)
+	}
+	// The worker's own diff is byte-identical to what the reviewers cleared: carry the verdict
+	// forward by re-pinning it to the rebased commit, preserving its expiry, findings, and
+	// content identity.
+	reviewedSHA := v.ReviewedSHA
+	ttl := time.Until(time.Unix(0, v.Expires))
+	if ttl <= 0 {
+		return false, nil // expired between Load and here — gateCoversRebased fails closed
+	}
+	v.ReviewedSHA = rebasedHead
+	if err := review.Write(m.P.ReviewVerdictFile(t.ID), v, ttl); err != nil {
+		return false, fmt.Errorf("land: could not re-pin the carried verdict for %q: %w", t.ID, err)
+	}
+	// The trusted gate auto-mints the approval token from the same review, pinned to the same
+	// commit; re-pin it forward too so the merge proceeds without a human. A human-minted
+	// approval is NEVER forged forward — the lead re-approves the rebased commit (a single
+	// step), but the three reviewers do not re-run.
+	if data, ok := approval.Data(m.P.ApprovalFile(t.ID)); ok {
+		if by, _ := splitApprovalPayload(data); by == "auto" {
+			if err := approval.Grant(m.P.ApprovalFile(t.ID), ttl, approvalPayload("auto", rebasedHead)); err != nil {
+				return false, fmt.Errorf("land: could not re-pin the carried auto-approval for %q: %w", t.ID, err)
+			}
+		}
+	}
+	m.audit(fmt.Sprintf("fast-land task=%s carried verdict %s->%s base=%s (reviewed diff unchanged)",
+		t.ID, short(reviewedSHA), short(rebasedHead), base))
+	return true, nil
 }
 
 // gateCoversRebased verifies the existing approval (and, when gated, a passing review
