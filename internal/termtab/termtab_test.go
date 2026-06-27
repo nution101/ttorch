@@ -38,7 +38,9 @@ func TestViewCommand(t *testing.T) {
 		"new-session -A",
 		"-s 'ttv-wk-42'",
 		"-t 'ttorch'",
-		"set-option -t 'ttv-wk-42' destroy-unattached on",
+		// Pinned OFF — never on — so a client disconnect cannot self-destruct the view
+		// and cascade into tearing down the fleet (see TestViewCommandSurvivesDisconnect).
+		"set-option -t 'ttv-wk-42' destroy-unattached off",
 		// the grouped view session reports the worker's friendly label as its tab
 		// title (set-titles is per-session, so the view needs its own).
 		"set-option -t 'ttv-wk-42' set-titles on",
@@ -60,6 +62,23 @@ func TestViewCommandExecsTmux(t *testing.T) {
 	cmd := viewCommand("ttorch", "wk-42")
 	if !strings.HasPrefix(cmd, "exec tmux ") {
 		t.Errorf("view command must exec tmux so no shell survives the view, got %q", cmd)
+	}
+}
+
+// TestViewCommandSurvivesDisconnect pins the disconnect-crash fix: the grouped view
+// session must pin destroy-unattached OFF and must never set it on. tmux cannot tell
+// a closed tab from a dropped client, so a self-destructing view tore down the whole
+// fleet when the lead's remote connection dropped — the view died, the unattached
+// shared session followed, the server exited, and every worker's uncommitted work
+// was lost. Pinning off (overriding any inherited global on) keeps the view, and the
+// fleet, intact across a disconnect.
+func TestViewCommandSurvivesDisconnect(t *testing.T) {
+	cmd := viewCommand("ttorch", "wk-42")
+	if !strings.Contains(cmd, "set-option -t 'ttv-wk-42' destroy-unattached off") {
+		t.Errorf("view command must pin destroy-unattached off, got %q", cmd)
+	}
+	if strings.Contains(cmd, "destroy-unattached on") {
+		t.Errorf("view command must never set destroy-unattached on (a disconnect would self-destruct the view and cascade to the fleet): %q", cmd)
 	}
 }
 

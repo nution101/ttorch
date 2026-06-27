@@ -2,8 +2,10 @@
 // view onto a worker's tmux window, so the lead can watch a worker without
 // leaving tmux. The worker process itself never leaves its tmux window in the
 // shared session: the native tab only attaches a grouped (view) session that
-// shares the source session's window list. Closing the tab destroys the view
-// session and leaves the worker's window and process intact.
+// shares the source session's window list. The view never self-destructs on a
+// client disconnect (destroy-unattached is pinned off); it is torn down by Close
+// (worker teardown) or when the shared session is killed, always leaving the
+// worker's window and process intact.
 //
 // The whole feature is macOS-only and best-effort: Open returns nil when the
 // feature is disabled, the OS is not macOS, or the underlying osascript fails
@@ -187,13 +189,23 @@ func viewName(window string) string {
 }
 
 // viewCommand builds the tmux command the native tab runs. It creates (or
-// attaches to) a grouped view session sharing the source session's windows,
-// sets destroy-unattached (scoped explicitly to the view session) so closing the
-// tab tears down only the view, turns on title reporting for the view session so
-// the tab shows the worker's friendly label (tmux.TitleFormat reads the shared
-// window's @ttorch_label; set-titles is a per-session option, so the grouped view
-// needs its own), and selects the worker's window. new-session WITHOUT -d attaches
-// immediately, so destroy-unattached only fires when the user closes the tab.
+// attaches to) a grouped view session sharing the source session's windows, pins
+// destroy-unattached OFF on the view (scoped explicitly to the view session), turns
+// on title reporting for the view session so the tab shows the worker's friendly
+// label (tmux.TitleFormat reads the shared window's @ttorch_label; set-titles is a
+// per-session option, so the grouped view needs its own), and selects the worker's
+// window.
+//
+// destroy-unattached is pinned OFF — never on. tmux cannot distinguish a closed tab
+// from a dropped client (both leave the session unattached), so a self-destructing
+// view was the root of the disconnect crash: when the lead's remote client dropped,
+// the view tore itself down and, with the shared session unattached too, the server
+// exited and every live worker died with its uncommitted work. Pinning off also
+// overrides any "destroy-unattached on" the view would otherwise inherit from the
+// lead's global tmux config. The view is now reaped only by Close (worker teardown)
+// or when the shared session is killed; a manually closed tab leaves a harmless
+// detached view that the next Open reattaches to (new-session -A) and teardown
+// later reaps.
 //
 // This command is executed by the terminal's interactive shell (via osascript
 // `do script` / `write text`), so every interpolated operand is single-quoted
@@ -209,7 +221,7 @@ func viewName(window string) string {
 func viewCommand(session, window string) string {
 	view := viewName(window)
 	return fmt.Sprintf(
-		"exec tmux new-session -A -s %s -t %s \\; set-option -t %s destroy-unattached on \\; set-option -t %s set-titles on \\; set-option -t %s set-titles-string %s \\; select-window -t %s:%s",
+		"exec tmux new-session -A -s %s -t %s \\; set-option -t %s destroy-unattached off \\; set-option -t %s set-titles on \\; set-option -t %s set-titles-string %s \\; select-window -t %s:%s",
 		shq(view), shq(session), shq(view), shq(view), shq(view), shq(tmux.TitleFormat), shq(view), shq(window),
 	)
 }
