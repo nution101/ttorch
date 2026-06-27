@@ -1450,9 +1450,13 @@ func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error)
 		if v.Overall != review.Pass {
 			return "", fmt.Errorf("trust gate: the review verdict for %q is %q, not pass; resolve the blocking findings and re-record", taskID, v.Overall)
 		}
-		// Fresh validate of the COMMITTED sha (an immutable detached checkout), using the
-		// gate definition from the DEFAULT BRANCH. No checks detected is a hard BLOCK.
-		green, results, err := validateCommitted(repo, workerHead)
+		// Validate the COMMITTED sha (an immutable detached checkout), using the gate
+		// definition from the DEFAULT BRANCH. No checks detected is a hard BLOCK. When trust
+		// prep already validated this EXACT sha (its commit-pinned validate.json is still the
+		// gate's notion of green for this commit), reuse that result rather than re-run the
+		// identical full suite — only HEAD moving since prep, or no pinned result, forces a
+		// fresh run. The merged commit is still backed by a green, commit-pinned validate.
+		green, results, _, err := m.validateForMerge(repo, taskID, workerHead)
 		if err != nil {
 			return "", err
 		}
@@ -1615,6 +1619,54 @@ func validateCommitted(repo, sha string) (bool, []validate.Result, error) {
 	}
 	defer worktree.RemoveWorktree(repo, co)
 	return gateValidate(co, repo)
+}
+
+// validateForMerge resolves the trust gate's green/results decision for the committed sha,
+// reusing the commit-pinned validate trust prep already staged (validate.json, pinned by
+// head.txt) when it pins to EXACTLY this sha — so the identical commit is not run through
+// the full suite twice (once at prep, once at the merge). It falls back to a fresh
+// validateCommitted whenever no staged result pins to this sha: the worker advanced HEAD
+// since prep, or prep never ran. reused reports which path was taken. The green semantics
+// are identical either way (validateCommitted persisted the same []validate.Result prep
+// staged), so the merged commit is always backed by a green, commit-pinned validate — the
+// gate just stops re-running it.
+func (m *Manager) validateForMerge(repo, taskID, sha string) (green bool, results []validate.Result, reused bool, err error) {
+	if staged, ok := m.reusablePrepValidate(taskID, sha); ok {
+		return stagedGreen(staged), staged, true, nil
+	}
+	green, results, err = validateCommitted(repo, sha)
+	return green, results, false, err
+}
+
+// reusablePrepValidate returns the validate results trust prep staged for taskID IF AND
+// ONLY IF they are pinned (via head.txt) to exactly sha — i.e. the staged run validated
+// the very commit now being merged. A missing/mismatched head.txt, or an unreadable or
+// malformed validate.json, yields ok=false so the caller re-validates rather than trusts a
+// stale or absent result. It reads committed objects' recorded outcome only; the immutable
+// sha guarantees the tree behind the result is unchanged.
+func (m *Manager) reusablePrepValidate(taskID, sha string) ([]validate.Result, bool) {
+	dir := m.P.ReviewInputsDir(taskID)
+	pinned, err := os.ReadFile(filepath.Join(dir, "head.txt"))
+	if err != nil || strings.TrimSpace(string(pinned)) != sha {
+		return nil, false
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "validate.json"))
+	if err != nil {
+		return nil, false
+	}
+	var results []validate.Result
+	if err := json.Unmarshal(raw, &results); err != nil {
+		return nil, false
+	}
+	return results, true
+}
+
+// stagedGreen mirrors gateGreen's pass semantics for a persisted result set, where the
+// originating step list is no longer available: at least one check ran and none failed. An
+// empty or null result set is a no-checks-detected hard BLOCK, never a pass (an empty
+// Failures() must not read as green) — exactly as the merge gate treats it.
+func stagedGreen(results []validate.Result) bool {
+	return len(results) > 0 && len(validate.Failures(results)) == 0
 }
 
 // hasDefaultBranchGateScript reports whether the repo's default branch defines the gate
