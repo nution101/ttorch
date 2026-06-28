@@ -2,10 +2,11 @@
 name: ttorch-review
 description: >
   Run the adversarial-review trust gate on a worker's diff: prepare the review inputs,
-  fan out three independent reviewer subagents (correctness, scope, security), record a
-  commit-pinned verdict, and — in trusted delivery mode — merge without a separate lead
-  approval. Use when gating a task for a trusted-mode or --require-verdict merge. Also runs
-  the standalone, advisory security audit that applies in EVERY delivery mode.
+  fan out independent reviewer subagents (correctness, scope, security — scaled to the
+  change size), record a commit-pinned verdict, and — in trusted delivery mode — merge
+  without a separate lead approval. Use when gating a task for a trusted-mode or
+  --require-verdict merge. Also runs the standalone, advisory security audit that applies
+  in EVERY delivery mode.
 metadata:
   managed-by: ttorch
 user-invocable: true
@@ -91,19 +92,38 @@ an automatic block.
    that will fast-forward — a worker cannot show a benign working tree while a different
    commit merges. Commit (or discard) all changes before prep.
 
-2. **Fan out three reviewers — in parallel, one per dimension.** Dispatch the
-   `ttorch-reviewer-correctness`, `ttorch-reviewer-scope`, and `ttorch-reviewer-security`
-   agents. Give each the inputs dir path and the commit from `head.txt`. Each reads the
-   inputs, reviews **only** its dimension, and writes `<dimension>.json` into the inputs
-   dir following the findings contract below. Reviewers never edit code, and they **trust
-   the green `validate.json`** that prep staged rather than re-running the suite themselves
-   — review is a static read of the diff (a green `validate.json` already proves the repo's
+2. **Fan out the reviewers for this diff — in parallel, one per dimension.** The gate
+   **scales the reviewer set to the change size**, so spawn exactly the dimensions `trust
+   prep` named (it prints them, and records them in `reviewers.json` in the inputs dir):
+
+   - **Substantial / code change → all three:** `ttorch-reviewer-correctness`,
+     `ttorch-reviewer-scope`, and `ttorch-reviewer-security`. This is also the default
+     whenever the diff is anything but cleanly docs-only or trivial.
+   - **Docs-only change** (every changed file is inert prose — `.md`, `.txt`, a
+     LICENSE-style file) **→ correctness + scope.** Prose has no executable surface, so the
+     security reviewer is dropped — for documentation only, never for code.
+   - **Trivial change** (one small code file, within the gate's line budget) **→
+     correctness + security.** A tiny single-file change has little room for scope creep, so
+     scope is dropped — but it is still code, so **security is kept**.
+
+   Give each the inputs dir path and the commit from `head.txt`. Each reads the inputs,
+   reviews **only** its dimension, and writes `<dimension>.json` into the inputs dir
+   following the findings contract below. Reviewers never edit code, and they **trust the
+   green `validate.json`** that prep staged rather than re-running the suite themselves —
+   review is a static read of the diff (a green `validate.json` already proves the repo's
    build/lint and full test suite pass at the pinned commit), with at most one targeted check, only
    to probe a specific gap a reviewer names.
 
-3. **Record the verdict.** `ttorch trust record <id>` aggregates the three reports into a
-   single commit-pinned, time-boxed verdict (Go owns the verdict body, so a missing or
-   malformed report **fails closed** to `block`). In **trusted** mode a `pass` verdict
+   > **Why scale, and why it stays safe.** The full pass is wasted on a one-line README
+   > fix. Reducing the set keeps the gate fast on low-risk diffs while never under-reviewing
+   > a real one: **security review is dropped only for a diff with no code at all**, and
+   > anything the gate cannot cleanly classify as docs-only or trivial falls back to the
+   > full three-dimension pass. `trust record` then aggregates against exactly the prepared
+   > set, and a missing record fails safe to all three.
+
+3. **Record the verdict.** `ttorch trust record <id>` aggregates the prepared reports into
+   a single commit-pinned, time-boxed verdict (Go owns the verdict body, so a missing or
+   malformed report for any required dimension **fails closed** to `block`). In **trusted** mode a `pass` verdict
    over a still-green worktree auto-mints the approval token; every other mode leaves the
    verdict advisory.
 
