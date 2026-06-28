@@ -283,7 +283,7 @@ func TestSpawnPeekTeardown(t *testing.T) {
 	session := fmt.Sprintf("ttorch-test-%d", os.Getpid())
 	t.Setenv("TTORCH_HOME", t.TempDir())
 	t.Setenv("TTORCH_TMUX_SESSION", session)
-	defer exec.Command("tmux", "kill-session", "-t", session).Run()
+	t.Cleanup(func() { exec.Command("tmux", "kill-session", "-t", session).Run() })
 
 	m, err := New(paths.Default())
 	if err != nil {
@@ -546,7 +546,7 @@ func TestTeardownRefusesDirtyWorktree(t *testing.T) {
 	session := fmt.Sprintf("ttorch-test-dirty-%d", os.Getpid())
 	t.Setenv("TTORCH_HOME", t.TempDir())
 	t.Setenv("TTORCH_TMUX_SESSION", session)
-	defer exec.Command("tmux", "kill-session", "-t", session).Run()
+	t.Cleanup(func() { exec.Command("tmux", "kill-session", "-t", session).Run() })
 
 	m, err := New(paths.Default())
 	if err != nil {
@@ -607,7 +607,7 @@ func TestDeliveryLifecycle(t *testing.T) {
 	session := fmt.Sprintf("ttorch-deliver-%d", os.Getpid())
 	t.Setenv("TTORCH_HOME", t.TempDir())
 	t.Setenv("TTORCH_TMUX_SESSION", session)
-	defer exec.Command("tmux", "kill-session", "-t", session).Run()
+	t.Cleanup(func() { exec.Command("tmux", "kill-session", "-t", session).Run() })
 
 	m, err := New(paths.Default())
 	if err != nil {
@@ -683,7 +683,7 @@ func TestMergeLocal_ApprovalBinding(t *testing.T) {
 	session := fmt.Sprintf("ttorch-bind-%d", os.Getpid())
 	t.Setenv("TTORCH_HOME", t.TempDir())
 	t.Setenv("TTORCH_TMUX_SESSION", session)
-	defer exec.Command("tmux", "kill-session", "-t", session).Run()
+	t.Cleanup(func() { exec.Command("tmux", "kill-session", "-t", session).Run() })
 
 	m, err := New(paths.Default())
 	if err != nil {
@@ -2270,7 +2270,7 @@ func TestStopSession(t *testing.T) {
 	session := fmt.Sprintf("ttorch-stop-%d", os.Getpid())
 	t.Setenv("TTORCH_HOME", t.TempDir())
 	t.Setenv("TTORCH_TMUX_SESSION", session)
-	defer exec.Command("tmux", "kill-session", "-t", session).Run()
+	t.Cleanup(func() { exec.Command("tmux", "kill-session", "-t", session).Run() })
 
 	m, err := New(paths.Default())
 	if err != nil {
@@ -2307,7 +2307,7 @@ func TestRestoreAndReset(t *testing.T) {
 	session := fmt.Sprintf("ttorch-restore-%d", os.Getpid())
 	t.Setenv("TTORCH_HOME", t.TempDir())
 	t.Setenv("TTORCH_TMUX_SESSION", session)
-	defer exec.Command("tmux", "kill-session", "-t", session).Run()
+	t.Cleanup(func() { exec.Command("tmux", "kill-session", "-t", session).Run() })
 
 	m, err := New(paths.Default())
 	if err != nil {
