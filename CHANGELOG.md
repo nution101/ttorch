@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.7.0](https://github.com/nution101/ttorch/compare/v0.6.0...v0.7.0) (2026-06-28)
+
+
+### Features
+
+* **db:** add durable task leases + reclaim to the tasks table ([cdb7eec](https://github.com/nution101/ttorch/commit/cdb7eeccf478368713745d78bc9160b5bd4d8678))
+* **gate:** make the trust-gate verdict durable in SQLite ([2e3b9a4](https://github.com/nution101/ttorch/commit/2e3b9a44c6d21fa8a4ed94d0f11fc1ade3d3d7a7))
+* **livestate:** broaden recoverable API-stall auto-resume patterns ([125562b](https://github.com/nution101/ttorch/commit/125562b40d2633b4bd4fdacbf9ab342575f59a41))
+* **orchestrator:** scale the trust gate's reviewer set to diff size ([1aefa73](https://github.com/nution101/ttorch/commit/1aefa73e21926f19a053fc4c87bb981c89383b44))
+* **review:** classify diff size to scale the reviewer set ([3d5524e](https://github.com/nution101/ttorch/commit/3d5524ecf36003bb178fed9067b6748a7891e049))
+* **watch:** add an external manager-liveness watchdog ([a567d2c](https://github.com/nution101/ttorch/commit/a567d2c41b8ec741b812408403e4c070a35d521c))
+
+
+### Bug Fixes
+
+* **manager:** enforce disjoint dispatch and an always-armed wake ([187e6cf](https://github.com/nution101/ttorch/commit/187e6cfeefaa4de1f41af46feff90a3df6ce85bc))
+* **manager:** point capacity guidance at the new `free slots` signal ([4c09f88](https://github.com/nution101/ttorch/commit/4c09f88d173e00eaad6b335d7d83b0a53d9a11c9))
+* **review:** classify diff size off an authoritative unquoted file list ([0c74da3](https://github.com/nution101/ttorch/commit/0c74da3ef801279bdd94494f52e238f707451603))
+* **status:** report real worktree-pool capacity, not idle-worker count ([91f24ae](https://github.com/nution101/ttorch/commit/91f24aec4b7c34f84b7c4e5efc472103e9036a41))
+
 ## [0.6.0](https://github.com/nution101/ttorch/compare/v0.5.2...v0.6.0) (2026-06-28)
 
 
