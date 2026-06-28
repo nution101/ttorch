@@ -855,6 +855,38 @@ func TestTrustPrep_ScalesReviewers(t *testing.T) {
 	}
 }
 
+// TestTrustPrep_QuotedCodeFilenameKeepsSecurity reproduces the gate-bypass end to end: a
+// worker pairs an innocuous README edit with a code file whose non-ASCII name git QUOTES
+// in the patch body. Classifying off the patch text would drop the quoted path and misread
+// the diff as docs-only, dropping the security reviewer. Sourcing the file list from
+// `git diff --name-only -z` (unquoted) keeps the change classified as code, so prep records
+// the full set including security.
+func TestTrustPrep_QuotedCodeFilenameKeepsSecurity(t *testing.T) {
+	m, repo := deliveryHarness(t, "quoted")
+	task, err := m.Spawn("q1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := task.Worktree
+	// Innocuous docs edit + a code file with a non-ASCII name git quotes in the patch.
+	if err := os.WriteFile(filepath.Join(wt, "README.md"), []byte("# readme\nharmless\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "café.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, wt, "add", "-A")
+	gitIn(t, wt, "commit", "-q", "-m", "work")
+
+	if _, err := m.TrustPrep("q1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(m.ReviewersFor("q1"), " "); got != "correctness scope security" {
+		t.Fatalf("a diff with a quoted code file must force the full set incl. security, got %q", got)
+	}
+	_, _ = m.Teardown("q1", true)
+}
+
 // TestReviewersFor_FailsSafeToFull: with no prep record (or a malformed one), ReviewersFor
 // returns the full set, so a verdict can never be recorded against fewer reviewers than
 // were prepared.

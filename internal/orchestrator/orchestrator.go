@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -1082,6 +1083,61 @@ func mergeBaseDiff(dir, base, rev string) (string, error) {
 	return gitOut(dir, "diff", base+"..."+rev)
 }
 
+// diffFiles returns the AUTHORITATIVE list of paths the committed three-dot diff base...rev
+// touches, via `git diff --name-only -z`: NUL-separated and UNQUOTED regardless of
+// core.quotePath, so a path with tabs, control characters, quotes, backslashes, or
+// non-ASCII bytes — which the patch body would quote — still appears in full and is never
+// silently dropped. ok is false on any git error so the caller fails closed (full reviewer
+// set). This is the source of truth for size classification; the patch body is never
+// scraped for filenames, because a dropped quoted path could hide a malicious code file
+// behind a docs-only edit and skip the security reviewer.
+func diffFiles(dir, base, rev string) (files []string, ok bool) {
+	out, err := gitOut(dir, "diff", "--name-only", "-z", base+"..."+rev)
+	if err != nil {
+		return nil, false
+	}
+	for _, p := range strings.Split(out, "\x00") {
+		if p != "" {
+			files = append(files, p)
+		}
+	}
+	return files, true
+}
+
+// diffLineStat returns the total added+removed content lines and whether any file is
+// binary for base...rev, via `git diff --numstat`. It reads only the two leading numeric
+// fields of each record (added, removed) and never the path, so path quoting is
+// irrelevant here. A binary file reports added/removed as "-"; that sets binary and is not
+// counted. ok is false on a git error or any unparseable record, so the caller fails
+// closed to the full reviewer set rather than under-counting a large change as trivial.
+func diffLineStat(dir, base, rev string) (lines int, binary, ok bool) {
+	out, err := gitOut(dir, "diff", "--numstat", base+"..."+rev)
+	if err != nil {
+		return 0, false, false
+	}
+	for _, ln := range strings.Split(out, "\n") {
+		if strings.TrimSpace(ln) == "" {
+			continue
+		}
+		fields := strings.SplitN(ln, "\t", 3)
+		if len(fields) < 3 {
+			return 0, false, false // malformed record — fail closed
+		}
+		added, removed := fields[0], fields[1]
+		if added == "-" || removed == "-" {
+			binary = true // binary file: size unknowable, do not count
+			continue
+		}
+		a, errA := strconv.Atoi(added)
+		r, errR := strconv.Atoi(removed)
+		if errA != nil || errR != nil {
+			return 0, false, false // unparseable counts — fail closed
+		}
+		lines += a + r
+	}
+	return lines, binary, true
+}
+
 // TrustPrep materializes the inputs the adversarial reviewers read for taskID into
 // ReviewInputsDir: the COMMITTED three-dot diff against the default branch (diff.patch),
 // the brief (brief.md, if one was written), a fresh validate of the committed sha
@@ -1147,7 +1203,15 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 	// docs-only or trivial diff gets a reduced set; anything else (including an uncertain
 	// diff) gets the full three-dimension pass. Security is dropped only for docs-only
 	// changes — never for code.
-	size, dims := review.Reviewers(diff)
+	//
+	// Classification reads an AUTHORITATIVE file list and stat from git (not the patch
+	// body): `git diff --name-only -z` lists every path UNQUOTED, so a worker cannot hide a
+	// malicious code file behind a quoted/non-ASCII name to misclassify a code diff as
+	// docs-only and skip the security reviewer. Any git failure fails closed to the full
+	// set via the ok flags.
+	files, filesOK := diffFiles(t.Worktree, def, head)
+	lines, binary, statOK := diffLineStat(t.Worktree, def, head)
+	size, dims := review.Classify(files, lines, binary, filesOK && statOK)
 	sb, err := json.MarshalIndent(scaledReviewers{Size: size, Dimensions: dims}, "", "  ")
 	if err != nil {
 		return "", err

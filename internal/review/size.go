@@ -31,8 +31,8 @@ const trivialLineBudget = 20
 // fail-safe default. Callers must treat the returned slices as read-only.
 var fullReviewers = []string{DimensionCorrectness, DimensionScope, DimensionSecurity}
 
-// Reviewers classifies diff (a unified `git diff`) by change size and returns the review
-// dimensions the trust gate must run for it, scaling the set to the risk the diff carries:
+// Classify returns the change-size class and the review dimensions the trust gate must run
+// for a diff, scaling the set to the risk it carries:
 //
 //   - docs-only (every changed file is inert prose) → {correctness, scope}. Prose can carry
 //     factual or scope errors but has no executable surface, so the security reviewer is
@@ -42,17 +42,21 @@ var fullReviewers = []string{DimensionCorrectness, DimensionScope, DimensionSecu
 //     is still code, so security is KEPT.
 //   - substantial (anything else) → the full {correctness, scope, security}.
 //
-// It biases to the full set whenever the diff is uncertain to classify — an empty or
-// unparseable diff, a binary blob, or any mix that is not cleanly docs-only or trivial —
-// so a malformed or surprising diff is over-reviewed, never under-reviewed. The returned
-// slice is a fresh copy the caller may retain. Security review is dropped only for a diff
-// with no code at all (docs-only); every code path keeps it.
-func Reviewers(diff string) (Size, []string) {
-	files, lines, binary := parseDiffStat(diff)
-
+// SECURITY-CRITICAL CONTRACT: files MUST be an AUTHORITATIVE, COMPLETE, UNQUOTED list of
+// every path the diff touches — e.g. `git diff --name-only -z` (NUL-separated, never
+// quoted regardless of core.quotePath). It must NOT be scraped from a patch body: git
+// quotes paths with tabs, control characters, quotes, backslashes, or non-ASCII bytes in
+// the patch text, and a scraper that drops a quoted path would let a worker hide a
+// malicious code file behind a docs-only edit and so skip the security reviewer. To
+// enforce that fail-closed, Classify treats an empty file list or any empty path entry as
+// uncertain and returns the full set, and the caller must likewise pass the full set
+// whenever the authoritative list could not be obtained. ok being false means git could
+// not produce a trustworthy stat (it too forces the full set). Security review is dropped
+// only for a diff with no code at all (docs-only); every code path keeps it.
+func Classify(files []string, lines int, binary, ok bool) (Size, []string) {
 	switch {
-	case len(files) == 0:
-		// No recognizable file changes: cannot assess size, so over-review.
+	case !ok || len(files) == 0 || hasEmpty(files):
+		// Incomplete or untrustworthy file info: never reduce review — over-review.
 		return SizeSubstantial, append([]string(nil), fullReviewers...)
 	case allDocs(files):
 		return SizeDocsOnly, []string{DimensionCorrectness, DimensionScope}
@@ -61,42 +65,6 @@ func Reviewers(diff string) (Size, []string) {
 	default:
 		return SizeSubstantial, append([]string(nil), fullReviewers...)
 	}
-}
-
-// parseDiffStat reads a unified diff and returns the distinct paths it touches, the total
-// added+removed content lines, and whether any touched file is binary. It is a heuristic
-// scan — filenames come from `diff --git` headers and line counts from `+`/`-` body lines —
-// sufficient to gauge change size; it does not aim to be a full patch parser.
-func parseDiffStat(diff string) (files []string, lines int, binary bool) {
-	seen := map[string]bool{}
-	for _, ln := range strings.Split(diff, "\n") {
-		switch {
-		case strings.HasPrefix(ln, "diff --git "):
-			if p := gitHeaderPath(ln); p != "" && !seen[p] {
-				seen[p] = true
-				files = append(files, p)
-			}
-		case strings.HasPrefix(ln, "Binary files ") || strings.HasPrefix(ln, "GIT binary patch"):
-			binary = true
-		case strings.HasPrefix(ln, "+++") || strings.HasPrefix(ln, "---"):
-			// File headers, not content — never counted.
-		case strings.HasPrefix(ln, "+") || strings.HasPrefix(ln, "-"):
-			lines++
-		}
-	}
-	return files, lines, binary
-}
-
-// gitHeaderPath extracts the post-image path from a `diff --git a/<p> b/<p>` header,
-// returning the part after " b/". It returns "" if the header is malformed (e.g. a path
-// with spaces git would have quoted), which only nudges classification toward the
-// fail-safe full set.
-func gitHeaderPath(header string) string {
-	i := strings.Index(header, " b/")
-	if i < 0 {
-		return ""
-	}
-	return strings.TrimSpace(header[i+len(" b/"):])
 }
 
 // docExtensions are inert-prose file extensions (lowercased, with leading dot). A file
@@ -137,4 +105,15 @@ func allDocs(files []string) bool {
 		}
 	}
 	return true
+}
+
+// hasEmpty reports whether any entry is the empty string — a sign the authoritative list
+// was parsed incompletely, which must force the full reviewer set.
+func hasEmpty(files []string) bool {
+	for _, f := range files {
+		if f == "" {
+			return true
+		}
+	}
+	return false
 }
