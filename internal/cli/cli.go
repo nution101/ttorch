@@ -34,6 +34,7 @@ import (
 	"github.com/nution101/ttorch/internal/profile"
 	"github.com/nution101/ttorch/internal/projectinit"
 	"github.com/nution101/ttorch/internal/review"
+	"github.com/nution101/ttorch/internal/scheduler"
 	"github.com/nution101/ttorch/internal/selfupdate"
 	"github.com/nution101/ttorch/internal/skills"
 	"github.com/nution101/ttorch/internal/tmux"
@@ -135,6 +136,8 @@ func Main(args []string) int {
 		return run(cmdAwaitLead(rest))
 	case "watchdog":
 		return run(cmdWatchdog(rest))
+	case "scheduler":
+		return run(cmdScheduler(rest))
 	case "validate":
 		return run(cmdValidate(rest))
 	case "ci-parity":
@@ -1334,6 +1337,53 @@ func cmdWatchdog(args []string) error {
 	}
 }
 
+// cmdScheduler runs the deterministic dispatch daemon (roadmap item A, phase 1): each tick
+// it re-derives ready pending backlog from SQLite, atomically claims the tasks it can prove
+// safe to run in parallel (a declared footprint that is disjoint from every live and
+// just-claimed worker, within free worktree capacity), and dispatches them through the SAME
+// spawn path the manager uses — so disjoint ready work never sits idle waiting for the
+// manager to remember it. It is OPT-IN: nothing starts it automatically, and existing
+// manager/worker behavior is unchanged unless it is run. Its log lines go to ITS stdout,
+// never the manager pane (no TTY injection). --once runs a single tick then exits (tests /
+// cron); otherwise it loops on --interval until Ctrl-C/SIGTERM.
+func cmdScheduler(args []string) error {
+	fs := flag.NewFlagSet("scheduler", flag.ContinueOnError)
+	interval := fs.Duration("interval", scheduler.DefaultInterval, "tick cadence: re-derive ready backlog and dispatch every interval")
+	once := fs.Bool("once", false, "run a single tick (claim + dispatch what is ready now), then exit")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	m, err := mgr()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+
+	sch := scheduler.New(m, *interval, os.Stdout)
+	// Ctrl-C and SIGTERM cancel the loop and let it exit cleanly.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if *once {
+		n, err := sch.RunOnce(ctx)
+		// A clean cancel mid-tick is a normal exit, not an error.
+		if err != nil && ctx.Err() == nil {
+			return err
+		}
+		fmt.Printf("scheduler: dispatched %d task(s)\n", n)
+		return nil
+	}
+	fmt.Fprintf(os.Stdout, "scheduler: dispatching ready backlog every %s (Ctrl-C to stop)\n", *interval)
+	if err := sch.Run(ctx); err != nil {
+		// A clean cancel/SIGTERM is a normal exit, not an error.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
 func cmdValidate(args []string) error {
 	if len(args) < 1 {
 		return errors.New("usage: ttorch validate <task-id>")
@@ -1863,6 +1913,14 @@ Supervision:
     [--interval d]          channel 'watch' uses — never a keystroke). Idle-aware, so it
     [--quiet]               no-ops when nothing waits; one-shot unless --interval loops
                             it as a daemon. Run from launchd/cron.
+  scheduler               deterministic dispatch daemon (opt-in; nothing auto-starts it):
+    [--interval d]          each tick re-derive ready pending backlog from the DB and
+    [--once]                atomically claim + dispatch the tasks it can prove safe — a
+                            declared footprint, disjoint from every live and just-claimed
+                            worker, within free worktree capacity — via the manager's own
+                            spawn path. Skips (never fails) overlapping or capacity-blocked
+                            tasks and footprint-less tasks (left for the manager). Logs to
+                            its own stdout, never the manager pane. --once runs one tick.
 
 Delivery:
   validate <id>               run the repo's build/test/lint checks on a worker
