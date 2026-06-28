@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.6.0](https://github.com/nution101/ttorch/compare/v0.5.2...v0.6.0) (2026-06-28)
+
+
+### Features
+
+* **cli:** land a done set concurrently via 'ttorch land --all' ([83404fe](https://github.com/nution101/ttorch/commit/83404fe20cfc92e47f8b2e25dd31d81d41194746))
+* **db:** add the auto_resumed event type for watcher-driven resume ([033bd8e](https://github.com/nution101/ttorch/commit/033bd8e680f6e41d5ec71ad1be28e035e8c9df83))
+* **livestate:** add Stalled heuristic for the mid-stream API-stall error ([6ddf747](https://github.com/nution101/ttorch/commit/6ddf747e020cbf146ba80714319ef62e0a4013e3))
+* **orchestrator:** async pipelined land queue (LandSet) ([5ef092c](https://github.com/nution101/ttorch/commit/5ef092c221e92e555d28c8fafb7d5d992785c179))
+* **orchestrator:** carry a verdict forward over a clean rebase ([f69c0dc](https://github.com/nution101/ttorch/commit/f69c0dc3bcca4a5745f28ff3423ae4da39a261ab))
+* **review:** record a content identity on the verdict ([f4c5c47](https://github.com/nution101/ttorch/commit/f4c5c471715c9a1927c0b6585175168403a11508))
+* **watch:** auto-resume an API-stalled worker on the idle liveness path ([24e0b13](https://github.com/nution101/ttorch/commit/24e0b131478b692074f6a97ffa0f812201a02232))
+
+
+### Bug Fixes
+
+* **termtab:** pin worker-view sessions destroy-unattached off ([327fa6e](https://github.com/nution101/ttorch/commit/327fa6e2cd1fbd53eceaf475c38cba650b3768b6))
+* **tmux:** pin destroy-unattached off on the shared session ([6ab351a](https://github.com/nution101/ttorch/commit/6ab351a8baadd1c62f18b3b1c7c52d9f69fa5af2))
+
+
+### Performance Improvements
+
+* **orchestrator:** reuse trust prep's validate at an unchanged-HEAD merge ([64ad52e](https://github.com/nution101/ttorch/commit/64ad52e9afd82461291946beee431bc42c6b0e60))
+* **review:** advisory qa reviewer trusts the staged validate.json ([0d1a270](https://github.com/nution101/ttorch/commit/0d1a270839d59539e438ff9618c41043ffa958b3))
+
 ## [0.5.2](https://github.com/nution101/ttorch/compare/v0.5.1...v0.5.2) (2026-06-27)
 
 
