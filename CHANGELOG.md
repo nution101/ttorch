@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.9.0](https://github.com/nution101/ttorch/compare/v0.8.0...v0.9.0) (2026-06-28)
+
+
+### Features
+
+* **land:** carry the approval forward with the verdict on a clean rebase ([87541ba](https://github.com/nution101/ttorch/commit/87541bad25bbe39e3a830b8fd98c5236ef1c9f64))
+* **scheduler:** autonomously land already-gated work (--land) ([3b52e86](https://github.com/nution101/ttorch/commit/3b52e869c4bc0a0f6b2ceae7b6a88a6b17f3b744))
+* **worker:** scale reasoning effort to task complexity (--effort) ([9534067](https://github.com/nution101/ttorch/commit/95340671ae246e6205ddc4e0ed8cdb58b5d59cb5))
+
 ## [0.8.0](https://github.com/nution101/ttorch/compare/v0.7.0...v0.8.0) (2026-06-28)
 
 
