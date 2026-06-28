@@ -102,10 +102,10 @@ func cmdTasks(args []string) error {
 var validTaskStatus = map[string]bool{
 	db.StatusPending: true, db.StatusActive: true, db.StatusNeedsInput: true,
 	db.StatusBlocked: true, db.StatusDone: true, db.StatusDelivered: true,
-	db.StatusTornDown: true, db.StatusAbandoned: true,
+	db.StatusTornDown: true, db.StatusAbandoned: true, db.StatusFailed: true,
 }
 
-const taskStatusList = "pending, active, needs_input (or needs-input), blocked, done, delivered, torn_down, abandoned"
+const taskStatusList = "pending, active, needs_input (or needs-input), blocked, done, delivered, torn_down, abandoned, failed"
 
 // parseStatusList splits a --status value into a normalized, validated slice for
 // TaskFilter.Status (→ status IN (?,…), §1.4). Entries are comma-separated and

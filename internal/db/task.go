@@ -15,7 +15,9 @@ const taskSelect = `SELECT
 	t.title, t.kind, t.status, t.stage, t.owner,
 	t.window, t.worktree, t.harness, t.session_id, t.pr, t.gate_passed, t.approved_by,
 	t.reviewed_sha, t.footprint, t.last_pane_hash, t.idle_sweeps,
-	t.created_at, t.updated_at, t.last_progress_at, p.repo_path
+	t.created_at, t.updated_at, t.last_progress_at,
+	t.lease_owner, t.lease_expires_at, t.retry_count, t.max_retries, t.attempt,
+	p.repo_path
 	FROM tasks t JOIN projects p ON p.id = t.project_id`
 
 func scanTask(sc rowScanner) (Task, error) {
@@ -27,12 +29,15 @@ func scanTask(sc rowScanner) (Task, error) {
 		footprint        string
 		createdAt, updAt string
 		lastProgress     sql.NullString
+		leaseExpires     sql.NullString
 	)
 	if err := sc.Scan(&t.ID, &t.ProjectID, &epicID, &phaseID, &parentID, &t.CreatedBy,
 		&t.Title, &t.Kind, &t.Status, &t.Stage, &t.Owner,
 		&t.Window, &t.Worktree, &t.Harness, &t.SessionID, &t.PR, &gate, &t.ApprovedBy,
 		&t.ReviewedSHA, &footprint, &t.LastPaneHash, &t.IdleSweeps,
-		&createdAt, &updAt, &lastProgress, &t.Project); err != nil {
+		&createdAt, &updAt, &lastProgress,
+		&t.LeaseOwner, &leaseExpires, &t.RetryCount, &t.MaxRetries, &t.Attempt,
+		&t.Project); err != nil {
 		return Task{}, err
 	}
 	t.GatePassed = gate != 0
@@ -64,6 +69,13 @@ func scanTask(sc rowScanner) (Task, error) {
 			return Task{}, err
 		}
 		t.LastProgressAt = &lp
+	}
+	if leaseExpires.Valid {
+		le, err := parseTime(leaseExpires.String)
+		if err != nil {
+			return Task{}, err
+		}
+		t.LeaseExpiresAt = &le
 	}
 	return t, nil
 }
@@ -103,6 +115,9 @@ func (s *Store) applyTaskDefaults(t *Task) {
 	if t.CreatedBy == "" {
 		t.CreatedBy = ActorManager
 	}
+	if t.MaxRetries == 0 {
+		t.MaxRetries = DefaultMaxRetries
+	}
 }
 
 // insertTaskTx inserts a fully-specified task row.
@@ -120,12 +135,14 @@ func (s *Store) insertTaskTx(ctx context.Context, tx *sql.Tx, t Task) error {
 			id, project_id, epic_id, phase_id, parent_task_id, created_by,
 			title, kind, status, stage, owner,
 			window, worktree, harness, session_id, pr, gate_passed, approved_by, reviewed_sha, footprint,
-			last_pane_hash, idle_sweeps, created_at, updated_at, last_progress_at)
-		VALUES (?, ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?)`,
+			last_pane_hash, idle_sweeps, created_at, updated_at, last_progress_at,
+			lease_owner, lease_expires_at, retry_count, max_retries, attempt)
+		VALUES (?, ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?)`,
 		t.ID, t.ProjectID, nullInt(t.EpicID), nullInt(t.PhaseID), nullStr(t.ParentTaskID), t.CreatedBy,
 		t.Title, t.Kind, t.Status, t.Stage, t.Owner,
 		t.Window, t.Worktree, t.Harness, t.SessionID, t.PR, gate, t.ApprovedBy, t.ReviewedSHA, fp,
-		t.LastPaneHash, t.IdleSweeps, formatTime(t.Created), formatTime(t.UpdatedAt), nullTime(t.LastProgressAt))
+		t.LastPaneHash, t.IdleSweeps, formatTime(t.Created), formatTime(t.UpdatedAt), nullTime(t.LastProgressAt),
+		t.LeaseOwner, nullTime(t.LeaseExpiresAt), t.RetryCount, t.MaxRetries, t.Attempt)
 	return err
 }
 
@@ -476,6 +493,12 @@ func (s *Store) ReportStatus(ctx context.Context, id, status, actor, msg string)
 			status, formatTime(now), formatTime(now), id); err != nil {
 			return err
 		}
+		// Progress is a heartbeat: extend the owning worker's lease (no-op if no lease is
+		// held). Same transaction as the status write, so the lease never drifts from the
+		// progress it is vouching for (§roadmap 2).
+		if err := leaseExtendTx(ctx, tx, now, id); err != nil {
+			return err
+		}
 		actionable := isWorkerActor(actor) && isActionableStatus(status)
 		eid, err := appendEvent(ctx, tx, now, Event{
 			EntityType: EntityTypeTask, EntityID: id, Type: EventStatusChanged,
@@ -516,6 +539,10 @@ func (s *Store) SetStage(ctx context.Context, id, stage, actor string) (Event, e
 			return err
 		}
 		if err := requireRows(res, "task "+id); err != nil {
+			return err
+		}
+		// A stage update is worker progress too — extend the lease (heartbeat, §roadmap 2).
+		if err := leaseExtendTx(ctx, tx, now, id); err != nil {
 			return err
 		}
 		eid, err := appendEvent(ctx, tx, now, Event{

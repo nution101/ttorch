@@ -601,7 +601,10 @@ func TestExportRoundTrip(t *testing.T) {
 		t.Fatalf("Export: %v", err)
 	}
 	dump := buf.String()
-	if !strings.Contains(dump, "CREATE TABLE tasks") {
+	// The 0003 rebuild recreates tasks via ALTER TABLE … RENAME, after which SQLite
+	// stores (and so dumps) the identifier quoted — CREATE TABLE "tasks". Accept either
+	// form; the replay below is the real round-trip guarantee.
+	if !strings.Contains(dump, `CREATE TABLE "tasks"`) && !strings.Contains(dump, "CREATE TABLE tasks") {
 		t.Error("dump missing tasks schema")
 	}
 	if !strings.Contains(dump, "'t1'") {

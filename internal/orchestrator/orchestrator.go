@@ -73,12 +73,15 @@ func (m *Manager) Close() error {
 // liveTasks returns the tracked tasks that are not in a terminal state — the
 // DB-backed equivalent of the old state.List(), which only ever held live records
 // because Teardown deleted them. Retained rows (torn_down/abandoned) are filtered
-// out so callers see exactly today's live fleet.
+// out so callers see exactly today's live fleet. 'failed' is terminal too (a task that
+// exhausted its lease retries, §roadmap 2), so it is filtered out alongside the others —
+// otherwise a poison-pilled task would keep occupying a fleet slot and holding its
+// worktree in inUseWorktrees.
 func (m *Manager) liveTasks() []db.Task {
 	tasks, _ := m.Store.ListTasks(context.Background(), db.TaskFilter{})
 	var out []db.Task
 	for _, t := range tasks {
-		if t.Status == db.StatusTornDown || t.Status == db.StatusAbandoned {
+		if t.Status == db.StatusTornDown || t.Status == db.StatusAbandoned || t.Status == db.StatusFailed {
 			continue
 		}
 		out = append(out, t)

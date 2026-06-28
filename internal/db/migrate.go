@@ -102,6 +102,93 @@ func (s *Store) schemaVersion(ctx context.Context) (int, error) {
 	return version, nil
 }
 
+// migrationRebuildMarker, present in a migration's SQL, tells the runner to apply that
+// migration with foreign-key ENFORCEMENT disabled and to re-validate integrity with
+// foreign_key_check afterward (see applyMigration). It is required for any migration that
+// REBUILDS a table — SQLite cannot ALTER a CHECK constraint in place, so changing one
+// means create-new / copy / drop-old / rename — whose DROP would otherwise fire ON DELETE
+// CASCADE on dependent tables and silently destroy their rows. It is a SQL comment, so it
+// is inert to SQLite itself.
+const migrationRebuildMarker = "-- ttorch:rebuild-table"
+
+func rebuildsTable(sql string) bool { return strings.Contains(sql, migrationRebuildMarker) }
+
+// applyMigration runs one migration body + ledger mutation (fn) in a single transaction.
+//
+// A normal migration just runs in s.withTx. A table-rebuild migration (rebuild=true)
+// cannot run with foreign keys enforced — SQLite fires ON DELETE CASCADE on the rebuilt
+// table's children during the DROP and destroys their rows — yet FK enforcement is a
+// no-op inside a transaction. So the whole step is pinned to a SINGLE dedicated
+// connection (s.db.Conn) where foreign_keys is disabled BEFORE the transaction and
+// re-enabled after; pinning guarantees the pragma governs the same connection the rebuild
+// runs on, never a fresh pool connection the DSN would silently re-open with
+// foreign_keys(on). Referential integrity is re-validated with foreign_key_check while
+// enforcement is still off, so a rebuild that orphaned a row fails loudly. (SQLite
+// "Making Other Kinds Of Table Schema Changes", steps 1/9/12.)
+func (s *Store) applyMigration(ctx context.Context, rebuild bool, fn func(*sql.Tx) error) error {
+	if !rebuild {
+		return s.withTx(ctx, fn)
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys=OFF`); err != nil {
+		return err
+	}
+	runErr := func() error {
+		tx, err := conn.BeginTx(ctx, nil) // BEGIN IMMEDIATE (DSN _txlock=immediate)
+		if err != nil {
+			return err
+		}
+		if err := fn(tx); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		return tx.Commit()
+	}()
+	if runErr == nil {
+		runErr = foreignKeyCheck(ctx, conn) // integrity gate, enforcement still off
+	}
+	// Re-enable enforcement no matter how the step exited; a store left with foreign keys
+	// disabled would corrupt every later write, so a restore failure on an otherwise-clean
+	// step is itself fatal.
+	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys=ON`); err != nil && runErr == nil {
+		runErr = fmt.Errorf("re-enabling foreign_keys after migration: %w", err)
+	}
+	return runErr
+}
+
+// foreignKeyCheck runs PRAGMA foreign_key_check and returns an error naming the first
+// referential-integrity violations, if any. PRAGMA foreign_key_check verifies regardless
+// of whether enforcement is currently enabled, so it is the integrity gate after a
+// table-rebuild migration that ran with enforcement disabled.
+func foreignKeyCheck(ctx context.Context, q queryer) error {
+	rows, err := q.QueryContext(ctx, `PRAGMA foreign_key_check`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var violations []string
+	for rows.Next() {
+		// columns: table, rowid, referred-table (parent), fk-index id
+		var table, parent sql.NullString
+		var rowid, fkid sql.NullInt64
+		if err := rows.Scan(&table, &rowid, &parent, &fkid); err != nil {
+			return err
+		}
+		violations = append(violations, fmt.Sprintf("%s(rowid=%d) → %s", table.String, rowid.Int64, parent.String))
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(violations) > 0 {
+		return fmt.Errorf("foreign_key_check failed: %s", strings.Join(violations, "; "))
+	}
+	return nil
+}
+
 // Migrate applies every pending migration in order, each inside its own
 // transaction together with the schema_migrations ledger row, so a crash leaves
 // the schema and the ledger consistent.
@@ -119,7 +206,8 @@ func (s *Store) Migrate(ctx context.Context) error {
 			continue
 		}
 		applied := formatTime(s.now())
-		err := s.withTx(ctx, func(tx *sql.Tx) error {
+		m := m
+		err := s.applyMigration(ctx, rebuildsTable(m.Up), func(tx *sql.Tx) error {
 			if _, err := tx.ExecContext(ctx, m.Up); err != nil {
 				return fmt.Errorf("migration %04d_%s up: %w", m.Version, m.Name, err)
 			}
@@ -159,7 +247,7 @@ func (s *Store) MigrateDown(ctx context.Context, toVersion int) error {
 		if m.Version <= toVersion || m.Version > current {
 			continue
 		}
-		err := s.withTx(ctx, func(tx *sql.Tx) error {
+		err := s.applyMigration(ctx, rebuildsTable(m.Down), func(tx *sql.Tx) error {
 			if _, err := tx.ExecContext(ctx,
 				`DELETE FROM schema_migrations WHERE version = ?`, m.Version,
 			); err != nil {

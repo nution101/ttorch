@@ -182,19 +182,22 @@ func TestMigration0002OnExisting0001(t *testing.T) {
 	if !tableExists(t, s, "tasks") {
 		t.Error("0001 tables (tasks) must survive the 0002 rollback")
 	}
-	if _, ok, err := s.GetTask(ctx, "mt1"); err != nil || !ok {
-		t.Fatalf("task data must survive the 0002 rollback: ok=%v err=%v", ok, err)
+	// GetTask can't be used here: at version 1 the tasks table lacks the lease columns
+	// the HEAD taskSelect references, so assert survival with a raw count instead.
+	var mt1 int
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM tasks WHERE id='mt1'`).Scan(&mt1); err != nil || mt1 != 1 {
+		t.Fatalf("task data must survive the 0002 rollback: count=%d err=%v", mt1, err)
 	}
 
-	// Re-apply 0002 on top of the existing 0001 DB.
+	// Re-apply the pending migrations on top of the existing 0001 DB.
 	if err := s.Migrate(ctx); err != nil {
-		t.Fatalf("re-Migrate to 2: %v", err)
+		t.Fatalf("re-Migrate: %v", err)
 	}
-	if v, err := s.schemaVersion(ctx); err != nil || v != 2 {
-		t.Fatalf("after re-up: version=%d err=%v, want 2", v, err)
+	if v, err := s.schemaVersion(ctx); err != nil || v != 3 {
+		t.Fatalf("after re-up: version=%d err=%v, want 3", v, err)
 	}
 	if !tableExists(t, s, "verdicts") {
-		t.Error("verdicts must be present again at version 2")
+		t.Error("verdicts must be present again after re-migrate")
 	}
 	// The restored table is usable.
 	if err := s.SaveVerdict(ctx, Verdict{TaskID: "mt1", Overall: "pass", ReviewedSHA: "z"}); err != nil {

@@ -195,6 +195,15 @@ func (m *Manager) SpawnWithFootprint(taskID, projectPath string, scout bool, raw
 			t = refreshed
 		}
 	}
+	// Grant the worker a lease so a dead worker's task can later be reclaimed on
+	// verifiable ground truth — an expired lease — rather than pane-output inference
+	// (§roadmap 2). The worker is already live and persisted; a failed lease-set must not
+	// strand it, and it degrades safely (the reclaim sweep only ever touches a task whose
+	// lease genuinely expired, so a task with no lease is simply never reclaimed) — so
+	// surface it and carry on, exactly like the spawned-event mirror below.
+	if err := m.Store.GrantLease(ctx, taskID, "worker:"+taskID); err != nil {
+		fmt.Fprintf(os.Stderr, "ttorch: could not grant a lease for %s: %v\n", taskID, err)
+	}
 	// Record the spawn as a typed, manager-authored, non-actionable event (§3.4). The
 	// worker is already live and persisted, and the events row is a best-effort audit
 	// mirror, so a failed append must not fail the spawn (which would strand a running

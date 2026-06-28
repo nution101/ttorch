@@ -19,6 +19,7 @@ const (
 	StatusDelivered  = "delivered"
 	StatusTornDown   = "torn_down"
 	StatusAbandoned  = "abandoned"
+	StatusFailed     = "failed" // terminal: retries exhausted after lease reclaim (poison-pill, §roadmap 2)
 )
 
 // Event types (§1.3, extensible).
@@ -44,6 +45,8 @@ const (
 	EventIdleUnreported   = "idle_unreported"
 	EventAutoResumed      = "auto_resumed"    // watcher nudged an API-stalled worker to continue (§4.4); non-actionable
 	EventManagerStalled   = "manager_stalled" // external watchdog re-poke of a stalled manager (§4.7); actionable, entity_type=manager
+	EventLeaseExpired     = "lease_expired"   // a task's lease expired and it was reclaimed to pending (§roadmap 2); actor=system, actionable
+	EventTaskFailed       = "task_failed"     // a reclaimed task hit the retry ceiling ⇒ terminal 'failed' (§roadmap 2); actor=system, actionable
 )
 
 // Task kinds (§1.1 CHECK; = state.Task.Kind).
@@ -153,6 +156,17 @@ type Task struct {
 	// liveness bookkeeping for the watcher's stale-detection (§4.4).
 	LastPaneHash string
 	IdleSweeps   int
+
+	// lease + retry bookkeeping (roadmap item 2). A dispatched task carries a lease
+	// (LeaseOwner + LeaseExpiresAt); the worker's progress path extends it (heartbeat).
+	// An expired lease is verifiable ground truth that the worker is gone, so the task
+	// can be reclaimed. RetryCount is bounded by MaxRetries (poison-pill ⇒ StatusFailed);
+	// Attempt counts dispatches. LeaseExpiresAt is nil when no lease is held.
+	LeaseOwner     string
+	LeaseExpiresAt *time.Time
+	RetryCount     int
+	MaxRetries     int
+	Attempt        int
 }
 
 // Event mirrors an events row: the append-only audit spine and the watcher's
