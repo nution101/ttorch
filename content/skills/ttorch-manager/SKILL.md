@@ -46,11 +46,18 @@ every turn, every wake, every check-in.
    window — not coding, not debugging, and **not code review**. Delegate all of it to
    worker tabs. Adversarial / pre-merge review runs in an **independent** worker — never
    the worker that wrote the code — so no author signs off on their own change.
-4. **Keep the fleet moving.** Model the work as a queue, not a sequential pipeline. Keep
-   every worker slot that safely can be busy, busy. Before you end any turn, dispatch
-   every backlog task whose files are **disjoint** from all in-flight workers; serialize
-   only on genuine file-overlap or a real dependency. Idling a slot while disjoint work
-   waits is a defect, not patience. Reporting is a gate, not a stop — run the **pre-yield
+4. **Keep the fleet moving — dispatch every disjoint task.** Model the work as a queue,
+   not a sequential pipeline. This is explicit and non-optional: at **every** turn and
+   check-in, dispatch **every** `pending` task whose file footprint is **disjoint** from
+   all live workers. Serialize **only** on genuine file-overlap or a true task dependency
+   — never hand-serialize to keep things tidy, to watch one worker at a time, or to run
+   "one roadmap step at a time." Idling a slot while disjoint, ready work waits is a
+   defect, not patience or caution. Do **not** read the `ttorch status` summary's
+   `idle slots` count as free dispatch capacity: it counts live workers currently in
+   idle-*state*, not empty worktree slots, so it says nothing about headroom for new work.
+   To judge real capacity, simply attempt the `ttorch spawn`: a true capacity cap refuses
+   explicitly; if it does not refuse, there was room. Never skip dispatching disjoint work
+   because that number looks low. Reporting is a gate, not a stop — run the **pre-yield
    checklist** below before you hand the turn back.
 5. **Run the autonomy loop.** After each turn in which you are **not** awaiting the lead,
    arm `ttorch watch` as a background task. When it returns an actionable batch (a worker
@@ -72,6 +79,34 @@ every turn, every wake, every check-in.
    wake lands the moment a `watch` is armed, which is the reason rule 5 has you re-arm
    `watch` at the end of every non-awaiting turn.
 
+## Anti-stall: never end a turn without a live wake
+
+Apart from the lead typing in the manager tab, your session advances **only** when one of
+your own background tasks completes and re-invokes you — an armed `ttorch watch` returning
+a batch, or a spawned worker/agent finishing. Nothing else moves you forward on its own,
+and you cannot rely on the lead for progress while work is in flight. The external
+`ttorch watchdog` is **not** an exception: it works *through* an armed `watch` (it raises
+the DB event your watch is blocking on), so its wake lands the moment a `watch` is armed —
+with **no** watch armed the poke just waits unconsumed until you next arm a `watch` (or
+restart), and it can reach you no other way without forbidden keystroke injection into your
+terminal. The practical consequence is absolute:
+
+- **Never end a turn without a live wake armed.** Any turn in which you are not awaiting
+  the lead must end with a background `ttorch watch` armed (rule 5), and you must re-arm it
+  **immediately** whenever it returns. A turn that ends with no armed `watch` *and* no
+  other pending background task is how the manager goes silent for hours — there is then
+  nothing left to re-invoke it.
+- **Arm before you risk an interruption.** You normally arm at end-of-turn (rule 5), but a
+  long foreground operation can fail or be interrupted *before* you reach that arm (a big
+  `ttorch land`, a slow `ttorch validate` or build). Arm a background `ttorch watch`
+  **first**: a background task outlives the turn that started it, so even if the operation
+  aborts your turn, that armed `watch` is still running to re-invoke you — and to let the
+  watchdog's poke land. An aborted turn with *no* armed `watch` leaves you fully silent,
+  with nothing — not even the watchdog — able to reach you.
+
+The **one** deliberate exception is awaiting the lead — there you cancel the watcher and
+wait silently for the lead's return to resume the loop (rule 5).
+
 ## The loop: re-derive → plan → delegate → supervise → validate → land
 
 Every check-in begins by re-deriving state from the board (rule 1), then advances every
@@ -85,10 +120,13 @@ task it can (rule 4):
    session (rule 5). `ttorch watch --reset` stays available as a manual fallback if you
    ever want to explicitly confirm the singleton slot is free before re-arming.
 2. **Plan.** Turn the lead's intent into discrete tasks, each with clear acceptance
-   criteria and a known file footprint (so you can tell which tasks are disjoint).
-   Planning is the highest-leverage step: a precise brief buys long, unsupervised worker
-   runs; a vague one buys minutes. State your plan back to the lead before dispatching
-   anything non-trivial.
+   criteria and a known file footprint (so you can tell which tasks are disjoint). Declare
+   that footprint at **file** granularity with `--touches`
+   (`internal/orchestrator/spawn.go`), never at **package** granularity
+   (`internal/orchestrator`): a whole-package footprint falsely serializes tasks that only
+   touch different files within it, idling slots for no reason. Planning is the
+   highest-leverage step: a precise brief buys long, unsupervised worker runs; a vague one
+   buys minutes. State your plan back to the lead before dispatching anything non-trivial.
 3. **Delegate.** Dispatch each task to a worker in its own isolated workspace with
    `ttorch spawn <task-id> <repo-path>`. Investigation-only tasks use `--scout` (they
    produce a report and never change code). Keep slots full — dispatch disjoint backlog
@@ -151,7 +189,7 @@ act, then re-check.
 | `ttorch project add <repo> [--name n]` · `project ls` | register / list projects (caches delivery mode for display) |
 | `ttorch epic add --project <id> --title "…"` · `epic ls` · `epic set-status <id> <s>` | manage epics |
 | `ttorch phase add --epic <id> --title "…"` · `phase ls` · `phase set-status <id> <s>` | manage phases |
-| `ttorch task add <id> --project <p> [--epic e] [--phase ph] [--title "…"] [--touches "a,b"]` | create a `pending` backlog task without spawning |
+| `ttorch task add <id> --project <p> [--epic e] [--phase ph] [--title "…"] [--touches "a,b"]` | create a `pending` backlog task without spawning; list `--touches` at **file** granularity (`internal/orchestrator/spawn.go`), not whole packages, so disjoint tasks stay parallelizable |
 | `ttorch init [--mode <mode>] [dir]` | set up a repo's AGENTS.md / delivery mode |
 
 ## Prime directives
