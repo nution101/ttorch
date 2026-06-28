@@ -1343,21 +1343,35 @@ func cmdWatchdog(args []string) error {
 	}
 }
 
-// cmdScheduler runs the deterministic dispatch daemon (roadmap item A, phase 1): each tick
-// it re-derives ready pending backlog from SQLite, atomically claims the tasks it can prove
-// safe to run in parallel (a declared footprint that is disjoint from every live and
-// just-claimed worker, within free worktree capacity), and dispatches them through the SAME
-// spawn path the manager uses — so disjoint ready work never sits idle waiting for the
-// manager to remember it. It is OPT-IN: nothing starts it automatically, and existing
-// manager/worker behavior is unchanged unless it is run. Its log lines go to ITS stdout,
-// never the manager pane (no TTY injection). --once runs a single tick then exits (tests /
-// cron); otherwise it loops on --interval until Ctrl-C/SIGTERM.
+// cmdScheduler runs the deterministic dispatch+land daemon (roadmap item A). Each tick it runs
+// whichever passes are enabled:
+//
+//   - DISPATCH (phase 1, on by default): re-derive ready pending backlog from SQLite, atomically
+//     claim the tasks it can prove safe to run in parallel (a declared footprint disjoint from
+//     every live and just-claimed worker, within free worktree capacity), and dispatch them
+//     through the SAME spawn path the manager uses — so disjoint ready work never sits idle.
+//   - LAND (phase 2a, opt-in via --land): find done tasks that ALREADY carry a passing durable
+//     verdict and land them through the SAME pipeline `ttorch land` runs (rebase, re-validate,
+//     carry verdict+approval, per-repo fast-forward, teardown) — so green, gated work merges
+//     without the manager doing it by hand. It NEVER lands ungated work: a passing verdict is
+//     required to attempt a task and the land path's own commit-pinned gate is the authority.
+//
+// The two passes are independent (--dispatch defaults on; --land opt-in), so it can run as a
+// dispatch-only daemon, a land-only daemon, or both. It is OPT-IN: nothing starts it
+// automatically, and existing manager/worker behavior is unchanged unless it is run. Its log
+// lines go to ITS stdout, never the manager pane (no TTY injection). --once runs a single tick
+// then exits (tests / cron); otherwise it loops on --interval until Ctrl-C/SIGTERM.
 func cmdScheduler(args []string) error {
 	fs := flag.NewFlagSet("scheduler", flag.ContinueOnError)
-	interval := fs.Duration("interval", scheduler.DefaultInterval, "tick cadence: re-derive ready backlog and dispatch every interval")
-	once := fs.Bool("once", false, "run a single tick (claim + dispatch what is ready now), then exit")
+	interval := fs.Duration("interval", scheduler.DefaultInterval, "tick cadence: re-derive the board and act every interval")
+	once := fs.Bool("once", false, "run a single tick (act on what is ready now), then exit")
+	dispatch := fs.Bool("dispatch", true, "claim + dispatch ready pending backlog (on by default; pass --dispatch=false for a land-only daemon)")
+	land := fs.Bool("land", false, "also LAND done tasks that already carry a passing verdict, via the same pipeline as 'ttorch land' (off by default)")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if !*dispatch && !*land {
+		return errors.New("scheduler: nothing to do — enable at least one of --dispatch (default) or --land")
 	}
 	m, err := mgr()
 	if err != nil {
@@ -1366,20 +1380,31 @@ func cmdScheduler(args []string) error {
 	defer m.Close()
 
 	sch := scheduler.New(m, *interval, os.Stdout)
+	sch.Dispatch = *dispatch
+	sch.Land = *land
 	// Ctrl-C and SIGTERM cancel the loop and let it exit cleanly.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	if *once {
-		n, err := sch.RunOnce(ctx)
-		// A clean cancel mid-tick is a normal exit, not an error.
-		if err != nil && ctx.Err() == nil {
-			return err
+		if *dispatch {
+			n, err := sch.RunOnce(ctx)
+			// A clean cancel mid-tick is a normal exit, not an error.
+			if err != nil && ctx.Err() == nil {
+				return err
+			}
+			fmt.Printf("scheduler: dispatched %d task(s)\n", n)
 		}
-		fmt.Printf("scheduler: dispatched %d task(s)\n", n)
+		if *land && ctx.Err() == nil {
+			n, err := sch.RunLandOnce(ctx)
+			if err != nil && ctx.Err() == nil {
+				return err
+			}
+			fmt.Printf("scheduler: landed %d task(s)\n", n)
+		}
 		return nil
 	}
-	fmt.Fprintf(os.Stdout, "scheduler: dispatching ready backlog every %s (Ctrl-C to stop)\n", *interval)
+	fmt.Fprintf(os.Stdout, "scheduler: %s every %s (Ctrl-C to stop)\n", schedulerModes(*dispatch, *land), *interval)
 	if err := sch.Run(ctx); err != nil {
 		// A clean cancel/SIGTERM is a normal exit, not an error.
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -1388,6 +1413,18 @@ func cmdScheduler(args []string) error {
 		return err
 	}
 	return nil
+}
+
+// schedulerModes describes the enabled passes for the daemon's startup banner.
+func schedulerModes(dispatch, land bool) string {
+	switch {
+	case dispatch && land:
+		return "dispatching ready backlog and landing gated work"
+	case land:
+		return "landing gated work"
+	default:
+		return "dispatching ready backlog"
+	}
 }
 
 func cmdValidate(args []string) error {
@@ -1922,14 +1959,18 @@ Supervision:
     [--interval d]          channel 'watch' uses — never a keystroke). Idle-aware, so it
     [--quiet]               no-ops when nothing waits; one-shot unless --interval loops
                             it as a daemon. Run from launchd/cron.
-  scheduler               deterministic dispatch daemon (opt-in; nothing auto-starts it):
-    [--interval d]          each tick re-derive ready pending backlog from the DB and
+  scheduler               deterministic dispatch+land daemon (opt-in; nothing auto-starts it):
+    [--interval d]          DISPATCH (on): each tick re-derive ready pending backlog and
     [--once]                atomically claim + dispatch the tasks it can prove safe — a
-                            declared footprint, disjoint from every live and just-claimed
-                            worker, within free worktree capacity — via the manager's own
+    [--dispatch]            declared footprint, disjoint from every live and just-claimed
+    [--land]                worker, within free worktree capacity — via the manager's own
                             spawn path. Skips (never fails) overlapping or capacity-blocked
-                            tasks and footprint-less tasks (left for the manager). Logs to
-                            its own stdout, never the manager pane. --once runs one tick.
+                            tasks and footprint-less tasks (left for the manager).
+                            LAND (--land, off): also land done tasks that ALREADY carry a
+                            passing verdict, via the same pipeline as 'ttorch land'; never
+                            lands ungated work. --dispatch/--land toggle the passes
+                            independently (--dispatch=false --land = land-only). Logs to its
+                            own stdout, never the manager pane. --once runs one tick.
 
 Delivery:
   validate <id>               run the repo's build/test/lint checks on a worker

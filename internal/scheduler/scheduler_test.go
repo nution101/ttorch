@@ -10,6 +10,7 @@ import (
 
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/orchestrator"
+	"github.com/nution101/ttorch/internal/review"
 	"github.com/nution101/ttorch/internal/state"
 	"github.com/nution101/ttorch/internal/worktree"
 )
@@ -33,7 +34,9 @@ type fakeFleet struct {
 	live     []db.Task
 	calls    []spawnCall
 	spawnErr map[string]error // per-task forced dispatch failure
-	record   func(id string)  // shared sink for the cross-instance race test
+	landed   []string         // ids handed to LandSet, in call order
+	landErr  map[string]error // per-task forced land failure
+	record   func(id string)  // shared sink for the cross-instance race tests
 }
 
 func (f *fakeFleet) Status() ([]db.Task, error) {
@@ -87,6 +90,32 @@ func (f *fakeFleet) dispatched() []string {
 	return ids
 }
 
+// LandSet stands in for the manager's concurrent land pipeline: it records each id it was
+// asked to land (the seam the scheduler's land claim feeds) and returns a per-task result,
+// failing exactly the ids in landErr. The real LandSet's merge gate is exercised in
+// internal/orchestrator; here the fake isolates the scheduler's selection/claim/release logic.
+func (f *fakeFleet) LandSet(ctx context.Context, taskIDs []string, requireVerdict bool) []orchestrator.LandResult {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	res := make([]orchestrator.LandResult, len(taskIDs))
+	for i, id := range taskIDs {
+		f.landed = append(f.landed, id)
+		if f.record != nil {
+			f.record(id)
+		}
+		res[i] = orchestrator.LandResult{TaskID: id, Err: f.landErr[id]}
+	}
+	return res
+}
+
+func (f *fakeFleet) landedIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.landed))
+	copy(out, f.landed)
+	return out
+}
+
 // --- test fixtures ----------------------------------------------------------------
 
 func newStore(t *testing.T) *db.Store {
@@ -121,6 +150,38 @@ func status(t *testing.T, s *db.Store, id string) string {
 		t.Fatalf("GetTask %s: ok=%v err=%v", id, ok, err)
 	}
 	return tk.Status
+}
+
+func leaseOwner(t *testing.T, s *db.Store, id string) string {
+	t.Helper()
+	tk, ok, err := s.GetTask(context.Background(), id)
+	if err != nil || !ok {
+		t.Fatalf("GetTask %s: ok=%v err=%v", id, ok, err)
+	}
+	return tk.LeaseOwner
+}
+
+// addDone creates a done task awaiting landing under repo with the given kind, plus an optional
+// durable verdict: verdict == "" records none, otherwise it saves a verdict with that Overall
+// (review.Pass / review.Block). A verdict requires the task to exist first (FK), so the order
+// matters.
+func addDone(t *testing.T, s *db.Store, repo, id, kind, verdict string) {
+	t.Helper()
+	ctx := context.Background()
+	proj, err := s.UpsertProject(ctx, repo, "")
+	if err != nil {
+		t.Fatalf("UpsertProject: %v", err)
+	}
+	if _, err := s.CreateTask(ctx, db.Task{
+		ID: id, ProjectID: proj.ID, Status: db.StatusDone, Kind: kind, Footprint: []string{"pkg/" + id},
+	}, db.ActorManager); err != nil {
+		t.Fatalf("CreateTask %s: %v", id, err)
+	}
+	if verdict != "" {
+		if err := s.SaveVerdict(ctx, db.Verdict{TaskID: id, Overall: verdict, ReviewedSHA: "sha-" + id}); err != nil {
+			t.Fatalf("SaveVerdict %s: %v", id, err)
+		}
+	}
 }
 
 func contains(ids []string, want string) bool {
@@ -520,5 +581,223 @@ func TestRunCancelsCleanly(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not return promptly after cancellation")
+	}
+}
+
+// --- land pass (phase 2a) ---------------------------------------------------------
+
+// TestRunLandOnceLandsGatedDone proves the happy path: a done task that already carries a
+// PASSING verdict is atomically claimed (a "lander:" lease) and handed to the land pipeline,
+// and is counted landed.
+func TestRunLandOnceLandsGatedDone(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	addDone(t, s, repo, "ship1", db.KindShip, review.Pass)
+
+	f := &fakeFleet{}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}}
+	n, err := sc.RunLandOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunLandOnce: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("landed count = %d, want 1", n)
+	}
+	if got := f.landedIDs(); len(got) != 1 || got[0] != "ship1" {
+		t.Fatalf("LandSet received %v, want [ship1]", got)
+	}
+	if lo := leaseOwner(t, s, "ship1"); lo != "lander:ship1" {
+		t.Errorf("lease owner = %q, want lander:ship1 (the held land claim)", lo)
+	}
+}
+
+// TestRunLandOnceSkipsUngatedDone is the headline SAFETY test: a done task with NO verdict and
+// one with a BLOCKING verdict are never landed and never even claimed — the scheduler is a
+// strict no-op for ungated work.
+func TestRunLandOnceSkipsUngatedDone(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	addDone(t, s, repo, "noverdict", db.KindShip, "")         // no verdict at all
+	addDone(t, s, repo, "blocked", db.KindShip, review.Block) // a recorded BLOCK
+	addDone(t, s, repo, "passing", db.KindShip, review.Pass)  // the control: this one lands
+
+	f := &fakeFleet{}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}}
+	n, err := sc.RunLandOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunLandOnce: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("landed count = %d, want 1 (only the passing task)", n)
+	}
+	got := f.landedIDs()
+	if len(got) != 1 || got[0] != "passing" {
+		t.Fatalf("LandSet received %v, want only [passing] — never the ungated tasks", got)
+	}
+	// The ungated tasks must not even be claimed (no land lease), so a later, legitimate land
+	// is never blocked by a phantom claim.
+	for _, id := range []string{"noverdict", "blocked"} {
+		if lo := leaseOwner(t, s, id); lo == "lander:"+id {
+			t.Errorf("ungated task %s was claimed (lease %q); it must be left untouched", id, lo)
+		}
+	}
+}
+
+// TestRunLandOnceExcludesCC proves ad-hoc cc sessions are never auto-landed even with a passing
+// verdict, exactly as the dispatch pass never auto-dispatches them.
+func TestRunLandOnceExcludesCC(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	addDone(t, s, repo, "ccsess", db.KindCC, review.Pass)
+	addDone(t, s, repo, "ship1", db.KindShip, review.Pass)
+
+	f := &fakeFleet{}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}}
+	if _, err := sc.RunLandOnce(ctx); err != nil {
+		t.Fatalf("RunLandOnce: %v", err)
+	}
+	got := f.landedIDs()
+	if len(got) != 1 || got[0] != "ship1" {
+		t.Fatalf("LandSet received %v, want only [ship1] — cc excluded", got)
+	}
+}
+
+// TestRunLandOnceReleasesClaimOnFailure proves a land that does not complete (a stale verdict,
+// a refused merge, a lost fast-forward race) leaves the task safely done with its claim
+// released, so a later tick can retry it.
+func TestRunLandOnceReleasesClaimOnFailure(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	addDone(t, s, repo, "stale", db.KindShip, review.Pass)
+
+	f := &fakeFleet{landErr: map[string]error{"stale": errors.New("verdict no longer covers the head")}}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}}
+	n, err := sc.RunLandOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunLandOnce must not surface a per-task land failure: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("a failed land must not count, got n=%d", n)
+	}
+	if got := f.landedIDs(); len(got) != 1 || got[0] != "stale" {
+		t.Fatalf("the task should have been attempted once, got %v", got)
+	}
+	if st := status(t, s, "stale"); st != db.StatusDone {
+		t.Errorf("status = %q, want done after a failed land", st)
+	}
+	if lo := leaseOwner(t, s, "stale"); lo != "" {
+		t.Errorf("land claim must be released after a failed land, got lease %q", lo)
+	}
+}
+
+// TestRunLandOnceContextCancelStops proves a cancelled context halts the land pass cleanly,
+// landing nothing and leaving no claim behind.
+func TestRunLandOnceContextCancelStops(t *testing.T) {
+	s := newStore(t)
+	repo := "/repo"
+	addDone(t, s, repo, "ship1", db.KindShip, review.Pass)
+
+	f := &fakeFleet{}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	n, err := sc.RunLandOnce(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunLandOnce on a cancelled ctx = (%d, %v), want context.Canceled", n, err)
+	}
+	if got := f.landedIDs(); len(got) != 0 {
+		t.Errorf("a cancelled land pass must land nothing, got %v", got)
+	}
+	if lo := leaseOwner(t, s, "ship1"); lo == "lander:ship1" {
+		t.Errorf("a cancelled land pass must leave no claim, got lease %q", lo)
+	}
+}
+
+// TestConcurrentRunLandOnceNoDoubleLand is the land race test, mirroring the dispatch one: two
+// scheduler instances on the SAME db file (two Store handles ⇒ two processes) running a land
+// tick concurrently hand each gated done task to the land pipeline EXACTLY once — the atomic
+// land claim serializes the decision across instances, so no task is double-landed and none is
+// lost.
+func TestConcurrentRunLandOnceNoDoubleLand(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state.db")
+	s1, err := db.Open(path)
+	if err != nil {
+		t.Fatalf("Open s1: %v", err)
+	}
+	defer s1.Close()
+	s2, err := db.Open(path)
+	if err != nil {
+		t.Fatalf("Open s2: %v", err)
+	}
+	defer s2.Close()
+
+	repo := "/repo"
+	const n = 12
+	for i := 0; i < n; i++ {
+		id := string(rune('a'+i/26)) + string(rune('a'+i%26))
+		addDone(t, s1, repo, id, db.KindShip, review.Pass)
+	}
+
+	var mu sync.Mutex
+	counts := map[string]int{}
+	sink := func(id string) {
+		mu.Lock()
+		counts[id]++
+		mu.Unlock()
+	}
+
+	var wg sync.WaitGroup
+	for _, s := range []*db.Store{s1, s2} {
+		s := s
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sc := &Scheduler{Store: s, Fleet: &fakeFleet{record: sink}, Pool: worktree.Pool{Max: 100}}
+			if _, err := sc.RunLandOnce(ctx); err != nil {
+				t.Errorf("concurrent RunLandOnce: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(counts) != n {
+		t.Fatalf("landed %d distinct tasks, want %d", len(counts), n)
+	}
+	for id, c := range counts {
+		if c != 1 {
+			t.Errorf("task %s landed %d times, want exactly 1", id, c)
+		}
+	}
+}
+
+// TestRunTickLandsOnlyWhenEnabled proves the land pass is OFF by default: a tick lands gated
+// done work only when sc.Land is set, so enabling it is an explicit opt-in with no behavior
+// change otherwise.
+func TestRunTickLandsOnlyWhenEnabled(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	addDone(t, s, repo, "ship1", db.KindShip, review.Pass)
+
+	// Land disabled (the zero value): the tick must not land.
+	f := &fakeFleet{}
+	off := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}} // Dispatch=false, Land=false
+	off.runTick(ctx)
+	if got := f.landedIDs(); len(got) != 0 {
+		t.Fatalf("a tick with land disabled landed %v, want nothing", got)
+	}
+
+	// Land enabled: the tick lands the gated task.
+	on := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}, Land: true}
+	on.runTick(ctx)
+	if got := f.landedIDs(); len(got) != 1 || got[0] != "ship1" {
+		t.Fatalf("a tick with land enabled landed %v, want [ship1]", got)
 	}
 }

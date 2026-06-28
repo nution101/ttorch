@@ -8,14 +8,26 @@
 // sitting idle while the manager is mid-turn or stalled — parallelism becomes deterministic
 // code, not a rule the manager must remember.
 //
-// This phase DISPATCHES only. Autonomous gating/merging and a supervisor are deliberate
-// follow-on phases. The daemon is OPT-IN: nothing starts it automatically (see
-// `ttorch scheduler`); existing manager/worker behavior is unchanged unless it is run.
+// Phase 1 DISPATCHES ready backlog; phase 2a additionally LANDS work that has already
+// passed the trust gate. With the land pass enabled, each tick also finds done tasks that
+// already carry a passing durable verdict and lands them through the manager's EXISTING land
+// pipeline (the same code `ttorch land` runs), so a green, gated task merges without the LLM
+// manager doing it by hand — the core throughput/anti-stall win. The two passes are
+// independent: a tick runs whichever are enabled, dispatch defaults on (`ttorch scheduler`)
+// and land is opt-in (`--land`). Autonomous GATING (spawning the reviewers, recording the
+// verdict) and a supervisor remain deliberate follow-on phases — this phase automates only
+// the LAND once a passing verdict already exists; it NEVER lands ungated work. The daemon is
+// OPT-IN: nothing starts it automatically (see `ttorch scheduler`); existing manager/worker
+// behavior is unchanged unless it is run.
 //
 // Concurrency model: the scheduler is self-consistent and safe to run as multiple
-// instances against one DB — the atomic claim (db.ClaimTask: BEGIN IMMEDIATE + status
-// re-check) makes double-claim impossible, and the overlap check consults active claims
-// (not just live tmux windows) so two instances never dispatch overlapping work. The one
+// instances against one DB — the atomic dispatch claim (db.ClaimTask: BEGIN IMMEDIATE +
+// status re-check) makes double-dispatch impossible, the atomic land claim (db.ClaimForLand,
+// the same BEGIN IMMEDIATE pattern) makes double-land impossible, and the overlap check
+// consults active claims (not just live tmux windows) so two instances never dispatch
+// overlapping work. (The land path's own gate — a fresh, commit-pinned passing verdict plus
+// a single-use approval consumed at the fast-forward — is the second, authoritative guard.)
+// The one
 // boundary in this phase: a HUMAN/LLM manager running `ttorch spawn` for the exact id the
 // scheduler has just claimed (active, window not yet up) won't see that claim in its own
 // liveness-gated overlap gate; the worst case is a window-name collision that fails one of
@@ -34,6 +46,7 @@ import (
 
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/orchestrator"
+	"github.com/nution101/ttorch/internal/review"
 	"github.com/nution101/ttorch/internal/state"
 	"github.com/nution101/ttorch/internal/worktree"
 )
@@ -58,6 +71,13 @@ type Fleet interface {
 	// SpawnWithFootprint dispatches a worker for an already-claimed task via the manager's
 	// spawn path (worktree + tmux window + harness launch).
 	SpawnWithFootprint(taskID, projectPath string, scout bool, rawCmd string, footprint []string, forceOverlap bool) (db.Task, error)
+	// LandSet lands the given already-gated tasks through the manager's concurrent land
+	// pipeline (rebase onto the current default, re-validate, carry the verdict+approval over
+	// a clean rebase, per-repo-locked fast-forward, teardown), returning one result per task
+	// in order. It is the SAME path `ttorch land` drives — the land pass reuses the merge gate
+	// rather than reimplementing it, so requireVerdict and every approval/verdict/validate
+	// check apply identically.
+	LandSet(ctx context.Context, taskIDs []string, requireVerdict bool) []orchestrator.LandResult
 }
 
 // Scheduler is the dispatch loop. Store is the task board (ready selection + atomic claim),
@@ -70,6 +90,15 @@ type Scheduler struct {
 	Pool     worktree.Pool
 	Interval time.Duration
 	Log      io.Writer
+
+	// Dispatch and Land select which passes each tick runs, independently. Dispatch (the
+	// phase-1 behavior) claims and dispatches ready pending backlog; Land claims and lands
+	// done tasks that already carry a passing verdict. New() turns Dispatch on (today's
+	// default); Land is OFF unless explicitly enabled (the autonomous-land opt-in) so there is
+	// no behavior change unless the scheduler is run with land turned on. RunOnce/RunLandOnce
+	// are unconditional primitives — these toggles gate only which the loop (runTick) drives.
+	Dispatch bool
+	Land     bool
 }
 
 // New builds the production Scheduler from a Manager: it dispatches through the manager's
@@ -82,6 +111,7 @@ func New(m *orchestrator.Manager, interval time.Duration, log io.Writer) *Schedu
 		Pool:     m.Pool,
 		Interval: interval,
 		Log:      log,
+		Dispatch: true, // dispatch is the default pass; the CLI may toggle it and enable Land
 	}
 }
 
@@ -108,19 +138,32 @@ func (sc *Scheduler) Run(ctx context.Context) error {
 	}
 }
 
-// runTick runs one tick and logs the outcome. A cancellation error is left for Run's select
-// to surface (not logged as a failure); any other error is logged and swallowed so the
-// daemon survives a transient DB hiccup.
+// runTick runs one tick of each enabled pass (dispatch, then land) and logs the outcome.
+// The passes are independent: a transient error in one is logged and swallowed so the daemon
+// survives a DB hiccup and still runs the other (the next tick re-derives from scratch). A
+// cancellation error is left for Run's select to surface (not logged as a failure), and a
+// cancellation between passes halts the rest of the tick promptly.
 func (sc *Scheduler) runTick(ctx context.Context) {
-	n, err := sc.RunOnce(ctx)
-	if err != nil {
-		if ctx.Err() == nil {
-			sc.logf("tick error: %v", err)
+	if sc.Dispatch {
+		if n, err := sc.RunOnce(ctx); err != nil {
+			if ctx.Err() == nil {
+				sc.logf("tick error: %v", err)
+			}
+		} else if n > 0 {
+			sc.logf("tick dispatched %d task(s)", n)
 		}
+	}
+	if ctx.Err() != nil {
 		return
 	}
-	if n > 0 {
-		sc.logf("tick dispatched %d task(s)", n)
+	if sc.Land {
+		if n, err := sc.RunLandOnce(ctx); err != nil {
+			if ctx.Err() == nil {
+				sc.logf("land tick error: %v", err)
+			}
+		} else if n > 0 {
+			sc.logf("tick landed %d task(s)", n)
+		}
 	}
 }
 
@@ -245,6 +288,121 @@ func (sc *Scheduler) RunOnce(ctx context.Context) (int, error) {
 		sc.logf("dispatched %s to %s (footprint: %s)", claimed.ID, repo, strings.Join(claimed.Footprint, ", "))
 	}
 	return dispatched, nil
+}
+
+// RunLandOnce performs one land pass and returns how many tasks it landed. It re-derives the
+// tasks awaiting landing from the DB (status done, excluding ad-hoc cc) and, for each that
+// already carries a PASSING durable verdict, atomically claims it (Store.ClaimForLand) and
+// hands the won set to the manager's EXISTING land pipeline (Fleet.LandSet) — the same code
+// `ttorch land` runs: rebase onto the current default, re-validate, carry the verdict+approval
+// forward across a clean rebase (or re-gate when the content changed), fast-forward under the
+// per-repo lock, and tear down.
+//
+// It NEVER lands ungated work. Two independent guards uphold that:
+//
+//   - the candidate pre-filter requires a passing verdict ROW to even attempt a task (a missing
+//     or blocking verdict is skipped here — never claimed, never handed to LandSet); and
+//   - LandSet's own trust gate (a fresh, COMMIT-PINNED passing verdict plus a valid approval,
+//     consumed only at the fast-forward) remains the authority that decides WHETHER each task
+//     merges. The pass reuses that gate — it does not weaken, bypass, or reimplement it — and
+//     passes requireVerdict=true so the verdict is required regardless of the repo's mode.
+//
+// So a task whose verdict is missing or blocking is skipped, and one whose verdict is stale and
+// not carryable is refused by LandSet, leaving the task safely done and un-landed; either way
+// the claim is released for a later retry. The verdict's FRESHNESS (still covering the merged
+// commit, or carrying across a clean rebase) is deliberately left to LandSet — pre-filtering on
+// reviewed_sha here would forfeit exactly the stale-base disjoint tasks LandSet can carry and
+// land cleanly.
+//
+// Concurrency: each task is claimed atomically before it is landed, so two concurrent
+// ticks/instances can never both land the same task — the loser of the claim simply skips.
+// LandSet bounds its own fan-out and serializes the fast-forward per repo, so landing is
+// capacity-bounded and per-repo-serialized exactly as a hand-run `ttorch land --all` is. It is
+// a no-op (returns 0) when nothing awaits landing or nothing carries a passing verdict.
+func (sc *Scheduler) RunLandOnce(ctx context.Context) (int, error) {
+	done, err := sc.Store.ListTasks(ctx, db.TaskFilter{
+		Status:      []string{db.StatusDone},
+		ExcludeKind: []string{db.KindCC}, // cc sessions are ad-hoc, lead-driven — never auto-landed
+	})
+	if err != nil {
+		return 0, err
+	}
+	if len(done) == 0 {
+		return 0, nil // nothing awaiting landing — the common idle-tick fast path
+	}
+
+	// Claim each gated candidate atomically, then hand the won set to LandSet as one batch so
+	// its concurrent pipeline (per-repo locks, bounded fan-out) lands them as efficiently as
+	// `ttorch land --all`. owners records the claim owner per task so a release targets exactly
+	// the claim it took. release uses context.Background() deliberately: a claim must always be
+	// freed even when the tick's own ctx is the reason we are unwinding (a SIGTERM cancel), so a
+	// half-claimed batch never strands done tasks until the lease lapses.
+	var ids []string
+	owners := map[string]string{}
+	release := func(id string) {
+		if owner := owners[id]; owner != "" {
+			if _, rerr := sc.Store.ReleaseLandClaim(context.Background(), id, owner); rerr != nil {
+				sc.logf("could not release land claim on %s: %v", id, rerr)
+			}
+		}
+	}
+	releaseAll := func() {
+		for _, id := range ids {
+			release(id)
+		}
+	}
+	for _, t := range done {
+		select {
+		case <-ctx.Done():
+			releaseAll() // free this tick's claims so a partial batch never strands on cancel
+			return 0, ctx.Err()
+		default:
+		}
+		// Fail safe: only land work that already carries a PASSING verdict. Gating stays the
+		// authority that produces the verdict; this pass automates only the land once one
+		// exists. A missing or blocking verdict is never landed — and never even claimed.
+		v, ok, err := sc.Store.GetVerdict(ctx, t.ID)
+		if err != nil {
+			releaseAll()
+			return 0, err
+		}
+		if !ok || v.Overall != review.Pass {
+			continue
+		}
+		owner := "lander:" + t.ID
+		won, err := sc.Store.ClaimForLand(ctx, t.ID, owner)
+		if err != nil {
+			releaseAll()
+			return 0, err
+		}
+		if !won {
+			continue // another tick/instance is landing it, or it moved off done — skip
+		}
+		ids = append(ids, t.ID)
+		owners[t.ID] = owner
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+
+	// requireVerdict=true forces the verdict gate regardless of the repo's delivery mode, so a
+	// local/validated repo can never auto-land ungated through this pass; in trusted mode it is
+	// implied. The authoritative gate (verdict freshness/commit-pin + approval) lives inside
+	// LandSet/MergeLocal and is never bypassed here.
+	landed := 0
+	for _, r := range sc.Fleet.LandSet(ctx, ids, true) {
+		if r.Err != nil {
+			// Did not land (a stale/uncarryable verdict, a rebase conflict, a refused merge, or
+			// a lost fast-forward race): leave it safely done and release the claim so a later
+			// tick can retry once the obstruction clears.
+			sc.logf("land of %s did not complete: %v", r.TaskID, r.Err)
+			release(r.TaskID)
+			continue
+		}
+		landed++
+		sc.logf("landed %s to %s", r.TaskID, r.Repo)
+	}
+	return landed, nil
 }
 
 // overlaps reports whether footprint conflicts with any LIVE worker (Fleet.CheckOverlap,
