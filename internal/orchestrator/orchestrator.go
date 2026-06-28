@@ -265,6 +265,15 @@ func (m *Manager) Teardown(taskID string, force bool) ([]string, error) {
 			notes = append(notes, "worktree returned to pool for reuse")
 		}
 	}
+	// Drop any durable trust verdict for this task. It is consume-once gate state, not audit
+	// history (the review_recorded event and audit.log preserve that a review happened), and
+	// the task is being discarded — so the row must not outlive it. This restores the
+	// self-cleanup the old TTL'd verdict file had: a torn-down id that is later re-spawned can
+	// never inherit a stale verdict row pinned to the prior task's commit. Best-effort, like
+	// the worktree release above.
+	if err := m.Store.DeleteVerdict(context.Background(), taskID); err != nil {
+		notes = append(notes, "verdict: "+err.Error())
+	}
 	// The DB retains the row (rows are never hard-deleted, §3.4/§7): mark it torn_down
 	// with a typed, non-actionable event so it drops out of the live fleet (liveTasks)
 	// while its history is preserved, and BLANK the worktree so the retained row never

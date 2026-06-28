@@ -2933,12 +2933,12 @@ func TestSecurityReview_AdvisoryAndIndependentOfTrustGate(t *testing.T) {
 	if v.Overall != review.Pass {
 		t.Fatalf("a clean security report should pass, got %q", v.Overall)
 	}
-	// Advisory: no approval minted, and the trust gate's verdict file is untouched.
+	// Advisory: no approval minted, and the trust gate's durable verdict is untouched.
 	if approval.Valid(m.P.ApprovalFile("sv1")) {
 		t.Fatal("security-review must NOT mint an approval token")
 	}
-	if _, ok := review.Load(m.P.ReviewVerdictFile("sv1")); ok {
-		t.Fatal("security-review must NOT write the trust gate's verdict file")
+	if _, ok := m.TrustShow("sv1"); ok {
+		t.Fatal("security-review must NOT write the trust gate's verdict")
 	}
 	// Task gate state is untouched (the advisory pass is side-effect-free on it).
 	reloaded, _, _ := m.Store.GetTask(context.Background(), "sv1")
@@ -3068,13 +3068,13 @@ func TestQAReview_AdvisoryAndIndependentOfReviewPaths(t *testing.T) {
 	if v.Overall != review.Pass {
 		t.Fatalf("a clean qa report should pass, got %q", v.Overall)
 	}
-	// Advisory: no approval minted, and neither the trust gate's verdict file nor the
-	// security audit's verdict file is written (the three paths use distinct files).
+	// Advisory: no approval minted, and neither the trust gate's durable verdict nor the
+	// security audit's verdict file is written (the three paths use distinct stores).
 	if approval.Valid(m.P.ApprovalFile("qv1")) {
 		t.Fatal("qa-review must NOT mint an approval token")
 	}
-	if _, ok := review.Load(m.P.ReviewVerdictFile("qv1")); ok {
-		t.Fatal("qa-review must NOT write the trust gate's verdict file")
+	if _, ok := m.TrustShow("qv1"); ok {
+		t.Fatal("qa-review must NOT write the trust gate's verdict")
 	}
 	if _, ok := m.SecurityReviewShow("qv1"); ok {
 		t.Fatal("qa-review must NOT write the security audit's verdict file")

@@ -81,15 +81,13 @@ func (p Paths) BriefPath(id string) string { return filepath.Join(p.DataDir(), i
 func (p Paths) WatchPIDFile() string { return filepath.Join(p.StateDir(), "watch.pid") }
 
 // ApprovalFile holds a short-lived approval token authorizing a merge for a task.
+// The adversarial-review VERDICT it sits beside is no longer a file — it is durable,
+// content-pinned SQLite state (the verdicts table), so a merge is never forced to
+// re-gate by file-TTL expiry. The approval token stays a short-lived file: its TTL is
+// the deliberate human-approval freshness window, distinct from the verdict so an audit
+// can always tell "a human approved" from "the reviewers passed".
 func (p Paths) ApprovalFile(id string) string {
 	return filepath.Join(p.StateDir(), id+".approve")
-}
-
-// ReviewVerdictFile holds a short-lived, commit-pinned adversarial-review verdict
-// for a task. It sits beside ApprovalFile and is kept distinct from it so an audit
-// can always tell "a human approved" from "the reviewers passed".
-func (p Paths) ReviewVerdictFile(id string) string {
-	return filepath.Join(p.StateDir(), id+".verdict")
 }
 
 // ReviewInputsDir holds the materialized inputs the review subagents read for a task

@@ -533,9 +533,12 @@ func (s *Store) SetStage(ctx context.Context, id, stage, actor string) (Event, e
 	return ev, nil
 }
 
-// RecordDelivery writes a task's delivery provenance (gate/approval/sha) and a
-// manager-authored event (review_recorded by default) in one transaction. The
-// event is always non-actionable (§1.3).
+// RecordDelivery writes a task's delivery provenance (gate/approval/sha), optionally
+// upserts the durable verdict row, and appends a manager-authored event
+// (review_recorded by default) — all in one transaction. The event is always
+// non-actionable (§1.3). When d.Verdict is non-nil the verdict row is replaced in the
+// SAME transaction as the summary update, so the flattened summary columns and the
+// authoritative verdict row can never drift apart (a crash leaves both old or both new).
 func (s *Store) RecordDelivery(ctx context.Context, id string, d Delivery) error {
 	now := s.now()
 	eventType := d.EventType
@@ -559,6 +562,11 @@ func (s *Store) RecordDelivery(ctx context.Context, id string, d Delivery) error
 		}
 		if err := requireRows(res, "task "+id); err != nil {
 			return err
+		}
+		if d.Verdict != nil {
+			if err := upsertVerdictTx(ctx, tx, now, *d.Verdict); err != nil {
+				return err
+			}
 		}
 		_, err = appendEvent(ctx, tx, now, Event{
 			EntityType: EntityTypeTask, EntityID: id, Type: eventType, Actor: actor, Payload: d.Payload,

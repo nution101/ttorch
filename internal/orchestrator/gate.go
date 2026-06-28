@@ -255,9 +255,10 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 }
 
 // TrustRecord aggregates the reviewers' per-dimension reports for taskID into a
-// commit-pinned verdict and persists it, recording GatePassed/ReviewedSHA on the
-// task. The sha it covers must still be the worker's HEAD (a record-time pin against
-// a commit landing after review).
+// commit-pinned verdict and persists it as a durable DB row (the authoritative source
+// the merge gate later reads), recording GatePassed/ReviewedSHA on the task in the same
+// transaction. The sha it covers must still be the worker's HEAD (a record-time pin
+// against a commit landing after review).
 //
 // In every mode except trusted the verdict authorizes nothing on its own — it is
 // advisory, and a merge still requires the human approval token. In trusted mode a
@@ -298,12 +299,10 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 		return zero, fmt.Errorf("trust record %q: could not compute the reviewed diff identity: %w", taskID, derr)
 	}
 	verdict.DiffID = review.DiffID([]byte(patch))
-	if err := review.Write(m.P.ReviewVerdictFile(taskID), verdict, ttl); err != nil {
-		return zero, err
-	}
 	t.ReviewedSHA = sha
 	t.GatePassed = verdict.Overall == review.Pass
 	t.ApprovedBy = ""
+	approvalSHA := ""
 	// Trusted mode is the sole carve-out: a PASS verdict auto-mints the approval token so
 	// the lead need not read the diff — but ONLY when the worktree is clean (reviewed
 	// state == the committed HEAD that will merge), the worktree passes the gate's fresh
@@ -329,14 +328,23 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 				return zero, err
 			}
 			t.ApprovedBy = "auto"
+			approvalSHA = sha
 		}
 	}
-	// Persist the verdict provenance (gate/approval/sha) in one write. The
-	// review_recorded event is manager-authored and non-actionable (§1.3). t was
+	// Persist the DURABLE verdict row AND the flattened summary (gate/approval/sha) in ONE
+	// transaction, so the authoritative verdict the merge gate reads and its summary
+	// columns can never drift. The verdict is content-pinned (reviewed_sha + diff_id) and
+	// carries no expiry — it stays valid until a genuine content change supersedes it, so a
+	// merge is never forced to re-gate by file-TTL expiry (the documented re-review loop).
+	// The review_recorded event is manager-authored and non-actionable (§1.3). t was
 	// mutated above as the accumulator for the auto-mint decision.
+	dv, err := toDBVerdict(taskID, verdict, t.ApprovedBy, approvalSHA)
+	if err != nil {
+		return zero, err
+	}
 	if err := m.Store.RecordDelivery(context.Background(), taskID, db.Delivery{
 		GatePassed: t.GatePassed, ApprovedBy: t.ApprovedBy, ReviewedSHA: t.ReviewedSHA,
-		EventType: db.EventReviewRecorded, Actor: db.ActorManager,
+		EventType: db.EventReviewRecorded, Actor: db.ActorManager, Verdict: &dv,
 	}); err != nil {
 		return zero, err
 	}
@@ -349,17 +357,70 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 	return verdict, nil
 }
 
-// TrustShow returns the current valid (unexpired) verdict for taskID, if any,
-// without consuming it.
+// TrustShow returns the current durable verdict for taskID, if any, without consuming
+// it. It reads the authoritative DB row (not a TTL'd file): the verdict is present until
+// a gated merge consumes it or a re-record replaces it, never expiring by age.
 func (m *Manager) TrustShow(taskID string) (review.Verdict, bool) {
-	return review.Load(m.P.ReviewVerdictFile(taskID))
+	dv, ok, err := m.Store.GetVerdict(context.Background(), taskID)
+	if err != nil || !ok {
+		return review.Verdict{}, false
+	}
+	v, err := fromDBVerdict(dv)
+	if err != nil {
+		return review.Verdict{}, false
+	}
+	return v, true
+}
+
+// toDBVerdict projects a review.Verdict (plus the approval token's provenance and the
+// commit it authorizes) into the storable db.Verdict, marshaling the findings to JSON.
+// The db layer stores findings as an opaque blob, so the review types never leak into it.
+func toDBVerdict(taskID string, v review.Verdict, approvedBy, approvalSHA string) (db.Verdict, error) {
+	// A clean verdict has nil findings, which json.Marshal renders as "null"; store the
+	// column's documented empty-array form ("[]") instead so the persisted shape always
+	// matches the schema's JSON-array contract.
+	findings := "[]"
+	if len(v.Findings) > 0 {
+		fb, err := json.Marshal(v.Findings)
+		if err != nil {
+			return db.Verdict{}, err
+		}
+		findings = string(fb)
+	}
+	return db.Verdict{
+		TaskID:      taskID,
+		Overall:     v.Overall,
+		ReviewedSHA: v.ReviewedSHA,
+		DiffID:      v.DiffID,
+		Findings:    findings,
+		ApprovedBy:  approvedBy,
+		ApprovalSHA: approvalSHA,
+	}, nil
+}
+
+// fromDBVerdict reconstructs a review.Verdict from a stored db.Verdict, unmarshaling the
+// findings JSON. The verdict carries no Expires (the durable row is content-pinned, not
+// time-boxed); nothing on the read path consults it.
+func fromDBVerdict(dv db.Verdict) (review.Verdict, error) {
+	var findings []review.Finding
+	if dv.Findings != "" {
+		if err := json.Unmarshal([]byte(dv.Findings), &findings); err != nil {
+			return review.Verdict{}, err
+		}
+	}
+	return review.Verdict{
+		Overall:     dv.Overall,
+		ReviewedSHA: dv.ReviewedSHA,
+		DiffID:      dv.DiffID,
+		Findings:    findings,
+	}, nil
 }
 
 // securityVerdictPath is where the standalone, advisory security-everywhere verdict
 // lives — beside the review inputs the security reviewer reads, and DISTINCT from the
-// trust gate's ReviewVerdictFile so the two never interfere: the advisory pass can
+// trust gate's durable DB verdict so the two never interfere: the advisory pass can
 // never mint an approval or satisfy the trusted gate, and recording it never disturbs a
-// trust verdict.
+// trust verdict. It stays a file because it is purely advisory and never gates a merge.
 func (m *Manager) securityVerdictPath(taskID string) string {
 	return filepath.Join(m.P.ReviewInputsDir(taskID), "security-verdict.json")
 }
@@ -427,10 +488,10 @@ func (m *Manager) SecurityReviewShow(taskID string) (review.Verdict, bool) {
 }
 
 // qaVerdictPath is where the standalone, advisory test-adequacy (QA) verdict lives — beside
-// the review inputs the QA reviewer reads, and DISTINCT from both the trust gate's
-// ReviewVerdictFile and the security audit's verdict, so none of the three interfere: the QA
-// pass can never mint an approval or satisfy the trusted gate, and recording it never
-// disturbs a trust or security verdict.
+// the review inputs the QA reviewer reads, and DISTINCT from both the trust gate's durable
+// DB verdict and the security audit's verdict, so none of the three interfere: the QA pass
+// can never mint an approval or satisfy the trusted gate, and recording it never disturbs a
+// trust or security verdict.
 func (m *Manager) qaVerdictPath(taskID string) string {
 	return filepath.Join(m.P.ReviewInputsDir(taskID), "qa-verdict.json")
 }

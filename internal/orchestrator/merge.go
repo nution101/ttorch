@@ -36,14 +36,24 @@ func (m *Manager) Approve(taskID string, ttl time.Duration) error {
 	if err := approval.Grant(m.P.ApprovalFile(taskID), ttl, approvalPayload("human", head)); err != nil {
 		return err
 	}
+	// When a durable verdict exists (a gated repo where `trust record` ran), stamp the human
+	// approval onto its row too, so the verdict's approval provenance never drifts from the
+	// task summary. A non-gated approval (no verdict row) leaves it nil — the file token alone
+	// authorizes that merge.
+	var dv *db.Verdict
+	if cur, ok, gerr := m.Store.GetVerdict(context.Background(), taskID); gerr == nil && ok {
+		cur.ApprovedBy = "human"
+		cur.ApprovalSHA = head
+		dv = &cur
+	}
 	// Record that THIS approval was the lead's — both in the token's provenance (the
 	// authority for the merge's audit label) and in the persisted task state (overwriting
-	// any prior auto-mint marker so the two never drift). RecordDelivery preserves the
-	// gate/sha fields it is given; the 'approved' event is manager/lead-authored and
-	// non-actionable, so it never wakes a watcher.
+	// any prior auto-mint marker so the two never drift), updating the verdict row in the
+	// same transaction. RecordDelivery preserves the gate/sha fields it is given; the
+	// 'approved' event is manager/lead-authored and non-actionable, so it never wakes a watcher.
 	if err := m.Store.RecordDelivery(context.Background(), taskID, db.Delivery{
 		GatePassed: t.GatePassed, ApprovedBy: "human", ReviewedSHA: t.ReviewedSHA,
-		EventType: db.EventApproved, Actor: db.ActorLead,
+		EventType: db.EventApproved, Actor: db.ActorLead, Verdict: dv,
 	}); err != nil {
 		return err
 	}
@@ -119,10 +129,15 @@ func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error)
 		if tokBy == "auto" && !hasDefaultBranchGateScript(repo) {
 			return "", fmt.Errorf("trust gate: %q has no .ttorch/validate.sh on the default branch, so a trusted auto-merge's checks would be worker-defined; the lead must approve it explicitly with 'ttorch approve %s'", taskID, taskID)
 		}
-		// Require a passing, unexpired verdict (load, not yet consume — a recoverable
-		// refusal below must leave it intact for a retry). Absent/expired/blocking all
-		// fail closed.
-		v, ok := review.Load(m.P.ReviewVerdictFile(taskID))
+		// Require a passing verdict from the durable DB row (read, not yet consume — a
+		// recoverable refusal below must leave it intact for a retry). A missing or blocking
+		// row fails closed. The row is content-pinned, not time-boxed: it never expires by
+		// age, so a merge is never forced to re-gate by file-TTL expiry — only a content
+		// change (the reviewed_sha pin re-checked at consume) can invalidate it.
+		v, ok, err := m.Store.GetVerdict(context.Background(), taskID)
+		if err != nil {
+			return "", fmt.Errorf("trust gate: could not read the review verdict for %q: %w", taskID, err)
+		}
 		if !ok {
 			return "", fmt.Errorf("trust gate: no valid review verdict for %q; run 'ttorch trust prep %s', review, then 'ttorch trust record %s'", taskID, taskID, taskID)
 		}
@@ -197,16 +212,24 @@ func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error)
 		m.recordDelivered(taskID, db.EventDelivered, fmt.Sprintf("%s -> %s", def, short(workerHead)))
 		return fmt.Sprintf("fast-forwarded %s to %s for task %s", def, short(workerHead), taskID), nil
 	}
-	// Consume the verdict beside the approval and pin it to the merged commit — the
-	// second commit-pin, parallel to approvedHead==workerHead, so a commit pushed after
-	// review can never ride in unreviewed. Consume re-checks pass, so a verdict that
-	// turned blocking since the load above fails closed here too.
-	cv, ok := review.Consume(m.P.ReviewVerdictFile(taskID))
-	if !ok {
-		return "", fmt.Errorf("trust gate: the review verdict for %q expired or is no longer passing; re-record it with 'ttorch trust record %s'", taskID, taskID)
+	// Consume the durable verdict and pin it to the merged commit — the second commit-pin,
+	// parallel to approvedHead==workerHead, so a commit pushed after review can never ride
+	// in unreviewed. Re-read it (it must still be present and passing — fail closed if a
+	// re-record turned it blocking since the load above) and require its reviewed_sha to
+	// equal the commit being merged; then delete the row so the same verdict can never
+	// authorize a second merge.
+	cv, ok, cerr := m.Store.GetVerdict(context.Background(), taskID)
+	if cerr != nil {
+		return "", fmt.Errorf("trust gate: could not read the review verdict for %q: %w", taskID, cerr)
+	}
+	if !ok || cv.Overall != review.Pass {
+		return "", fmt.Errorf("trust gate: the review verdict for %q is missing or no longer passing; re-record it with 'ttorch trust record %s'", taskID, taskID)
 	}
 	if cv.ReviewedSHA != workerHead {
 		return "", fmt.Errorf("trust gate: the verdict for %q covers %s but the worker is now %s; re-review and re-record", taskID, short(cv.ReviewedSHA), short(workerHead))
+	}
+	if err := m.Store.DeleteVerdict(context.Background(), taskID); err != nil {
+		return "", fmt.Errorf("trust gate: could not consume the review verdict for %q: %w", taskID, err)
 	}
 	// Attribute the audit to the consumed token's provenance, and fail closed if it is
 	// unknown (a legacy token with no provenance must not merge through the gate).
@@ -586,11 +609,14 @@ func (m *Manager) securityAuditNote(taskID, landedSHA string, gated bool) string
 // verdict onto changed content would be a trust hole, so it returns a loud re-gate error
 // instead. When there is no passing verdict to carry, or one predating content identities (an
 // empty DiffID), it carries nothing and returns (false, nil), letting gateCoversRebased issue
-// the usual re-gate demand. The verdict expiry, findings, and content identity are preserved so
-// a subsequent rebase can carry it again; the merge gate in MergeLocal re-validates and
+// the usual re-gate demand. The verdict's findings and content identity are preserved so a
+// subsequent rebase can carry it again; the merge gate in MergeLocal re-validates and
 // re-consumes the re-pinned tokens, so carry-forward is an optimization, never the authority.
 func (m *Manager) carryVerdictForward(t db.Task, base, rebasedHead string) (bool, error) {
-	v, ok := review.Load(m.P.ReviewVerdictFile(t.ID))
+	v, ok, err := m.Store.GetVerdict(context.Background(), t.ID)
+	if err != nil {
+		return false, fmt.Errorf("land: could not read the verdict for %q to carry it forward: %w", t.ID, err)
+	}
 	if !ok || v.Overall != review.Pass {
 		return false, nil // no carryable verdict — gateCoversRebased demands a fresh one
 	}
@@ -612,26 +638,36 @@ func (m *Manager) carryVerdictForward(t db.Task, base, rebasedHead string) (bool
 			t.ID, base, short(rebasedHead), t.ID, t.ID, t.ID)
 	}
 	// The worker's own diff is byte-identical to what the reviewers cleared: carry the verdict
-	// forward by re-pinning it to the rebased commit, preserving its expiry, findings, and
-	// content identity.
+	// forward by re-pinning its commit to the rebased commit, preserving the findings and
+	// content identity. The durable verdict has no TTL, so this is a plain content-pinned
+	// update of the same row.
+	//
+	// The trusted gate auto-mints the approval token from the same review, pinned to the same
+	// commit; carry it forward too — re-granting the file token to the rebased commit while
+	// preserving its ORIGINAL lifetime (not extending it), and advancing the row's recorded
+	// approval_sha alongside it. A human-minted approval is NEVER forged forward — the lead
+	// re-approves the rebased commit (a single step), so the recorded approval only advances
+	// when the auto token actually moves with the verdict; the three reviewers do not re-run.
 	reviewedSHA := v.ReviewedSHA
-	ttl := time.Until(time.Unix(0, v.Expires))
-	if ttl <= 0 {
-		return false, nil // expired between Load and here — gateCoversRebased fails closed
-	}
 	v.ReviewedSHA = rebasedHead
-	if err := review.Write(m.P.ReviewVerdictFile(t.ID), v, ttl); err != nil {
+	data, hasTok := approval.Data(m.P.ApprovalFile(t.ID))
+	by, _ := splitApprovalPayload(data)
+	carryAuto := hasTok && by == "auto"
+	var autoTTL time.Duration
+	if carryAuto {
+		ttl, ok := approval.Remaining(m.P.ApprovalFile(t.ID))
+		if !ok {
+			return false, nil // the auto-approval expired — gateCoversRebased fails closed
+		}
+		autoTTL = ttl
+		v.ApprovalSHA = rebasedHead
+	}
+	if err := m.Store.SaveVerdict(context.Background(), v); err != nil {
 		return false, fmt.Errorf("land: could not re-pin the carried verdict for %q: %w", t.ID, err)
 	}
-	// The trusted gate auto-mints the approval token from the same review, pinned to the same
-	// commit; re-pin it forward too so the merge proceeds without a human. A human-minted
-	// approval is NEVER forged forward — the lead re-approves the rebased commit (a single
-	// step), but the three reviewers do not re-run.
-	if data, ok := approval.Data(m.P.ApprovalFile(t.ID)); ok {
-		if by, _ := splitApprovalPayload(data); by == "auto" {
-			if err := approval.Grant(m.P.ApprovalFile(t.ID), ttl, approvalPayload("auto", rebasedHead)); err != nil {
-				return false, fmt.Errorf("land: could not re-pin the carried auto-approval for %q: %w", t.ID, err)
-			}
+	if carryAuto {
+		if err := approval.Grant(m.P.ApprovalFile(t.ID), autoTTL, approvalPayload("auto", rebasedHead)); err != nil {
+			return false, fmt.Errorf("land: could not re-pin the carried auto-approval for %q: %w", t.ID, err)
 		}
 	}
 	m.audit(fmt.Sprintf("fast-land task=%s carried verdict %s->%s base=%s (reviewed diff unchanged)",
@@ -653,7 +689,10 @@ func (m *Manager) gateCoversRebased(t db.Task, rebasedHead string, gated bool) e
 			short(rebasedHead), t.ID, t.ID, t.ID, t.ID)
 	}
 	if gated {
-		v, vok := review.Load(m.P.ReviewVerdictFile(t.ID))
+		v, vok, verr := m.Store.GetVerdict(context.Background(), t.ID)
+		if verr != nil {
+			return fmt.Errorf("land: could not read the review verdict for %q: %w", t.ID, verr)
+		}
 		if !vok || v.Overall != review.Pass || v.ReviewedSHA != rebasedHead {
 			return fmt.Errorf("land: no passing review verdict covers the rebased commit %s for %q; re-run 'ttorch trust prep %s', review, and 'ttorch trust record %s', then re-run 'ttorch land %s'",
 				short(rebasedHead), t.ID, t.ID, t.ID, t.ID)

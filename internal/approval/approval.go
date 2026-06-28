@@ -44,6 +44,22 @@ func Data(path string) (string, bool) {
 	return data, true
 }
 
+// Remaining returns how long a non-expired token has left to live, without consuming
+// it. ok is false when the token is absent or already expired. The land carry-forward
+// re-pins an auto-approval to the rebased commit while preserving its ORIGINAL lifetime
+// (rather than extending it), so it reads the remaining time here and re-grants with it.
+func Remaining(path string) (time.Duration, bool) {
+	exp, _, ok := read(path)
+	if !ok {
+		return 0, false
+	}
+	d := time.Duration(exp - time.Now().UnixNano())
+	if d <= 0 {
+		return 0, false
+	}
+	return d, true
+}
+
 // Consume removes the token and returns its bound data and whether it was valid.
 // A stale (expired) token is also removed.
 func Consume(path string) (data string, ok bool) {

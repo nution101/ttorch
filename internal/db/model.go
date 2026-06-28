@@ -223,6 +223,11 @@ type TaskFields struct {
 // Delivery carries the provenance RecordDelivery writes (gate/approval/sha) plus
 // the manager-authored event it emits. EventType defaults to review_recorded and
 // Actor to manager; the event is always actionable=0 (§1.3).
+//
+// Verdict, when non-nil, is upserted into the verdicts table in the SAME transaction
+// as the task summary update and the event, so the flattened summary columns
+// (gate_passed/approved_by/reviewed_sha) and the durable, authoritative verdict row
+// can never drift apart.
 type Delivery struct {
 	GatePassed  bool
 	ApprovedBy  string // "" | human | auto
@@ -230,6 +235,26 @@ type Delivery struct {
 	EventType   string // review_recorded | security_recorded | qa_recorded | …
 	Actor       string
 	Payload     string
+	Verdict     *Verdict // optional: upserted atomically with the summary
+}
+
+// Verdict mirrors a verdicts row: the durable, content-pinned trust-gate artifact for
+// a task (the authoritative source the merge gate validates freshness from, replacing
+// the short-lived TTL'd verdict file). It bundles the adversarial-review outcome
+// (Overall + Findings), the commit pin (ReviewedSHA) and content pin (DiffID), and the
+// approval token's durable record (ApprovedBy + ApprovalSHA). Findings is the opaque
+// JSON the orchestrator marshals from []review.Finding; the db layer never interprets
+// it, keeping internal/db free of any internal/review dependency.
+type Verdict struct {
+	TaskID      string
+	Overall     string // pass | block
+	ReviewedSHA string
+	DiffID      string
+	Findings    string // JSON array of review.Finding (opaque to db)
+	ApprovedBy  string // "" | human | auto
+	ApprovalSHA string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }
 
 // TimelineItem is one entry in a task's merged events∪notes history (§2.2).

@@ -38,8 +38,8 @@ func TestFreshDBBootstrapsToV0(t *testing.T) {
 	if err := s.Migrate(ctx); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if v, err = s.schemaVersion(ctx); err != nil || v != 1 {
-		t.Errorf("after Migrate: version=%d err=%v, want 1/nil", v, err)
+	if v, err = s.schemaVersion(ctx); err != nil || v != 2 {
+		t.Errorf("after Migrate: version=%d err=%v, want 2/nil", v, err)
 	}
 }
 
@@ -50,14 +50,14 @@ func TestMigrateUpDownUp(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t) // Open() already migrated up
 
-	if v, err := s.schemaVersion(ctx); err != nil || v != 1 {
-		t.Fatalf("after Open: version=%d err=%v, want 1", v, err)
+	if v, err := s.schemaVersion(ctx); err != nil || v != 2 {
+		t.Fatalf("after Open: version=%d err=%v, want 2", v, err)
 	}
 	var fk int
 	if err := s.db.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&fk); err != nil || fk != 1 {
 		t.Fatalf("foreign_keys=%d err=%v, want 1 (so child-first drop is actually required)", fk, err)
 	}
-	for _, tbl := range []string{"projects", "epics", "phases", "tasks", "events", "notes", "manager", "schema_migrations"} {
+	for _, tbl := range []string{"projects", "epics", "phases", "tasks", "events", "notes", "manager", "verdicts", "schema_migrations"} {
 		if !tableExists(t, s, tbl) {
 			t.Fatalf("table %q missing after up", tbl)
 		}
@@ -78,11 +78,14 @@ func TestMigrateUpDownUp(t *testing.T) {
 	if err := s.Migrate(ctx); err != nil {
 		t.Fatalf("re-Migrate: %v", err)
 	}
-	if v, err := s.schemaVersion(ctx); err != nil || v != 1 {
-		t.Fatalf("after re-up: version=%d err=%v, want 1", v, err)
+	if v, err := s.schemaVersion(ctx); err != nil || v != 2 {
+		t.Fatalf("after re-up: version=%d err=%v, want 2", v, err)
 	}
 	if !tableExists(t, s, "tasks") {
 		t.Error("tasks missing after re-up")
+	}
+	if !tableExists(t, s, "verdicts") {
+		t.Error("verdicts missing after re-up")
 	}
 }
 
@@ -97,7 +100,7 @@ func TestMigrateIdempotent(t *testing.T) {
 	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations`).Scan(&rows); err != nil {
 		t.Fatal(err)
 	}
-	if rows != 1 {
-		t.Errorf("schema_migrations rows = %d, want 1 (no duplicate ledger row)", rows)
+	if rows != 2 {
+		t.Errorf("schema_migrations rows = %d, want 2 (no duplicate ledger row)", rows)
 	}
 }
