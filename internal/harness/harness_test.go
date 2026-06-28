@@ -49,14 +49,67 @@ func TestEffortArgs(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Setenv("TTORCH_EFFORT", c.env)
-		if got := EffortArgs("claude"); got != c.want {
+		// An empty explicit level falls back to TTORCH_EFFORT / the default.
+		if got := EffortArgs("claude", ""); got != c.want {
 			t.Errorf("TTORCH_EFFORT=%q: got %q, want %q", c.env, got, c.want)
 		}
 	}
 	// Non-claude harnesses never get effort args.
 	t.Setenv("TTORCH_EFFORT", "ultracode")
-	if got := EffortArgs("other"); got != "" {
+	if got := EffortArgs("other", ""); got != "" {
 		t.Errorf("non-claude harness should get no effort args, got %q", got)
+	}
+}
+
+// TestEffortArgsExplicit proves an explicit per-task level wins over (and is independent
+// of) TTORCH_EFFORT, and is mapped case-insensitively — this is the path the spawn
+// command build and a resume both take.
+func TestEffortArgsExplicit(t *testing.T) {
+	t.Setenv("TTORCH_EFFORT", "off") // env says off; explicit level must still win
+	cases := []struct{ level, want string }{
+		{"medium", " --effort medium"},
+		{"MAX", " --effort max"},
+		{"ultracode", ` --settings '{"ultracode":true}'`},
+		{"off", ""},
+		{"", ""}, // empty falls back to env (off)
+	}
+	for _, c := range cases {
+		if got := EffortArgs("claude", c.level); got != c.want {
+			t.Errorf("EffortArgs(claude, %q) = %q, want %q", c.level, got, c.want)
+		}
+	}
+}
+
+func TestValidEffort(t *testing.T) {
+	for _, ok := range []string{"low", "medium", "high", "xhigh", "max", "ultracode", "off", "MAX", " High "} {
+		if !ValidEffort(ok) {
+			t.Errorf("ValidEffort(%q) = false, want true", ok)
+		}
+	}
+	for _, bad := range []string{"", "none", "default", "turbo", "ultra"} {
+		if ValidEffort(bad) {
+			t.Errorf("ValidEffort(%q) = true, want false", bad)
+		}
+	}
+}
+
+func TestResolveWorkerEffort(t *testing.T) {
+	// Explicit choice wins over env and kind default, and is normalized to lower case.
+	t.Setenv("TTORCH_EFFORT", "max")
+	if got := ResolveWorkerEffort("Medium", false); got != "medium" {
+		t.Errorf("explicit should win and lowercase: got %q, want medium", got)
+	}
+	// No explicit choice: TTORCH_EFFORT wins over the kind default.
+	if got := ResolveWorkerEffort("", true); got != "max" {
+		t.Errorf("env should win over scout default: got %q, want max", got)
+	}
+	// No explicit, no env: kind default — high for scout, ultracode for ship.
+	t.Setenv("TTORCH_EFFORT", "")
+	if got := ResolveWorkerEffort("", true); got != "high" {
+		t.Errorf("scout default: got %q, want high", got)
+	}
+	if got := ResolveWorkerEffort("", false); got != "ultracode" {
+		t.Errorf("ship default: got %q, want ultracode", got)
 	}
 }
 
@@ -66,12 +119,16 @@ func TestLaunchCommandsCarryEffort(t *testing.T) {
 	if got := InteractiveCommand("claude"); got != want {
 		t.Errorf("interactive: got %q, want %q", got, want)
 	}
-	brief := BriefCommand("claude", "/tmp/b.md", "sid-123")
+	brief := BriefCommand("claude", "/tmp/b.md", "sid-123", "")
 	if !strings.Contains(brief, `--settings '{"ultracode":true}'`) {
 		t.Errorf("brief command missing ultracode setting: %q", brief)
 	}
 	if !strings.HasSuffix(brief, `"$(cat '/tmp/b.md')"`) {
 		t.Errorf("brief command should end with the brief prompt: %q", brief)
+	}
+	// An explicit level on the brief command overrides the env default.
+	if got := BriefCommand("claude", "/tmp/b.md", "sid-123", "medium"); !strings.Contains(got, " --effort medium") {
+		t.Errorf("explicit brief effort should be applied, got %q", got)
 	}
 
 	t.Setenv("TTORCH_EFFORT", "off")
@@ -281,7 +338,7 @@ func TestManagerCharterWatchLoop(t *testing.T) {
 
 func TestBriefCommandCarriesSessionID(t *testing.T) {
 	t.Setenv("TTORCH_EFFORT", "off")
-	cmd := BriefCommand("claude", "/tmp/b.md", "wk-sid")
+	cmd := BriefCommand("claude", "/tmp/b.md", "wk-sid", "")
 	if !strings.Contains(cmd, " --session-id 'wk-sid'") {
 		t.Errorf("brief should carry --session-id, got %q", cmd)
 	}
@@ -295,16 +352,20 @@ func TestBriefCommandCarriesSessionID(t *testing.T) {
 
 func TestResumeCommand(t *testing.T) {
 	t.Setenv("TTORCH_EFFORT", "off")
-	cmd := ResumeCommand("claude", "wk-sid")
+	cmd := ResumeCommand("claude", "wk-sid", "")
 	if !strings.Contains(cmd, " --resume 'wk-sid'") {
 		t.Errorf("worker resume should carry --resume <id>, got %q", cmd)
 	}
 	if strings.Contains(cmd, "$(cat") || strings.Contains(cmd, "--session-id") {
 		t.Errorf("worker resume must not carry a brief or --session-id, got %q", cmd)
 	}
-	cont := ResumeCommand("claude", "")
+	cont := ResumeCommand("claude", "", "")
 	if !strings.Contains(cont, " --continue") || strings.Contains(cont, "--resume") {
 		t.Errorf("empty id should use --continue, got %q", cont)
+	}
+	// A persisted effort is restored on resume even when the env says off.
+	if got := ResumeCommand("claude", "wk-sid", "medium"); !strings.Contains(got, " --effort medium") {
+		t.Errorf("resume should restore the persisted effort, got %q", got)
 	}
 }
 
@@ -325,13 +386,18 @@ func TestManagerResumeOrFresh(t *testing.T) {
 
 func TestWorkerResumeOrFresh(t *testing.T) {
 	t.Setenv("TTORCH_EFFORT", "off")
-	cmd := WorkerResumeOrFresh("claude", "wk-sid", "/tmp/b.md")
+	cmd := WorkerResumeOrFresh("claude", "wk-sid", "/tmp/b.md", "")
 	if !strings.Contains(cmd, " --resume 'wk-sid'") || !strings.Contains(cmd, " || ") {
 		t.Errorf("should attempt resume then fall back, got %q", cmd)
 	}
 	// Fallback relaunches from the brief with the same id.
 	if !strings.Contains(cmd, " --session-id 'wk-sid'") || !strings.Contains(cmd, `"$(cat '/tmp/b.md')"`) {
 		t.Errorf("fallback should re-brief with the same id, got %q", cmd)
+	}
+	// The persisted effort flows into BOTH the resume and the re-brief fallback.
+	withEffort := WorkerResumeOrFresh("claude", "wk-sid", "/tmp/b.md", "high")
+	if strings.Count(withEffort, " --effort high") != 2 {
+		t.Errorf("both resume and fallback should carry the effort, got %q", withEffort)
 	}
 }
 

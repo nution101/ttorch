@@ -17,6 +17,7 @@ const taskSelect = `SELECT
 	t.reviewed_sha, t.footprint, t.last_pane_hash, t.idle_sweeps,
 	t.created_at, t.updated_at, t.last_progress_at,
 	t.lease_owner, t.lease_expires_at, t.retry_count, t.max_retries, t.attempt,
+	t.effort,
 	p.repo_path
 	FROM tasks t JOIN projects p ON p.id = t.project_id`
 
@@ -37,6 +38,7 @@ func scanTask(sc rowScanner) (Task, error) {
 		&t.ReviewedSHA, &footprint, &t.LastPaneHash, &t.IdleSweeps,
 		&createdAt, &updAt, &lastProgress,
 		&t.LeaseOwner, &leaseExpires, &t.RetryCount, &t.MaxRetries, &t.Attempt,
+		&t.Effort,
 		&t.Project); err != nil {
 		return Task{}, err
 	}
@@ -136,13 +138,13 @@ func (s *Store) insertTaskTx(ctx context.Context, tx *sql.Tx, t Task) error {
 			title, kind, status, stage, owner,
 			window, worktree, harness, session_id, pr, gate_passed, approved_by, reviewed_sha, footprint,
 			last_pane_hash, idle_sweeps, created_at, updated_at, last_progress_at,
-			lease_owner, lease_expires_at, retry_count, max_retries, attempt)
-		VALUES (?, ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?)`,
+			lease_owner, lease_expires_at, retry_count, max_retries, attempt, effort)
+		VALUES (?, ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?,  ?)`,
 		t.ID, t.ProjectID, nullInt(t.EpicID), nullInt(t.PhaseID), nullStr(t.ParentTaskID), t.CreatedBy,
 		t.Title, t.Kind, t.Status, t.Stage, t.Owner,
 		t.Window, t.Worktree, t.Harness, t.SessionID, t.PR, gate, t.ApprovedBy, t.ReviewedSHA, fp,
 		t.LastPaneHash, t.IdleSweeps, formatTime(t.Created), formatTime(t.UpdatedAt), nullTime(t.LastProgressAt),
-		t.LeaseOwner, nullTime(t.LeaseExpiresAt), t.RetryCount, t.MaxRetries, t.Attempt)
+		t.LeaseOwner, nullTime(t.LeaseExpiresAt), t.RetryCount, t.MaxRetries, t.Attempt, t.Effort)
 	return err
 }
 
@@ -249,10 +251,10 @@ func (s *Store) UpsertTask(ctx context.Context, t Task, actor string) (Task, err
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE tasks SET
 					window = ?, worktree = ?, harness = ?, session_id = ?, pr = ?,
-					owner = ?, title = ?, epic_id = ?, phase_id = ?, footprint = ?, updated_at = ?
+					owner = ?, title = ?, epic_id = ?, phase_id = ?, footprint = ?, effort = ?, updated_at = ?
 				WHERE id = ?`,
 				t.Window, t.Worktree, t.Harness, t.SessionID, t.PR,
-				t.Owner, t.Title, nullInt(t.EpicID), nullInt(t.PhaseID), fp, formatTime(s.now()),
+				t.Owner, t.Title, nullInt(t.EpicID), nullInt(t.PhaseID), fp, t.Effort, formatTime(s.now()),
 				t.ID); err != nil {
 				return err
 			}
@@ -384,6 +386,9 @@ func taskFieldsAssignments(f TaskFields) ([]string, []any, error) {
 			return nil, nil, err
 		}
 		add("footprint", fp)
+	}
+	if f.Effort != nil {
+		add("effort", *f.Effort)
 	}
 	return set, args, nil
 }

@@ -141,6 +141,12 @@ type Task struct {
 	ReviewedSHA string
 	Footprint   []string
 
+	// Effort is the reasoning-effort level the worker was dispatched at
+	// (low|medium|high|xhigh|max|ultracode|off). "" means unset — the launch path
+	// falls back to TTORCH_EFFORT / the kind default. Persisted so a resume after a
+	// stop/update restores the same effort (see harness.ResolveWorkerEffort).
+	Effort string
+
 	ProjectID      int64
 	EpicID         *int64
 	PhaseID        *int64
@@ -232,6 +238,7 @@ type TaskFields struct {
 	EpicID    *int64
 	PhaseID   *int64
 	Footprint *[]string
+	Effort    *string
 }
 
 // Delivery carries the provenance RecordDelivery writes (gate/approval/sha) plus

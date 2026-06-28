@@ -378,6 +378,19 @@ func TestRenderOverlap(t *testing.T) {
 // regression that dropped it would otherwise keep every resolver test green. The
 // --message-file path reaches the guard and returns before any manager/tmux call,
 // so this stays hermetic.
+// TestCmdSpawn_InvalidEffort pins the --effort guard: an unrecognized level fails loudly
+// (naming the accepted set) BEFORE any side effect, so a typo never silently launches the
+// worker at the wrong effort. The check runs before mgr()/spawn, so no tmux/DB is needed.
+func TestCmdSpawn_InvalidEffort(t *testing.T) {
+	err := cmdSpawn([]string{"task1", t.TempDir(), "--effort", "turbo"})
+	if err == nil {
+		t.Fatal("cmdSpawn with an unknown --effort must return an error")
+	}
+	if !strings.Contains(err.Error(), "invalid --effort") {
+		t.Fatalf("error = %q, want it to mention an invalid --effort", err)
+	}
+}
+
 func TestCmdSend_EmptyMessageFailsLoudly(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "empty.txt")
 	if err := os.WriteFile(path, nil, 0o644); err != nil {

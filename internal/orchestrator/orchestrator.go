@@ -552,7 +552,7 @@ func (m *Manager) restore() []string {
 			notes = append(notes, fmt.Sprintf("skipped %s (%s)", t.ID, err.Error()))
 			continue
 		}
-		_ = tmux.SendLine(m.Session, t.Window, harness.WorkerResumeOrFresh(h, t.SessionID, m.P.BriefPath(t.ID)))
+		_ = tmux.SendLine(m.Session, t.Window, harness.WorkerResumeOrFresh(h, t.SessionID, m.P.BriefPath(t.ID), t.Effort))
 		_ = termtab.Open(m.Session, t.Window)
 		notes = append(notes, "restored "+t.ID)
 	}

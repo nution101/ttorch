@@ -21,23 +21,36 @@ import (
 // it runs rawCmd (used for testing and escape hatches). It declares no footprint,
 // so it is exempt from overlap enforcement — the back-compat entry point.
 func (m *Manager) Spawn(taskID, projectPath string, scout bool, rawCmd string) (db.Task, error) {
-	return m.SpawnWithFootprint(taskID, projectPath, scout, rawCmd, nil, false)
+	return m.SpawnWithEffort(taskID, projectPath, scout, rawCmd, nil, false, "")
 }
 
-// SpawnWithFootprint is Spawn plus deterministic overlap prevention: footprint is
-// the repo-relative paths/prefixes the task will touch. When it is non-empty and
-// forceOverlap is false, the spawn is REFUSED if the footprint overlaps any live
-// worker's footprint (in the same repo), naming the conflicting task — so two
+// SpawnWithFootprint is Spawn plus deterministic overlap prevention (see
+// SpawnWithEffort for the footprint semantics). It dispatches at the default/unset
+// effort. Its signature is kept stable so the scheduler daemon's interface and call
+// site need no change; the explicit-effort path is SpawnWithEffort.
+func (m *Manager) SpawnWithFootprint(taskID, projectPath string, scout bool, rawCmd string, footprint []string, forceOverlap bool) (db.Task, error) {
+	return m.SpawnWithEffort(taskID, projectPath, scout, rawCmd, footprint, forceOverlap, "")
+}
+
+// SpawnWithEffort is SpawnWithFootprint plus an explicit per-task reasoning effort
+// (`ttorch spawn --effort`). effort is the requested level, or "" to use the default;
+// it is resolved through harness.ResolveWorkerEffort (explicit > TTORCH_EFFORT > kind
+// default, where a scout defaults to high) and the resolved level is BOTH used for the
+// launch command and persisted on the task row so a later resume restores it.
+//
+// footprint is the repo-relative paths/prefixes the task will touch. When it is
+// non-empty and forceOverlap is false, the spawn is REFUSED if the footprint overlaps
+// any live worker's footprint (in the same repo), naming the conflicting task — so two
 // workers are never dispatched onto the same files. The check runs before any side
-// effect (worktree, window), so a refusal leaves nothing behind. A declared
-// footprint is recorded on the task; an empty footprint enforces nothing.
+// effect (worktree, window), so a refusal leaves nothing behind. A declared footprint
+// is recorded on the task; an empty footprint enforces nothing.
 //
 // The gate reads the persisted, live worker set and the task's own footprint is
 // saved only after its window comes up, so the no-overlap guarantee holds for
 // serial dispatch (the manager dispatches one worker at a time). This matches the
 // unlocked worktree-pool semantics; two truly concurrent spawns of overlapping
 // footprints are not serialized.
-func (m *Manager) SpawnWithFootprint(taskID, projectPath string, scout bool, rawCmd string, footprint []string, forceOverlap bool) (db.Task, error) {
+func (m *Manager) SpawnWithEffort(taskID, projectPath string, scout bool, rawCmd string, footprint []string, forceOverlap bool, effort string) (db.Task, error) {
 	var zero db.Task
 	if err := m.requireTmux(); err != nil {
 		return zero, err
@@ -59,6 +72,10 @@ func (m *Manager) SpawnWithFootprint(taskID, projectPath string, scout bool, raw
 	if scout {
 		kind = "scout"
 	}
+	// Resolve the reasoning effort once: explicit --effort > TTORCH_EFFORT > kind default
+	// (scout ⇒ high, ship ⇒ ultracode). The resolved level drives the launch command AND
+	// is persisted on the task row below, so a resume restores the same effort.
+	resolvedEffort := harness.ResolveWorkerEffort(effort, scout)
 
 	// Deterministic overlap gate: refuse a dispatch that would put this worker onto
 	// files a live worker already holds. Done before acquiring any resource so a
@@ -117,7 +134,7 @@ func (m *Manager) SpawnWithFootprint(taskID, projectPath string, scout bool, raw
 		// Prepend TTORCH_TASK_ID/TTORCH_DB so the worker's reporting commands resolve
 		// their task + DB from the launch env (the .ttorch/task file is the durable
 		// fallback that also survives a resume). §3.1.
-		cmd = harness.WorkerLaunchPrefix(taskID, dbPath) + harness.BriefCommand(h, brief, sid)
+		cmd = harness.WorkerLaunchPrefix(taskID, dbPath) + harness.BriefCommand(h, brief, sid, resolvedEffort)
 	}
 	if err := tmux.SendLine(m.Session, window, cmd); err != nil {
 		m.abortSpawn(window, repo, wt)
@@ -164,6 +181,7 @@ func (m *Manager) SpawnWithFootprint(taskID, projectPath string, scout bool, raw
 		ID: taskID, ProjectID: proj.ID, Window: window, Worktree: wt,
 		Harness: h, Kind: kind, Created: time.Now(), SessionID: sid,
 		Footprint: footprint, Status: db.StatusActive, Owner: "worker:" + taskID,
+		Effort: resolvedEffort,
 	}, db.ActorManager)
 	if err != nil {
 		// The worker is live by now (waitForLaunch confirmed it), so a failed save would

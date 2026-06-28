@@ -60,8 +60,8 @@ func TestMigration0003FreshSchema(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
 
-	if v, err := s.schemaVersion(ctx); err != nil || v != 3 {
-		t.Fatalf("fresh DB version = %d err=%v, want 3", v, err)
+	if v, err := s.schemaVersion(ctx); err != nil || v != 4 {
+		t.Fatalf("fresh DB version = %d err=%v, want 4", v, err)
 	}
 	cols := taskColumns(t, s)
 	for _, c := range []string{"lease_owner", "lease_expires_at", "retry_count", "max_retries", "attempt"} {
@@ -134,15 +134,15 @@ func TestMigration0003RebuildPreservesChildren(t *testing.T) {
 		t.Errorf("failed task mapped to %q on down, want abandoned", st)
 	}
 
-	// --- back up to 3 ---
+	// --- back up to the latest ---
 	if err := s.Migrate(ctx); err != nil {
-		t.Fatalf("re-Migrate to 3: %v", err)
+		t.Fatalf("re-Migrate to latest: %v", err)
 	}
-	if v, _ := s.schemaVersion(ctx); v != 3 {
-		t.Fatalf("version after re-up = %d, want 3", v)
+	if v, _ := s.schemaVersion(ctx); v != 4 {
+		t.Fatalf("version after re-up = %d, want 4", v)
 	}
 	if !taskColumns(t, s)["lease_owner"] {
-		t.Error("lease columns must be back at version 3")
+		t.Error("lease columns must be back after re-up")
 	}
 	// Data still intact and usable through the store.
 	if tk, ok, err := s.GetTask(ctx, "t1"); err != nil || !ok || tk.MaxRetries != DefaultMaxRetries {

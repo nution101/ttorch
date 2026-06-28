@@ -133,6 +133,13 @@ task it can (rule 4):
    `ttorch spawn <task-id> <repo-path>`. Investigation-only tasks use `--scout` (they
    produce a report and never change code). Keep slots full — dispatch disjoint backlog
    rather than let a worker sit idle. Never edit the lead's real checkout yourself.
+   **Match reasoning effort to complexity** with `--effort <level>`
+   (`low|medium|high|xhigh|max|ultracode|off`): reserve `ultracode` for tasks that earn it —
+   trust-gate/delivery, concurrency, security, or multi-file changes; use `high` or `medium`
+   for docs, dead-code removal, and mechanical or single-file edits (where `ultracode` is
+   mostly wasted wall-clock); scouts default to `high`. The chosen level persists on the task
+   and is restored on a stop/restart; without the flag it falls back to `$TTORCH_EFFORT`, else
+   `ultracode` for ship workers and `high` for scouts.
 4. **Supervise.** Check progress with `ttorch status`, read a worker's output with
    `ttorch peek <task-id>`, and steer one with `ttorch send <task-id> "<message>"`.
    Intervene when a worker is blocked or off-track.
@@ -173,7 +180,7 @@ act, then re-check.
 | --- | --- |
 | `ttorch tasks [--project p] [--epic e] [--status s[,s…]] [--tree] [--timeline <id>]` | the DB-backed task list incl. `pending` backlog — your primary source of truth |
 | `ttorch status` | live worker state (tmux) joined with each task's DB status / stage / owner |
-| `ttorch spawn <id> <repo> [--scout]` | start a worker on a task in an isolated workspace |
+| `ttorch spawn <id> <repo> [--scout] [--effort <level>]` | start a worker on a task in an isolated workspace; `--effort low\|medium\|high\|xhigh\|max\|ultracode\|off` matches reasoning effort to complexity (persisted, restored on resume; scouts default to `high`) |
 | `ttorch peek <id> [lines]` | read recent output from a worker |
 | `ttorch send <id> "<text>"` | type a message into a worker (steer / unblock) |
 | `ttorch watch [--since n]` | arm the event-driven watcher as a background task; it blocks until an actionable DB event, prints the batch, then exits to wake you (self-heals past an orphan holding the singleton) |

@@ -38,15 +38,57 @@ func Available(kind string) bool {
 	return err == nil
 }
 
-// EffortArgs returns the extra `claude` arguments that set the reasoning effort
-// for a spawned worker (and the `ttorch cc` session). The level is read from
-// TTORCH_EFFORT (default "ultracode"); set TTORCH_EFFORT=off to leave Claude's
-// own default untouched.
-func EffortArgs(kind string) string {
+// EffortArgs returns the extra `claude` arguments that set the reasoning effort for a
+// spawned worker (or the `ttorch cc` session). level is the explicit per-task choice
+// (e.g. from `spawn --effort`); when it is empty the level falls back to TTORCH_EFFORT
+// and finally the "ultracode" default (effortLevel). A level (or TTORCH_EFFORT) of off
+// leaves Claude's own default untouched. Non-claude harnesses never get effort args.
+func EffortArgs(kind, level string) string {
 	if kind != "claude" {
 		return ""
 	}
+	if l := strings.ToLower(strings.TrimSpace(level)); l != "" {
+		return effortArgsForLevel(l)
+	}
 	return effortArgsForLevel(effortLevel())
+}
+
+// EffortLevels are the per-task reasoning-effort levels `ttorch spawn --effort` accepts.
+// low|medium|high|xhigh|max go through claude's --effort flag; ultracode enables the
+// ultracode session feature (xhigh reasoning + dynamic workflow orchestration); off
+// leaves claude's own default untouched.
+var EffortLevels = []string{"low", "medium", "high", "xhigh", "max", "ultracode", "off"}
+
+// ValidEffort reports whether s names a recognized effort level (case-insensitive). The
+// empty string is NOT valid here — it means "unset", which callers handle separately —
+// so a flag value that is set is always one of EffortLevels.
+func ValidEffort(s string) bool {
+	s = strings.ToLower(strings.TrimSpace(s))
+	for _, l := range EffortLevels {
+		if l == s {
+			return true
+		}
+	}
+	return false
+}
+
+// ResolveWorkerEffort resolves the reasoning-effort level to launch a worker with. The
+// order is: the explicit per-task choice (e.g. `spawn --effort`), then the global
+// TTORCH_EFFORT env, then the kind default — "high" for a scout (investigation only, it
+// does not need ultracode) and "ultracode" for a ship worker. The result is a concrete
+// level the spawn path persists on the task row so a later resume restores the same
+// effort. It is always non-empty.
+func ResolveWorkerEffort(explicit string, scout bool) string {
+	if e := strings.ToLower(strings.TrimSpace(explicit)); e != "" {
+		return e
+	}
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("TTORCH_EFFORT"))); v != "" {
+		return v
+	}
+	if scout {
+		return "high"
+	}
+	return "ultracode"
 }
 
 // effortArgsForLevel maps an effort level to claude flags. "ultracode" is not an
@@ -96,7 +138,7 @@ const managerCharter = "You are the ttorch MANAGER for this tmux session; the pe
 func InteractiveCommand(kind string) string {
 	switch kind {
 	case "claude":
-		return "claude --dangerously-skip-permissions" + EffortArgs(kind)
+		return "claude --dangerously-skip-permissions" + EffortArgs(kind, "")
 	default:
 		return kind
 	}
@@ -156,12 +198,13 @@ func ManagerResumeCommand(kind, sessionID, charterFile string) string {
 }
 
 // BriefCommand starts the harness with a task brief as its initial prompt. It is
-// launched with a stable session id so a later restore can resume this exact
-// worker conversation.
-func BriefCommand(kind, briefPath, sessionID string) string {
+// launched with a stable session id so a later restore can resume this exact worker
+// conversation. effort is the resolved per-task reasoning effort (see
+// ResolveWorkerEffort); "" defers to TTORCH_EFFORT / the default.
+func BriefCommand(kind, briefPath, sessionID, effort string) string {
 	switch kind {
 	case "claude":
-		return "claude --dangerously-skip-permissions" + EffortArgs(kind) +
+		return "claude --dangerously-skip-permissions" + EffortArgs(kind, effort) +
 			" --session-id " + shq(sessionID) +
 			" \"$(cat " + quote(briefPath) + ")\""
 	default:
@@ -172,11 +215,12 @@ func BriefCommand(kind, briefPath, sessionID string) string {
 // ResumeCommand resumes a worker conversation after a stop/reboot/upgrade with no
 // brief: it continues the exact conversation via --resume <sessionID>, or
 // --continue (most recent conversation in the worktree) when no id is known
-// (legacy state).
-func ResumeCommand(kind, sessionID string) string {
+// (legacy state). effort is the persisted per-task reasoning effort the resumed
+// session relaunches at; "" defers to TTORCH_EFFORT / the default (legacy rows).
+func ResumeCommand(kind, sessionID, effort string) string {
 	switch kind {
 	case "claude":
-		base := "claude --dangerously-skip-permissions" + EffortArgs(kind)
+		base := "claude --dangerously-skip-permissions" + EffortArgs(kind, effort)
 		if sessionID == "" {
 			return base + " --continue"
 		}
@@ -199,12 +243,13 @@ func ManagerResumeOrFresh(kind, sessionID, charterFile string) string {
 
 // WorkerResumeOrFresh resumes a worker conversation, falling back to relaunching
 // it from its brief (same session id) if the resume fails, so a worker is never
-// left at a dead shell after a stop/reboot/upgrade.
-func WorkerResumeOrFresh(kind, sessionID, briefPath string) string {
+// left at a dead shell after a stop/reboot/upgrade. effort is the persisted per-task
+// reasoning effort both the resume and the re-brief relaunch at.
+func WorkerResumeOrFresh(kind, sessionID, briefPath, effort string) string {
 	if kind != "claude" {
-		return ResumeCommand(kind, sessionID)
+		return ResumeCommand(kind, sessionID, effort)
 	}
-	return ResumeCommand(kind, sessionID) + " || " + BriefCommand(kind, briefPath, sessionID)
+	return ResumeCommand(kind, sessionID, effort) + " || " + BriefCommand(kind, briefPath, sessionID, effort)
 }
 
 // NewSessionID returns a random RFC-4122 version-4 UUID, used as a stable Claude
