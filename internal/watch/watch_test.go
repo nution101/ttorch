@@ -567,6 +567,73 @@ func TestPollLiveness_StallAutoResumed(t *testing.T) {
 	}
 }
 
+// TestPollLiveness_StallAutoResumed_Phrasings: every recoverable API-stall phrasing the
+// matcher recognizes drives the watcher's auto_resumed path — a single "continue" nudge
+// plus a non-actionable auto_resumed event on the audit spine — while a non-stall API
+// error (a self-retrying rate limit) drives neither. The clock is held within the dwell so
+// the only thing that can act is the stall fast path, isolating the matcher decision from
+// the idle_unreported net.
+func TestPollLiveness_StallAutoResumed_Phrasings(t *testing.T) {
+	cases := []struct {
+		name   string
+		pane   string
+		resume bool
+	}{
+		{"response stalled mid-stream", "API Error: Response stalled mid-stream\n│ >", true},
+		{"stalled case-insensitive", "api error: response STALLED MID-STREAM\n│ >", true},
+		{"stalled no hyphen", "Response stalled mid stream, retrying\n│ >", true},
+		{"connection closed mid-response", "API Error: Connection closed mid-response\n│ >", true},
+		{"closed case-insensitive", "api error: CONNECTION CLOSED MID-RESPONSE\n│ >", true},
+		{"closed no hyphen", "Connection closed mid response, retrying\n│ >", true},
+		{"non-stall rate limit", "API Error: 429 rate limit exceeded\n│ >", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			w, s, _, clk := newWatcher(t)
+			ctx := context.Background()
+			seedActiveTask(t, s, "stall", "wk-stall")
+			w.capture = func(string) paneObservation {
+				return paneObservation{present: true, captured: true, pane: c.pane}
+			}
+			gt, _, err := s.GetTask(ctx, "stall")
+			if err != nil {
+				t.Fatalf("GetTask: %v", err)
+			}
+			clk.t = gt.Created.Add(time.Second) // well within the dwell
+
+			var nudged int
+			w.nudge = func(string) error { nudged++; return nil }
+
+			// Run through the stability threshold: the fast path fires on the sweep that
+			// reaches idleStaleSweeps (the third, given the first establishes the hash).
+			for i := 0; i <= idleStaleSweeps; i++ {
+				if err := w.pollLiveness(ctx); err != nil {
+					t.Fatalf("pollLiveness sweep %d: %v", i, err)
+				}
+			}
+
+			want := 0
+			if c.resume {
+				want = 1
+			}
+			if nudged != want {
+				t.Fatalf("nudged = %d, want %d for pane %q", nudged, want, c.pane)
+			}
+			has, err := s.HasEventType(ctx, "stall", db.EventAutoResumed)
+			if err != nil {
+				t.Fatalf("HasEventType: %v", err)
+			}
+			if has != c.resume {
+				t.Fatalf("auto_resumed present = %v, want %v for pane %q", has, c.resume, c.pane)
+			}
+			// The fast path never doubles as a manager wake.
+			if idle, _ := s.HasEventType(ctx, "stall", db.EventIdleUnreported); idle {
+				t.Fatalf("auto-resume must not also surface idle_unreported for pane %q", c.pane)
+			}
+		})
+	}
+}
+
 // TestPollLiveness_HealthyNotNudged: neither a busy worker nor a healthy, idle-but-not-
 // stalled worker is ever nudged, no matter how many sweeps run (even past the dwell).
 // The auto-resume is reserved for the unambiguous stall error.

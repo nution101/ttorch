@@ -436,9 +436,9 @@ func (w *Watcher) pollArmedPRs(ctx context.Context) error {
 // is persisted (SetLiveness) so it survives across short-lived watch invocations; a pane
 // change resets it. A busy pane (livestate.Busy) is always treated as live and resets
 // the count, so a worker mid-turn is never flagged regardless of the dwell. As a fast
-// path, an idle pane carrying the harness's mid-stream API-stall error (livestate.Stalled)
-// is auto-resumed with a "continue" nudge once stable, instead of waiting out the dwell —
-// see the inline note where it fires.
+// path, an idle pane carrying one of the harness's recoverable API-stall errors
+// (livestate.Stalled) is auto-resumed with a "continue" nudge once stable, instead of
+// waiting out the dwell — see the inline note where it fires.
 func (w *Watcher) pollLiveness(ctx context.Context) error {
 	tasks, err := w.Store.ListTasks(ctx, db.TaskFilter{
 		Status:      []string{db.StatusActive},
@@ -492,8 +492,9 @@ func (w *Watcher) pollLiveness(ctx context.Context) error {
 		h := hashPane(obs.pane)
 		if t.LastPaneHash == h {
 			sweeps := t.IdleSweeps + 1
-			// API-stall auto-resume: a worker showing the harness's "Response stalled
-			// mid-stream" error on an otherwise-idle, stable pane is dead in the water but
+			// API-stall auto-resume: a worker showing one of the harness's recoverable
+			// API-stall errors (livestate.Stalled — a stream or connection that died
+			// mid-response) on an otherwise-idle, stable pane is dead in the water but
 			// trivially recoverable — nudge it to continue rather than burning the full
 			// dwell and waking the manager for a self-healing condition. The stall string is
 			// unambiguous (and absent from any busy pane, already filtered above), so this
