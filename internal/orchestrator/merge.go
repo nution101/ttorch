@@ -495,10 +495,11 @@ func (m *Manager) landPrep(t db.Task, spec landSpec, fetchMu *sync.Mutex) (landP
 	// moved the worker onto an advanced default, the prior approval of the pre-rebase commit no
 	// longer covers what would merge. Verdict-portable fast-land: when the worker's own three-dot
 	// diff is byte-identical to what the reviewers cleared, carry the passing verdict forward to
-	// the rebased commit (re-pinning it, and the auto-minted approval) instead of forcing a full
-	// re-gate; a rebase that changed the reviewed content is never carried — carryVerdictForward
-	// returns a loud re-gate error. gateCoversRebased then confirms the (possibly carried) tokens
-	// pin the rebased commit, consuming nothing — MergeLocal remains the consuming authority.
+	// the rebased commit (re-pinning it and its approval — auto-minted or human-granted) instead
+	// of forcing a full re-gate or re-approval; a rebase that changed the reviewed content is
+	// never carried — carryVerdictForward returns a loud re-gate error. gateCoversRebased then
+	// confirms the (possibly carried) tokens pin the rebased commit, consuming nothing —
+	// MergeLocal remains the consuming authority.
 	if spec.mode != "pr" {
 		if spec.gated && rebasedHead != preRebase {
 			if _, err := m.carryVerdictForward(t, base, rebasedHead); err != nil {
@@ -597,21 +598,24 @@ func (m *Manager) securityAuditNote(taskID, landedSHA string, gated bool) string
 }
 
 // carryVerdictForward implements verdict-portable fast-land. When a gated land has rebased the
-// worker onto an advanced default — moving the commit SHA the verdict was pinned to — it
-// carries the existing PASSING verdict forward to the rebased commit, re-pinning the verdict
-// (and, when the gate auto-minted it, the approval token) to rebasedHead WITHOUT re-running
-// trust prep or the three reviewers — but ONLY when the worker's own three-dot diff against
-// the rebase base is byte-identical to the diff the reviewers cleared, matched by the verdict's
-// recorded content identity (review.DiffID). This is the throughput fix that stops re-gating a
-// task every time an unrelated merge advances the default beneath it.
+// worker onto an advanced default — moving the commit SHA the verdict and approval were pinned
+// to — it carries the existing PASSING verdict AND its approval token forward to the rebased
+// commit, re-pinning both to rebasedHead WITHOUT re-running trust prep, the three reviewers, or
+// a human re-approval — but ONLY when the worker's own three-dot diff against the rebase base is
+// byte-identical to the diff the reviewers cleared, matched by the verdict's recorded content
+// identity (review.DiffID). The approval is carried whether the trusted gate auto-minted it or
+// the lead granted it by hand: an unchanged diff is the same attestation on a new base. This is
+// the throughput fix that stops re-gating (and re-approving) a task every time an unrelated
+// merge advances the default beneath it.
 //
 // A content change — anything but a clean, disjoint rebase — is NEVER carried: re-pinning a
-// verdict onto changed content would be a trust hole, so it returns a loud re-gate error
-// instead. When there is no passing verdict to carry, or one predating content identities (an
-// empty DiffID), it carries nothing and returns (false, nil), letting gateCoversRebased issue
-// the usual re-gate demand. The verdict's findings and content identity are preserved so a
-// subsequent rebase can carry it again; the merge gate in MergeLocal re-validates and
-// re-consumes the re-pinned tokens, so carry-forward is an optimization, never the authority.
+// verdict or approval onto changed content would be a trust hole, so it returns a loud re-gate
+// error instead. When there is no passing verdict to carry, one predating content identities (an
+// empty DiffID), or no live approval token still pinning the reviewed commit, it carries nothing
+// and returns (false, nil), letting gateCoversRebased issue the usual re-gate/re-approve demand.
+// The carry is atomic — both tokens move to the rebased commit or neither does — and the merge
+// gate in MergeLocal re-validates and re-consumes the re-pinned tokens, so carry-forward is an
+// optimization, never the authority.
 func (m *Manager) carryVerdictForward(t db.Task, base, rebasedHead string) (bool, error) {
 	v, ok, err := m.Store.GetVerdict(context.Background(), t.ID)
 	if err != nil {
@@ -637,41 +641,54 @@ func (m *Manager) carryVerdictForward(t db.Task, base, rebasedHead string) (bool
 		return false, fmt.Errorf("land: rebasing %q onto the advanced %s changed its reviewed diff, so the recorded verdict no longer covers the rebased commit %s; re-run 'ttorch trust prep %s', review, and 'ttorch trust record %s', then re-run 'ttorch land %s'",
 			t.ID, base, short(rebasedHead), t.ID, t.ID, t.ID)
 	}
-	// The worker's own diff is byte-identical to what the reviewers cleared: carry the verdict
-	// forward by re-pinning its commit to the rebased commit, preserving the findings and
-	// content identity. The durable verdict has no TTL, so this is a plain content-pinned
-	// update of the same row.
+	// The worker's own diff is byte-identical to what the reviewers cleared, so the gate the
+	// reviewers and the approver granted still covers exactly what will merge — only the base it
+	// sits on moved, and neither the verdict nor the approval ever spoke to the base. Carry BOTH
+	// forward to the rebased commit, atomically (both move, or neither does):
 	//
-	// The trusted gate auto-mints the approval token from the same review, pinned to the same
-	// commit; carry it forward too — re-granting the file token to the rebased commit while
-	// preserving its ORIGINAL lifetime (not extending it), and advancing the row's recorded
-	// approval_sha alongside it. A human-minted approval is NEVER forged forward — the lead
-	// re-approves the rebased commit (a single step), so the recorded approval only advances
-	// when the auto token actually moves with the verdict; the three reviewers do not re-run.
+	//   - the durable verdict, re-pinned to the rebased commit, preserving its findings and
+	//     content identity (the row has no TTL, so this is a plain content-pinned update);
+	//   - the approval token, re-pinned to the rebased commit with its ORIGINAL provenance and
+	//     ORIGINAL expiry. This carries a HUMAN approval as faithfully as the trusted gate's AUTO
+	//     one: the DiffID match proves the approved content is byte-identical, so re-pinning is
+	//     not forging an attestation the approver never made — it is following the same reviewed
+	//     diff onto the commit that now carries it. (A non-clean rebase changed the diff and was
+	//     already refused above, so a changed/unreviewed diff is never carried.)
+	//
+	// Both-or-neither: we carry the approval ONLY when a valid token still pins the SAME
+	// pre-rebase commit the verdict covered, and we re-pin it FIRST — if the token lapsed in the
+	// read→re-pin window (moved==false) the verdict is left untouched and the land re-gates; only
+	// once the approval has moved do we advance the verdict, rolling the approval back if that
+	// write fails. MergeLocal re-validates and re-consumes both re-pinned tokens against the
+	// commit it fast-forwards, so a partial carry can only ever fail closed, never bypass the gate.
 	reviewedSHA := v.ReviewedSHA
-	v.ReviewedSHA = rebasedHead
 	data, hasTok := approval.Data(m.P.ApprovalFile(t.ID))
-	by, _ := splitApprovalPayload(data)
-	carryAuto := hasTok && by == "auto"
-	var autoTTL time.Duration
-	if carryAuto {
-		ttl, ok := approval.Remaining(m.P.ApprovalFile(t.ID))
-		if !ok {
-			return false, nil // the auto-approval expired — gateCoversRebased fails closed
-		}
-		autoTTL = ttl
-		v.ApprovalSHA = rebasedHead
+	approvedBy, approvedSHA := splitApprovalPayload(data)
+	if !hasTok || (approvedBy != "auto" && approvedBy != "human") || approvedSHA != reviewedSHA {
+		// No approval token we can faithfully carry (absent, expired, an unrecognized provenance,
+		// or pinned to a different commit than the verdict). Carry nothing and let
+		// gateCoversRebased demand a fresh approval of the rebased commit (fail closed).
+		return false, nil
 	}
+	moved, err := approval.Repin(m.P.ApprovalFile(t.ID), approvalPayload(approvedBy, rebasedHead))
+	if err != nil {
+		return false, fmt.Errorf("land: could not re-pin the carried approval for %q: %w", t.ID, err)
+	}
+	if !moved {
+		return false, nil // the approval lapsed before it could be carried — re-gate, verdict untouched
+	}
+	v.ReviewedSHA = rebasedHead
+	v.ApprovalSHA = rebasedHead
 	if err := m.Store.SaveVerdict(context.Background(), v); err != nil {
+		// Roll the approval back to the pre-rebase commit so a failed verdict write leaves BOTH
+		// tokens at the original commit (both-or-neither), never the approval ahead of a stale
+		// verdict. Best-effort: even if the rollback fails the verdict is still stale, so the gate
+		// refuses and nothing unreviewed can land.
+		_, _ = approval.Repin(m.P.ApprovalFile(t.ID), approvalPayload(approvedBy, reviewedSHA))
 		return false, fmt.Errorf("land: could not re-pin the carried verdict for %q: %w", t.ID, err)
 	}
-	if carryAuto {
-		if err := approval.Grant(m.P.ApprovalFile(t.ID), autoTTL, approvalPayload("auto", rebasedHead)); err != nil {
-			return false, fmt.Errorf("land: could not re-pin the carried auto-approval for %q: %w", t.ID, err)
-		}
-	}
-	m.audit(fmt.Sprintf("fast-land task=%s carried verdict %s->%s base=%s (reviewed diff unchanged)",
-		t.ID, short(reviewedSHA), short(rebasedHead), base))
+	m.audit(fmt.Sprintf("fast-land task=%s carried verdict %s->%s base=%s approver=%s (reviewed diff unchanged)",
+		t.ID, short(reviewedSHA), short(rebasedHead), base, approvedBy))
 	return true, nil
 }
 

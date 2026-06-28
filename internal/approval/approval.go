@@ -44,20 +44,27 @@ func Data(path string) (string, bool) {
 	return data, true
 }
 
-// Remaining returns how long a non-expired token has left to live, without consuming
-// it. ok is false when the token is absent or already expired. The land carry-forward
-// re-pins an auto-approval to the rebased commit while preserving its ORIGINAL lifetime
-// (rather than extending it), so it reads the remaining time here and re-grants with it.
-func Remaining(path string) (time.Duration, bool) {
-	exp, _, ok := read(path)
-	if !ok {
-		return 0, false
+// Repin rebinds a still-valid token to newData while preserving its ORIGINAL absolute
+// expiry, so a carry-forward never resets the clock or extends the grant. It is the land
+// carry-forward primitive: a clean, disjoint rebase moves the reviewed commit to a new sha,
+// and the approval token must follow it to the rebased commit — same provenance, same
+// remaining lifetime — when (and only when) the reviewed content is byte-identical.
+//
+// The re-check of the token's validity and the write are done here together against the same
+// read, so a token that lapsed in a caller's read→re-pin window is reported as moved==false
+// and NOTHING is written (the caller can then carry nothing and fail closed). moved==true
+// means the token was rebound to newData. Either way the gate is never bypassed: the merge
+// re-validates the consumed token's sha against the commit it actually fast-forwards.
+func Repin(path, newData string) (moved bool, err error) {
+	exp, _, present := read(path)
+	if !present || time.Now().UnixNano() >= exp {
+		return false, nil
 	}
-	d := time.Duration(exp - time.Now().UnixNano())
-	if d <= 0 {
-		return 0, false
+	body := strconv.FormatInt(exp, 10) + "\n" + newData + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		return false, err
 	}
-	return d, true
+	return true, nil
 }
 
 // Consume removes the token and returns its bound data and whether it was valid.

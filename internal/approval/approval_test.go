@@ -56,6 +56,48 @@ func TestData(t *testing.T) {
 	}
 }
 
+func TestRepin(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "t1.approve")
+
+	// Re-pinning an absent token does nothing and reports not-moved (the carry then fails closed).
+	if moved, err := Repin(path, "human sha-new"); err != nil || moved {
+		t.Fatalf("Repin of an absent token: moved=%v err=%v, want false/nil", moved, err)
+	}
+	if Valid(path) {
+		t.Fatal("Repin must not create a token where none existed")
+	}
+
+	// Grant a token, then re-pin it to new data: the data changes, the token stays valid, and
+	// the ORIGINAL absolute expiry is preserved (a carry-forward never extends the grant).
+	if err := Grant(path, time.Hour, "human sha-old"); err != nil {
+		t.Fatal(err)
+	}
+	expBefore, _, _ := read(path)
+	moved, err := Repin(path, "human sha-new")
+	if err != nil || !moved {
+		t.Fatalf("Repin of a valid token: moved=%v err=%v, want true/nil", moved, err)
+	}
+	data, ok := Data(path)
+	if !ok || data != "human sha-new" {
+		t.Fatalf("after Repin Data=%q ok=%v, want human sha-new/true", data, ok)
+	}
+	if expAfter, _, _ := read(path); expAfter != expBefore {
+		t.Fatalf("Repin must preserve the original expiry: before=%d after=%d", expBefore, expAfter)
+	}
+
+	// Re-pinning an EXPIRED token does nothing and reports not-moved.
+	exp := filepath.Join(t.TempDir(), "t2.approve")
+	if err := Grant(exp, -time.Second, "auto sha-x"); err != nil {
+		t.Fatal(err)
+	}
+	if moved, err := Repin(exp, "auto sha-y"); err != nil || moved {
+		t.Fatalf("Repin of an expired token: moved=%v err=%v, want false/nil", moved, err)
+	}
+	if d, _ := Data(exp); d != "" {
+		t.Fatal("an expired token must not be rebound")
+	}
+}
+
 func TestExpiredToken(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "t1.approve")
 	if err := Grant(path, -time.Second, "sha-abc"); err != nil {
