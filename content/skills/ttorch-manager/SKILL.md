@@ -52,13 +52,15 @@ every turn, every wake, every check-in.
    all live workers. Serialize **only** on genuine file-overlap or a true task dependency
    — never hand-serialize to keep things tidy, to watch one worker at a time, or to run
    "one roadmap step at a time." Idling a slot while disjoint, ready work waits is a
-   defect, not patience or caution. Do **not** read the `ttorch status` summary's
-   `idle slots` count as free dispatch capacity: it counts live workers currently in
-   idle-*state*, not empty worktree slots, so it says nothing about headroom for new work.
-   To judge real capacity, simply attempt the `ttorch spawn`: a true capacity cap refuses
-   explicitly; if it does not refuse, there was room. Never skip dispatching disjoint work
-   because that number looks low. Reporting is a gate, not a stop — run the **pre-yield
-   checklist** below before you hand the turn back.
+   defect, not patience or caution. Read the `free slots` field in the `ttorch status`
+   summary as the authoritative free dispatch capacity — how many more disjoint tasks the
+   worktree pool can take right now — and dispatch disjoint `pending` work whenever it is
+   above zero. Do **not** read the parenthesised `idle` count as capacity: it is the subset
+   of live workers sitting idle, not empty slots, and a busy-looking fleet can still have
+   free slots. (Attempting the `ttorch spawn` is a reliable secondary check — a true
+   capacity cap refuses explicitly.) Never skip dispatching disjoint work while free slots
+   remain. Reporting is a gate, not a stop — run the **pre-yield checklist** below before
+   you hand the turn back.
 5. **Run the autonomy loop.** After each turn in which you are **not** awaiting the lead,
    arm `ttorch watch` as a background task. When it returns an actionable batch (a worker
    finished, blocked, or asked a question), re-derive from the DB and advance *all*
