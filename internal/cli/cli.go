@@ -745,31 +745,68 @@ func cmdStatus() error {
 		return err
 	}
 	defer m.Close()
-	tasks, err := m.Status()
+	live, err := m.Status()
 	if err != nil {
 		return err
 	}
-	// status reports spawned/live workers — every task that carries a tmux window —
-	// and derives each one's working/idle/gone STATE (§3.3). Pending backlog (task
-	// add / follow-on, no window) is excluded here; it belongs in `ttorch tasks`,
-	// which lists the full hierarchy including backlog.
-	tasks = windowedTasks(tasks)
-	if len(tasks) == 0 {
+	// statusView splits the FULL live set into the windowed display rows and the free
+	// worktree-pool capacity (derived from the full set, see its doc). Pending backlog
+	// (task add / follow-on, no window) is excluded from the table; it belongs in
+	// `ttorch tasks`, which lists the full hierarchy including backlog.
+	rows, free := statusView(live, m.TaskState, m.Pool)
+	if len(rows) == 0 {
 		fmt.Println("no active workers. dispatch with: ttorch spawn <task-id> <repo-path>")
 		return nil
 	}
-	rows := make([]statusRow, len(tasks))
-	for i, t := range tasks {
+	renderStatus(os.Stdout, rows, free)
+	return nil
+}
+
+// statusView assembles what `ttorch status` renders, from the FULL live task set: the
+// display rows — only spawned/windowed workers, each tagged with its live STATE from
+// state (m.TaskState in production) — and the free worktree-pool capacity per repo.
+// Capacity is computed over the FULL live set, NOT the windowed row subset: a live
+// worktree-holding task that carries no window still occupies a pool slot, so it must
+// count against capacity. That mirrors the orchestrator's in-use accounting
+// (Manager.inUseWorktrees, which filters on Worktree!="" over liveTasks() and never
+// looks at the window), so the summary never overstates what a fresh dispatch could
+// acquire. Split from cmdStatus so this windowed-rows-vs-full-capacity split is
+// unit-testable without a tmux session.
+func statusView(live []db.Task, state func(db.Task) string, pool worktree.Pool) ([]statusRow, map[string]int) {
+	windowed := windowedTasks(live)
+	rows := make([]statusRow, len(windowed))
+	for i, t := range windowed {
 		// The row set and lifecycle columns (STATUS/STAGE/OWNER) come from the DB;
 		// STATE is derived live from the task's tmux window.
 		rows[i] = statusRow{
-			ID: t.ID, Kind: t.Kind, State: m.TaskState(t),
+			ID: t.ID, Kind: t.Kind, State: state(t),
 			Status: t.Status, Stage: t.Stage, Owner: t.Owner,
 			Window: t.Window, Project: t.Project, Footprint: t.Footprint,
 		}
 	}
-	renderStatus(os.Stdout, rows)
-	return nil
+	return rows, freeSlotsByRepo(pool, live)
+}
+
+// freeSlotsByRepo maps each repo with a live task to its free worktree-pool capacity —
+// the pool cap minus the slots its live workers currently hold (worktree.Pool.FreeSlots).
+// The in-use accounting mirrors the orchestrator's (Manager.inUseWorktrees): a live task
+// occupies a slot for as long as it holds a worktree, including after its window has gone
+// but before teardown releases the slot, so the count never overstates what a fresh
+// dispatch could actually acquire.
+func freeSlotsByRepo(pool worktree.Pool, live []db.Task) map[string]int {
+	inUse := map[string][]string{}
+	for _, t := range live {
+		if t.Worktree != "" {
+			inUse[t.Project] = append(inUse[t.Project], t.Worktree)
+		}
+	}
+	free := map[string]int{}
+	for _, t := range live {
+		if _, ok := free[t.Project]; !ok {
+			free[t.Project] = pool.FreeSlots(inUse[t.Project])
+		}
+	}
+	return free
 }
 
 // windowedTasks keeps only tasks that were spawned — those carrying a tmux window.
@@ -796,19 +833,28 @@ type statusRow struct {
 }
 
 // renderStatus prints the worker table — each worker's declared footprint on an
-// indented continuation line beneath it — followed by a summary line that makes
-// "how many idle slots could take disjoint work?" visible at a glance. The summary
-// counts only LIVE workers (idle or working), so "with footprints" agrees with the
-// conflict gate, which ignores gone workers; a gone worker's footprint still shows
-// on its row for context.
-func renderStatus(w io.Writer, rows []statusRow) {
+// indented continuation line beneath it — followed by a summary line whose headline is
+// FREE DISPATCH CAPACITY: how many more disjoint tasks the worktree pool can take right
+// now. free maps each repo to that count (see freeSlotsByRepo). live/idle/with-footprints
+// describe the CURRENT fleet — counted over LIVE workers only (idle or working), so
+// "with footprints" agrees with the conflict gate, which ignores gone workers; a gone
+// worker's footprint still shows on its row for context. "idle" is parenthesised as a
+// subset of live so it is never misread as free capacity (the old "idle slots" wording
+// conflated the two and hid genuinely-free worktree slots from operators).
+func renderStatus(w io.Writer, rows []statusRow, free map[string]int) {
 	const format = "%-16s %-6s %-8s %-12s %-14s %-16s %-10s %s\n"
 	fmt.Fprintf(w, format, "TASK", "KIND", "STATE", "STATUS", "STAGE", "OWNER", "WINDOW", "PROJECT")
 	var live, idle, declared int
+	var repos []string
+	seen := map[string]bool{}
 	for _, r := range rows {
 		fmt.Fprintf(w, format, r.ID, r.Kind, r.State, dash(r.Status), dash(r.Stage), dash(r.Owner), dash(r.Window), r.Project)
 		if len(r.Footprint) > 0 {
 			fmt.Fprintf(w, "%-16s touches: %s\n", "", strings.Join(r.Footprint, ", "))
+		}
+		if !seen[r.Project] {
+			seen[r.Project] = true
+			repos = append(repos, r.Project) // first-seen order, matching the table
 		}
 		if r.State != "idle" && r.State != "working" {
 			continue // gone (or unknown): not a live slot, not counted in the summary
@@ -821,7 +867,28 @@ func renderStatus(w io.Writer, rows []statusRow) {
 			declared++
 		}
 	}
-	fmt.Fprintf(w, "%d live · %d idle slots · %d with footprints\n", live, idle, declared)
+	fmt.Fprintf(w, "%d live (%d idle) · %s · %d with footprints\n", live, idle, freeSummary(repos, free), declared)
+}
+
+// freeSummary renders the free worktree-pool capacity for the status summary. With a
+// single repo (the common case) it reads "%d free slots". Capacity is per repo, so across
+// multiple repos it breaks the count down ("free slots: 14 in cli, 16 in orcha") rather
+// than report a single fleet-wide total that no one repo could actually absorb. repos is
+// in table order; free is keyed by repo path (freeSlotsByRepo), and a repo absent from
+// free reads as zero free slots.
+func freeSummary(repos []string, free map[string]int) string {
+	switch len(repos) {
+	case 0:
+		return "0 free slots"
+	case 1:
+		return fmt.Sprintf("%d free slots", free[repos[0]])
+	default:
+		parts := make([]string, len(repos))
+		for i, repo := range repos {
+			parts[i] = fmt.Sprintf("%d in %s", free[repo], filepath.Base(repo))
+		}
+		return "free slots: " + strings.Join(parts, ", ")
+	}
 }
 
 // cmdCheckOverlap reports which live workers a proposed footprint would conflict

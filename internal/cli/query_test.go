@@ -72,7 +72,7 @@ func TestRenderStatusColumns(t *testing.T) {
 	renderStatus(&b, []statusRow{
 		{ID: "a", Kind: "ship", State: "working", Status: "active", Stage: "implementing", Owner: "worker:a", Window: "wk-a", Project: "/repo"},
 		{ID: "b", Kind: "ship", State: "gone", Status: "active", Stage: "", Owner: "", Window: "wk-b", Project: "/repo"},
-	})
+	}, map[string]int{"/repo": 14})
 	out := b.String()
 	for _, want := range []string{"STATUS", "STAGE", "OWNER", "active", "implementing", "worker:a"} {
 		if !strings.Contains(out, want) {

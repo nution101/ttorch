@@ -7,7 +7,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/orchestrator"
+	"github.com/nution101/ttorch/internal/worktree"
 )
 
 // TestMain points TTORCH_HOME at a throwaway dir for the whole package so any test
@@ -243,7 +245,7 @@ func TestRenderStatus(t *testing.T) {
 		// A gone worker that still carries a footprint: its row shows it, but the
 		// summary must NOT count it (the conflict gate ignores gone workers).
 		{ID: "d", Kind: "ship", State: "gone", Window: "wk-d", Project: "/repo", Footprint: []string{"internal/orchestrator"}},
-	})
+	}, map[string]int{"/repo": 14})
 	out := b.String()
 	// The footprint of a declaring worker is shown, including the gone one.
 	if !strings.Contains(out, "touches: internal/cli, internal/state") {
@@ -252,10 +254,77 @@ func TestRenderStatus(t *testing.T) {
 	if !strings.Contains(out, "touches: internal/orchestrator") {
 		t.Fatalf("status should still show a gone worker's footprint for context, got:\n%s", out)
 	}
-	// Summary counts live only: a (idle) + b (working) are live; only a is idle;
-	// only a declared a footprint among the live (d is gone, so not counted).
-	if !strings.Contains(out, "2 live · 1 idle slots · 1 with footprints") {
+	// Summary headline is FREE DISPATCH CAPACITY (14 free slots for the one repo), not
+	// the live-but-idle worker count. live/idle/with-footprints count live workers only:
+	// a (idle) + b (working) are live; only a is idle; only a declared a footprint among
+	// the live (d is gone, so not counted). "idle" is parenthesised as a subset of live
+	// so it can never be misread as free capacity.
+	if !strings.Contains(out, "2 live (1 idle) · 14 free slots · 1 with footprints") {
 		t.Fatalf("status summary line missing/wrong, got:\n%s", out)
+	}
+}
+
+// TestRenderStatusFreeSlotsMultiRepo: capacity is per repo, so a fleet spanning two
+// repos breaks the free count down by repo (base name) rather than reporting one
+// misleading fleet-wide total. The per-repo numbers come straight from the free map.
+func TestRenderStatusFreeSlotsMultiRepo(t *testing.T) {
+	var b strings.Builder
+	renderStatus(&b, []statusRow{
+		{ID: "a", Kind: "ship", State: "working", Window: "wk-a", Project: "/home/cli"},
+		{ID: "b", Kind: "ship", State: "working", Window: "wk-b", Project: "/home/orcha"},
+	}, map[string]int{"/home/cli": 14, "/home/orcha": 16})
+	out := b.String()
+	if !strings.Contains(out, "free slots: 14 in cli, 16 in orcha") {
+		t.Fatalf("multi-repo summary should break free slots down per repo, got:\n%s", out)
+	}
+	// The per-repo breakdown replaces the single-number form, so the bare "N free slots"
+	// must NOT appear (it would read as a fleet-wide total no one repo could absorb).
+	if strings.Contains(out, "30 free slots") {
+		t.Fatalf("multi-repo summary must not collapse to a fleet-wide total, got:\n%s", out)
+	}
+}
+
+// TestFreeSlotsByRepo: occupancy depends only on HOLDING a worktree, never on a task's
+// STATE — so a task without a worktree consumes no capacity, and the per-repo free count
+// is the pool cap minus the worktrees actually held. (That STATE never enters the count is
+// what makes a gone-but-not-torn-down worker still subtract from capacity; the full-live-set
+// wiring that realises it end-to-end is pinned by TestStatusView_CapacityFromFullLiveSet.)
+func TestFreeSlotsByRepo(t *testing.T) {
+	pool := worktree.Pool{Max: 4}
+	free := freeSlotsByRepo(pool, []db.Task{
+		{ID: "a", Project: "/repo", Worktree: "/wt/a"},
+		{ID: "b", Project: "/repo", Worktree: "/wt/b"},
+		{ID: "c", Project: "/repo", Worktree: ""}, // no worktree → not occupying a slot
+		{ID: "d", Project: "/other", Worktree: "/wt/d"},
+	})
+	if free["/repo"] != 2 {
+		t.Errorf("/repo free = %d, want 2 (cap 4 minus 2 held slots)", free["/repo"])
+	}
+	if free["/other"] != 3 {
+		t.Errorf("/other free = %d, want 3 (cap 4 minus 1 held slot)", free["/other"])
+	}
+}
+
+// TestStatusView_CapacityFromFullLiveSet pins the load-bearing decision: free capacity is
+// computed over the FULL live set, not the windowed row subset. A live, worktree-holding
+// task with NO window is excluded from the display rows (status shows only windowed
+// workers) yet still OCCUPIES a pool slot, so it MUST subtract from free capacity — exactly
+// as the orchestrator's inUseWorktrees counts it. Narrowing statusView's capacity input to
+// windowedTasks(live) (re-introducing the over-count-vs-orchestrator bug this change fixes)
+// would flip free["/repo"] from 1 to 2 and fail here.
+func TestStatusView_CapacityFromFullLiveSet(t *testing.T) {
+	live := []db.Task{
+		{ID: "a", Kind: "ship", Project: "/repo", Window: "wk-a", Worktree: "/wt/a"},
+		// Live and holding a slot, but windowless: not a display row, still occupies capacity.
+		{ID: "b", Kind: "ship", Project: "/repo", Window: "", Worktree: "/wt/b"},
+	}
+	state := func(db.Task) string { return "working" }
+	rows, free := statusView(live, state, worktree.Pool{Max: 3})
+	if len(rows) != 1 || rows[0].ID != "a" {
+		t.Fatalf("rows should list only the windowed worker a, got %+v", rows)
+	}
+	if free["/repo"] != 1 {
+		t.Fatalf("free /repo = %d, want 1 (cap 3 minus BOTH held slots — windowed AND windowless)", free["/repo"])
 	}
 }
 

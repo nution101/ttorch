@@ -129,6 +129,27 @@ func (p Pool) Acquire(repo string, inUse []string) (string, error) {
 	return s, nil
 }
 
+// FreeSlots reports how many MORE workers the pool can host for a repo right now: the
+// pool cap (Max) minus the slots already in use, clamped at zero. inUse is the set of
+// worktree paths held by live workers for that repo — ttorch's task records are the
+// occupancy source of truth (see the package doc), so no separate reservation state is
+// consulted. Paths are de-duplicated by absolute path to mirror Acquire's busy-set, so
+// the result is exactly the number of additional disjoint workers that can be dispatched
+// before Acquire reports the pool full. It is a read-only projection of Max and current
+// occupancy: it touches no worktree and changes no pool state.
+func (p Pool) FreeSlots(inUse []string) int {
+	busy := map[string]bool{}
+	for _, w := range inUse {
+		if abs, err := filepath.Abs(w); err == nil {
+			busy[abs] = true
+		}
+	}
+	if free := p.Max - len(busy); free > 0 {
+		return free
+	}
+	return 0
+}
+
 // Release resets a finished slot to a clean tracked state and keeps it for reuse. It
 // first parks the slot on a detached HEAD, dropping any per-task branch it was on, so
 // a pooled slot never pins a branch name (e.g. ttorch/<id>) that a later spawn may

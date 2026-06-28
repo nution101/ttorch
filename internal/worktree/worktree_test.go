@@ -541,3 +541,27 @@ func TestAcquire_NewSlotBasesOnFreshOrigin(t *testing.T) {
 		t.Fatalf("a newly created slot should start at the fresh origin tip %s, got %s", originTip, got)
 	}
 }
+
+// TestPoolFreeSlots: free capacity reflects pool availability — the cap (Max) minus the
+// worktree slots in use, clamped at zero, with duplicate paths counted once (mirroring
+// Acquire's busy-set). It is a pure projection of Max and occupancy, so it needs no repo
+// on disk.
+func TestPoolFreeSlots(t *testing.T) {
+	p := Pool{Max: 4}
+	cases := []struct {
+		name  string
+		inUse []string
+		want  int
+	}{
+		{"empty pool is fully free", nil, 4},
+		{"each in-use slot consumes one", []string{"/wt/0", "/wt/1"}, 2},
+		{"duplicate paths count once", []string{"/wt/0", "/wt/0"}, 3},
+		{"at capacity reports zero", []string{"/wt/0", "/wt/1", "/wt/2", "/wt/3"}, 0},
+		{"over capacity clamps at zero", []string{"/wt/0", "/wt/1", "/wt/2", "/wt/3", "/wt/4"}, 0},
+	}
+	for _, c := range cases {
+		if got := p.FreeSlots(c.inUse); got != c.want {
+			t.Errorf("%s: FreeSlots(%v) with Max=%d = %d, want %d", c.name, c.inUse, p.Max, got, c.want)
+		}
+	}
+}
