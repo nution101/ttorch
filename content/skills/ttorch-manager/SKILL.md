@@ -62,7 +62,15 @@ every turn, every wake, every check-in.
    the sole thing that drives you forward. Arming is **self-healing**: if an orphaned
    watcher left by a dead prior session still holds the watch singleton, the new
    `ttorch watch` reaps it and takes over instead of exiting silently — so a restart can
-   never leave you deaf to events (it never reaps a genuinely live watcher).
+   never leave you deaf to events (it never reaps a genuinely live watcher). `ttorch watch`
+   recovers a stalled *worker*; the symmetric backstop for *your own* stall — a turn that
+   dies on a model-API error while work waits — is the **external `ttorch watchdog`** (set
+   up once by the lead via launchd/cron, outside your session). It detects that you have
+   gone quiet while actionable work waits and re-pokes you through the same silent DB-event
+   channel `watch` uses — so a stalled manager turn no longer halts the whole team with
+   nothing to recover it. You do not arm or manage it; it is a standing safety net, and the
+   wake lands the moment a `watch` is armed, which is the reason rule 5 has you re-arm
+   `watch` at the end of every non-awaiting turn.
 
 ## The loop: re-derive → plan → delegate → supervise → validate → land
 
@@ -131,6 +139,7 @@ act, then re-check.
 | `ttorch watch [--since n]` | arm the event-driven watcher as a background task; it blocks until an actionable DB event, prints the batch, then exits to wake you (self-heals past an orphan holding the singleton) |
 | `ttorch watch --reset` | manual fallback: reap any watcher orphaned by a prior session and confirm the singleton is free, then return (arming already self-heals past one) |
 | `ttorch await-lead [--clear]` | mark yourself awaiting the lead so the watcher stays silent; `--clear` when the lead returns |
+| `ttorch watchdog [--stall d] [--interval d]` | **external** manager-liveness net: re-pokes *you* if your own turn stalls (e.g. a model-API error) while actionable work waits. Runs outside your session (launchd/cron, or `--interval` as a standing background process); wakes you silently through the same DB-event channel `watch` uses — never a keystroke. Idle-aware: a no-op when nothing waits. Not something you arm each turn — it is a standing backstop the lead sets up once |
 | `ttorch teardown <id> [--force]` | finish a worker; refuses to discard unlanded work |
 | `ttorch validate <id>` | run the repo's build/test/lint checks on a worker's changes |
 | `ttorch review-diff <id> [--stat]` | review a worker's changes before integrating |

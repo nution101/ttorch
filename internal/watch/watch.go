@@ -617,6 +617,8 @@ func formatEventLine(e db.Event) string {
 		return fmt.Sprintf("window-gone           task=%-18s window=%s%s", e.EntityID, e.Payload, id)
 	case db.EventIdleUnreported:
 		return fmt.Sprintf("idle-unreported       task=%-18s window=%s%s", e.EntityID, e.Payload, id)
+	case db.EventManagerStalled:
+		return fmt.Sprintf("manager-stalled       re-derive the board and advance outstanding work%s", id)
 	default:
 		detail := ""
 		if e.Payload != "" {

@@ -133,6 +133,8 @@ func Main(args []string) int {
 		return run(cmdWatch(rest))
 	case "await-lead":
 		return run(cmdAwaitLead(rest))
+	case "watchdog":
+		return run(cmdWatchdog(rest))
 	case "validate":
 		return run(cmdValidate(rest))
 	case "ci-parity":
@@ -1201,6 +1203,70 @@ func cmdAwaitLead(args []string) error {
 	return nil
 }
 
+// cmdWatchdog runs the EXTERNAL manager-liveness net (§4.7): the counterpart to
+// `ttorch watch` (which recovers stalled WORKERS) for the manager itself. It detects a
+// manager that is stalled — its own LLM turn died on an API error — WHILE actionable
+// work waits, and re-pokes it by appending a single actionable event that an armed
+// `ttorch watch` surfaces, waking the manager through the harness's background-task-
+// completion channel. It never writes to the manager console and never injects a
+// keystroke; the DB row is the only out-of-band lever. It is idle-aware: a check with
+// nothing to do is a cheap no-op, so it is safe to run on a short launchd/cron interval.
+// One-shot by default (ideal for `StartInterval`); --interval D runs its own loop (the
+// "small ttorch daemon" form). Its own status lines go to ITS stdout (the cron/launchd
+// log), not the manager — suppress them with --quiet for an unattended schedule.
+func cmdWatchdog(args []string) error {
+	fs := flag.NewFlagSet("watchdog", flag.ContinueOnError)
+	stall := fs.Duration("stall", 5*time.Minute, "treat the manager as stalled after this long with no manager action")
+	interval := fs.Duration("interval", 0, "run continuously, checking every interval (0 = one check, then exit)")
+	quiet := fs.Bool("quiet", false, "suppress per-check status output (for unattended cron/launchd schedules)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	p := paths.Default()
+	store, err := db.Open(p.StateDB())
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	wd := watch.NewWatchdog(store, p)
+	wd.Stall = *stall
+
+	check := func() error {
+		res, err := wd.Check(ctx)
+		if err != nil {
+			return err
+		}
+		if !*quiet {
+			if res.Poked {
+				fmt.Println("watchdog: re-poked the stalled manager —", res.Reason)
+			} else {
+				fmt.Println("watchdog: standing by —", res.Reason)
+			}
+		}
+		return nil
+	}
+
+	if *interval <= 0 {
+		return check()
+	}
+	for {
+		if err := check(); err != nil {
+			return err
+		}
+		t := time.NewTimer(*interval)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return nil
+		case <-t.C:
+		}
+	}
+}
+
 func cmdValidate(args []string) error {
 	if len(args) < 1 {
 		return errors.New("usage: ttorch validate <task-id>")
@@ -1725,6 +1791,11 @@ Supervision:
   watch --reset           reap an orphan watcher and confirm the singleton is free
   await-lead [--clear]    mark the manager as awaiting the lead (the watcher stays
                           silent and never surfaces); --clear when the lead returns
+  watchdog                external manager-liveness net: re-poke a STALLED manager that
+    [--stall d]             has actionable work waiting (silently, via the same DB-event
+    [--interval d]          channel 'watch' uses — never a keystroke). Idle-aware, so it
+    [--quiet]               no-ops when nothing waits; one-shot unless --interval loops
+                            it as a daemon. Run from launchd/cron.
 
 Delivery:
   validate <id>               run the repo's build/test/lint checks on a worker

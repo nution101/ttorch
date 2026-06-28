@@ -871,6 +871,46 @@ flag, the still-blocking watch fires on its next sweep.
    switches to plain-text questions (no picker) while awaiting the lead. Record the test result in
    the PR that lands the watcher.
 
+### 4.7 The manager-liveness watchdog (`ttorch watchdog`)
+
+`ttorch watch` recovers a stalled **worker** (§4.4 auto-resume) but cannot recover the **manager**
+itself: a manager whose own LLM turn dies on a model-API error halts the whole orchestration, and
+because the only safe wake is the harness's background-task-completion of a manager-owned task
+(§B.1), nothing inside the session can restart it. `ttorch watchdog` is the **external** backstop —
+a launchd/cron job, or `ttorch watchdog --interval` run as a small daemon — that lives outside the
+manager session and re-pokes a stalled manager through the **same DB-event channel** `watch` uses;
+it never writes to the manager console, adds to its history, or injects a keystroke (the only
+out-of-band lever an external process has is a DB row, §B.1/§B.2).
+
+One check (`internal/watch/watchdog.go` `Watchdog.Check`) is idle-aware by construction — it stands
+down unless every gate says the manager is genuinely stalled with work waiting, so it can be polled
+cheaply on a short interval:
+
+1. No `manager` row, or `awaiting_lead=1` → stand down (a manager awaiting the lead is deliberately
+   silent — re-poking it would pull it off a pending decision, the §4.6 cardinal sin).
+2. An unconsumed actionable event exists (`MAX(actionable id) > watch_watermark`) → the normal
+   `watch` channel already wakes the manager (now if armed, or the instant it re-arms). This gate is
+   **also the debounce**: the event the watchdog appends makes it true on the next run, so pokes
+   never stack while one is pending.
+3. No outstanding work → idle, stand down. "Outstanding work" is a non-cc task in a manager-owned
+   terminal state (`done`/`blocked`/`needs_input`) — these emit one actionable event the manager
+   consumes, after which nothing re-surfaces them until the manager acts — or, **only when no live
+   watcher holds the singleton** (a read-only pid-file probe, never taking the flock), an `active`
+   worker that nothing is supervising. A watched active worker self-heals through the §4.4 net, so
+   it is not the watchdog's job.
+4. The manager acted within the **stall window** (`now - manager.updated_at < stall`, default 5m;
+   `updated_at` advances on every manager DB action incl. arming `watch`) → not stalled yet.
+
+Past all four, it appends one `manager_stalled` event (`entity_type=manager`, `actor=system`,
+`actionable=1`). An armed `watch` surfaces it like any other actionable row → background-completion
+→ the manager is re-invoked, re-derives the board, and advances the outstanding work. The wake lands
+immediately when a `watch` is armed (the manager idling in its loop, or recovered to an idle prompt
+after a stalled turn); if the session is fully dead with no `watch` armed, the poke waits unconsumed
+and is surfaced on the next arm/restart — the existing manager-window-absent self-exit (§4.5) and
+`--reset` remain the backstop for a crashed session. It is self-correcting: once the manager
+advances its watermark past the poke but stalls again before clearing the work, gate 2 re-opens and
+the next check re-pokes.
+
 ---
 
 ## 5. Supervisor changes

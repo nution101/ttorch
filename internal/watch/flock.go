@@ -379,6 +379,24 @@ func (w *Watcher) Reset(ctx context.Context) error {
 	return nil
 }
 
+// watchHolderAlive reports whether a live `ttorch watch` currently holds the watch
+// singleton, as far as a read-only probe can tell. It reads the pid file (never taking
+// the flock, so it can never contend with a watcher arming) and confirms the recorded
+// holder is a running `ttorch watch` process. It is the watchdog's "is the manager
+// already in the event loop?" check: a live holder means real worker events will wake
+// the manager, so the watchdog stands down rather than synthesize a poke. It fails
+// CLOSED — a missing/garbled file, a dead pid, or a pid that no longer looks like a
+// watch all report not-alive (the conservative answer for the watchdog: treat the
+// manager as unwatched and let the other gates decide). The flock — not this file — is
+// the real singleton truth; this probe only informs the watchdog's idle-awareness.
+func watchHolderAlive(path string) bool {
+	pid, ok := readWatchPID(path)
+	if !ok {
+		return false
+	}
+	return processAlive(pid) && isWatchProcess(pid)
+}
+
 // hashPane is the stable content hash liveness compares a worker pane against
 // across sweeps (matches the supervisor's hash).
 func hashPane(s string) string {
