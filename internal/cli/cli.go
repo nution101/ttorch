@@ -1321,9 +1321,10 @@ func cmdTrust(args []string) error {
 		if err != nil {
 			return err
 		}
+		dims := m.ReviewersFor(id)
 		fmt.Printf("prepared review inputs for %s in %s\n", id, dir)
-		fmt.Printf("  run the three reviewers (%s), then: ttorch trust record %s\n",
-			strings.Join([]string{"correctness", "scope", "security"}, " | "), id)
+		fmt.Printf("  run the %d reviewer(s) for this diff (%s), then: ttorch trust record %s\n",
+			len(dims), strings.Join(dims, " | "), id)
 		return nil
 	case "record":
 		fs := flag.NewFlagSet("trust record", flag.ContinueOnError)

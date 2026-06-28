@@ -808,6 +808,78 @@ func TestTrustPrep(t *testing.T) {
 	_, _ = m.Teardown("pp1", true)
 }
 
+// TestTrustPrep_ScalesReviewers: prep scales the persisted reviewer set to the diff size
+// — a docs-only change records the reduced {correctness, scope} (no security), a
+// multi-file code change records the full three — and ReviewersFor reads back exactly what
+// prep wrote, so dispatch and aggregation agree.
+func TestTrustPrep_ScalesReviewers(t *testing.T) {
+	cases := []struct {
+		id    string
+		files map[string]string
+		want  string
+	}{
+		{
+			id:    "docs",
+			files: map[string]string{"NOTES.md": "# notes\nsome prose\n"},
+			want:  "correctness scope",
+		},
+		{
+			id:    "code",
+			files: map[string]string{"a.go": "package a\n", "b.go": "package b\n"},
+			want:  "correctness scope security",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.id, func(t *testing.T) {
+			m, repo := deliveryHarness(t, "scale-"+tc.id)
+			task, err := m.Spawn(tc.id, repo, false, "sleep 60")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for name, content := range tc.files {
+				if err := os.WriteFile(filepath.Join(task.Worktree, name), []byte(content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			gitIn(t, task.Worktree, "add", "-A")
+			gitIn(t, task.Worktree, "commit", "-q", "-m", "work")
+
+			if _, err := m.TrustPrep(tc.id); err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Join(m.ReviewersFor(tc.id), " "); got != tc.want {
+				t.Fatalf("ReviewersFor = %q, want %q", got, tc.want)
+			}
+			_, _ = m.Teardown(tc.id, true)
+		})
+	}
+}
+
+// TestReviewersFor_FailsSafeToFull: with no prep record (or a malformed one), ReviewersFor
+// returns the full set, so a verdict can never be recorded against fewer reviewers than
+// were prepared.
+func TestReviewersFor_FailsSafeToFull(t *testing.T) {
+	m, _ := deliveryHarness(t, "failsafe")
+	full := "correctness scope security"
+
+	// No reviewers.json at all.
+	if got := strings.Join(m.ReviewersFor("nope"), " "); got != full {
+		t.Fatalf("missing record: ReviewersFor = %q, want %q", got, full)
+	}
+
+	// A malformed record also falls back to full.
+	dir := m.P.ReviewInputsDir("bad")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "reviewers.json"), []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(m.ReviewersFor("bad"), " "); got != full {
+		t.Fatalf("malformed record: ReviewersFor = %q, want %q", got, full)
+	}
+}
+
 // TestTrustPrep_RefusesStaleBase: when the default branch has advanced past the worker's
 // base (the worker's HEAD lacks commits the default now has), trust prep must FAIL with a
 // rebase message and stage NOTHING — never run the reviewers against a stale-base diff

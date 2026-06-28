@@ -32,10 +32,43 @@ import (
 	"github.com/nution101/ttorch/internal/worktree"
 )
 
-// requiredReviewers are the adversarial-review dimensions every trust verdict must
-// cover. It is the single source of truth for both recording (which per-dimension
-// reports to aggregate) and completeness (a missing dimension fails closed).
+// requiredReviewers is the full adversarial-review set and the fail-safe default. The
+// actual set a given task's verdict must cover is scaled to the diff size by
+// review.Reviewers (a docs-only or trivial diff gets a reduced set) and persisted at prep
+// time; this set is what a task falls back to when that record is missing — so a verdict
+// can only ever be recorded against MORE reviewers than were prepared, never fewer.
 var requiredReviewers = []string{review.DimensionCorrectness, review.DimensionScope, review.DimensionSecurity}
+
+// reviewersFileName is the prep-time, diff-derived record of which review dimensions the
+// trust gate requires for a task — the scaled reviewer set. TrustPrep writes it from the
+// staged diff so the manager knows which reviewers to spawn, and TrustRecord reads it back
+// so aggregation requires EXACTLY the set that was prepared (no drift between dispatch and
+// record). It lives beside the other review inputs in ReviewInputsDir.
+const reviewersFileName = "reviewers.json"
+
+// scaledReviewers is the persisted reviewer-set decision: the change-size class and the
+// dimensions the trust gate requires for it. The manager reads it to spawn exactly those
+// reviewer subagents.
+type scaledReviewers struct {
+	Size       review.Size `json:"size"`
+	Dimensions []string    `json:"dimensions"`
+}
+
+// ReviewersFor returns the review dimensions the trust gate requires for taskID, as
+// recorded by TrustPrep in reviewers.json. A missing or malformed record (e.g. inputs
+// prepared by an older ttorch, or an empty set) falls back to the full set — fail-safe, so
+// a verdict is never recorded against fewer reviewers than were actually prepared.
+func (m *Manager) ReviewersFor(taskID string) []string {
+	b, err := os.ReadFile(filepath.Join(m.P.ReviewInputsDir(taskID), reviewersFileName))
+	if err != nil {
+		return append([]string(nil), requiredReviewers...)
+	}
+	var s scaledReviewers
+	if err := json.Unmarshal(b, &s); err != nil || len(s.Dimensions) == 0 {
+		return append([]string(nil), requiredReviewers...)
+	}
+	return s.Dimensions
+}
 
 // Manager performs runtime operations against a tmux session and the state store.
 type Manager struct {
@@ -1109,6 +1142,19 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 	if err := os.WriteFile(filepath.Join(dir, "diff.patch"), []byte(diff), 0o644); err != nil {
 		return "", err
 	}
+	// Scale the reviewer set to the diff size and persist the decision, so the manager
+	// spawns exactly these reviewers and TrustRecord aggregates against the same set. A
+	// docs-only or trivial diff gets a reduced set; anything else (including an uncertain
+	// diff) gets the full three-dimension pass. Security is dropped only for docs-only
+	// changes — never for code.
+	size, dims := review.Reviewers(diff)
+	sb, err := json.MarshalIndent(scaledReviewers{Size: size, Dimensions: dims}, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(dir, reviewersFileName), append(sb, '\n'), 0o644); err != nil {
+		return "", err
+	}
 	// A worker may run without a written brief; copy it only when present.
 	if b, err := os.ReadFile(m.P.BriefPath(taskID)); err == nil {
 		if err := os.WriteFile(filepath.Join(dir, "brief.md"), b, 0o644); err != nil {
@@ -1128,7 +1174,8 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 	if err := os.WriteFile(filepath.Join(dir, "head.txt"), []byte(head+"\n"), 0o644); err != nil {
 		return "", err
 	}
-	m.audit(fmt.Sprintf("trust-prep task=%s commit=%s", taskID, short(head)))
+	m.audit(fmt.Sprintf("trust-prep task=%s commit=%s size=%s reviewers=%s",
+		taskID, short(head), size, strings.Join(dims, "+")))
 	return dir, nil
 }
 
@@ -1163,7 +1210,7 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 	if sha != head {
 		return zero, fmt.Errorf("review covers %s but the worker HEAD is now %s; re-run 'ttorch trust prep %s' and review again", short(sha), short(head), taskID)
 	}
-	verdict, err := review.Aggregate(m.P.ReviewInputsDir(taskID), sha, requiredReviewers)
+	verdict, err := review.Aggregate(m.P.ReviewInputsDir(taskID), sha, m.ReviewersFor(taskID))
 	if err != nil {
 		return zero, err
 	}
