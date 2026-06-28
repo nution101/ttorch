@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/nution101/ttorch/compare/v0.7.0...v0.8.0) (2026-06-28)
+
+
+### Features
+
+* **scheduler:** add the deterministic dispatch daemon (roadmap A, phase 1) ([bab7af4](https://github.com/nution101/ttorch/commit/bab7af4f007dba4da3aa03c564fe8f0737ffafe7))
+
 ## [0.7.0](https://github.com/nution101/ttorch/compare/v0.6.0...v0.7.0) (2026-06-28)
 
 
