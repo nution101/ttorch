@@ -241,6 +241,12 @@ type Scheduler struct {
 	// now returns the current time; nil means time.Now. It is the single clock the idle-nudge
 	// pass reads so a test can drive grace deterministically without sleeping.
 	now func() time.Time
+
+	// lastHeartbeatAt is when recordTick last emitted a HEARTBEAT line to the daemon log
+	// (in-memory observability state, §roadmap H5). The durable status row is written EVERY tick;
+	// the human-readable heartbeat is throttled to ~heartbeatInterval regardless of the tick
+	// cadence. Zero until the first tick, so the first tick after a start/restart emits a heartbeat.
+	lastHeartbeatAt time.Time
 }
 
 // idleObservation is one task's idle-stability state: the last idle pane hash seen and how
@@ -333,12 +339,15 @@ func (sc *Scheduler) Run(ctx context.Context) error {
 // dispatch-disabled run still reclaims and poison-pills, it just defers the restart to a tick
 // with dispatch on.
 func (sc *Scheduler) runTick(ctx context.Context) {
+	var stats tickStats // §roadmap H5: accumulate this tick's outcome for one durable status write
 	if sc.Supervise {
 		if n, err := sc.RunSuperviseOnce(ctx); err != nil {
 			if ctx.Err() == nil {
 				sc.logf("supervise tick error: %v", err)
+				stats.noteErr(err)
 			}
 		} else if n > 0 {
+			stats.recovered += n
 			sc.logf("tick reclaimed %d task(s) for retry", n)
 		}
 		if ctx.Err() == nil {
@@ -348,6 +357,7 @@ func (sc *Scheduler) runTick(ctx context.Context) {
 			if n, err := sc.RunNudgeIdleOnce(ctx); err != nil {
 				if ctx.Err() == nil {
 					sc.logf("idle-nudge tick error: %v", err)
+					stats.noteErr(err)
 				}
 			} else if n > 0 {
 				sc.logf("tick nudged %d idle worker(s)", n)
@@ -361,8 +371,10 @@ func (sc *Scheduler) runTick(ctx context.Context) {
 		if n, err := sc.RunOnce(ctx); err != nil {
 			if ctx.Err() == nil {
 				sc.logf("tick error: %v", err)
+				stats.noteErr(err)
 			}
 		} else if n > 0 {
+			stats.dispatched += n
 			sc.logf("tick dispatched %d task(s)", n)
 		}
 	}
@@ -376,8 +388,10 @@ func (sc *Scheduler) runTick(ctx context.Context) {
 		if n, err := sc.RunGateOnce(ctx); err != nil {
 			if ctx.Err() == nil {
 				sc.logf("gate tick error: %v", err)
+				stats.noteErr(err)
 			}
 		} else if n > 0 {
+			stats.gated += n
 			sc.logf("tick gated %d task(s)", n)
 		}
 	}
@@ -388,11 +402,22 @@ func (sc *Scheduler) runTick(ctx context.Context) {
 		if n, err := sc.RunLandOnce(ctx); err != nil {
 			if ctx.Err() == nil {
 				sc.logf("land tick error: %v", err)
+				stats.noteErr(err)
 			}
 		} else if n > 0 {
+			stats.landed += n
 			sc.logf("tick landed %d task(s)", n)
 		}
 	}
+	if ctx.Err() != nil {
+		return
+	}
+	// One durable status write per tick: advance last_tick_at + fold in this tick's counters,
+	// and emit a throttled heartbeat to the daemon log. Even a fully idle tick records, which is
+	// what lets `ttorch scheduler status` and the watchdog tell a healthy idle daemon from a
+	// wedged one. A cancelled tick (any early return above) is the daemon shutting down — it
+	// deliberately leaves the last completed tick's record standing rather than writing a partial.
+	sc.recordTick(ctx, stats)
 }
 
 // RunOnce performs one scheduling tick and returns how many tasks it dispatched. It

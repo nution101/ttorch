@@ -291,6 +291,27 @@ type Verdict struct {
 	UpdatedAt   time.Time
 }
 
+// SchedulerStatus mirrors the singleton scheduler_status row: the durable observability record
+// the dispatch daemon upserts once per tick (see schedulerstatus.go). It is what `ttorch
+// scheduler status` and the manager's watchdog read to tell a healthy idle daemon from a wedged
+// one. LastTickAt is the liveness signal (it advances every tick, even an idle no-op tick); the
+// counters are cumulative work totals across the row's lifetime (they persist across a daemon
+// restart); and LastError surfaces the most recent handled/swallowed pass error. A zero
+// LastErrorAt means no error has been recorded yet.
+type SchedulerStatus struct {
+	LastTickAt  time.Time
+	TickCount   int64
+	Dispatched  int64
+	Landed      int64
+	Gated       int64
+	Recovered   int64
+	Deferred    int64
+	Errors      int64
+	LastError   string
+	LastErrorAt time.Time
+	UpdatedAt   time.Time
+}
+
 // TimelineItem is one entry in a task's merged events∪notes history (§2.2).
 type TimelineItem struct {
 	TS    time.Time

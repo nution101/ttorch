@@ -1381,6 +1381,11 @@ func cmdWatchdog(args []string) error {
 // injection). --once runs a single tick then exits (tests / cron); otherwise it loops on
 // --interval until Ctrl-C/SIGTERM.
 func cmdScheduler(args []string) error {
+	// `scheduler status` is a read-only observability subcommand (not a daemon mode), so it is
+	// dispatched before the daemon flags are parsed.
+	if len(args) > 0 && args[0] == "status" {
+		return cmdSchedulerStatus(args[1:])
+	}
 	fs := flag.NewFlagSet("scheduler", flag.ContinueOnError)
 	interval := fs.Duration("interval", scheduler.DefaultInterval, "tick cadence: re-derive the board and act every interval")
 	once := fs.Bool("once", false, "run a single tick (act on what is ready now), then exit")
@@ -1499,6 +1504,55 @@ func cmdScheduler(args []string) error {
 			return nil
 		}
 		return err
+	}
+	return nil
+}
+
+// cmdSchedulerStatus prints the daemon's durable observability row — last-tick age, cumulative
+// counters (dispatched / landed / gated / recovered / deferred / errors), and the most recent
+// swallowed error — alongside the live board gauges (queue depth + active workers) and whether
+// the scheduler singleton lock is currently held (a daemon process is alive). It exits non-zero
+// when the daemon is STALLED: its last tick is older than --stale-after (default
+// scheduler.StaleAfterDefault), or no tick has ever been recorded. That lets the manager's
+// watchdog shell out to it to distinguish a DAEMON stall (held lock but stale last_tick, or no
+// daemon at all) from a MANAGER stall. It is READ-ONLY: it never starts the daemon or writes the
+// board, so it is safe to poll.
+func cmdSchedulerStatus(args []string) error {
+	fs := flag.NewFlagSet("scheduler status", flag.ContinueOnError)
+	staleAfter := fs.Duration("stale-after", scheduler.StaleAfterDefault, "report the daemon stalled (exit non-zero) when its last recorded tick is older than this")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	m, err := mgr()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+
+	ctx := context.Background()
+	row, has, err := m.Store.GetSchedulerStatus(ctx)
+	if err != nil {
+		return err
+	}
+	pending, active := scheduler.BoardGauges(ctx, m.Store)
+	view := scheduler.StatusView{
+		Row:        row,
+		HasRow:     has,
+		Pending:    pending,
+		Active:     active,
+		LockHeld:   singleton.Held(m.P.SchedulerPIDFile()),
+		Now:        time.Now(),
+		StaleAfter: *staleAfter,
+	}
+	fmt.Fprint(os.Stdout, view.Render())
+	if view.Stalled() {
+		// A non-zero exit is the watchdog's machine-readable signal; the full report is already on
+		// stdout. Keep the error line concise and greppable.
+		if has {
+			return fmt.Errorf("daemon stalled: last tick %s ago (threshold %s)",
+				time.Since(row.LastTickAt).Round(time.Second), *staleAfter)
+		}
+		return errors.New("daemon stalled: no tick recorded yet")
 	}
 	return nil
 }
@@ -2087,6 +2141,10 @@ Supervision:
                             cannot launch many heavy validates at once. Each also reads an env var
                             (TTORCH_MAX_ACTIVE_WORKERS / TTORCH_LOAD_CEILING /
                             TTORCH_MAX_LAND_CONCURRENCY); an explicit flag overrides the env.
+  scheduler status        show the daemon's observability: last-tick age, cumulative counters,
+    [--stale-after d]       last error, queue depth + active, and whether the singleton lock is
+                            held. Exits non-zero when the last tick is older than --stale-after
+                            (default 90s) so a watchdog can detect a stalled daemon. Read-only.
 
 Delivery:
   validate <id>               run the repo's build/test/lint checks on a worker

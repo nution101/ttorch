@@ -38,8 +38,8 @@ func TestFreshDBBootstrapsToV0(t *testing.T) {
 	if err := s.Migrate(ctx); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if v, err = s.schemaVersion(ctx); err != nil || v != 5 {
-		t.Errorf("after Migrate: version=%d err=%v, want 5/nil", v, err)
+	if v, err = s.schemaVersion(ctx); err != nil || v != 6 {
+		t.Errorf("after Migrate: version=%d err=%v, want 6/nil", v, err)
 	}
 }
 
@@ -50,14 +50,14 @@ func TestMigrateUpDownUp(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t) // Open() already migrated up
 
-	if v, err := s.schemaVersion(ctx); err != nil || v != 5 {
-		t.Fatalf("after Open: version=%d err=%v, want 5", v, err)
+	if v, err := s.schemaVersion(ctx); err != nil || v != 6 {
+		t.Fatalf("after Open: version=%d err=%v, want 6", v, err)
 	}
 	var fk int
 	if err := s.db.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&fk); err != nil || fk != 1 {
 		t.Fatalf("foreign_keys=%d err=%v, want 1 (so child-first drop is actually required)", fk, err)
 	}
-	for _, tbl := range []string{"projects", "epics", "phases", "tasks", "events", "notes", "manager", "verdicts", "schema_migrations"} {
+	for _, tbl := range []string{"projects", "epics", "phases", "tasks", "events", "notes", "manager", "verdicts", "scheduler_status", "schema_migrations"} {
 		if !tableExists(t, s, tbl) {
 			t.Fatalf("table %q missing after up", tbl)
 		}
@@ -69,7 +69,7 @@ func TestMigrateUpDownUp(t *testing.T) {
 	if v, err := s.schemaVersion(ctx); err != nil || v != 0 {
 		t.Fatalf("after down: version=%d err=%v, want 0", v, err)
 	}
-	for _, tbl := range []string{"tasks", "events", "schema_migrations"} {
+	for _, tbl := range []string{"tasks", "events", "scheduler_status", "schema_migrations"} {
 		if tableExists(t, s, tbl) {
 			t.Errorf("table %q still present after down", tbl)
 		}
@@ -78,8 +78,8 @@ func TestMigrateUpDownUp(t *testing.T) {
 	if err := s.Migrate(ctx); err != nil {
 		t.Fatalf("re-Migrate: %v", err)
 	}
-	if v, err := s.schemaVersion(ctx); err != nil || v != 5 {
-		t.Fatalf("after re-up: version=%d err=%v, want 5", v, err)
+	if v, err := s.schemaVersion(ctx); err != nil || v != 6 {
+		t.Fatalf("after re-up: version=%d err=%v, want 6", v, err)
 	}
 	if !tableExists(t, s, "tasks") {
 		t.Error("tasks missing after re-up")
@@ -100,7 +100,7 @@ func TestMigrateIdempotent(t *testing.T) {
 	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations`).Scan(&rows); err != nil {
 		t.Fatal(err)
 	}
-	if rows != 5 {
-		t.Errorf("schema_migrations rows = %d, want 5 (no duplicate ledger row)", rows)
+	if rows != 6 {
+		t.Errorf("schema_migrations rows = %d, want 6 (no duplicate ledger row)", rows)
 	}
 }
