@@ -156,7 +156,10 @@ func TestBriefForLaunch_KeepsManagerBrief(t *testing.T) {
 	if err := m.WriteBrief("bf1", body); err != nil {
 		t.Fatal(err)
 	}
-	path := m.briefForLaunch("bf1", "ship")
+	path, err := m.briefForLaunch("bf1", "ship", false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if path != m.P.BriefPath("bf1") {
 		t.Fatalf("briefForLaunch path = %q, want %q", path, m.P.BriefPath("bf1"))
 	}
@@ -170,11 +173,14 @@ func TestBriefForLaunch_KeepsManagerBrief(t *testing.T) {
 }
 
 // TestBriefForLaunch_WritesStubWhenAbsent confirms the fallback is preserved: with no
-// brief written, the launch gets the generic stub.
+// brief written, an INTERACTIVE launch gets the generic stub.
 func TestBriefForLaunch_WritesStubWhenAbsent(t *testing.T) {
 	t.Setenv("TTORCH_HOME", t.TempDir())
 	m := &Manager{P: paths.Default()}
-	path := m.briefForLaunch("st1", "ship")
+	path, err := m.briefForLaunch("st1", "ship", false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	got, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("stub not written: %v", err)

@@ -211,6 +211,10 @@ func (sc *Scheduler) runTick(ctx context.Context) {
 //
 //   - it declares a footprint (an undeclared footprint cannot be proven disjoint from a
 //     concurrently-dispatched sibling, so the scheduler leaves it for the manager);
+//   - it has a stored brief (has_brief): with none, the autonomous spawn would strand the
+//     worker on the "wait for ttorch send" stub that no daemon send will satisfy, so a
+//     briefless task is left for the manager — the same skip-don't-fail treatment as an
+//     undeclared footprint;
 //   - its footprint is disjoint from every LIVE worker (Fleet.CheckOverlap) AND from every
 //     task already claimed THIS tick (which has no live window yet, so CheckOverlap cannot
 //     see it);
@@ -289,6 +293,16 @@ func (sc *Scheduler) RunOnce(ctx context.Context) (int, error) {
 			sc.logf("skip %s: no declared footprint (left for the manager)", t.ID)
 			continue
 		}
+		// The scheduler auto-dispatches only work whose readiness it can VERIFY. With no
+		// stored brief, the autonomous spawn would launch the worker on the "wait for
+		// ttorch send" stub — but no `ttorch send` is coming on the daemon path, so the
+		// worker would hold a pool slot and go silent until its lease lapsed. Leave a
+		// briefless task for the manager (mirroring the footprint skip), exactly as the
+		// has_brief column records (set by `task add --brief` / `spawn --brief`).
+		if !t.HasBrief {
+			sc.logf("skip %s: no stored brief (left for the manager)", t.ID)
+			continue
+		}
 		if freeOf(repo) <= 0 {
 			continue // no capacity in this repo right now — try the next ready task
 		}
@@ -320,7 +334,8 @@ func (sc *Scheduler) RunOnce(ctx context.Context) (int, error) {
 		// worker's initial prompt is the brief stored for this task (by `ttorch task add
 		// --brief/--brief-file`), which the spawn reads from the task's brief file — so an
 		// autonomously-dispatched worker starts on its FULL brief, not the stub that waits for a
-		// manager `ttorch send`. A task with no stored brief falls back to the stub, unchanged.
+		// manager `ttorch send`. The has_brief gate above guarantees a stored brief here; the
+		// autonomous spawn refuses (rather than stub) if it is ever somehow missing.
 		if _, err := sc.Fleet.SpawnWithFootprint(claimed.ID, repo, scout, "", claimed.Footprint, false); err != nil {
 			// Dispatch failed after the claim. Revert so the task is not a phantom (active +
 			// lease, no window): back to pending with the lease cleared. The guarded revert

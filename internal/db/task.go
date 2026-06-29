@@ -17,7 +17,7 @@ const taskSelect = `SELECT
 	t.reviewed_sha, t.footprint, t.last_pane_hash, t.idle_sweeps,
 	t.created_at, t.updated_at, t.last_progress_at,
 	t.lease_owner, t.lease_expires_at, t.retry_count, t.max_retries, t.attempt,
-	t.effort,
+	t.effort, t.has_brief,
 	p.repo_path
 	FROM tasks t JOIN projects p ON p.id = t.project_id`
 
@@ -27,6 +27,7 @@ func scanTask(sc rowScanner) (Task, error) {
 		epicID, phaseID  sql.NullInt64
 		parentID         sql.NullString
 		gate             int64
+		hasBrief         int64
 		footprint        string
 		createdAt, updAt string
 		lastProgress     sql.NullString
@@ -38,11 +39,12 @@ func scanTask(sc rowScanner) (Task, error) {
 		&t.ReviewedSHA, &footprint, &t.LastPaneHash, &t.IdleSweeps,
 		&createdAt, &updAt, &lastProgress,
 		&t.LeaseOwner, &leaseExpires, &t.RetryCount, &t.MaxRetries, &t.Attempt,
-		&t.Effort,
+		&t.Effort, &hasBrief,
 		&t.Project); err != nil {
 		return Task{}, err
 	}
 	t.GatePassed = gate != 0
+	t.HasBrief = hasBrief != 0
 	if epicID.Valid {
 		v := epicID.Int64
 		t.EpicID = &v
@@ -132,19 +134,23 @@ func (s *Store) insertTaskTx(ctx context.Context, tx *sql.Tx, t Task) error {
 	if t.GatePassed {
 		gate = 1
 	}
+	hasBrief := 0
+	if t.HasBrief {
+		hasBrief = 1
+	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO tasks (
 			id, project_id, epic_id, phase_id, parent_task_id, created_by,
 			title, kind, status, stage, owner,
 			window, worktree, harness, session_id, pr, gate_passed, approved_by, reviewed_sha, footprint,
 			last_pane_hash, idle_sweeps, created_at, updated_at, last_progress_at,
-			lease_owner, lease_expires_at, retry_count, max_retries, attempt, effort)
-		VALUES (?, ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?,  ?)`,
+			lease_owner, lease_expires_at, retry_count, max_retries, attempt, effort, has_brief)
+		VALUES (?, ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?,  ?, ?)`,
 		t.ID, t.ProjectID, nullInt(t.EpicID), nullInt(t.PhaseID), nullStr(t.ParentTaskID), t.CreatedBy,
 		t.Title, t.Kind, t.Status, t.Stage, t.Owner,
 		t.Window, t.Worktree, t.Harness, t.SessionID, t.PR, gate, t.ApprovedBy, t.ReviewedSHA, fp,
 		t.LastPaneHash, t.IdleSweeps, formatTime(t.Created), formatTime(t.UpdatedAt), nullTime(t.LastProgressAt),
-		t.LeaseOwner, nullTime(t.LeaseExpiresAt), t.RetryCount, t.MaxRetries, t.Attempt, t.Effort)
+		t.LeaseOwner, nullTime(t.LeaseExpiresAt), t.RetryCount, t.MaxRetries, t.Attempt, t.Effort, hasBrief)
 	return err
 }
 
@@ -616,4 +622,18 @@ func (s *Store) SetLiveness(ctx context.Context, id, paneHash string, idleSweeps
 		return err
 	}
 	return requireRows(res, "task "+id)
+}
+
+// SetBriefStored marks a task as having a stored brief (has_brief=1), recording that the
+// scheduler may auto-dispatch it onto its full brief rather than skipping it as briefless.
+// The brief-writing path (WriteBrief) calls it after the brief file is written, so the
+// flag is only ever raised once the durable brief actually exists. It is DELIBERATELY a
+// no-op when the row does not exist yet — the manager's `ttorch spawn --brief` writes the
+// brief file BEFORE the spawn creates the task row — so it never errors on a
+// not-yet-created task (no requireRows). It never clears the flag. No event (§2.2).
+func (s *Store) SetBriefStored(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE tasks SET has_brief = 1, updated_at = ? WHERE id = ?`,
+		formatTime(s.now()), id)
+	return err
 }

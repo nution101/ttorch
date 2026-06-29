@@ -28,8 +28,13 @@ func (m *Manager) Spawn(taskID, projectPath string, scout bool, rawCmd string) (
 // SpawnWithEffort for the footprint semantics). It dispatches at the default/unset
 // effort. Its signature is kept stable so the scheduler daemon's interface and call
 // site need no change; the explicit-effort path is SpawnWithEffort.
+//
+// It is the AUTONOMOUS (scheduler daemon) entry point, so it dispatches with
+// autonomous=true: a daemon dispatch must never write the manager-send brief stub (no
+// `ttorch send` is coming for it), and a briefless task should already have been skipped
+// by the scheduler — see spawnWithEffort / briefForLaunch.
 func (m *Manager) SpawnWithFootprint(taskID, projectPath string, scout bool, rawCmd string, footprint []string, forceOverlap bool) (db.Task, error) {
-	return m.SpawnWithEffort(taskID, projectPath, scout, rawCmd, footprint, forceOverlap, "")
+	return m.spawnWithEffort(taskID, projectPath, scout, rawCmd, footprint, forceOverlap, "", true)
 }
 
 // SpawnWithEffort is SpawnWithFootprint plus an explicit per-task reasoning effort
@@ -50,7 +55,22 @@ func (m *Manager) SpawnWithFootprint(taskID, projectPath string, scout bool, raw
 // serial dispatch (the manager dispatches one worker at a time). This matches the
 // unlocked worktree-pool semantics; two truly concurrent spawns of overlapping
 // footprints are not serialized.
+//
+// It is the INTERACTIVE (manager / `ttorch spawn`) entry point, so it dispatches with
+// autonomous=false: a brief-less interactive spawn launches the worker on the
+// manager-send stub and waits for the manager's `ttorch send`. The autonomous daemon
+// path is SpawnWithFootprint (autonomous=true).
 func (m *Manager) SpawnWithEffort(taskID, projectPath string, scout bool, rawCmd string, footprint []string, forceOverlap bool, effort string) (db.Task, error) {
+	return m.spawnWithEffort(taskID, projectPath, scout, rawCmd, footprint, forceOverlap, effort, false)
+}
+
+// spawnWithEffort is the shared spawn implementation behind both entry points. autonomous
+// distinguishes a scheduler-daemon dispatch (true) from an interactive manager/`ttorch
+// spawn` (false); it controls whether a missing brief is allowed to fall back to the
+// manager-send stub (interactive only) or is refused (autonomous — the daemon must never
+// strand a worker on a stub no `ttorch send` will satisfy). All other behavior is
+// identical across the two callers.
+func (m *Manager) spawnWithEffort(taskID, projectPath string, scout bool, rawCmd string, footprint []string, forceOverlap bool, effort string, autonomous bool) (db.Task, error) {
 	var zero db.Task
 	if err := m.requireTmux(); err != nil {
 		return zero, err
@@ -144,7 +164,15 @@ func (m *Manager) SpawnWithEffort(taskID, projectPath string, scout bool, rawCmd
 	harnessLaunch := rawCmd == ""
 	cmd := rawCmd
 	if cmd == "" {
-		brief := m.briefForLaunch(taskID, kind)
+		brief, err := m.briefForLaunch(taskID, kind, autonomous)
+		if err != nil {
+			// briefForLaunch only errors on an autonomous dispatch with no stored brief —
+			// the scheduler should have skipped it. Unwind the half-started spawn (window +
+			// worktree are already up) rather than strand a worker on a stub no send will
+			// satisfy; the scheduler's revert returns the claim to pending.
+			m.abortSpawn(window, repo, wt)
+			return zero, fmt.Errorf("spawn %q: %w", taskID, err)
+		}
 		// Prepend TTORCH_TASK_ID/TTORCH_DB so the worker's reporting commands resolve
 		// their task + DB from the launch env (the .ttorch/task file is the durable
 		// fallback that also survives a resume). §3.1.
@@ -323,25 +351,56 @@ func (m *Manager) abortSpawn(window, repo, wt string) {
 	}
 }
 
-// briefForLaunch returns the path to the brief the worker launch command reads,
-// writing the generic stub there first ONLY when no brief already exists. A brief the
-// manager supplied via `spawn --brief/--brief-file` (written by WriteBrief before the
-// spawn) is therefore used as the worker's initial prompt instead of the stub, and a
-// resume/respawn keeps the original brief rather than clobbering it.
-func (m *Manager) briefForLaunch(taskID, kind string) string {
+// briefForLaunch returns the path to the brief the worker launch command reads. A brief
+// the manager supplied via `task add`/`spawn --brief` (written by WriteBrief before the
+// spawn) is used as the worker's initial prompt, and a resume/respawn keeps an existing
+// brief rather than clobbering it.
+//
+// When NO brief exists yet, behavior splits on dispatch provenance:
+//
+//   - interactive (autonomous=false): write the generic "wait for ttorch send" stub and
+//     launch on it — the manager sends the real brief moments later via `ttorch send`.
+//   - autonomous (autonomous=true): REFUSE. The scheduler must skip a briefless task (it
+//     gates dispatch on the has_brief column), so reaching here means a regression; a
+//     daemon dispatch must never strand a worker on a stub no `ttorch send` will satisfy.
+//     Failing loud is the second guard behind the scheduler's skip.
+func (m *Manager) briefForLaunch(taskID, kind string, autonomous bool) (string, error) {
 	path := m.P.BriefPath(taskID)
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		_ = writeBriefStub(path, taskID, kind)
+	if _, err := os.Stat(path); err == nil {
+		return path, nil // a brief already exists (real brief, or a stub kept across a respawn)
 	}
-	return path
+	if autonomous {
+		return "", fmt.Errorf("task %s has no stored brief; refusing to dispatch it onto the manager-send stub (a briefless task is left for the manager)", taskID)
+	}
+	if err := writeBriefStub(path, taskID, kind); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 // WriteBrief stores content as task taskID's brief (paths.BriefPath) so the next Spawn
-// launches the worker with it as the initial prompt rather than the generic stub. It
-// creates the data dir and overwrites any existing brief for the id. `ttorch spawn
-// --brief/--brief-file` calls it before spawning.
+// launches the worker with it as the initial prompt rather than the generic stub, and
+// records brief presence on the task row (has_brief) so the scheduler can gate
+// auto-dispatch on a stored brief without probing the filesystem. It creates the data
+// dir and overwrites any existing brief for the id. `ttorch task add --brief` /
+// `spawn --brief` call it.
+//
+// The file is written FIRST, then the flag is raised, so has_brief is never true without
+// a brief actually on disk (a conservative false-negative is safe — the scheduler simply
+// skips — while a false-positive would re-introduce the briefless-stall bug). The flag
+// update is a no-op when the task row does not exist yet — `ttorch spawn --brief` writes
+// the brief before the spawn creates the row, and that spawn launches on the file
+// regardless — so it never errors there. The Store is always present in production
+// (orchestrator.New); the nil guard keeps the file-write seam unit-testable with a bare
+// Manager.
 func (m *Manager) WriteBrief(taskID, content string) error {
-	return writeBrief(m.P.BriefPath(taskID), content)
+	if err := writeBrief(m.P.BriefPath(taskID), content); err != nil {
+		return err
+	}
+	if m.Store != nil {
+		return m.Store.SetBriefStored(context.Background(), taskID)
+	}
+	return nil
 }
 
 // writeBrief writes body to path as a task brief, creating its parent directory.

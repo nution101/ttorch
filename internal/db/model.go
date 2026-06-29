@@ -148,6 +148,16 @@ type Task struct {
 	// stop/update restores the same effort (see harness.ResolveWorkerEffort).
 	Effort string
 
+	// HasBrief records whether a real (non-stub) brief — the worker's full initial
+	// prompt — has been stored for this task (paths.BriefPath), set by the brief-writing
+	// path (WriteBrief, driven by `ttorch task add --brief` / `spawn --brief`). The
+	// dispatch scheduler gates auto-dispatch on it: a footprint-bearing task with no
+	// brief is left for the manager rather than spawned onto the "wait for ttorch send"
+	// stub that no autonomous send will satisfy. It is the DB-resident readiness signal
+	// the daemon reads instead of probing the brief file (which a prior spawn's stub can
+	// masquerade as a real brief).
+	HasBrief bool
+
 	ProjectID      int64
 	EpicID         *int64
 	PhaseID        *int64

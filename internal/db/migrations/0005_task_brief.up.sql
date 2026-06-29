@@ -1,0 +1,11 @@
+-- ==================== migration 0005 (up): brief presence =======================
+-- Records whether a task has a stored brief — the worker's full initial prompt, written
+-- by `ttorch task add --brief` / `spawn --brief` via WriteBrief. The dispatch scheduler
+-- gates auto-dispatch on it: a footprint-bearing task with NO brief is left for the
+-- manager rather than claimed and spawned onto the "wait for ttorch send" stub that no
+-- autonomous send will ever satisfy (the silent briefless stall this column closes).
+-- Modeling presence in the DB lets the scheduler derive readiness without a filesystem
+-- probe of the brief file — and, unlike the file, it cannot be fooled by a stub a prior
+-- spawn left behind. A plain ADD COLUMN with a constant default: it changes no CHECK
+-- constraint, so — like 0004 — it needs no table rebuild and no foreign-key dance.
+ALTER TABLE tasks ADD COLUMN has_brief INTEGER NOT NULL DEFAULT 0;

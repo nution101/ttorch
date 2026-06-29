@@ -343,7 +343,7 @@ func TestCmdTaskAddPendingBacklog(t *testing.T) {
 // error that creates no task.
 func TestCmdTaskAddStoresBrief(t *testing.T) {
 	var projID int64
-	withSeedDB(t, func(ctx context.Context, s *db.Store) {
+	dbPath := withSeedDB(t, func(ctx context.Context, s *db.Store) {
 		p, _ := s.UpsertProject(ctx, "/r", "r")
 		projID = p.ID
 	})
@@ -372,7 +372,7 @@ func TestCmdTaskAddStoresBrief(t *testing.T) {
 		t.Fatalf("stored brief = %q, want %q", got, fromFile)
 	}
 
-	// No brief flag stores no brief — dispatch then falls back to the stub.
+	// No brief flag stores no brief — the scheduler then SKIPS the task (left for the manager).
 	if _, err := captureStdout(t, func() error {
 		return cmdTaskAdd([]string{"brief-none", "--project", itoa(projID)})
 	}); err != nil {
@@ -380,6 +380,20 @@ func TestCmdTaskAddStoresBrief(t *testing.T) {
 	}
 	if _, err := os.Stat(paths.Default().BriefPath("brief-none")); !os.IsNotExist(err) {
 		t.Fatalf("a task added with no brief must not store one; stat err = %v", err)
+	}
+
+	// The brief presence must be recorded on the task row (has_brief), so the scheduler can
+	// gate dispatch on it without a filesystem probe: set for the briefed tasks, clear for the
+	// briefless one.
+	store := reopen(t, dbPath)
+	if !mustTask(t, store, "brief-inline").HasBrief {
+		t.Error("brief-inline: has_brief must be true after task add --brief")
+	}
+	if !mustTask(t, store, "brief-file").HasBrief {
+		t.Error("brief-file: has_brief must be true after task add --brief-file")
+	}
+	if mustTask(t, store, "brief-none").HasBrief {
+		t.Error("brief-none: has_brief must be false for a task added with no brief")
 	}
 
 	// Both flags at once is ambiguous: a loud error, and nothing is written (resolveBrief

@@ -1,9 +1,11 @@
 package scheduler
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -137,6 +139,8 @@ func newStore(t *testing.T) *db.Store {
 }
 
 // addPending creates a pending backlog task under repo with the given footprint and kind.
+// It marks the task as having a stored brief (the normal case for backlog the scheduler
+// dispatches); a briefless task is created with addPendingNoBrief instead.
 func addPending(t *testing.T, s *db.Store, repo, id, kind string, footprint []string) {
 	t.Helper()
 	ctx := context.Background()
@@ -146,6 +150,25 @@ func addPending(t *testing.T, s *db.Store, repo, id, kind string, footprint []st
 	}
 	if _, err := s.CreateTask(ctx, db.Task{
 		ID: id, ProjectID: proj.ID, Status: db.StatusPending, Kind: kind, Footprint: footprint,
+		HasBrief: true,
+	}, db.ActorManager); err != nil {
+		t.Fatalf("CreateTask %s: %v", id, err)
+	}
+}
+
+// addPendingNoBrief creates a pending backlog task with a footprint but NO stored brief —
+// the case the scheduler must skip (leave for the manager) rather than spawn onto the
+// manager-send stub.
+func addPendingNoBrief(t *testing.T, s *db.Store, repo, id string, footprint []string) {
+	t.Helper()
+	ctx := context.Background()
+	proj, err := s.UpsertProject(ctx, repo, "")
+	if err != nil {
+		t.Fatalf("UpsertProject: %v", err)
+	}
+	if _, err := s.CreateTask(ctx, db.Task{
+		ID: id, ProjectID: proj.ID, Status: db.StatusPending, Kind: db.KindShip, Footprint: footprint,
+		HasBrief: false,
 	}, db.ActorManager); err != nil {
 		t.Fatalf("CreateTask %s: %v", id, err)
 	}
@@ -495,6 +518,39 @@ func TestRunOnceSkipsFootprintless(t *testing.T) {
 	}
 	if status(t, s, "bare") != db.StatusPending {
 		t.Error("a footprint-less task must remain pending")
+	}
+}
+
+// TestRunOnceSkipsBriefless proves the brief gate: a pending footprint-bearing task with
+// NO stored brief is SKIPPED (left for the manager, not claimed/dispatched) and logged,
+// while a sibling WITH a stored brief dispatches normally. This is the fix for the silent
+// briefless stall — without it the daemon would claim the briefless task, spawn it onto
+// the "wait for ttorch send" stub, and the worker would hold a pool slot and go silent.
+func TestRunOnceSkipsBriefless(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	addPendingNoBrief(t, s, repo, "briefless", []string{"internal/db"})
+	addPending(t, s, repo, "briefed", db.KindShip, []string{"internal/cli"})
+
+	var log bytes.Buffer
+	f := &fakeFleet{}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}, Log: &log}
+	n, err := sc.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if n != 1 || !contains(f.dispatched(), "briefed") || contains(f.dispatched(), "briefless") {
+		t.Fatalf("only the briefed task must dispatch, got n=%d dispatched=%v", n, f.dispatched())
+	}
+	if status(t, s, "briefless") != db.StatusPending {
+		t.Errorf("a briefless task must remain pending (not claimed), got %q", status(t, s, "briefless"))
+	}
+	if leaseOwner(t, s, "briefless") != "" {
+		t.Error("a skipped briefless task must not be claimed (no lease)")
+	}
+	if got := log.String(); !strings.Contains(got, "skip briefless: no stored brief") {
+		t.Errorf("expected a 'no stored brief' skip log for briefless, got:\n%s", got)
 	}
 }
 
@@ -888,6 +944,7 @@ func addActiveWorker(t *testing.T, s *db.Store, repo, id string, footprint []str
 	if _, err := s.CreateTask(ctx, db.Task{
 		ID: id, ProjectID: proj.ID, Status: db.StatusActive, Kind: db.KindShip,
 		Owner: "worker:" + id, Window: "wk-" + id, Footprint: footprint,
+		HasBrief: true, // a dispatched worker has a stored brief, so reclaim can re-dispatch it
 	}, db.ActorManager); err != nil {
 		t.Fatalf("CreateTask %s: %v", id, err)
 	}
@@ -909,6 +966,7 @@ func addExpiredLeaseWorker(t *testing.T, s *db.Store, repo, id string, footprint
 		ID: id, ProjectID: proj.ID, Status: db.StatusActive, Kind: db.KindShip,
 		Owner: "worker:" + id, Window: "wk-" + id, Footprint: footprint,
 		LeaseOwner: "worker:" + id, LeaseExpiresAt: &past,
+		HasBrief: true, // a dispatched worker has a stored brief, so reclaim can re-dispatch it
 	}, db.ActorManager); err != nil {
 		t.Fatalf("CreateTask %s: %v", id, err)
 	}
