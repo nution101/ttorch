@@ -576,6 +576,20 @@ func (m *Manager) restore() []string {
 		}); err != nil {
 			fmt.Fprintf(os.Stderr, "ttorch: could not record the resume sign-of-life event for %s: %v\n", t.ID, err)
 		}
+		// Refresh the supervisor's OTHER recovery anchor: the lease. The sign-of-life event above
+		// only outranks a stale window_gone (db.ReclaimWindowGone); a worker resumed in place after
+		// a long pause can ALSO hold a lease that lapsed during the downtime, which the lease-expiry
+		// sweep (db.ReclaimExpiredLeases) would read as ground-truth death and reclaim — the same
+		// spurious, bounded restart of a now-live worker. Pushing the held lease forward to
+		// now+DefaultLeaseDuration restores the worker's lease anchor so the sweep skips it.
+		// ExtendLease is a no-op when no lease is held, so it is safe for any restored worker, and
+		// it does NOT mask a genuine crash: a worker that dies after the resume stops heartbeating,
+		// its refreshed lease lapses again, and the sweep reclaims it as before. Best-effort like
+		// the append — the window is already rebuilt and the worker resuming — so a failure is
+		// surfaced and carried, never aborting the restore.
+		if err := m.Store.ExtendLease(context.Background(), t.ID); err != nil {
+			fmt.Fprintf(os.Stderr, "ttorch: could not refresh the resume lease anchor for %s: %v\n", t.ID, err)
+		}
 		notes = append(notes, "restored "+t.ID)
 	}
 	return notes

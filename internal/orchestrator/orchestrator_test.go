@@ -625,6 +625,112 @@ func TestRestoreRefreshesWindowGoneAnchor(t *testing.T) {
 	}
 }
 
+// TestRestoreRefreshesLeaseAnchor proves the resume path closes the supervisor's OTHER recovery
+// boundary: the lease-expiry sweep (db.ReclaimExpiredLeases). That sweep is purely
+// timestamp-based — it reads no sign-of-life event (unlike ReclaimWindowGone) — so the
+// window-gone anchor refresh alone does not protect a resumed worker whose lease lapsed during
+// a long pause. restore() must therefore extend the lease itself. A worker rebuilt in place
+// (L1) has its still-held but lapsed lease pushed forward, so the sweep skips it; a worker that
+// restore did NOT rebuild because its window still lingered while it stopped heartbeating (L2 —
+// a worker that hung/died after an earlier resume) keeps its lapsed lease and is reclaimed. One
+// ReclaimExpiredLeases call proves both: refreshed-worker-not-reclaimed and
+// died-after-resume-still-reclaimed.
+//
+// Hermetic via fakeTmux: the fake reports "manager" and L2's window as present (so restore skips
+// both) while L1's window is absent (so restore rebuilds it, exercising the real refresh path).
+// Real-clock safe via past-stamped expiries (no clock seam needed, mirroring the scheduler
+// tests' addExpiredLeaseWorker) — a refreshed lease lands at now+DefaultLeaseDuration, far
+// enough ahead that the immediate sweep sees it unexpired.
+func TestRestoreRefreshesLeaseAnchor(t *testing.T) {
+	fakeTmux(t, "manager")
+	// Report BOTH "manager" and L2's window as present (newline-joined): restore skips a worker
+	// whose window already exists, so it rebuilds — and refreshes — only L1.
+	t.Setenv("TTORCH_FAKE_WINDOW", "manager\nwk-L2")
+	store, err := db.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	ctx := context.Background()
+	m := &Manager{Session: "ttorch-restore-lease", Store: store}
+
+	proj, err := store.UpsertProject(ctx, "/repo", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-time.Hour)
+	// L1: an active worker whose lease lapsed during the pause, window now absent, worktree
+	// present — the resume-in-place case. Without the refresh, restore would revive it yet the
+	// next lease sweep would reclaim the live worker the instant it came back.
+	if _, err := store.CreateTask(ctx, db.Task{
+		ID: "L1", ProjectID: proj.ID, Status: db.StatusActive, Kind: db.KindShip,
+		Owner: "worker:L1", Window: "wk-L1", Worktree: t.TempDir(),
+		LeaseOwner: "worker:L1", LeaseExpiresAt: &past,
+	}, db.ActorManager); err != nil {
+		t.Fatal(err)
+	}
+	// L2: an active worker that was resumed earlier (its window still lingers) but then stopped
+	// heartbeating — its lease lapsed. restore skips it (window present), so the lease sweep must
+	// still reclaim it: the refresh must not globally disable recovery.
+	if _, err := store.CreateTask(ctx, db.Task{
+		ID: "L2", ProjectID: proj.ID, Status: db.StatusActive, Kind: db.KindShip,
+		Owner: "worker:L2", Window: "wk-L2", Worktree: t.TempDir(),
+		LeaseOwner: "worker:L2", LeaseExpiresAt: &past,
+	}, db.ActorManager); err != nil {
+		t.Fatal(err)
+	}
+
+	notes := m.restore()
+	restoredL1, touchedL2 := false, false
+	for _, n := range notes {
+		if n == "restored L1" {
+			restoredL1 = true
+		}
+		if n == "restored L2" {
+			touchedL2 = true
+		}
+	}
+	if !restoredL1 {
+		t.Fatalf("restore did not rebuild the resumed worker L1; notes=%v", notes)
+	}
+	if touchedL2 {
+		t.Fatalf("restore must skip L2 (its window still exists), but rebuilt it; notes=%v", notes)
+	}
+
+	// restore must have pushed L1's lease forward (the worker is live again); L2's lapsed lease
+	// must be untouched (restore never rebuilt it).
+	l1, _, err := store.GetTask(ctx, "L1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l1.LeaseExpiresAt == nil || !l1.LeaseExpiresAt.After(time.Now()) {
+		t.Fatalf("L1 lease_expires_at = %v, want refreshed into the future", l1.LeaseExpiresAt)
+	}
+	l2, _, err := store.GetTask(ctx, "L2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l2.LeaseExpiresAt == nil || l2.LeaseExpiresAt.After(time.Now()) {
+		t.Fatalf("L2 lease_expires_at = %v, want still lapsed (restore must not touch a skipped worker)", l2.LeaseExpiresAt)
+	}
+
+	// The sweep: AC1 — the refreshed worker L1 is NOT reclaimed; AC2 — the died-after-resume
+	// worker L2 IS reclaimed (back to pending for re-dispatch).
+	out, err := store.ReclaimExpiredLeases(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1 || out[0].TaskID != "L2" {
+		t.Fatalf("lease sweep must reclaim only L2, got %+v", out)
+	}
+	if tk, _, _ := store.GetTask(ctx, "L1"); tk.Status != db.StatusActive {
+		t.Errorf("L1 status = %q, want still active (the resumed worker is live)", tk.Status)
+	}
+	if tk, _, _ := store.GetTask(ctx, "L2"); tk.Status != db.StatusPending {
+		t.Errorf("L2 status = %q, want pending (reclaimed after it died post-resume)", tk.Status)
+	}
+}
+
 func TestTeardownRefusesDirtyWorktree(t *testing.T) {
 	if !tmux.Available() {
 		t.Skip("tmux not installed")
