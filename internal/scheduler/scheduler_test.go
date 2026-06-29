@@ -41,6 +41,11 @@ type fakeFleet struct {
 	record     func(id string)  // shared sink for the cross-instance race tests
 	statusErr  error            // forced Status (live-fleet read) failure — the fail-closed abort path
 	overlapErr error            // forced CheckOverlap (board read) failure — the fail-closed refuse path
+
+	panes   map[string]string // pane content Peek returns, by task id (idle-nudge tests)
+	peekErr map[string]error  // per-task forced Peek failure (e.g. a gone window)
+	sendErr map[string]error  // per-task forced Send failure
+	sends   []string          // task ids Send was called on, in order
 }
 
 func (f *fakeFleet) Status() ([]db.Task, error) {
@@ -124,6 +129,54 @@ func (f *fakeFleet) landedIDs() []string {
 	out := make([]string, len(f.landed))
 	copy(out, f.landed)
 	return out
+}
+
+// Peek returns the configured pane for a task (the idle-nudge pass's observation seam),
+// or a forced error standing in for a gone/unreadable window.
+func (f *fakeFleet) Peek(taskID string, lines int) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.peekErr[taskID]; err != nil {
+		return "", err
+	}
+	return f.panes[taskID], nil
+}
+
+// Send records a nudge ATTEMPT into a worker's pane (the seam the idle-nudge pass drives) and
+// then returns any forced error standing in for a refused/dead-window send. The attempt is
+// recorded even on a forced error so a test can assert the send was tried (record-then-send).
+func (f *fakeFleet) Send(taskID, text string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sends = append(f.sends, taskID)
+	if f.record != nil {
+		f.record(taskID)
+	}
+	return f.sendErr[taskID]
+}
+
+// setPane updates the pane Peek will return for a task — used between ticks to model a worker
+// reacting to a nudge (or staying frozen).
+func (f *fakeFleet) setPane(id, pane string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.panes == nil {
+		f.panes = map[string]string{}
+	}
+	f.panes[id] = pane
+}
+
+// sendCount reports how many times Send targeted id.
+func (f *fakeFleet) sendCount(id string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, s := range f.sends {
+		if s == id {
+			n++
+		}
+	}
+	return n
 }
 
 // --- test fixtures ----------------------------------------------------------------
@@ -1240,5 +1293,491 @@ func TestRunTickSupervisesOnlyWhenEnabled(t *testing.T) {
 	on.runTick(ctx)
 	if status(t, s, "g1") != db.StatusPending {
 		t.Fatalf("a tick with supervise enabled left g1 %q, want pending (reclaimed)", status(t, s, "g1"))
+	}
+}
+
+// --- idle-nudge pass (alive-but-idle recovery, §roadmap H2) ----------------------
+
+const (
+	idleNudgePane = "│ > Try \"edit this file\"                 │" // turn ended, sitting at the prompt
+	busyNudgePane = "✶ Working… (12s · esc to interrupt)"          // mid-turn, must never be nudged
+	shellNudge    = "go: command failed\nbrian@host ~/repo $ "     // crashed to a shell — not at the prompt
+)
+
+// addActiveLeasedWorker creates an active, briefed worker with an explicit window, lease
+// expiry, and last_progress_at — the building block for the idle-nudge edge cases (manager
+// window, expired lease). appendSpawned mirrors the dispatch audit event so the freshness
+// anchor (spawned OR worker heartbeat) is present, exactly as a real dispatch leaves it.
+func addActiveLeasedWorker(t *testing.T, s *db.Store, repo, id, window string, leaseExpiry, progress time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	proj, err := s.UpsertProject(ctx, repo, "")
+	if err != nil {
+		t.Fatalf("UpsertProject: %v", err)
+	}
+	if _, err := s.CreateTask(ctx, db.Task{
+		ID: id, ProjectID: proj.ID, Status: db.StatusActive, Kind: db.KindShip,
+		Owner: "worker:" + id, Window: window, Footprint: []string{"pkg/" + id},
+		LeaseOwner: "worker:" + id, LeaseExpiresAt: &leaseExpiry,
+		LastProgressAt: &progress, HasBrief: true,
+	}, db.ActorManager); err != nil {
+		t.Fatalf("CreateTask %s: %v", id, err)
+	}
+	appendSpawned(t, s, id)
+}
+
+// addIdleWorker is the common alive-but-idle candidate: a live window, a VALID (future) lease,
+// and a last_progress_at the caller controls (backdate it past the grace period to make the
+// worker nudge-eligible, or keep it recent to model a worker that just reported).
+func addIdleWorker(t *testing.T, s *db.Store, repo, id string, progress time.Time) {
+	t.Helper()
+	addActiveLeasedWorker(t, s, repo, id, "wk-"+id, time.Now().Add(time.Hour), progress)
+}
+
+func newIdleScheduler(s *db.Store, f *fakeFleet, log *bytes.Buffer, grace time.Duration, maxNudges int) *Scheduler {
+	sc := &Scheduler{
+		Store: s, Fleet: f, Pool: worktree.Pool{Max: 100},
+		IdleNudgeGrace: grace, MaxIdleNudges: maxNudges,
+	}
+	if log != nil { // leave Log as a nil interface (not a typed-nil) so logf's nil-guard holds
+		sc.Log = log
+	}
+	return sc
+}
+
+// TestNudgeIdle_NudgesAliveIdleOnce is the headline path: an alive worker (live window, valid
+// lease, status active) idle at the prompt past the grace period is nudged exactly once; a
+// second tick before any fresh activity does NOT re-nudge.
+func TestNudgeIdle_NudgesAliveIdleOnce(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	addIdleWorker(t, s, "/repo", "w1", time.Now().Add(-10*time.Minute)) // idle 10m
+	var log bytes.Buffer
+	f := &fakeFleet{panes: map[string]string{"w1": idleNudgePane}}
+	sc := newIdleScheduler(s, f, &log, 3*time.Minute, 2)
+
+	n, err := sc.RunNudgeIdleOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunNudgeIdleOnce: %v", err)
+	}
+	if n != 1 || f.sendCount("w1") != 1 {
+		t.Fatalf("first tick: nudged=%d sends=%d, want 1/1", n, f.sendCount("w1"))
+	}
+	if status(t, s, "w1") != db.StatusActive {
+		t.Errorf("status = %q after nudge, want active (a nudge never changes status)", status(t, s, "w1"))
+	}
+	if !strings.Contains(log.String(), "nudged idle worker w1") {
+		t.Errorf("missing nudge log; got %q", log.String())
+	}
+
+	// Second tick, SAME pane, no fresh activity → must NOT re-nudge.
+	n, err = sc.RunNudgeIdleOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunNudgeIdleOnce 2: %v", err)
+	}
+	if n != 0 || f.sendCount("w1") != 1 {
+		t.Fatalf("second tick re-nudged: nudged=%d sends=%d, want 0/1", n, f.sendCount("w1"))
+	}
+}
+
+// TestNudgeIdle_SkipsBlockedAndNeedsInput proves a worker that reported blocked/needs_input —
+// a manager decision — is never auto-nudged, while a sibling idle active worker still is.
+func TestNudgeIdle_SkipsBlockedAndNeedsInput(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	past := time.Now().Add(-10 * time.Minute)
+	addIdleWorker(t, s, "/repo", "a", past)
+	addIdleWorker(t, s, "/repo", "b", past)
+	addIdleWorker(t, s, "/repo", "c", past)
+	if _, err := s.ReportStatus(ctx, "b", db.StatusBlocked, "worker:b", "stuck on X"); err != nil {
+		t.Fatalf("ReportStatus blocked: %v", err)
+	}
+	if _, err := s.ReportStatus(ctx, "c", db.StatusNeedsInput, "worker:c", "which API?"); err != nil {
+		t.Fatalf("ReportStatus needs_input: %v", err)
+	}
+	f := &fakeFleet{panes: map[string]string{"a": idleNudgePane, "b": idleNudgePane, "c": idleNudgePane}}
+	sc := newIdleScheduler(s, f, nil, 3*time.Minute, 2)
+
+	if _, err := sc.RunNudgeIdleOnce(ctx); err != nil {
+		t.Fatalf("RunNudgeIdleOnce: %v", err)
+	}
+	if f.sendCount("a") != 1 {
+		t.Errorf("active idle worker a nudged %d times, want 1", f.sendCount("a"))
+	}
+	if f.sendCount("b") != 0 || f.sendCount("c") != 0 {
+		t.Errorf("blocked/needs_input nudged (b=%d c=%d), want 0/0 — those are the manager's", f.sendCount("b"), f.sendCount("c"))
+	}
+}
+
+// TestNudgeIdle_SkipsBusyWorker proves a worker mid-turn (a busy pane) is never nudged, no
+// matter how long since its last report.
+func TestNudgeIdle_SkipsBusyWorker(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	addIdleWorker(t, s, "/repo", "w1", time.Now().Add(-time.Hour)) // long since a report
+	f := &fakeFleet{panes: map[string]string{"w1": busyNudgePane}}
+	sc := newIdleScheduler(s, f, nil, 3*time.Minute, 2)
+
+	n, err := sc.RunNudgeIdleOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunNudgeIdleOnce: %v", err)
+	}
+	if n != 0 || f.sendCount("w1") != 0 {
+		t.Fatalf("busy worker nudged: n=%d sends=%d, want 0/0", n, f.sendCount("w1"))
+	}
+}
+
+// TestNudgeIdle_SkipsRecentlyActive proves the grace gate: a worker idle at the prompt but
+// whose last report is WITHIN the grace period is not yet nudged (a slow-but-working turn).
+func TestNudgeIdle_SkipsRecentlyActive(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	addIdleWorker(t, s, "/repo", "w1", time.Now()) // just reported
+	f := &fakeFleet{panes: map[string]string{"w1": idleNudgePane}}
+	sc := newIdleScheduler(s, f, nil, 3*time.Minute, 2)
+
+	n, err := sc.RunNudgeIdleOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunNudgeIdleOnce: %v", err)
+	}
+	if n != 0 || f.sendCount("w1") != 0 {
+		t.Fatalf("recently-active worker nudged: n=%d sends=%d, want 0/0", n, f.sendCount("w1"))
+	}
+}
+
+// TestNudgeIdle_SkipsNonPromptPane proves a pane that is NOT at the input prompt (a crash to a
+// shell) is never injected into, even though it is not busy.
+func TestNudgeIdle_SkipsNonPromptPane(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	addIdleWorker(t, s, "/repo", "w1", time.Now().Add(-10*time.Minute))
+	f := &fakeFleet{panes: map[string]string{"w1": shellNudge}}
+	sc := newIdleScheduler(s, f, nil, 3*time.Minute, 2)
+
+	if _, err := sc.RunNudgeIdleOnce(ctx); err != nil {
+		t.Fatalf("RunNudgeIdleOnce: %v", err)
+	}
+	if f.sendCount("w1") != 0 {
+		t.Fatalf("non-prompt pane nudged %d times, want 0", f.sendCount("w1"))
+	}
+}
+
+// TestNudgeIdle_StopsAfterMaxNudges proves the restart-storm bound: a worker that keeps going
+// idle (a changing pane) after each nudge is nudged at most MaxIdleNudges times, after which
+// the pass logs the give-up ONCE and stays silent.
+func TestNudgeIdle_StopsAfterMaxNudges(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	addIdleWorker(t, s, "/repo", "w1", time.Now().Add(-10*time.Minute))
+	var log bytes.Buffer
+	f := &fakeFleet{panes: map[string]string{"w1": "screen-1\n│ > "}}
+	sc := newIdleScheduler(s, f, &log, 0, 2) // grace 0: the cap, not spacing, is under test
+
+	// Three episodes (each a fresh idle screen): nudge, nudge, then STOP.
+	for i, screen := range []string{"screen-1\n│ > ", "screen-2\n│ > ", "screen-3\n│ > "} {
+		f.setPane("w1", screen)
+		if _, err := sc.RunNudgeIdleOnce(ctx); err != nil {
+			t.Fatalf("tick %d: %v", i+1, err)
+		}
+	}
+	if f.sendCount("w1") != 2 {
+		t.Fatalf("sends = %d, want 2 (capped at MaxIdleNudges)", f.sendCount("w1"))
+	}
+	if !strings.Contains(log.String(), "idle worker w1: nudged 2x, no progress — leaving for manager") {
+		t.Fatalf("missing give-up log; got %q", log.String())
+	}
+
+	// A further tick on yet another fresh idle screen must NOT nudge and must NOT re-log.
+	f.setPane("w1", "screen-4\n│ > ")
+	if _, err := sc.RunNudgeIdleOnce(ctx); err != nil {
+		t.Fatalf("tick 4: %v", err)
+	}
+	if f.sendCount("w1") != 2 {
+		t.Fatalf("sends = %d after cap, want 2 (no further nudges)", f.sendCount("w1"))
+	}
+	if got := strings.Count(log.String(), "leaving for manager"); got != 1 {
+		t.Fatalf("give-up logged %d times, want exactly 1 (no spam)", got)
+	}
+}
+
+// TestNudgeIdle_FreshActivityResetsBudget proves a worker that shows fresh activity (a
+// heartbeat) after being nudged starts a clean episode — the consecutive-nudge budget is
+// replenished, so a later idle stretch is nudged again.
+func TestNudgeIdle_FreshActivityResetsBudget(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	addIdleWorker(t, s, "/repo", "w1", time.Now().Add(-10*time.Minute))
+	f := &fakeFleet{panes: map[string]string{"w1": "screen-1\n│ > "}}
+	sc := newIdleScheduler(s, f, nil, 0, 1) // budget of ONE per episode
+
+	if _, err := sc.RunNudgeIdleOnce(ctx); err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+	// Without fresh activity the budget (1) is spent: a new idle screen would NOT re-nudge.
+	if f.sendCount("w1") != 1 {
+		t.Fatalf("after first tick sends=%d, want 1", f.sendCount("w1"))
+	}
+	// Worker shows a fresh heartbeat → new episode.
+	if _, err := s.SetStage(ctx, "w1", "back to work", "worker:w1"); err != nil {
+		t.Fatalf("SetStage heartbeat: %v", err)
+	}
+	f.setPane("w1", "screen-2\n│ > ")
+	if _, err := sc.RunNudgeIdleOnce(ctx); err != nil {
+		t.Fatalf("tick 2: %v", err)
+	}
+	if f.sendCount("w1") != 2 {
+		t.Fatalf("after fresh activity sends=%d, want 2 (budget replenished)", f.sendCount("w1"))
+	}
+}
+
+// TestNudgeIdle_SkipsExpiredLeaseAndManagerWindow proves the pass never nudges a worker whose
+// lease has lapsed (the reclaim pass owns it) nor the manager window (not the worker fleet).
+func TestNudgeIdle_SkipsExpiredLeaseAndManagerWindow(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	past := time.Now().Add(-10 * time.Minute)
+	addActiveLeasedWorker(t, s, "/repo", "expired", "wk-expired", time.Now().Add(-time.Hour), past) // lease lapsed
+	addActiveLeasedWorker(t, s, "/repo", "mgr", "manager", time.Now().Add(time.Hour), past)         // manager window
+	f := &fakeFleet{panes: map[string]string{"expired": idleNudgePane, "mgr": idleNudgePane}}
+	sc := newIdleScheduler(s, f, nil, 3*time.Minute, 2)
+
+	if _, err := sc.RunNudgeIdleOnce(ctx); err != nil {
+		t.Fatalf("RunNudgeIdleOnce: %v", err)
+	}
+	if f.sendCount("expired") != 0 {
+		t.Errorf("expired-lease worker nudged %d times, want 0 (reclaim owns it)", f.sendCount("expired"))
+	}
+	if f.sendCount("mgr") != 0 {
+		t.Errorf("manager window nudged %d times, want 0", f.sendCount("mgr"))
+	}
+}
+
+// TestNudgeIdle_Disabled proves MaxIdleNudges <= 0 disables the pass entirely (a no-op even on
+// a perfectly nudge-eligible worker).
+func TestNudgeIdle_Disabled(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	addIdleWorker(t, s, "/repo", "w1", time.Now().Add(-10*time.Minute))
+	f := &fakeFleet{panes: map[string]string{"w1": idleNudgePane}}
+	sc := newIdleScheduler(s, f, nil, 3*time.Minute, 0) // disabled
+
+	n, err := sc.RunNudgeIdleOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunNudgeIdleOnce: %v", err)
+	}
+	if n != 0 || f.sendCount("w1") != 0 {
+		t.Fatalf("disabled pass acted: n=%d sends=%d, want 0/0", n, f.sendCount("w1"))
+	}
+}
+
+// TestNudgeIdle_PeekErrorSkipped proves an unreadable/gone window is skipped (not nudged, not
+// fatal) — the window-gone reclaim path owns a dead window, not the nudge pass.
+func TestNudgeIdle_PeekErrorSkipped(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	addIdleWorker(t, s, "/repo", "gone", time.Now().Add(-10*time.Minute))
+	addIdleWorker(t, s, "/repo", "ok", time.Now().Add(-10*time.Minute))
+	f := &fakeFleet{
+		panes:   map[string]string{"ok": idleNudgePane},
+		peekErr: map[string]error{"gone": errors.New("no window")},
+	}
+	sc := newIdleScheduler(s, f, nil, 3*time.Minute, 2)
+
+	n, err := sc.RunNudgeIdleOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunNudgeIdleOnce: %v", err)
+	}
+	if n != 1 || f.sendCount("ok") != 1 || f.sendCount("gone") != 0 {
+		t.Fatalf("peek-error handling wrong: n=%d ok=%d gone=%d, want 1/1/0", n, f.sendCount("ok"), f.sendCount("gone"))
+	}
+}
+
+// TestNudgeIdle_SendFailureRecordedNoReSend proves the record-then-send safety: when the send
+// fails, the nudge is STILL recorded (the claim committed first), so the next tick on the same
+// idle screen does NOT re-nudge — under-nudge beats re-nudge-storming a wedged pane.
+func TestNudgeIdle_SendFailureRecordedNoReSend(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	addIdleWorker(t, s, "/repo", "w1", time.Now().Add(-10*time.Minute))
+	f := &fakeFleet{
+		panes:   map[string]string{"w1": idleNudgePane},
+		sendErr: map[string]error{"w1": errors.New("tmux send failed")},
+	}
+	sc := newIdleScheduler(s, f, nil, 0, 2)
+
+	n, err := sc.RunNudgeIdleOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunNudgeIdleOnce: %v", err)
+	}
+	if n != 0 || f.sendCount("w1") != 1 {
+		t.Fatalf("first tick: nudged=%d sends(attempted)=%d, want 0/1", n, f.sendCount("w1"))
+	}
+	// The claim committed the nudge before the (failed) send — so it is on the spine.
+	info, err := s.IdleNudgeInfo(ctx, "w1")
+	if err != nil {
+		t.Fatalf("IdleNudgeInfo: %v", err)
+	}
+	if info.Count != 1 {
+		t.Fatalf("record-then-send: count=%d, want 1 (the failed send is still recorded)", info.Count)
+	}
+	// Second tick, same idle screen: must NOT re-attempt the send (already nudged this screen).
+	if _, err := sc.RunNudgeIdleOnce(ctx); err != nil {
+		t.Fatalf("RunNudgeIdleOnce 2: %v", err)
+	}
+	if f.sendCount("w1") != 1 {
+		t.Fatalf("second tick re-sent to a wedged pane (attempts=%d, want 1)", f.sendCount("w1"))
+	}
+}
+
+// TestNudgeIdle_StabilityGate proves the consecutive-observation gate: with IdleConfirmations
+// = 2 a single idle observation does NOT nudge; a second consecutive tick at the SAME pane
+// does; and a pane change between observations resets the count so a flickering (working)
+// worker never crosses the threshold.
+func TestNudgeIdle_StabilityGate(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	addIdleWorker(t, s, "/repo", "w1", time.Now().Add(-10*time.Minute))
+	f := &fakeFleet{panes: map[string]string{"w1": "screen-A\n│ > "}}
+	sc := newIdleScheduler(s, f, nil, 0, 2)
+	sc.IdleConfirmations = 2
+
+	// First idle observation: not yet stable → no nudge.
+	if _, err := sc.RunNudgeIdleOnce(ctx); err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+	if f.sendCount("w1") != 0 {
+		t.Fatalf("nudged on the FIRST idle observation (sends=%d), want 0", f.sendCount("w1"))
+	}
+	// Pane changes before a second confirmation → count resets, still no nudge.
+	f.setPane("w1", "screen-B\n│ > ")
+	if _, err := sc.RunNudgeIdleOnce(ctx); err != nil {
+		t.Fatalf("tick 2: %v", err)
+	}
+	if f.sendCount("w1") != 0 {
+		t.Fatalf("nudged after a pane CHANGE (sends=%d), want 0 (count must reset)", f.sendCount("w1"))
+	}
+	// Same pane as tick 2 → now two consecutive identical observations → nudge.
+	if _, err := sc.RunNudgeIdleOnce(ctx); err != nil {
+		t.Fatalf("tick 3: %v", err)
+	}
+	if f.sendCount("w1") != 1 {
+		t.Fatalf("did not nudge after two stable observations (sends=%d), want 1", f.sendCount("w1"))
+	}
+}
+
+// TestNudgeIdle_SkipsNonRecoverableAPIError proves a worker sitting at the prompt after a
+// non-recoverable API error (rate-limit/auth) is NOT nudged — "continue" cannot fix it — while
+// a recoverable mid-stream stall (livestate.Stalled) IS nudged, matching the watcher.
+func TestNudgeIdle_SkipsNonRecoverableAPIError(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	past := time.Now().Add(-10 * time.Minute)
+	addIdleWorker(t, s, "/repo", "ratelimited", past)
+	addIdleWorker(t, s, "/repo", "stalled", past)
+	f := &fakeFleet{panes: map[string]string{
+		"ratelimited": "API Error: 429 rate limit exceeded\n│ > ",
+		"stalled":     "API Error: Response stalled mid-stream\n│ > ",
+	}}
+	sc := newIdleScheduler(s, f, nil, 3*time.Minute, 2)
+
+	if _, err := sc.RunNudgeIdleOnce(ctx); err != nil {
+		t.Fatalf("RunNudgeIdleOnce: %v", err)
+	}
+	if f.sendCount("ratelimited") != 0 {
+		t.Errorf("rate-limited worker nudged %d times, want 0 (non-recoverable)", f.sendCount("ratelimited"))
+	}
+	if f.sendCount("stalled") != 1 {
+		t.Errorf("recoverable-stall worker nudged %d times, want 1", f.sendCount("stalled"))
+	}
+}
+
+// TestClaimIdleNudge_AtomicDecision exercises the Store-level atomic claim directly: a worker
+// that changed status (or whose lease lapsed) since the snapshot is NOT claimable, the same
+// idle screen is claimed at most once, a fresh screen re-claims until the budget is spent, and
+// the budget then yields a give-up.
+func TestClaimIdleNudge_AtomicDecision(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	addIdleWorker(t, s, "/repo", "w1", time.Now().Add(-10*time.Minute))
+	// grace 0; each claim reads time.Now() fresh so the grace anchor (which includes the just-
+	// recorded nudge's timestamp) is never in the future relative to the call.
+
+	// First claim on screen h1 → Send (records the nudge).
+	d, _, err := s.ClaimIdleNudge(ctx, "w1", "h1", time.Now(), 0, 2)
+	if err != nil {
+		t.Fatalf("claim 1: %v", err)
+	}
+	if d != db.IdleNudgeSend {
+		t.Fatalf("claim 1 = %v, want Send", d)
+	}
+	// Same screen again → Skip (already nudged this screen, no double-nudge).
+	if d, _, err := s.ClaimIdleNudge(ctx, "w1", "h1", time.Now(), 0, 2); err != nil || d != db.IdleNudgeSkip {
+		t.Fatalf("claim 1b = %v err=%v, want Skip (same screen)", d, err)
+	}
+	// Fresh screen h2, budget (2) not spent → Send.
+	if d, _, err := s.ClaimIdleNudge(ctx, "w1", "h2", time.Now(), 0, 2); err != nil || d != db.IdleNudgeSend {
+		t.Fatalf("claim 2 = %v err=%v, want Send", d, err)
+	}
+	// Fresh screen h3, budget now spent (2 sent) → GiveUp, count reported.
+	d, count, err := s.ClaimIdleNudge(ctx, "w1", "h3", time.Now(), 0, 2)
+	if err != nil || d != db.IdleNudgeGiveUp || count != 2 {
+		t.Fatalf("claim 3 = %v count=%d err=%v, want GiveUp/2", d, count, err)
+	}
+	// Capped: a further claim is a silent Skip (give-up logged once).
+	if d, _, err := s.ClaimIdleNudge(ctx, "w1", "h4", time.Now(), 0, 2); err != nil || d != db.IdleNudgeSkip {
+		t.Fatalf("claim 4 = %v err=%v, want Skip (capped)", d, err)
+	}
+}
+
+// TestClaimIdleNudge_StatusAndLeaseReCheck proves the under-lock re-check drops a worker that
+// is no longer a valid candidate — the guard against the snapshot→claim race where a worker
+// reports blocked/needs_input/done (or its lease lapses) mid-pass.
+func TestClaimIdleNudge_StatusAndLeaseReCheck(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+
+	// Status moved to needs_input since the snapshot → not claimable.
+	s := newStore(t)
+	addIdleWorker(t, s, "/repo", "blk", now.Add(-10*time.Minute))
+	if _, err := s.ReportStatus(ctx, "blk", db.StatusNeedsInput, "worker:blk", "which API?"); err != nil {
+		t.Fatalf("ReportStatus: %v", err)
+	}
+	if d, _, err := s.ClaimIdleNudge(ctx, "blk", "h1", now, 0, 2); err != nil || d != db.IdleNudgeSkip {
+		t.Fatalf("needs_input claim = %v err=%v, want Skip", d, err)
+	}
+
+	// Lease lapsed since the snapshot → not claimable (reclaim owns it).
+	s2 := newStore(t)
+	addActiveLeasedWorker(t, s2, "/repo", "exp", "wk-exp", now.Add(-time.Hour), now.Add(-10*time.Minute))
+	if d, _, err := s2.ClaimIdleNudge(ctx, "exp", "h1", now, 0, 2); err != nil || d != db.IdleNudgeSkip {
+		t.Fatalf("expired-lease claim = %v err=%v, want Skip", d, err)
+	}
+}
+
+// TestRunTickNudgesUnderSupervise proves the idle-nudge pass is wired into the tick under the
+// Supervise gate, AT THE PRODUCTION-DEFAULT stability threshold (IdleConfirmations=2): a tick
+// with Supervise off never nudges; with Supervise on, the stability gate composes with the tick
+// loop — the first tick observes (no nudge) and the second consecutive idle tick nudges.
+func TestRunTickNudgesUnderSupervise(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	addIdleWorker(t, s, "/repo", "w1", time.Now().Add(-10*time.Minute))
+	f := &fakeFleet{panes: map[string]string{"w1": idleNudgePane}}
+
+	off := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}, IdleNudgeGrace: 3 * time.Minute, MaxIdleNudges: 2, IdleConfirmations: defaultIdleConfirmations}
+	off.runTick(ctx) // Supervise=false
+	off.runTick(ctx)
+	if f.sendCount("w1") != 0 {
+		t.Fatalf("idle-nudge ran with Supervise off (sends=%d)", f.sendCount("w1"))
+	}
+
+	on := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}, Supervise: true, IdleNudgeGrace: 3 * time.Minute, MaxIdleNudges: 2, IdleConfirmations: defaultIdleConfirmations}
+	on.runTick(ctx) // first observation under the production-default gate: not yet stable
+	if f.sendCount("w1") != 0 {
+		t.Fatalf("nudged on the first tick despite IdleConfirmations=2 (sends=%d, want 0)", f.sendCount("w1"))
+	}
+	on.runTick(ctx) // second consecutive idle tick: stable → nudge
+	if f.sendCount("w1") != 1 {
+		t.Fatalf("idle-nudge did not run under Supervise after two stable ticks (sends=%d, want 1)", f.sendCount("w1"))
 	}
 }

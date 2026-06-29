@@ -44,6 +44,7 @@ const (
 	EventWindowGone       = "window_gone"
 	EventIdleUnreported   = "idle_unreported"
 	EventAutoResumed      = "auto_resumed"     // watcher nudged an API-stalled worker to continue (§4.4); non-actionable
+	EventIdleNudged       = "idle_nudged"      // scheduler nudged an alive-but-idle worker to continue (§roadmap H2); actor=system, non-actionable; payload=pane hash
 	EventManagerStalled   = "manager_stalled"  // external watchdog re-poke of a stalled manager (§4.7); actionable, entity_type=manager
 	EventLeaseExpired     = "lease_expired"    // a task's lease expired and it was reclaimed to pending (§roadmap 2); actor=system, actionable
 	EventTaskFailed       = "task_failed"      // a reclaimed task hit the retry ceiling ⇒ terminal 'failed' (§roadmap 2); actor=system, actionable

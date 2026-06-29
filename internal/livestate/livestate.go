@@ -12,8 +12,36 @@ import "strings"
 // and `ttorch status`, so the two never disagree.
 func Busy(pane string) bool {
 	low := strings.ToLower(pane)
-	for _, m := range []string{"esc to interrupt", "working…", "working...", "thinking", "generating"} {
+	for _, m := range []string{"esc to interrupt", "working…", "working...", "thinking", "generating", "compacting"} {
 		if strings.Contains(low, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// Idle reports whether a captured pane shows a worker sitting at the Claude Code input
+// prompt with its turn ENDED — the positive complement to Busy. A pane is idle when it
+// is NOT Busy AND shows the input-prompt caret: the "> " the harness renders inside its
+// input box (e.g. `│ > Try "edit this file"`, or a bare `> ` line). Requiring the caret —
+// rather than treating EVERY not-busy pane as idle — is what keeps a nudge from ever being
+// injected into a pane that is not actually waiting for input: a crashed shell prompt
+// (`$ `), a half-rendered frame, or a screen with no input box at all is not idle. The
+// caret is matched only at the START of a line once box-border glyphs and indentation are
+// stripped, so a ">" buried inside ordinary output never counts. A Busy pane is never idle
+// (a worker mid-turn is filtered first), so a genuinely working worker is never mistaken
+// for idle. Kept beside Busy/Stalled so the supervisor's idle-nudge and any future caller
+// share one definition of "idle at the prompt."
+func Idle(pane string) bool {
+	if Busy(pane) {
+		return false
+	}
+	for _, line := range strings.Split(pane, "\n") {
+		// Strip the input box's left/right border glyphs and surrounding whitespace so the
+		// caret that opens the prompt line is exposed; the caret itself (">") is never in
+		// the cutset, so "> Try …" survives as "> Try …".
+		s := strings.TrimSpace(strings.Trim(line, " \t│┃┆┇┊┋╎╏║|"))
+		if s == ">" || strings.HasPrefix(s, "> ") {
 			return true
 		}
 	}

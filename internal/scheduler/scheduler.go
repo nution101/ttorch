@@ -52,12 +52,17 @@ package scheduler
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/nution101/ttorch/internal/db"
+	"github.com/nution101/ttorch/internal/livestate"
 	"github.com/nution101/ttorch/internal/orchestrator"
 	"github.com/nution101/ttorch/internal/review"
 	"github.com/nution101/ttorch/internal/state"
@@ -68,6 +73,39 @@ import (
 // dispatch every 5s. Generous enough that a tick is cheap and the DB is barely touched when
 // nothing is ready, tight enough that freshly-added disjoint backlog dispatches promptly.
 const DefaultInterval = 5 * time.Second
+
+// Idle-nudge defaults (the alive-but-idle recovery pass, §roadmap H2). The grace period is
+// deliberately on the order of minutes: a worker that merely paused between sub-steps, or is
+// thinking with no busy indicator yet, must NEVER be nudged — only one whose turn has been
+// idle at the prompt for longer than any plausible brief pause. The max-nudge count is a
+// small restart-storm bound: after this many consecutive nudges fail to revive a worker, the
+// pass falls silent and leaves it for the manager or lease expiry, never spamming a wedged
+// pane. Both are overridable via TTORCH_IDLE_NUDGE_GRACE (a Go duration) and
+// TTORCH_MAX_IDLE_NUDGES; a max of 0 (or negative) DISABLES the pass entirely.
+const (
+	defaultIdleNudgeGrace = 3 * time.Minute
+	defaultMaxIdleNudges  = 2
+
+	// defaultIdleConfirmations requires a worker to be observed idle at the same pane for two
+	// consecutive ticks before the first nudge — a single transient not-busy frame never fires.
+	defaultIdleConfirmations = 2
+
+	// idleCaptureLines is how many trailing pane lines the idle-nudge pass reads — enough to
+	// contain the harness's input box (so the prompt caret is visible) plus any busy/stall
+	// marker above it. It mirrors the watcher's small capture window.
+	idleCaptureLines = 12
+
+	// managerWindow is the tmux window the manager session runs in; the idle-nudge pass never
+	// inspects or injects into it (it is not part of the autonomous worker fleet).
+	managerWindow = "manager"
+
+	// idleNudgeText is the message typed into an idle worker's pane — the same single word a
+	// manager would `ttorch send` to resume a stalled turn.
+	idleNudgeText = "continue"
+
+	envIdleNudgeGrace = "TTORCH_IDLE_NUDGE_GRACE"
+	envMaxIdleNudges  = "TTORCH_MAX_IDLE_NUDGES"
+)
 
 // Fleet is the orchestrator surface the scheduler drives. *orchestrator.Manager satisfies
 // it; tests substitute a fake so the selection/claim logic runs without tmux or a real
@@ -93,6 +131,15 @@ type Fleet interface {
 	// rather than reimplementing it, so requireVerdict and every approval/verdict/validate
 	// check apply identically.
 	LandSet(ctx context.Context, taskIDs []string, requireVerdict bool) []orchestrator.LandResult
+	// Peek returns the last n lines of a worker's tmux pane (the SAME capture `ttorch peek`
+	// reads). The idle-nudge pass uses it to observe whether an alive worker's turn has ended
+	// at the input prompt. It errors when the task or its window is gone, which the caller
+	// treats as "not observable this tick" (the window-gone reclaim path owns a dead window).
+	Peek(taskID string, lines int) (string, error)
+	// Send types a line into a worker's pane — the SAME mechanism `ttorch send` uses. The
+	// idle-nudge pass calls it with "continue" to resume an alive-but-idle worker. It refuses
+	// (errors) when the worker has no live window, so a nudge is never injected into a dead one.
+	Send(taskID, text string) error
 }
 
 // Scheduler is the dispatch loop. Store is the task board (ready selection + atomic claim),
@@ -119,6 +166,41 @@ type Scheduler struct {
 	Dispatch  bool
 	Land      bool
 	Supervise bool
+
+	// IdleNudgeGrace and MaxIdleNudges configure the alive-but-idle recovery pass that runs
+	// inside Supervise (§roadmap H2). An alive worker (live window, valid lease, status
+	// 'active') whose pane has sat idle at the prompt longer than IdleNudgeGrace is nudged
+	// once with "continue"; MaxIdleNudges bounds how many consecutive nudges an unrevived
+	// worker receives before the pass stands down. Both are zero by default on a bare struct
+	// (so the pass is OFF unless explicitly configured — existing tests and any hand-built
+	// Scheduler see no new behavior); New() populates them from the env-or-default. A
+	// MaxIdleNudges <= 0 disables the pass.
+	IdleNudgeGrace time.Duration
+	MaxIdleNudges  int
+
+	// IdleConfirmations is how many CONSECUTIVE ticks a worker must be observed idle at the
+	// SAME pane before the first nudge — the stability gate that keeps a single transient
+	// not-busy capture (e.g. a mid-compaction frame of a working worker) from ever triggering
+	// a send. <1 is treated as 1 (nudge on first idle observation). New() sets it to 2.
+	IdleConfirmations int
+
+	// idleSeen tracks, per task, the last idle pane hash observed and how many consecutive
+	// ticks it has held — the in-memory backing for the IdleConfirmations stability gate. It is
+	// touched only from the (single-threaded) tick loop, so it needs no lock; it is best-effort
+	// across a daemon restart (a restart just costs one extra confirmation tick). nil until the
+	// first idle-nudge pass lazily initializes it.
+	idleSeen map[string]idleObservation
+
+	// now returns the current time; nil means time.Now. It is the single clock the idle-nudge
+	// pass reads so a test can drive grace deterministically without sleeping.
+	now func() time.Time
+}
+
+// idleObservation is one task's idle-stability state: the last idle pane hash seen and how
+// many consecutive ticks it has been observed unchanged.
+type idleObservation struct {
+	hash  string
+	count int
 }
 
 // New builds the production Scheduler from a Manager: it dispatches through the manager's
@@ -132,7 +214,34 @@ func New(m *orchestrator.Manager, interval time.Duration, log io.Writer) *Schedu
 		Interval: interval,
 		Log:      log,
 		Dispatch: true, // dispatch is the default pass; the CLI may toggle it and enable Land
+
+		IdleNudgeGrace:    idleNudgeGraceFromEnv(),
+		MaxIdleNudges:     maxIdleNudgesFromEnv(),
+		IdleConfirmations: defaultIdleConfirmations,
 	}
+}
+
+// idleNudgeGraceFromEnv resolves the idle-nudge grace period from TTORCH_IDLE_NUDGE_GRACE
+// (a Go duration like "5m"), falling back to defaultIdleNudgeGrace when unset or unparseable.
+func idleNudgeGraceFromEnv() time.Duration {
+	if v := strings.TrimSpace(os.Getenv(envIdleNudgeGrace)); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return defaultIdleNudgeGrace
+}
+
+// maxIdleNudgesFromEnv resolves the consecutive-nudge ceiling from TTORCH_MAX_IDLE_NUDGES,
+// falling back to defaultMaxIdleNudges when unset or unparseable. A configured value of 0
+// (or negative) is honored as "disable the idle-nudge pass".
+func maxIdleNudgesFromEnv() int {
+	if v := strings.TrimSpace(os.Getenv(envMaxIdleNudges)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return defaultMaxIdleNudges
 }
 
 // Run drives RunOnce on a ticker until ctx is cancelled, then returns ctx.Err(). The first
@@ -177,6 +286,18 @@ func (sc *Scheduler) runTick(ctx context.Context) {
 			}
 		} else if n > 0 {
 			sc.logf("tick reclaimed %d task(s) for retry", n)
+		}
+		if ctx.Err() == nil {
+			// Idle-nudge runs after reclaim: a worker the reclaim pass just moved off 'active'
+			// (a dead window/expired lease) is no longer a nudge candidate, so the two never
+			// act on the same task in one tick.
+			if n, err := sc.RunNudgeIdleOnce(ctx); err != nil {
+				if ctx.Err() == nil {
+					sc.logf("idle-nudge tick error: %v", err)
+				}
+			} else if n > 0 {
+				sc.logf("tick nudged %d idle worker(s)", n)
+			}
 		}
 	}
 	if ctx.Err() != nil {
@@ -536,6 +657,204 @@ func (sc *Scheduler) logReclaims(outcomes []db.ReclaimOutcome, cause string) int
 		reclaimed++
 	}
 	return reclaimed
+}
+
+// RunNudgeIdleOnce performs one idle-nudge pass and returns how many alive-but-idle workers
+// it nudged. It is the alive-but-idle complement to RunSuperviseOnce's verifiable-death
+// recovery (§roadmap H2): a worker can be perfectly alive — its tmux window present, its lease
+// valid — yet sit IDLE at the input prompt because its harness turn simply ended at an empty
+// prompt (a finished sub-step waiting for input that, in the autonomous path, no human will
+// type). Such a worker holds its pool slot and lease for the FULL lease window while making no
+// progress. This pass nudges it ONCE per idle episode with "continue" — the same resume a
+// manager would `ttorch send` by hand — so the autonomous fleet self-heals instead of
+// stranding the slot until the lease finally lapses.
+//
+// It is deliberately conservative; a worker is nudged ONLY when ALL hold (see nudgeIfIdle):
+//
+//   - it is status 'active' — so a worker that reported blocked/needs_input/done (a decision
+//     the MANAGER owns) is out of scope, never nudged — and non-cc (the lead-driven sessions
+//     are not the scheduler's to drive), and not the manager window;
+//   - it holds a VALID lease (an expired/absent lease is the reclaim pass's job, not a nudge's)
+//     and has reported progress at least once (a last_progress_at to time the idle stretch);
+//   - its pane is observable AND idle at the prompt (livestate.Idle: NOT busy AND showing the
+//     input caret), and NOT showing a non-recoverable API error — a working, half-rendered,
+//     crashed-to-shell, or rate-limited/auth-failed pane is never injected into;
+//   - it has been observed idle at the SAME pane for IdleConfirmations consecutive ticks (the
+//     stability gate), so a single transient not-busy frame of a working worker never fires;
+//   - it has been idle past IdleNudgeGrace (timed from the later of last_progress_at and the
+//     last nudge, so a brief inter-step pause and a just-nudged worker are both spared);
+//   - this exact idle screen has not already been nudged (pane hash differs from the last
+//     idle_nudged) and the consecutive-nudge budget (MaxIdleNudges) is not spent.
+//
+// The decision-and-record step is ATOMIC: Store.ClaimIdleNudge re-derives the predicate and
+// records the idle_nudged event inside one BEGIN IMMEDIATE transaction (mirroring ClaimTask /
+// the reclaim paths), re-reading status + lease under the write lock. That is what makes
+// "once per episode" and the bounded budget hold across a daemon restart AND across two
+// instances against one DB, and what closes the race where a worker reports
+// blocked/needs_input/done between this pass's active-task snapshot and the send. The pass is
+// a no-op (returns 0) when disabled (MaxIdleNudges <= 0), when nothing is active, or when
+// nothing is idle. A per-task pane-capture or send failure is non-fatal (that worker is
+// skipped); only a DB error aborts the pass, which the next tick re-derives from scratch.
+func (sc *Scheduler) RunNudgeIdleOnce(ctx context.Context) (int, error) {
+	if sc.MaxIdleNudges <= 0 {
+		return 0, nil // idle-nudge disabled
+	}
+	tasks, err := sc.Store.ListTasks(ctx, db.TaskFilter{
+		Status:      []string{db.StatusActive},
+		ExcludeKind: []string{db.KindCC}, // cc sessions are lead-driven — never auto-nudged
+	})
+	if err != nil {
+		return 0, err
+	}
+	if sc.idleSeen == nil {
+		sc.idleSeen = make(map[string]idleObservation)
+	}
+	now := sc.clock()
+	nudged := 0
+	active := make(map[string]bool, len(tasks))
+	for _, t := range tasks {
+		active[t.ID] = true
+		if err := ctx.Err(); err != nil {
+			return nudged, err
+		}
+		ok, err := sc.nudgeIfIdle(ctx, t, now)
+		if err != nil {
+			return nudged, err
+		}
+		if ok {
+			nudged++
+		}
+	}
+	// Prune stability state for tasks that have left the active set (done/failed/reclaimed), so
+	// the in-memory map never grows without bound across a long-running daemon.
+	for id := range sc.idleSeen {
+		if !active[id] {
+			delete(sc.idleSeen, id)
+		}
+	}
+	return nudged, nil
+}
+
+// nudgeIfIdle evaluates ONE active task and nudges it when it is alive-but-idle past the grace
+// period (see RunNudgeIdleOnce for the full predicate). It returns whether it sent a nudge. A
+// DB read/write error is returned (it aborts the pass, like the reclaim paths); a pane-capture
+// or send failure is non-fatal — that worker is skipped (a failed send is logged) so one dead
+// window never stalls nudging the rest of the fleet.
+//
+// The pane-shape checks (idle/error/stability) run here, from the live capture; the
+// status/lease/grace/budget decision and the record run under a write lock in
+// Store.ClaimIdleNudge, so the act of nudging is atomic and a worker that changed status since
+// the snapshot is dropped.
+func (sc *Scheduler) nudgeIfIdle(ctx context.Context, t db.Task, now time.Time) (bool, error) {
+	// Never the manager window or a window-less task — only the autonomous worker fleet.
+	if t.Window == "" || t.Window == managerWindow {
+		return false, nil
+	}
+	// Valid lease only: an expired/absent lease is the reclaim pass's domain, not a nudge's.
+	// (ClaimIdleNudge re-checks this under the lock; this is the cheap pre-filter.)
+	if t.LeaseExpiresAt == nil || !t.LeaseExpiresAt.After(now) {
+		return false, nil
+	}
+	// Need a progress anchor to time the idle stretch from. A worker that has never reported is
+	// also almost certainly still ramping up (busy), so deferring it costs nothing.
+	if t.LastProgressAt == nil {
+		return false, nil
+	}
+	pane, err := sc.Fleet.Peek(t.ID, idleCaptureLines)
+	if err != nil {
+		sc.forgetIdle(t.ID) // unobservable — reset stability so a later idle run starts fresh
+		return false, nil   // window gone/unreadable — reclaim owns dead windows
+	}
+	if !livestate.Idle(pane) || nonRecoverableError(pane) {
+		// Busy/working, not at the input prompt, or showing a non-recoverable API error
+		// (rate-limit/auth) that "continue" cannot fix — never inject, and reset the stability
+		// count so a transient idle frame must re-stabilize before a nudge.
+		sc.forgetIdle(t.ID)
+		return false, nil
+	}
+	h := hashPane(pane)
+	// Stability gate: require the SAME idle screen across IdleConfirmations consecutive ticks
+	// before acting, so a single transient not-busy capture of a working worker never nudges.
+	if !sc.idleConfirmed(t.ID, h) {
+		return false, nil
+	}
+	// Atomic claim: ClaimIdleNudge re-reads status + lease under a BEGIN IMMEDIATE write lock,
+	// re-derives the grace/budget/already-nudged decision, and records the event — so two
+	// instances never double-nudge and a worker that changed status since the snapshot is
+	// dropped. The event is recorded BEFORE the send (record-then-send); a send that then fails
+	// leaves the worker un-nudged for this screen rather than risking a re-nudge storm.
+	decision, count, err := sc.Store.ClaimIdleNudge(ctx, t.ID, h, now, sc.IdleNudgeGrace, sc.MaxIdleNudges)
+	if err != nil {
+		return false, err
+	}
+	switch decision {
+	case db.IdleNudgeGiveUp:
+		sc.logf("idle worker %s: nudged %dx, no progress — leaving for manager", t.ID, count)
+		return false, nil
+	case db.IdleNudgeSend:
+		if err := sc.Fleet.Send(t.ID, idleNudgeText); err != nil {
+			sc.logf("idle worker %s: nudge send failed (recorded; not re-nudged this screen): %v", t.ID, err)
+			return false, nil
+		}
+		sc.logf("nudged idle worker %s (idle %s)", t.ID, now.Sub(*t.LastProgressAt).Round(time.Second))
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
+// idleConfirmed records one observation that task id is idle at pane hash h, and reports
+// whether it has now been observed idle at the SAME hash for IdleConfirmations consecutive
+// ticks (the stability gate). A changed hash restarts the count at 1.
+func (sc *Scheduler) idleConfirmed(id, h string) bool {
+	obs := sc.idleSeen[id]
+	if obs.hash == h {
+		obs.count++
+	} else {
+		obs = idleObservation{hash: h, count: 1}
+	}
+	sc.idleSeen[id] = obs
+	return obs.count >= sc.idleConfirmations()
+}
+
+// forgetIdle clears a task's idle-stability state — called when it is observed not-idle (or
+// unobservable) so the next idle stretch must re-stabilize before a nudge.
+func (sc *Scheduler) forgetIdle(id string) {
+	delete(sc.idleSeen, id)
+}
+
+// idleConfirmations is the consecutive-observation threshold, with a floor of 1 (so a bare
+// struct that sets only grace/max still nudges on the first idle observation).
+func (sc *Scheduler) idleConfirmations() int {
+	if sc.IdleConfirmations < 1 {
+		return 1
+	}
+	return sc.IdleConfirmations
+}
+
+// nonRecoverableError reports whether an idle pane shows an API error that a "continue" nudge
+// cannot fix — a rate limit, auth failure, or the like. It deliberately EXCLUDES the harness's
+// self-recoverable mid-stream stalls (livestate.Stalled), which "continue" DOES fix, so the
+// scheduler's exclusion matches the watcher's auto-resume inclusion: the two agree on what is
+// safely resumable. A worker showing a non-recoverable error is left for the manager.
+func nonRecoverableError(pane string) bool {
+	return strings.Contains(strings.ToLower(pane), "api error") && !livestate.Stalled(pane)
+}
+
+// clock returns the scheduler's current time (time.Now unless a test injected sc.now).
+func (sc *Scheduler) clock() time.Time {
+	if sc.now != nil {
+		return sc.now()
+	}
+	return time.Now()
+}
+
+// hashPane returns a stable hex digest of a captured pane, used to recognize whether an idle
+// worker's screen has changed since its last nudge. The digest is hex (never the word
+// "capped"), so it can never collide with db.IdleNudgeCappedMarker.
+func hashPane(pane string) string {
+	sum := sha256.Sum256([]byte(pane))
+	return hex.EncodeToString(sum[:])
 }
 
 // overlaps reports whether footprint conflicts with any LIVE worker (Fleet.CheckOverlap,

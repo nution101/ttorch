@@ -1434,6 +1434,15 @@ func cmdScheduler(args []string) error {
 				return err
 			}
 			fmt.Printf("scheduler: reclaimed %d task(s) for retry\n", n)
+			// Idle-nudge runs in the same supervise step as the loop's runTick, so the one-shot
+			// path matches the daemon: nudge alive-but-idle workers after reclaiming dead ones.
+			if ctx.Err() == nil {
+				n, err := sch.RunNudgeIdleOnce(ctx)
+				if err != nil && ctx.Err() == nil {
+					return err
+				}
+				fmt.Printf("scheduler: nudged %d idle worker(s)\n", n)
+			}
 		}
 		if *dispatch && ctx.Err() == nil {
 			n, err := sch.RunOnce(ctx)

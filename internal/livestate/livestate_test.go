@@ -15,6 +15,7 @@ func TestBusy(t *testing.T) {
 		{"working dots", "Working... (3s · esc to cancel)", true},
 		{"thinking", "Thinking about the problem", true},
 		{"generating", "Generating response", true},
+		{"compacting", "Compacting conversation…", true},
 		{"case insensitive", "ESC TO INTERRUPT", true},
 		{"substring inside larger output", "blah blah\nesc to interrupt\nmore", true},
 	}
@@ -22,6 +23,35 @@ func TestBusy(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			if got := Busy(c.pane); got != c.want {
 				t.Errorf("Busy(%q) = %v, want %v", c.pane, got, c.want)
+			}
+		})
+	}
+}
+
+func TestIdle(t *testing.T) {
+	cases := []struct {
+		name string
+		pane string
+		want bool
+	}{
+		{"empty", "", false},
+		{"blank lines only", "\n\n   \n", false},
+		{"boxed idle prompt", "│ > Try \"edit this file\"                    │", true},
+		{"bare caret prompt", "all set\n> ", true},
+		{"boxed empty caret", "╭───────────╮\n│ >         │\n╰───────────╯", true},
+		{"busy is never idle", "│ > something\n✶ Working… (12s · esc to interrupt)", false},
+		{"thinking is never idle", "Thinking about it\n│ > ", false},
+		{"compacting is never idle", "Compacting conversation…\n│ > ", false},
+		{"shell prompt is not idle", "command not found\nbrian@host ~ $ ", false},
+		{"no caret at all", "some output\nmore output", false},
+		{"caret only mid-line never counts", "see the diff -> here", false},
+		{"idle prompt after stall error", "API Error: Response stalled mid-stream\n│ > ", true},
+		{"markdown blockquote in ended turn still idle", "> a quoted line\n│ > ", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := Idle(c.pane); got != c.want {
+				t.Errorf("Idle(%q) = %v, want %v", c.pane, got, c.want)
 			}
 		})
 	}
