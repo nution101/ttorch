@@ -19,6 +19,25 @@ import (
 	"github.com/nution101/ttorch/internal/worktree"
 )
 
+// nowFunc is the wall clock the gate consults for the autonomous auto-mint max-age. It is a
+// package seam (overridable in tests) so a test can age a freshly-recorded verdict past the
+// configured bound without sleeping.
+var nowFunc = time.Now
+
+// remintTTL is the lifetime of an approval token (re-)minted from the durable verdict. The
+// token is a derived cache the merge gate consumes, NOT the authority (the content+commit-
+// pinned verdict row is), so this lifetime only has to outlast a single land attempt's
+// validate-then-fast-forward; an expiry merely triggers another re-mint from the verdict on
+// the next attempt, never a terminal refusal.
+const remintTTL = 30 * time.Minute
+
+// eventApprovalRequired is the actionable event the gate surfaces when a gated task cannot
+// auto-land purely because its auto-approval authority lapsed (the autonomous auto-mint
+// exceeded the repo's configured max-age) — so a still-passing task that now needs a human
+// is never silently stuck in the land queue. It is defined here (not in internal/db) because
+// db treats Event.Type as an opaque string and the event originates solely from this gate.
+const eventApprovalRequired = "approval_required"
+
 // Approve grants a short-lived approval token authorizing a merge for taskID.
 // This is intended for the lead to run, not the manager.
 func (m *Manager) Approve(taskID string, ttl time.Duration) error {
@@ -91,11 +110,31 @@ func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error)
 	if err != nil || !ok {
 		return "", fmt.Errorf("unknown task %q", taskID)
 	}
+	repo := t.Project
+	gated := requireVerdict || projectinit.ReadMode(repo) == "trusted"
+	// The committed object that will fast-forward. Everything the gate validates and pins
+	// is THIS sha — never the mutable worktree, which a running worker could change.
+	workerHead, err := worktree.Head(t.Worktree)
+	if err != nil {
+		return "", err
+	}
+	// Collapse the two-store approval: for a GATED merge the durable, content+commit-pinned
+	// verdict row is the single merge authority. (Re-)mint the short-lived approval token from
+	// it when the verdict still authorizes workerHead, so a token that expired while the task
+	// waited in a busy land queue never strands a still-passing, unchanged verdict in a
+	// retry-forever loop. It mints nothing when the verdict does not authorize workerHead (the
+	// checks below then refuse — fail closed), and refuses an over-age autonomous auto-mint
+	// outright (surfacing an actionable event so the now-stale task is never silently stuck).
+	// The (re-)mint is an optimization, never the authority: every gate check below still runs
+	// against the committed workerHead.
+	if gated {
+		if _, err := m.remintFromVerdict(t, workerHead); err != nil {
+			return "", err
+		}
+	}
 	if !approval.Valid(m.P.ApprovalFile(taskID)) {
 		return "", fmt.Errorf("no valid approval for %q; the lead must run 'ttorch approve %s' first", taskID, taskID)
 	}
-	repo := t.Project
-	gated := requireVerdict || projectinit.ReadMode(repo) == "trusted"
 	// Read the approval token's provenance (human|auto) from the token itself, not from
 	// mutable task state, so a crash between minting and saving can never relabel a merge.
 	tokData, _ := approval.Data(m.P.ApprovalFile(taskID))
@@ -106,12 +145,6 @@ func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error)
 	// not merge ungated.
 	if !gated && tokBy == "auto" {
 		return "", fmt.Errorf("%q carries an auto-approval that is only valid through the trust gate, but the gate is not active (repo not in trusted mode and no --require-verdict); refusing to merge ungated", taskID)
-	}
-	// The committed object that will fast-forward. Everything the gate validates and pins
-	// is THIS sha — never the mutable worktree, which a running worker could change.
-	workerHead, err := worktree.Head(t.Worktree)
-	if err != nil {
-		return "", err
 	}
 	def := worktree.DefaultBranch(repo)
 	if gated {
@@ -298,6 +331,90 @@ func (m *Manager) consumeVerdict(taskID string) {
 	if err := m.Store.DeleteVerdict(context.Background(), taskID); err != nil {
 		fmt.Fprintf(os.Stderr, "ttorch: warning: could not consume the review verdict for %s after merge: %v (it is pinned to the merged commit and cannot authorize an unreviewed merge)\n", taskID, err)
 	}
+}
+
+// remintFromVerdict collapses the two-store approval: it makes the short-lived approval token
+// a derived cache of the durable, content+commit-pinned VERDICT row — the SINGLE merge
+// authority — so a token that expired while a gated task waited in a busy land queue can never
+// strand a still-passing, unchanged verdict in a retry-forever loop. When the verdict still
+// AUTHORIZES targetSHA — Overall==pass, the commit pin ReviewedSHA==targetSHA, a recognized
+// approval provenance (auto|human) whose own pin ApprovalSHA==targetSHA — it (re-)mints the
+// token to targetSHA with that provenance. It mints NOTHING (fail closed, returns false/nil)
+// when the verdict does not authorize targetSHA — missing, blocking, content-mismatched
+// (reviewed_sha moved), or recorded-but-unapproved (ApprovedBy=="") — so the caller's existing
+// gate checks produce the precise refusal and a genuine re-gate is still required.
+//
+// For an AUTO provenance it additionally enforces the repo's configured autonomous max-age:
+// an auto-pass older than the bound is refused with a loud error AND an actionable event (so a
+// weeks-old trusted pass never silently auto-lands with no human, and a now-stale task is never
+// silently stuck), and the lead must approve it by hand — a HUMAN approval carries no age
+// bound. A token already valid and pinned to targetSHA with the verdict's provenance is left
+// untouched (the common fresh case). The (re-)mint is never the authority: MergeLocal
+// re-validates and re-consumes the token against the exact commit it fast-forwards, so a token
+// minted here can only ever let a STILL-passing, UNCHANGED, in-policy verdict land — never a
+// changed diff or a non-passing verdict.
+func (m *Manager) remintFromVerdict(t db.Task, targetSHA string) (bool, error) {
+	v, ok, err := m.Store.GetVerdict(context.Background(), t.ID)
+	if err != nil {
+		return false, fmt.Errorf("trust gate: could not read the review verdict for %q: %w", t.ID, err)
+	}
+	// The verdict must PASS and pin exactly targetSHA — both the reviewed commit and the
+	// approval's own commit. Any drift means the verdict does not cover what would merge:
+	// mint nothing and let the caller's content-pin checks refuse (fail closed).
+	if !ok || v.Overall != review.Pass || v.ReviewedSHA != targetSHA || v.ApprovalSHA != targetSHA {
+		return false, nil
+	}
+	by := v.ApprovedBy
+	if by != "auto" && by != "human" {
+		return false, nil // recorded but never approved — the lead must approve (fail closed)
+	}
+	// Bound autonomous auto-mint staleness (auto only; a human approval never expires by age).
+	// The age is measured from the verdict's first-recorded time (created_at, preserved across
+	// carry-forward re-pins), so a task that churns in the land queue for longer than the policy
+	// allows is escalated to a human rather than auto-landed on a long-stale review.
+	if by == "auto" {
+		if maxAge, bounded := projectinit.ReadAutoMintMaxAge(t.Project); bounded {
+			if age := nowFunc().Sub(v.CreatedAt); age > maxAge {
+				reason := fmt.Sprintf("autonomous auto-approval is %s old, exceeding this repo's auto-mint-max-age of %s; a human must approve with 'ttorch approve %s'",
+					age.Round(time.Second), maxAge, t.ID)
+				m.surfaceApprovalRequired(t.ID, reason)
+				return false, fmt.Errorf("trust gate: %s for %q", reason, t.ID)
+			}
+		}
+	}
+	// The verdict authorizes targetSHA. Leave an already-correct token untouched; otherwise
+	// (re-)mint a fresh one from the authoritative verdict, pinned to targetSHA.
+	if data, valid := approval.Data(m.P.ApprovalFile(t.ID)); valid {
+		if tokBy, tokSHA := splitApprovalPayload(data); tokSHA == targetSHA && tokBy == by {
+			return false, nil
+		}
+	}
+	if err := approval.Grant(m.P.ApprovalFile(t.ID), remintTTL, approvalPayload(by, targetSHA)); err != nil {
+		return false, fmt.Errorf("trust gate: could not re-mint the approval for %q from its durable verdict: %w", t.ID, err)
+	}
+	m.audit(fmt.Sprintf("remint-approval task=%s commit=%s approver=%s (from durable verdict)", t.ID, short(targetSHA), by))
+	return true, nil
+}
+
+// surfaceApprovalRequired appends an ACTIONABLE event (so the watcher wakes the manager) when
+// a gated task cannot auto-land purely because its auto-approval authority lapsed — the
+// "never silently stuck" guarantee. It is deduped by event TYPE (HasEventType): a periodic land
+// pass that keeps refusing the same over-age task appends the escalation exactly once and the
+// watcher surfaces it once (its watermark stream delivers each appended row a single time),
+// rather than once per tick. The type-specific dedup cannot be falsely suppressed by an
+// unrelated actionable event on the task. Best-effort: a failed append is reported, never fatal.
+func (m *Manager) surfaceApprovalRequired(taskID, reason string) {
+	ctx := context.Background()
+	if has, err := m.Store.HasEventType(ctx, taskID, eventApprovalRequired); err == nil && has {
+		return
+	}
+	if _, err := m.Store.AppendEvent(ctx, db.Event{
+		EntityType: db.EntityTypeTask, EntityID: taskID, Type: eventApprovalRequired,
+		Actor: db.ActorSystem, Actionable: true, Payload: reason,
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "ttorch: could not surface the approval_required event for %s: %v\n", taskID, err)
+	}
+	m.audit(fmt.Sprintf("approval-required task=%s %s", taskID, reason))
 }
 
 // approvalPayload packs the grant provenance ("human"|"auto") with the reviewed sha into
@@ -666,24 +783,31 @@ func (m *Manager) securityAuditNote(taskID, landedSHA string, gated bool) string
 }
 
 // carryVerdictForward implements verdict-portable fast-land. When a gated land has rebased the
-// worker onto an advanced default — moving the commit SHA the verdict and approval were pinned
-// to — it carries the existing PASSING verdict AND its approval token forward to the rebased
-// commit, re-pinning both to rebasedHead WITHOUT re-running trust prep, the three reviewers, or
-// a human re-approval — but ONLY when the worker's own three-dot diff against the rebase base is
-// byte-identical to the diff the reviewers cleared, matched by the verdict's recorded content
-// identity (review.DiffID). The approval is carried whether the trusted gate auto-minted it or
-// the lead granted it by hand: an unchanged diff is the same attestation on a new base. This is
-// the throughput fix that stops re-gating (and re-approving) a task every time an unrelated
-// merge advances the default beneath it.
+// worker onto an advanced default — moving the commit SHA the verdict was pinned to — it carries
+// the existing PASSING verdict forward to the rebased commit, re-pinning it to rebasedHead
+// WITHOUT re-running trust prep, the three reviewers, or a human re-approval — but ONLY when the
+// worker's own three-dot diff against the rebase base is byte-identical to the diff the reviewers
+// cleared, matched by the verdict's recorded content identity (review.DiffID). This is the
+// throughput fix that stops re-gating a task every time an unrelated merge advances the default
+// beneath it.
+//
+// The durable, content+commit-pinned verdict row is now the SINGLE merge authority, so carry-
+// forward re-pins JUST the verdict (an atomic row update) — the short-lived approval token is a
+// derived cache that gateCoversRebased / MergeLocal re-mint from the carried verdict on demand
+// (remintFromVerdict). This collapses the old two-store carry (verdict + token re-pinned in
+// lock-step) and removes its read→re-pin race: there is no longer a window in which the token
+// can lapse between the read and the re-pin, because the token is no longer the thing being
+// carried. The verdict's recorded approval provenance (ApprovedBy auto|human) and approval pin
+// (ApprovalSHA) move with it, so a HUMAN approval is carried as faithfully as the trusted gate's
+// AUTO one: an unchanged diff is the same attestation on a new base.
 //
 // A content change — anything but a clean, disjoint rebase — is NEVER carried: re-pinning a
-// verdict or approval onto changed content would be a trust hole, so it returns a loud re-gate
-// error instead. When there is no passing verdict to carry, one predating content identities (an
-// empty DiffID), or no live approval token still pinning the reviewed commit, it carries nothing
-// and returns (false, nil), letting gateCoversRebased issue the usual re-gate/re-approve demand.
-// The carry is atomic — both tokens move to the rebased commit or neither does — and the merge
-// gate in MergeLocal re-validates and re-consumes the re-pinned tokens, so carry-forward is an
-// optimization, never the authority.
+// verdict onto changed content would be a trust hole, so it returns a loud re-gate error
+// instead. When there is no passing verdict to carry, or one predating content identities (an
+// empty DiffID), it carries nothing and returns (false, nil), letting gateCoversRebased issue
+// the usual re-gate/re-approve demand. MergeLocal re-validates and re-consumes the re-pinned
+// verdict against the commit it fast-forwards, so carry-forward is an optimization, never the
+// authority.
 func (m *Manager) carryVerdictForward(t db.Task, base, rebasedHead string) (bool, error) {
 	v, ok, err := m.Store.GetVerdict(context.Background(), t.ID)
 	if err != nil {
@@ -709,54 +833,30 @@ func (m *Manager) carryVerdictForward(t db.Task, base, rebasedHead string) (bool
 		return false, fmt.Errorf("land: rebasing %q onto the advanced %s changed its reviewed diff, so the recorded verdict no longer covers the rebased commit %s; re-run 'ttorch trust prep %s', review, and 'ttorch trust record %s', then re-run 'ttorch land %s'",
 			t.ID, base, short(rebasedHead), t.ID, t.ID, t.ID)
 	}
-	// The worker's own diff is byte-identical to what the reviewers cleared, so the gate the
-	// reviewers and the approver granted still covers exactly what will merge — only the base it
-	// sits on moved, and neither the verdict nor the approval ever spoke to the base. Carry BOTH
-	// forward to the rebased commit, atomically (both move, or neither does):
-	//
-	//   - the durable verdict, re-pinned to the rebased commit, preserving its findings and
-	//     content identity (the row has no TTL, so this is a plain content-pinned update);
-	//   - the approval token, re-pinned to the rebased commit with its ORIGINAL provenance and
-	//     ORIGINAL expiry. This carries a HUMAN approval as faithfully as the trusted gate's AUTO
-	//     one: the DiffID match proves the approved content is byte-identical, so re-pinning is
-	//     not forging an attestation the approver never made — it is following the same reviewed
-	//     diff onto the commit that now carries it. (A non-clean rebase changed the diff and was
-	//     already refused above, so a changed/unreviewed diff is never carried.)
-	//
-	// Both-or-neither: we carry the approval ONLY when a valid token still pins the SAME
-	// pre-rebase commit the verdict covered, and we re-pin it FIRST — if the token lapsed in the
-	// read→re-pin window (moved==false) the verdict is left untouched and the land re-gates; only
-	// once the approval has moved do we advance the verdict, rolling the approval back if that
-	// write fails. MergeLocal re-validates and re-consumes both re-pinned tokens against the
-	// commit it fast-forwards, so a partial carry can only ever fail closed, never bypass the gate.
+	// The worker's own diff is byte-identical to what the reviewers cleared, so the verdict the
+	// reviewers (and the approver) granted still covers exactly what will merge — only the base
+	// it sits on moved, and the verdict never spoke to the base. Carry it forward atomically by
+	// re-pinning the row's reviewed commit to rebasedHead, preserving its findings, content
+	// identity, and approval provenance. Advance the approval pin (ApprovalSHA) in lock-step only
+	// when an approval exists (ApprovedBy auto|human) — an unapproved-but-passing verdict still
+	// follows its content forward, and gateCoversRebased then demands the human approval that is
+	// still owed. The approval token is NOT touched here; gateCoversRebased / MergeLocal re-mint
+	// it from this carried verdict (remintFromVerdict), and the merge re-validates and re-consumes
+	// against the commit it fast-forwards, so the carry can only ever fail closed, never bypass.
 	reviewedSHA := v.ReviewedSHA
-	data, hasTok := approval.Data(m.P.ApprovalFile(t.ID))
-	approvedBy, approvedSHA := splitApprovalPayload(data)
-	if !hasTok || (approvedBy != "auto" && approvedBy != "human") || approvedSHA != reviewedSHA {
-		// No approval token we can faithfully carry (absent, expired, an unrecognized provenance,
-		// or pinned to a different commit than the verdict). Carry nothing and let
-		// gateCoversRebased demand a fresh approval of the rebased commit (fail closed).
-		return false, nil
-	}
-	moved, err := approval.Repin(m.P.ApprovalFile(t.ID), approvalPayload(approvedBy, rebasedHead))
-	if err != nil {
-		return false, fmt.Errorf("land: could not re-pin the carried approval for %q: %w", t.ID, err)
-	}
-	if !moved {
-		return false, nil // the approval lapsed before it could be carried — re-gate, verdict untouched
-	}
+	approver := v.ApprovedBy
 	v.ReviewedSHA = rebasedHead
-	v.ApprovalSHA = rebasedHead
+	if approver == "auto" || approver == "human" {
+		v.ApprovalSHA = rebasedHead
+	}
 	if err := m.Store.SaveVerdict(context.Background(), v); err != nil {
-		// Roll the approval back to the pre-rebase commit so a failed verdict write leaves BOTH
-		// tokens at the original commit (both-or-neither), never the approval ahead of a stale
-		// verdict. Best-effort: even if the rollback fails the verdict is still stale, so the gate
-		// refuses and nothing unreviewed can land.
-		_, _ = approval.Repin(m.P.ApprovalFile(t.ID), approvalPayload(approvedBy, reviewedSHA))
 		return false, fmt.Errorf("land: could not re-pin the carried verdict for %q: %w", t.ID, err)
 	}
+	if approver == "" {
+		approver = "none"
+	}
 	m.audit(fmt.Sprintf("fast-land task=%s carried verdict %s->%s base=%s approver=%s (reviewed diff unchanged)",
-		t.ID, short(reviewedSHA), short(rebasedHead), base, approvedBy))
+		t.ID, short(reviewedSHA), short(rebasedHead), base, approver))
 	return true, nil
 }
 
@@ -766,7 +866,19 @@ func (m *Manager) carryVerdictForward(t db.Task, base, rebasedHead string) (bool
 // approve the rebased commit when its own rebase moved the worker onto an advanced default,
 // instead of MergeLocal later consuming a now-stale token and reporting a confusing generic
 // mismatch.
+//
+// For a GATED land the durable verdict row is the merge authority, so this first (re-)mints
+// the derived approval token from it (remintFromVerdict): a token that expired while the task
+// waited in a busy land queue is reconstructed from the still-authorizing verdict instead of
+// being treated as a terminal "no valid approval" (the retry-forever bug). The re-mint produces
+// nothing when the verdict does not authorize the rebased commit — leaving the precise refusals
+// below to fire (fail closed) — and refuses an over-age autonomous auto-mint outright.
 func (m *Manager) gateCoversRebased(t db.Task, rebasedHead string, gated bool) error {
+	if gated {
+		if _, err := m.remintFromVerdict(t, rebasedHead); err != nil {
+			return err
+		}
+	}
 	data, ok := approval.Data(m.P.ApprovalFile(t.ID))
 	_, approvedSha := splitApprovalPayload(data)
 	if !ok || approvedSha != rebasedHead {

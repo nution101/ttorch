@@ -5,7 +5,48 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestReadAutoMintMaxAge(t *testing.T) {
+	// Absent file / absent line / unparseable / non-positive ⇒ NO bound (the default; a
+	// still-passing auto verdict always lands).
+	for _, tc := range []struct {
+		name, body string
+	}{
+		{"no file", ""},
+		{"no line", "# notes\n- delivery-mode: trusted\n"},
+		{"unparseable", "- auto-mint-max-age: soon\n"},
+		{"zero", "- auto-mint-max-age: 0\n"},
+		{"negative", "- auto-mint-max-age: -5h\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if tc.body != "" {
+				if err := os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte(tc.body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if d, ok := ReadAutoMintMaxAge(dir); ok || d != 0 {
+				t.Fatalf("ReadAutoMintMaxAge = %v ok=%v, want 0/false", d, ok)
+			}
+		})
+	}
+
+	// A valid positive duration ⇒ that bound. Read from anywhere in the file (so a developer
+	// can place it where `ttorch init` will not regenerate over it).
+	dir := t.TempDir()
+	if _, err := Init(dir, "trusted"); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "AGENTS.md"))
+	if err := os.WriteFile(filepath.Join(dir, "AGENTS.md"), append(b, []byte("\n- auto-mint-max-age: 72h\n")...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if d, ok := ReadAutoMintMaxAge(dir); !ok || d != 72*time.Hour {
+		t.Fatalf("ReadAutoMintMaxAge = %v ok=%v, want 72h/true", d, ok)
+	}
+}
 
 func TestInitialized(t *testing.T) {
 	dir := t.TempDir()

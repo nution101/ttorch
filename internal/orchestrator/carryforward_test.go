@@ -109,11 +109,12 @@ func TestLand_FastLandCarriesHumanApprovalOnCleanRebase(t *testing.T) {
 }
 
 // TestCarryVerdictForward_CarriesHumanApprovalAndVerdict drives the carry primitive directly and
-// asserts the precise post-condition the task requires: after a clean rebase whose diff matches
-// the recorded content identity, BOTH the durable verdict AND the human approval token end up
-// pinning the REBASED commit (with the approval's human provenance preserved), and the
-// pre-merge gate check then confirms the gate covers the rebased commit without consuming
-// anything.
+// asserts the precise post-condition the task requires after collapsing the two-store approval:
+// after a clean rebase whose diff matches the recorded content identity, carryVerdictForward
+// re-pins the durable VERDICT row to the REBASED commit (preserving its human provenance) — the
+// single merge authority — and the pre-merge gate check (gateCoversRebased) then re-mints the
+// derived human approval token onto the rebased commit from that verdict and confirms the gate
+// covers it, consuming nothing.
 func TestCarryVerdictForward_CarriesHumanApprovalAndVerdict(t *testing.T) {
 	m, repo := deliveryHarness(t, "carryunit")
 	commitGateScript(t, repo, "exit 0")
@@ -157,22 +158,30 @@ func TestCarryVerdictForward_CarriesHumanApprovalAndVerdict(t *testing.T) {
 	if !carried {
 		t.Fatal("carryVerdictForward should report it carried the gate forward")
 	}
-	// The approval token now COVERS THE REBASED COMMIT, with its human provenance preserved.
-	data, ok := approval.Data(m.P.ApprovalFile("cu1"))
-	if !ok {
-		t.Fatal("the approval token must still be present after the carry")
-	}
-	if by, sha := splitApprovalPayload(data); by != "human" || sha != rebased {
-		t.Fatalf("the carried approval must pin the rebased commit as human (got by=%q sha=%s, want human/%s)", by, short(sha), short(rebased))
-	}
-	// The verdict row was re-pinned to the rebased commit (reviewed + approval sha both advance).
+	// The durable verdict row — the single merge authority — was re-pinned to the rebased
+	// commit (reviewed + approval sha both advance), preserving the human provenance.
 	v, ok, _ := m.Store.GetVerdict(context.Background(), "cu1")
-	if !ok || v.ReviewedSHA != rebased || v.ApprovalSHA != rebased {
-		t.Fatalf("the carried verdict must pin the rebased commit: %+v ok=%v", v, ok)
+	if !ok || v.ReviewedSHA != rebased || v.ApprovalSHA != rebased || v.ApprovedBy != "human" {
+		t.Fatalf("the carried verdict must pin the rebased commit as human: %+v ok=%v", v, ok)
 	}
-	// And the pre-merge gate check confirms it covers the rebased commit, consuming nothing.
+	// carryVerdictForward re-pins JUST the verdict; the derived token is re-minted at the gate
+	// check, so the pre-carry human token still pins the ORIGINAL commit at this point.
+	if data, ok := approval.Data(m.P.ApprovalFile("cu1")); ok {
+		if _, sha := splitApprovalPayload(data); sha != feat {
+			t.Fatalf("carryVerdictForward must not move the token itself; want it still pinned to %s, got %s", short(feat), short(sha))
+		}
+	}
+	// The pre-merge gate check re-mints the human approval token onto the rebased commit from
+	// the carried verdict and confirms the gate covers it, consuming nothing.
 	if err := m.gateCoversRebased(reloaded, rebased, true); err != nil {
 		t.Fatalf("gateCoversRebased must pass after the carry: %v", err)
+	}
+	data, ok := approval.Data(m.P.ApprovalFile("cu1"))
+	if !ok {
+		t.Fatal("the approval token must be re-minted onto the rebased commit by the gate check")
+	}
+	if by, sha := splitApprovalPayload(data); by != "human" || sha != rebased {
+		t.Fatalf("the re-minted approval must pin the rebased commit as human (got by=%q sha=%s, want human/%s)", by, short(sha), short(rebased))
 	}
 	_, _ = m.Teardown("cu1", true)
 }

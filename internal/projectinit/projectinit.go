@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 const (
@@ -51,6 +52,38 @@ func ReadMode(dir string) string {
 		}
 	}
 	return def
+}
+
+// autoMintMaxAgeKey is the per-repo policy line that bounds how stale a trusted,
+// AUTONOMOUS auto-mint may be before the gate refuses to auto-land it and a human must
+// approve instead. It is a `- auto-mint-max-age: <duration>` line in AGENTS.md (a Go
+// duration such as 72h), read alongside the delivery mode.
+const autoMintMaxAgeKey = "- auto-mint-max-age:"
+
+// ReadAutoMintMaxAge returns the repo's configured maximum age for an AUTONOMOUS auto-mint
+// land — the staleness bound that keeps a weeks-old trusted auto-pass from silently
+// auto-landing with no human ever looking again. It reads the first
+// `- auto-mint-max-age: <duration>` line in dir/AGENTS.md (anywhere in the file, so a
+// developer can place it where `ttorch init` will not regenerate over it), parsing a Go
+// duration. The bool is false — meaning NO bound (the default; a still-passing auto verdict
+// always lands) — when the file or the line is absent, or the value is unparseable or
+// non-positive. It governs ONLY the auto path: a human approval never expires by age. This
+// is a READ-ONLY consumer of a human-authored policy; ttorch never writes the line.
+func ReadAutoMintMaxAge(dir string) (time.Duration, bool) {
+	b, err := os.ReadFile(filepath.Join(dir, "AGENTS.md"))
+	if err != nil {
+		return 0, false
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), autoMintMaxAgeKey); ok {
+			d, err := time.ParseDuration(strings.TrimSpace(rest))
+			if err != nil || d <= 0 {
+				return 0, false
+			}
+			return d, true
+		}
+	}
+	return 0, false
 }
 
 // Initialized reports whether dir already carries the ttorch-managed block in its
