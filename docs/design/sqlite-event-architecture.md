@@ -1,6 +1,13 @@
 # Design spec — SQLite event-driven orchestration
 
-**Status:** proposed (build-ready)
+> **Historical design proposal.** This is the original build-ready spec for the SQLite +
+> event-driven-watch migration, written as deltas against the pre-migration code. That work
+> has since shipped, and the scheduler daemon (v0.8–v0.10) postdates it entirely. For the
+> **as-built** description of the running system — including the scheduler — see
+> [`../ARCHITECTURE.md`](../ARCHITECTURE.md). This document is kept for design context, not
+> as current reference; treat its `file:line` citations as a snapshot in time.
+
+**Status:** proposed (build-ready) — *superseded by [`../ARCHITECTURE.md`](../ARCHITECTURE.md)*
 **Scope:** replace ttorch's JSON task records with a global SQLite database as the single
 source of truth, and replace the supervisor's tmux `send-keys` "poke" waking with an
 event-driven, manager-owned background watcher.
