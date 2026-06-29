@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.10.0](https://github.com/nution101/ttorch/compare/v0.9.0...v0.10.0) (2026-06-29)
+
+
+### Features
+
+* **scheduler:** auto-recover crashed/stalled workers with bounded restarts (--supervise) ([29f427b](https://github.com/nution101/ttorch/commit/29f427baa0c9cfdba5cc20522af206cef91d12c2))
+* **scheduler:** make autonomy the default — auto-start + land fixes + task briefs ([f054769](https://github.com/nution101/ttorch/commit/f054769445d55dd09133b4e930661026c5d7ac39))
+
 ## [0.9.0](https://github.com/nution101/ttorch/compare/v0.8.0...v0.9.0) (2026-06-28)
 
 
