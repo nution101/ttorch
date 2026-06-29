@@ -317,6 +317,74 @@ func TestPollLiveness_WindowGone(t *testing.T) {
 	}
 }
 
+// TestPollLiveness_WindowGoneAfterRedispatch is the watcher half of the repeat-crash fix:
+// after a crashed worker is reclaimed and RE-DISPATCHED via ClaimTask, a GENUINE new crash of
+// the re-dispatched incarnation must still surface a fresh window_gone — it must not be
+// suppressed by the prior incarnation's stale window_gone. ClaimTask advances last_progress_at
+// to the claim time, which moves the already-surfaced gate's cutoff
+// (HasActionableEventForTask, keyed on last_progress_at) past the stale event, so the new
+// crash is emitted promptly instead of waiting out the slow lease-expiry backstop. Without the
+// stamp the cutoff would be nil (this incarnation never reported), the stale window_gone would
+// count as "already surfaced", and the new crash would be silently dropped here.
+func TestPollLiveness_WindowGoneAfterRedispatch(t *testing.T) {
+	w, s, _, _ := newWatcher(t)
+	ctx := context.Background()
+
+	// Incarnation #1: an active, spawned worker.
+	proj, err := s.UpsertProject(ctx, "/repo/rd", "")
+	if err != nil {
+		t.Fatalf("UpsertProject: %v", err)
+	}
+	if _, err := s.CreateTask(ctx, db.Task{
+		ID: "rd", ProjectID: proj.ID, Window: "wk-rd", Kind: db.KindShip, Status: db.StatusActive,
+	}, db.ActorManager); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if _, err := s.AppendEvent(ctx, db.Event{
+		EntityType: db.EntityTypeTask, EntityID: "rd", Type: db.EventSpawned, Actor: db.ActorManager,
+	}); err != nil {
+		t.Fatalf("AppendEvent spawned: %v", err)
+	}
+	// ...which then crashes (window confirmed gone).
+	if _, err := s.AppendEvent(ctx, db.Event{
+		EntityType: db.EntityTypeTask, EntityID: "rd", Type: db.EventWindowGone, Actor: db.ActorSystem,
+		Actionable: true, Payload: "wk-rd",
+	}); err != nil {
+		t.Fatalf("AppendEvent window_gone: %v", err)
+	}
+
+	// The supervisor reclaims the crash; the scheduler re-dispatches via ClaimTask, which
+	// advances last_progress_at past the stale window_gone and plants its incarnation marker.
+	if out, err := s.ReclaimWindowGone(ctx); err != nil || len(out) != 1 {
+		t.Fatalf("ReclaimWindowGone = %+v err=%v, want one reclaim", out, err)
+	}
+	if _, won, err := s.ClaimTask(ctx, "rd", "worker:rd"); err != nil || !won {
+		t.Fatalf("ClaimTask re-dispatch: won=%v err=%v", won, err)
+	}
+
+	// The re-dispatched incarnation genuinely crashes: its window is gone again.
+	w.capture = func(string) paneObservation { return paneObservation{present: false} }
+	if err := w.pollLiveness(ctx); err != nil {
+		t.Fatalf("pollLiveness: %v", err)
+	}
+
+	// A fresh window_gone must have been emitted (two now exist for the task) — the stale one
+	// no longer masks the new crash.
+	evs, err := s.EventsSince(ctx, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, e := range evs {
+		if e.EntityID == "rd" && e.Type == db.EventWindowGone {
+			n++
+		}
+	}
+	if n != 2 {
+		t.Fatalf("window_gone count = %d, want 2 (a re-dispatched worker's new crash must not be suppressed)", n)
+	}
+}
+
 // TestPollLiveness_IdleUnreportedAfterTwoSweeps: an unchanged, not-busy pane emits
 // idle_unreported only once it has been stable for idleStaleSweeps sweeps; the per-
 // sweep count is persisted on the task row. The wall-clock dwell is satisfied here (the

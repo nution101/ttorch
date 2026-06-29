@@ -83,6 +83,29 @@ func TestClaimTaskFlipsPendingToActiveWithLease(t *testing.T) {
 	if _, ok := hasEventType(actionable, EventStatusChanged); ok {
 		t.Error("a system-actor status_changed claim must not be in the actionable feed")
 	}
+
+	// The claim stamps last_progress_at to the claim time — the re-dispatch incarnation
+	// marker the watcher's staleness gates key on (parity with the manager spawn path's
+	// pending → active ReportStatus). The returned row carries it directly (GrantLease,
+	// run above, leaves last_progress_at untouched).
+	if claimed.LastProgressAt == nil || !claimed.LastProgressAt.Equal(clk.now()) {
+		t.Errorf("claimed last_progress_at = %v, want the claim time %v", claimed.LastProgressAt, clk.now())
+	}
+	// The claim also plants a non-actionable 'spawned' incarnation marker so the window-gone
+	// supervisor's freshness anchor outranks any prior stale window_gone the instant the row
+	// is active — the chokepoint that stops a re-dispatched, live worker being repeat-reclaimed.
+	sp, ok := hasEventType(taskEvents(t, s, "c1"), EventSpawned)
+	if !ok {
+		t.Fatal("expected a spawned incarnation marker from the claim")
+	}
+	if sp.Actionable || sp.Actor != ActorSystem {
+		t.Errorf("the claim's spawned marker must be non-actionable, system-actor: %+v", sp)
+	}
+	// Being non-actionable, it must stay out of the actionable watch feed (claiming must not
+	// wake the watcher).
+	if _, ok := hasEventType(actionable, EventSpawned); ok {
+		t.Error("a non-actionable spawned incarnation marker must not be in the actionable feed")
+	}
 }
 
 // TestClaimTaskSecondClaimLosesRace proves the core no-double-claim guarantee at the
@@ -242,5 +265,59 @@ func TestReleaseClaimRevertsGuarded(t *testing.T) {
 	// A release of a missing task is a guarded no-op, not an error.
 	if released, err := s.ReleaseClaim(ctx, "ghost", "worker:ghost"); err != nil || released {
 		t.Errorf("release of a missing task must decline: released=%v err=%v", released, err)
+	}
+}
+
+// TestClaimTaskRetiresStaleWindowGone is the repeat-crash regression: after a crashed worker
+// is reclaimed and the scheduler RE-DISPATCHES it via ClaimTask, the prior incarnation's
+// window_gone must NOT reclaim the now-live worker — even before the spawn path appends its own
+// 'spawned' event (and even if that best-effort append is later dropped). ClaimTask plants a
+// 'spawned' incarnation marker in the claim transaction, so the window-gone freshness anchor
+// outranks the stale window_gone the instant the task is active. Without it the supervisor
+// would reclaim the live worker every tick, burning retries to a poison-pill — the "repeat
+// crash". (TestReclaimWindowGoneIgnoresStaleSignal covers only a literal new 'spawned' append,
+// not the real ClaimTask re-dispatch path.)
+func TestClaimTaskRetiresStaleWindowGone(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newTestStoreClock(t)
+	mkSpawnedWorker(t, s, "r1") // spawned #1, active
+	markWindowGone(t, s, "r1")  // incarnation #1 crashed
+
+	// First reclaim: the crash is the current sign of life ⇒ back to pending, retry 1.
+	out, err := s.ReclaimWindowGone(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1 || out[0].TaskID != "r1" || out[0].RetryCount != 1 {
+		t.Fatalf("first reclaim = %+v, want one r1 reclaim at retry 1", out)
+	}
+	if tk, _, _ := s.GetTask(ctx, "r1"); tk.Status != StatusPending {
+		t.Fatalf("after reclaim status = %q, want pending", tk.Status)
+	}
+
+	// Scheduler re-dispatch: claim the pending task back to active. The claim ALONE (no
+	// spawn.go 'spawned' append yet) must retire the stale window_gone.
+	claimed, won, err := s.ClaimTask(ctx, "r1", "worker:r1")
+	if err != nil || !won {
+		t.Fatalf("re-claim: won=%v err=%v", won, err)
+	}
+	if claimed.Status != StatusActive {
+		t.Fatalf("re-claimed status = %q, want active", claimed.Status)
+	}
+
+	// The supervisor must now leave the live, just-re-dispatched worker alone.
+	again, err := s.ReclaimWindowGone(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again) != 0 {
+		t.Fatalf("a re-dispatched worker must not be reclaimed on the prior incarnation's window_gone, got %+v", again)
+	}
+	tk, _, _ := s.GetTask(ctx, "r1")
+	if tk.Status != StatusActive {
+		t.Errorf("status = %q, want still active (live re-dispatched worker)", tk.Status)
+	}
+	if tk.RetryCount != 1 {
+		t.Errorf("retry_count = %d, want 1 (no extra retry burned by a false reclaim)", tk.RetryCount)
 	}
 }
