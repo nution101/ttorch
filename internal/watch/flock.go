@@ -100,8 +100,12 @@ func lockedLiveFile(f *os.File, path string) bool {
 }
 
 // watchRecord is what the singleton pid file holds: the holder's pid and a session
-// token identifying the manager incarnation it serves. The token is empty in a legacy
-// pid file (written before this field existed) or when the holder had no tmux to read.
+// token identifying the manager incarnation it serves. The pid is the WATCH process's pid
+// (its liveness + the reap target); the token (instanceToken) is the manager PANE's
+// pid+start-time — a separate identity that survives pane-pid reuse, used to tell a
+// restarted manager from its dead predecessor. The token is empty in a legacy pid file
+// (written before this field existed) or when the holder had no tmux / no readable start
+// time to mint one.
 type watchRecord struct {
 	pid   int
 	token string
@@ -149,6 +153,75 @@ func readWatchPID(path string) (int, bool) {
 		return 0, false
 	}
 	return rec.pid, true
+}
+
+// instanceToken builds the manager-instance token from the manager pane's pid and the
+// start time of the process running in it. The start time is what makes the token robust
+// to pid REUSE: a bare pid is not a stable identity — a long-lived/thrashing host can hand
+// a restarted manager the same pane pid its dead predecessor held, and a pid-only token
+// would then collide, so the orphan reap would mistake the new incarnation's token for the
+// old holder's and leave the stale watcher in place (the new manager goes blind). lstart is
+// fixed for a process's lifetime and a reused pid belongs to a process that started later,
+// so pinning pid+start-time yields a different token across that reuse and the stale holder
+// is correctly seen as an orphan. Returns "" (indeterminate identity) when the pid is
+// unknown or the start time can't be read — the fail-closed answer, so the holder is never
+// reaped on session grounds when we can't be sure. The value is whitespace-free (see
+// processStartTime) so it stays a single field in the whitespace-delimited watch record.
+//
+// The discriminator is only as fine-grained as its start-time source: ps lstart has
+// one-second resolution, so a pane pid reused within the SAME wall-clock second as its dead
+// predecessor still collides (a far tighter window than the bare-pid token this replaces,
+// where any reuse collided). `ttorch watch --reset` force-reaps token-blind and remains the
+// manual backstop for that residual.
+func instanceToken(pid int, startTime string) string {
+	if pid <= 0 || startTime == "" {
+		return ""
+	}
+	return "pane:" + strconv.Itoa(pid) + ":" + startTime
+}
+
+// processStartTime returns a stable, whitespace-free encoding of pid's process start time
+// (`ps -p <pid> -o lstart=`, e.g. "Mon Jun 29 00:16:32 2026"), or "" if it can't be read.
+// lstart is immutable for the life of a process and differs for a process that merely reused
+// a dead one's pid, which is exactly the discriminator instanceToken needs. The raw value
+// contains spaces; we collapse every whitespace run (strings.Fields normalizes any padding
+// differences too) and rejoin with "-" so the result is a single token-safe field — the
+// watch record is whitespace-delimited and the token must never contain whitespace. Returns
+// "" on any doubt (non-positive pid, ps unavailable/errored, empty output) so instanceToken
+// fails closed rather than mint a weaker identity.
+//
+// lstart is rendered in a timezone, so the ps call is pinned to a FIXED zone (TZ=UTC): two
+// watch arms of the same manager that happened to run under different ambient $TZ would
+// otherwise mint different tokens for the SAME live pane process, making the live watcher
+// look stale and risking a reap — the double-arm this layer must never cause. Pinning the
+// zone makes the encoding depend only on the process's actual start instant.
+func processStartTime(pid int) string {
+	if pid <= 0 {
+		return ""
+	}
+	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=")
+	cmd.Env = append(envWithout("TZ"), "TZ=UTC")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.Join(strings.Fields(string(out)), "-")
+}
+
+// envWithout returns the current environment with every assignment of key removed, so a
+// caller can append its own deterministic value without a duplicate-key ambiguity (which of
+// two same-key entries getenv honors is platform-dependent).
+func envWithout(key string) []string {
+	prefix := key + "="
+	src := os.Environ()
+	out := make([]string, 0, len(src))
+	for _, e := range src {
+		if strings.HasPrefix(e, prefix) {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 // processAlive reports whether a process is running (signal 0 probe).
@@ -237,9 +310,13 @@ func (w *Watcher) acquire(ctx context.Context) (*os.File, error) {
 // session INSTANCE it served is gone — detected by its recorded token differing from the
 // live one. The manager's tmux session NAME is a constant ("ttorch"), so a restarted
 // manager reuses it and a name check cannot tell the new manager from the dead prior one;
-// the instance token (Watcher.sessionToken) can. It fails CLOSED: an unidentifiable
-// holder, a legacy file with no recorded token, or an indeterminate live token (no tmux)
-// all report not-an-orphan, so a genuinely live watcher is never reaped.
+// the instance token (Watcher.sessionToken / instanceToken) can. The token pins the manager
+// pane's pid to its process START TIME, so even a restart that REUSES the dead manager's
+// pane pid yields a different token (the new process started later) and is still correctly
+// classified as an orphan — the pid-reuse hazard a bare-pid token would miss. It fails
+// CLOSED: an unidentifiable holder, a legacy file with no recorded token, or an
+// indeterminate live token (no tmux / unreadable start time) all report not-an-orphan, so a
+// genuinely live watcher is never reaped.
 func (w *Watcher) holderIsOrphan(live string) (watchRecord, bool) {
 	rec, ok := readWatchRecord(w.P.WatchPIDFile())
 	if !ok || rec.pid == os.Getpid() {

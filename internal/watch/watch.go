@@ -164,12 +164,20 @@ func New(store *db.Store, p paths.Paths, session string) *Watcher {
 	w.kill = defaultKill
 	w.sessionToken = func() string {
 		// The manager session NAME is a constant ("ttorch"), so it cannot distinguish a
-		// restarted manager from the dead prior one. The manager window's pane pid is
-		// fresh per incarnation, so it identifies the live INSTANCE; the orphan reap in
-		// acquire compares the holder's recorded token against this to tell a live holder
-		// from a stale one. "" when tmux or the manager window is unavailable — then
-		// orphan-by-session is indeterminate and the holder is given the benefit of the
-		// doubt (never reaped on session grounds).
+		// restarted manager from the dead prior one. The manager window's pane identifies
+		// the live INSTANCE; the orphan reap in acquire compares the holder's recorded
+		// token against this to tell a live holder from a stale one. The token pins the
+		// pane pid to its process START TIME (instanceToken), because the pid ALONE is not
+		// a stable identity: on a long-lived/thrashing host tmux/the OS can REUSE a dead
+		// manager's pane pid for the restarted manager, and a bare-pid token would then
+		// match the dead predecessor's record — leaving the stale watcher unreaped and the
+		// new manager blind (the cardinal singleton failure). The start time differs for a
+		// reused pid (a distinct process started later), so the token still differs and the
+		// stale holder is correctly classified as an orphan. "" when tmux/the manager window
+		// is unavailable, or the start time can't be read — then identity is indeterminate
+		// and the holder gets the benefit of the doubt (never reaped on session grounds);
+		// failing closed here is deliberate, so a transient ps glitch can never make a LIVE
+		// watcher's token look stale and get it reaped (double-arm).
 		if !tmux.Available() {
 			return ""
 		}
@@ -177,7 +185,7 @@ func New(store *db.Store, p paths.Paths, session string) *Watcher {
 		if pid <= 0 {
 			return ""
 		}
-		return "pane:" + strconv.Itoa(pid)
+		return instanceToken(pid, processStartTime(pid))
 	}
 	return w
 }

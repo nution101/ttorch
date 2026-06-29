@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -115,6 +116,74 @@ func TestCommandLineIsWatch(t *testing.T) {
 	}
 }
 
+// TestInstanceToken: the start-time-pinned token is what makes the singleton robust to
+// pane-pid reuse (H3). The SAME pid with two different start times MUST yield different
+// tokens (so a restarted manager that inherited the dead one's pane pid is seen as a new
+// incarnation), the same pid+start-time is stable (the live watcher is recognized), and
+// every indeterminate input fails closed to "" (so a holder is never reaped on session
+// grounds when identity is unknown). The token is always a single whitespace-free field.
+func TestInstanceToken(t *testing.T) {
+	a := instanceToken(5555, "Mon-Jun-29-00:00:00-2026")
+	b := instanceToken(5555, "Tue-Jun-30-11:11:11-2026")
+	if a == "" || b == "" {
+		t.Fatalf("instanceToken returned empty for valid input (a=%q b=%q)", a, b)
+	}
+	if a == b {
+		t.Fatalf("same pid, different start times produced the same token %q — pid reuse would go undetected", a)
+	}
+	if got := instanceToken(5555, "Mon-Jun-29-00:00:00-2026"); got != a {
+		t.Fatalf("instanceToken not stable for identical input: %q vs %q", got, a)
+	}
+	if strings.ContainsAny(a, " \t\n") {
+		t.Errorf("instanceToken produced token-unsafe whitespace: %q", a)
+	}
+	for _, tc := range []struct {
+		pid       int
+		startTime string
+	}{
+		{0, "Mon-Jun-29-00:00:00-2026"}, // unknown pane pid
+		{-1, "x"},                       // invalid pid
+		{5555, ""},                      // start time could not be read
+	} {
+		if got := instanceToken(tc.pid, tc.startTime); got != "" {
+			t.Errorf("instanceToken(%d, %q) = %q, want \"\" (fail closed)", tc.pid, tc.startTime, got)
+		}
+	}
+}
+
+// TestProcessStartTime: our own pid is a live process, so ps must report a stable,
+// whitespace-free start time; a non-positive pid is never real and fails closed to "". The
+// assertion is skipped only when ps itself is unavailable — there the token legitimately
+// degrades to "" (indeterminate) and the holder is given the benefit of the doubt.
+func TestProcessStartTime(t *testing.T) {
+	got := processStartTime(os.Getpid())
+	if got == "" {
+		t.Skip("ps -o lstart unavailable in this environment")
+	}
+	if strings.ContainsAny(got, " \t\n") {
+		t.Errorf("processStartTime returned token-unsafe whitespace: %q", got)
+	}
+	if again := processStartTime(os.Getpid()); again != got {
+		t.Errorf("processStartTime not stable across reads: %q vs %q", got, again)
+	}
+	// The encoding must be independent of the ambient $TZ (the ps call pins TZ=UTC): two arms
+	// of the same manager under different zones must mint the SAME token for the same live
+	// process, else a live watcher could look stale and be reaped (double-arm).
+	t.Setenv("TZ", "America/New_York")
+	east := processStartTime(os.Getpid())
+	t.Setenv("TZ", "Asia/Tokyo")
+	west := processStartTime(os.Getpid())
+	if east != west {
+		t.Errorf("processStartTime is TZ-sensitive: %q (EST) vs %q (JST) — token would differ across arms", east, west)
+	}
+	if v := processStartTime(0); v != "" {
+		t.Errorf("processStartTime(0) = %q, want \"\"", v)
+	}
+	if v := processStartTime(-1); v != "" {
+		t.Errorf("processStartTime(-1) = %q, want \"\"", v)
+	}
+}
+
 // TestReset_NoOrphanReturnsImmediately: with no recorded watcher, --reset acquires
 // the free singleton and returns, leaving no pid file behind.
 func TestReset_NoOrphanReturnsImmediately(t *testing.T) {
@@ -219,6 +288,15 @@ func TestHolderIsOrphan(t *testing.T) {
 	}{
 		{"alive holder, stale session token", "4242 pane:999", true, live, true},
 		{"alive holder, current session token", "4242 pane:1000", true, live, false},
+		// PID-reuse (the H3 case): the holder's WATCH pid is alive, but the manager PANE pid
+		// it served (5555) has been reused by the restarted manager — same pane pid, later
+		// start time. The start-time-pinned token differs, so the stale watcher is correctly
+		// an orphan and gets reaped; the new manager arms instead of going blind.
+		{"alive holder, pane pid reused with a new start time",
+			"4242 pane:5555:Mon-Jun-29-00:00:00-2026", true, "pane:5555:Tue-Jun-30-11:11:11-2026", true},
+		// Same pane pid AND start time ⇒ the genuinely live current watcher; never reaped.
+		{"alive holder, same pane pid and start time (live)",
+			"4242 pane:5555:Mon-Jun-29-00:00:00-2026", true, "pane:5555:Mon-Jun-29-00:00:00-2026", false},
 		{"dead holder", "4242 pane:999", false, live, true},
 		{"alive holder, legacy file (no token)", "4242", true, live, false},
 		{"alive holder, no live token (no tmux)", "4242 pane:999", true, "", false},
