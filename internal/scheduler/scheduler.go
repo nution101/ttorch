@@ -103,8 +103,15 @@ const (
 	// manager would `ttorch send` to resume a stalled turn.
 	idleNudgeText = "continue"
 
-	envIdleNudgeGrace = "TTORCH_IDLE_NUDGE_GRACE"
-	envMaxIdleNudges  = "TTORCH_MAX_IDLE_NUDGES"
+	// defaultMaxClaimsPerTick bounds how many heavy spawns one dispatch tick fires. The next
+	// tick (DefaultInterval later) drains the rest of the ready backlog, so the ceiling smooths
+	// a large backlog into a steady ramp instead of a single burst of worktree+tmux+harness
+	// launches. Overridable via TTORCH_MAX_CLAIMS_PER_TICK; a value <= 0 means no cap.
+	defaultMaxClaimsPerTick = 8
+
+	envIdleNudgeGrace   = "TTORCH_IDLE_NUDGE_GRACE"
+	envMaxIdleNudges    = "TTORCH_MAX_IDLE_NUDGES"
+	envMaxClaimsPerTick = "TTORCH_MAX_CLAIMS_PER_TICK"
 )
 
 // Fleet is the orchestrator surface the scheduler drives. *orchestrator.Manager satisfies
@@ -112,15 +119,15 @@ const (
 // worktree pool. Every method is one the manager already exposes — the scheduler reuses
 // the manager's spawn, overlap gate, and live-fleet view rather than reimplementing them.
 type Fleet interface {
-	// Status returns the live (non-terminal) tracked tasks — the occupancy source of truth
-	// for worktree capacity (mirroring Manager.inUseWorktrees) and the live set the overlap
-	// gate consults.
-	Status() ([]db.Task, error)
-	// CheckOverlap reports which LIVE workers a proposed footprint conflicts with in repo —
-	// the same deterministic gate the manager's spawn uses. It returns an error when the board
-	// cannot be read; the scheduler treats that as "cannot prove disjoint" and refuses to
-	// dispatch the task this tick (fail closed), never as "no conflict".
-	CheckOverlap(repo string, proposed []string) ([]orchestrator.Conflict, error)
+	// Snapshot captures the live fleet ONCE per tick: the non-terminal tracked tasks plus the
+	// set of live tmux windows, read with one board read and at most one tmux probe. The tick
+	// reads occupancy (worktree capacity, mirroring Manager.inUseWorktrees), the active/live
+	// set the overlap gate consults, and per-task liveness all from this one consistent view —
+	// replacing the per-(ready × live)-pair Status()/CheckOverlap re-reads that re-queried the
+	// board and re-spawned a `tmux list-windows` subprocess for every pair. It returns an error
+	// when the board (or tmux) cannot be read; the scheduler treats that as "cannot prove the
+	// fleet" and ABORTS the tick (fail closed), never proceeding against an empty view.
+	Snapshot() (*orchestrator.LiveSnapshot, error)
 	// SpawnWithFootprint dispatches a worker for an already-claimed task via the manager's
 	// spawn path (worktree + tmux window + harness launch).
 	SpawnWithFootprint(taskID, projectPath string, scout bool, rawCmd string, footprint []string, forceOverlap bool) (db.Task, error)
@@ -209,6 +216,16 @@ type Scheduler struct {
 	// a send. <1 is treated as 1 (nudge on first idle observation). New() sets it to 2.
 	IdleConfirmations int
 
+	// MaxClaimsPerTick caps how many tasks a single dispatch tick will claim+dispatch, so one
+	// tick can never claim an unbounded burst — each dispatch is a heavy spawn (worktree + tmux
+	// window + harness launch), and the next tick (DefaultInterval later) drains the rest of the
+	// ready backlog. Per-repo worktree capacity already bounds claims within a repo; this is a
+	// fleet-wide per-tick ceiling that complements the governor's MaxActiveWorkers (a total
+	// concurrent-worker cap) — a tick dispatches the smaller of the two budgets. <= 0 means NO
+	// cap (a bare struct and any hand-built Scheduler are uncapped, so existing behavior is
+	// unchanged); New() sets the production default from the env-or-default.
+	MaxClaimsPerTick int
+
 	// Backpressure governor (roadmap H4) — a machine-aware throttle layered ON TOP of the hard
 	// worktree-pool cap and the disjoint-footprint invariant; it only ever dispatches FEWER
 	// workers, never more, so it cannot weaken any correctness gate. MaxActiveWorkers caps how
@@ -271,6 +288,7 @@ func New(m *orchestrator.Manager, interval time.Duration, log io.Writer) *Schedu
 		IdleNudgeGrace:    idleNudgeGraceFromEnv(),
 		MaxIdleNudges:     maxIdleNudgesFromEnv(),
 		IdleConfirmations: defaultIdleConfirmations,
+		MaxClaimsPerTick:  maxClaimsPerTickFromEnv(),
 
 		// Backpressure governor (H4): default-on machine-load throttle (env-overridable). The
 		// active-worker cap is sized from the worktree pool; the land cap and load ceiling take
@@ -302,6 +320,18 @@ func maxIdleNudgesFromEnv() int {
 		}
 	}
 	return defaultMaxIdleNudges
+}
+
+// maxClaimsPerTickFromEnv resolves the per-tick claim ceiling from TTORCH_MAX_CLAIMS_PER_TICK,
+// falling back to defaultMaxClaimsPerTick when unset or unparseable. A configured value of 0
+// (or negative) is honored as "no cap" (an unbounded tick).
+func maxClaimsPerTickFromEnv() int {
+	if v := strings.TrimSpace(os.Getenv(envMaxClaimsPerTick)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return defaultMaxClaimsPerTick
 }
 
 // Run drives RunOnce on a ticker until ctx is cancelled, then returns ctx.Err(). The first
@@ -430,16 +460,25 @@ func (sc *Scheduler) runTick(ctx context.Context) {
 //     worker on the "wait for ttorch send" stub that no daemon send will satisfy, so a
 //     briefless task is left for the manager — the same skip-don't-fail treatment as an
 //     undeclared footprint;
-//   - its footprint is disjoint from every LIVE worker (Fleet.CheckOverlap) AND from every
-//     task already claimed THIS tick (which has no live window yet, so CheckOverlap cannot
-//     see it);
+//   - its footprint is disjoint from every occupied worker AND from every task already
+//     claimed THIS tick (which has no live window yet);
 //   - its repo has free worktree-pool capacity, counting tasks already claimed this tick.
+//
+// It reads the live fleet ONCE via Fleet.Snapshot (one board read + at most one tmux probe)
+// and answers capacity, occupancy, and per-task liveness from that single in-memory view —
+// instead of the old per-(ready × live)-pair re-read that re-queried the board and spawned a
+// `tmux list-windows` subprocess for every pair. The disjointness DECISION is identical: a
+// task is "occupied" — and so blocks an overlapping ready task — exactly when its footprint is
+// held by a worker that is either status=active (a claim, with or without a window yet) OR
+// tmux-live (a live window of any non-terminal status), the same union the snapshot-less
+// active-seed + liveness-gated CheckOverlap produced.
 //
 // Tasks that overlap or lack capacity are SKIPPED (left pending for a future tick), never
 // failed. Each selected task is claimed atomically (Store.ClaimTask: a BEGIN IMMEDIATE tx
 // re-checking status='pending') before the heavy dispatch, so two concurrent ticks/instances
-// can never double-dispatch — the loser of the claim simply skips. It is a no-op (returns
-// 0) when there is no ready work or no free capacity.
+// can never double-dispatch — the loser of the claim simply skips. A tick claims at most
+// MaxClaimsPerTick tasks (when > 0) so a large backlog ramps over several ticks rather than
+// bursting. It is a no-op (returns 0) when there is no ready work or no free capacity.
 func (sc *Scheduler) RunOnce(ctx context.Context) (int, error) {
 	ready, err := sc.Store.ListTasks(ctx, db.TaskFilter{
 		Status:      []string{db.StatusPending},
@@ -452,10 +491,15 @@ func (sc *Scheduler) RunOnce(ctx context.Context) (int, error) {
 		return 0, nil // nothing ready — the common idle-tick fast path
 	}
 
-	live, err := sc.Fleet.Status()
+	// Snapshot the live fleet ONCE for the whole tick: capacity, occupancy, and per-task
+	// liveness below all read this one consistent view. A read error (DB or tmux) ABORTS the
+	// tick — fail closed (C2), never proceed against an empty view that reads as "no live
+	// workers ⇒ full capacity ⇒ no overlap" and claim a pool of tasks against that phantom.
+	snap, err := sc.Fleet.Snapshot()
 	if err != nil {
 		return 0, err
 	}
+	live := snap.Tasks
 
 	// Backpressure governor (H4): a machine-load throttle layered ON TOP of the pool cap and
 	// the disjoint-footprint invariant below — it only ever dispatches FEWER workers, never
@@ -491,16 +535,21 @@ func (sc *Scheduler) RunOnce(ctx context.Context) (int, error) {
 	}
 
 	// Per-repo footprints already "occupied" — owned by a worker that is, or is about to be,
-	// on those files. Seeded from every ACTIVE task in the live snapshot (claimed/dispatched
-	// workers), then extended with each task claimed THIS tick. This closes the gap that
-	// Fleet.CheckOverlap alone leaves: CheckOverlap is liveness-gated (a tmux window must
-	// exist), so a task claimed-but-not-yet-spawned — by a prior tick whose dispatch is slow,
-	// by a second scheduler instance, or by this tick before its window comes up — is
-	// invisible to it. Checking active-task footprints from the snapshot makes the daemon
-	// refuse to dispatch overlapping work onto a claim that has not yet materialized a window.
+	// on those files. A snapshot task occupies its footprint when it is EITHER status=active
+	// (a claim, with or without a window yet) OR tmux-live (snap.Live — a live window of any
+	// non-terminal status), then the set is extended with each task claimed THIS tick. This is
+	// the SAME union the old per-task gate produced: the active arm catches a claim that has
+	// not yet materialized a window (invisible to a liveness-gated check — a prior tick's slow
+	// dispatch, a second scheduler instance, or this tick before its window comes up), and the
+	// snap.Live arm catches every live-windowed worker (the contribution the old liveness-gated
+	// CheckOverlap made), now answered in memory from the one snapshot instead of a per-pair
+	// `tmux list-windows` subprocess. cc sessions and empty footprints never occupy.
 	occupied := map[string][][]string{}
 	for _, t := range live {
-		if t.Status == db.StatusActive && t.Kind != db.KindCC && len(t.Footprint) > 0 {
+		if t.Kind == db.KindCC || len(t.Footprint) == 0 {
+			continue
+		}
+		if t.Status == db.StatusActive || snap.Live(t) {
 			occupied[t.Project] = append(occupied[t.Project], t.Footprint)
 		}
 	}
@@ -538,17 +587,7 @@ func (sc *Scheduler) RunOnce(ctx context.Context) (int, error) {
 		if freeOf(repo) <= 0 {
 			continue // no capacity in this repo right now — try the next ready task
 		}
-		conflict, err := sc.overlaps(repo, t.Footprint, occupied[repo])
-		if err != nil {
-			// Fail closed: the overlap gate could not read the board, so disjointness is
-			// unproven. Skip this task THIS tick (leave it pending for a future tick) rather
-			// than read the read-failure as "no conflict" and dispatch onto possibly-shared
-			// files. A whole-board read failure surfaces earlier via Fleet.Status (which aborts
-			// the tick); this guards the per-task overlap read that can fail independently.
-			sc.logf("skip %s: cannot verify overlap (board read failed): %v", t.ID, err)
-			continue
-		}
-		if conflict {
+		if footprintConflicts(t.Footprint, occupied[repo]) {
 			continue // overlaps a live or already-claimed worker — skip, leave pending
 		}
 		// Governor cap (H4): this task is otherwise dispatchable (footprint declared, brief
@@ -594,6 +633,12 @@ func (sc *Scheduler) RunOnce(ctx context.Context) (int, error) {
 		occupied[repo] = append(occupied[repo], claimed.Footprint)
 		dispatched++
 		sc.logf("dispatched %s to %s (footprint: %s)", claimed.ID, repo, strings.Join(claimed.Footprint, ", "))
+		if sc.MaxClaimsPerTick > 0 && dispatched >= sc.MaxClaimsPerTick {
+			// Per-tick claim ceiling reached — leave the rest of the ready backlog pending for
+			// the next tick so one tick never fires an unbounded burst of heavy spawns.
+			sc.logf("claim cap reached (%d) — deferring the rest of the backlog to the next tick", sc.MaxClaimsPerTick)
+			break
+		}
 	}
 	if govCapHit {
 		// Backpressure was applied this tick: we filled the max-active budget and left the
@@ -996,30 +1041,21 @@ func hashPane(pane string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// overlaps reports whether footprint conflicts with any LIVE worker (Fleet.CheckOverlap,
-// the manager's gate, which catches live-windowed workers of any status) or with any
-// already-occupied footprint (active claims, with or without a window yet, plus tasks
-// claimed earlier this tick). The occupied set is checked with the same pure predicate the
-// manager's overlap core uses (state.FootprintOverlap), so the daemon's disjointness
-// matches the manager's exactly. Callers only reach this with a non-empty footprint.
-//
-// It returns the CheckOverlap read error unchanged (rather than collapsing it to false):
-// a board-read failure means disjointness is UNPROVEN, and the caller must fail closed
-// (skip the task) rather than treat an empty conflict list as "safe to dispatch".
-func (sc *Scheduler) overlaps(repo string, footprint []string, occupied [][]string) (bool, error) {
-	conflicts, err := sc.Fleet.CheckOverlap(repo, footprint)
-	if err != nil {
-		return false, err
-	}
-	if len(conflicts) > 0 {
-		return true, nil
-	}
+// footprintConflicts reports whether footprint overlaps any already-occupied footprint for
+// the repo — every worker the tick has deemed on those files: the active-or-live workers
+// seeded from the once-per-tick snapshot, plus tasks claimed earlier this same tick. It is a
+// pure check (state.FootprintOverlap, the SAME predicate the manager's overlap core uses), so
+// the daemon's disjointness matches the manager's exactly, with no DB read or tmux subprocess
+// — the board/liveness reads happened once when the snapshot was built (Fleet.Snapshot), and
+// a read error there already aborted the tick (fail closed). Callers only reach this with a
+// non-empty footprint.
+func footprintConflicts(footprint []string, occupied [][]string) bool {
 	for _, fp := range occupied {
 		if len(state.FootprintOverlap(footprint, fp)) > 0 {
-			return true, nil
+			return true
 		}
 	}
-	return false, nil
+	return false
 }
 
 func (sc *Scheduler) logf(format string, args ...any) {

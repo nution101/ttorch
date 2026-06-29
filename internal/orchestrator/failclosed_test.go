@@ -1,6 +1,8 @@
 package orchestrator
 
 import (
+	"context"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -49,6 +51,69 @@ func TestCheckOverlapFailsClosedOnReadError(t *testing.T) {
 	}
 	if conflicts != nil {
 		t.Fatalf("CheckOverlap must not report a conflict set (which reads as 'no conflict') on a read error, got %v", conflicts)
+	}
+}
+
+// TestSnapshotFailsClosedOnReadError proves the once-per-tick live-fleet snapshot fails closed:
+// when the board cannot be read, Snapshot returns the error and a nil snapshot, so the
+// scheduler's RunOnce aborts the tick rather than proceeding against an empty view (no live
+// workers ⇒ full capacity ⇒ no overlap). The liveTasks read is the first thing Snapshot does,
+// so a closed DB exercises the same fail-closed path the scheduler relies on.
+func TestSnapshotFailsClosedOnReadError(t *testing.T) {
+	m := managerWithUnreadableBoard(t)
+	snap, err := m.Snapshot()
+	if err == nil {
+		t.Fatal("Snapshot must return the board-read error, not swallow it")
+	}
+	if snap != nil {
+		t.Fatalf("Snapshot must not return a snapshot on a read error, got %v", snap)
+	}
+}
+
+// TestSnapshotFailsClosedOnTmuxReadError proves the OTHER half of the snapshot's fail-closed
+// contract (C2): when the board reads fine but the tmux window probe fails, Snapshot still
+// returns the error (and a nil snapshot) rather than treating the unreadable window set as "no
+// live windows". This is the half carrying the actual behavior change — the old hot path
+// resolved liveness via tmux.WindowExists, which DISCARDS the tmux error and reads a failed
+// probe as "not live" (a fail-OPEN on overlap); Snapshot propagates it and aborts the tick. It
+// needs a readable board with >=1 live task (so Snapshot gets past the empty-board short-circuit
+// that skips the probe) plus a tmux whose list-windows fails.
+func TestSnapshotFailsClosedOnTmuxReadError(t *testing.T) {
+	// A stub `tmux` on PATH whose list-windows exits non-zero — the transient `tmux
+	// list-windows` hiccup the window probe must surface, modelled hermetically (no real tmux,
+	// no host session state), mirroring the fakeTmux helper.
+	dir := t.TempDir()
+	script := "#!/bin/sh\ncase \"$1\" in\n  list-windows) echo 'tmux: list-windows failed' >&2; exit 1 ;;\nesac\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "tmux"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	s, err := db.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	// A live (non-terminal) task so Snapshot proceeds PAST the empty-board short-circuit (which
+	// skips the tmux probe) and actually reaches ListWindows.
+	proj, err := s.UpsertProject(context.Background(), "/repo", "")
+	if err != nil {
+		t.Fatalf("UpsertProject: %v", err)
+	}
+	if _, err := s.CreateTask(context.Background(), db.Task{
+		ID: "live1", ProjectID: proj.ID, Status: db.StatusActive, Kind: db.KindShip,
+		Window: "wk-live1", Footprint: []string{"internal/cli"},
+	}, db.ActorManager); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	m := &Manager{Store: s, Session: "ttorch-tmuxfail"}
+
+	snap, err := m.Snapshot()
+	if err == nil {
+		t.Fatal("Snapshot must propagate the tmux window-probe error, not swallow it (the fail-open the old per-task path had)")
+	}
+	if snap != nil {
+		t.Fatalf("Snapshot must not return a snapshot on a tmux read error, got %v", snap)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/state"
+	"github.com/nution101/ttorch/internal/tmux"
 )
 
 // Conflict reports that a proposed footprint overlaps a live worker's footprint.
@@ -88,6 +89,79 @@ func (m *Manager) CheckOverlap(repo string, proposed []string) ([]Conflict, erro
 		return nil, err
 	}
 	return computeConflicts(proposed, tasks), nil
+}
+
+// LiveSnapshot is a once-per-tick view of the live fleet: the non-terminal tracked tasks
+// (liveTasks) plus the set of tmux window names that were present when the snapshot was
+// taken. It lets the scheduler's dispatch tick answer every occupancy / overlap / liveness
+// question for the whole tick from ONE board read and AT MOST ONE tmux probe, instead of
+// re-reading the board and re-spawning a `tmux list-windows` subprocess per (ready × live)
+// pair (the O(ready × live) hot path this replaces). Build one via Manager.Snapshot; tests
+// and the scheduler's fake fleet build one via NewLiveSnapshot.
+type LiveSnapshot struct {
+	// Tasks is the live (non-terminal) fleet, exactly as liveTasks() returns it — the single
+	// source the tick reads for capacity (worktree holders), occupancy (active claims), and
+	// the candidate set for liveness.
+	Tasks []db.Task
+	// liveWins is the set of window names present in tmux at snapshot time. Membership is the
+	// in-memory equivalent of Manager.Live(t) / tmux.WindowExists, with no per-call subprocess.
+	liveWins map[string]struct{}
+}
+
+// NewLiveSnapshot builds a snapshot from an explicit task list and the set of live window
+// names — the seam the scheduler's fake fleet (and unit tests) use to construct a snapshot
+// without tmux or a DB, modelling liveness as "the task's window is in liveWindows". Empty
+// window names are ignored (a window-less task is never live). Production builds the snapshot
+// via Manager.Snapshot.
+func NewLiveSnapshot(tasks []db.Task, liveWindows []string) *LiveSnapshot {
+	set := make(map[string]struct{}, len(liveWindows))
+	for _, w := range liveWindows {
+		if w != "" {
+			set[w] = struct{}{}
+		}
+	}
+	return &LiveSnapshot{Tasks: tasks, liveWins: set}
+}
+
+// Live reports whether a task's tmux window was present when the snapshot was taken — the
+// in-memory equivalent of Manager.Live(t), with no per-call subprocess. A task with no window
+// (claimed but not yet spawned) is never live.
+func (s *LiveSnapshot) Live(t db.Task) bool {
+	if t.Window == "" {
+		return false
+	}
+	_, ok := s.liveWins[t.Window]
+	return ok
+}
+
+// Snapshot captures the live fleet ONCE: one liveTasks() board read and — only when there is
+// at least one live task whose liveness could matter — one tmux ListWindows probe. The
+// resulting LiveSnapshot answers liveness (Live) in memory for the rest of the tick, so the
+// scheduler no longer re-reads the board or re-probes tmux per (ready × live) pair.
+//
+// It FAILS CLOSED, mirroring liveTasks/Status/CheckOverlap: a board-read error (the DB lock
+// timeout / WAL hiccup liveTasks already surfaces) OR a tmux read error propagates, and the
+// caller (the scheduler's RunOnce) ABORTS the tick rather than proceeding against an empty
+// view that would read as "no live workers ⇒ full capacity ⇒ no overlap". The ListWindows
+// probe is skipped entirely when there are no live tasks (nothing to liveness-check), so an
+// empty board never depends on tmux.
+func (m *Manager) Snapshot() (*LiveSnapshot, error) {
+	tasks, err := m.liveTasks()
+	if err != nil {
+		return nil, err
+	}
+	if len(tasks) == 0 {
+		return &LiveSnapshot{liveWins: map[string]struct{}{}}, nil
+	}
+	wins, err := tmux.ListWindows(m.Session)
+	if err != nil {
+		return nil, err
+	}
+	set := make(map[string]struct{}, len(wins))
+	for _, w := range wins {
+		set[w] = struct{}{}
+	}
+	return &LiveSnapshot{Tasks: tasks, liveWins: set}, nil
 }
 
 // OverlapString renders a conflict's path pairs as "proposed↔existing" entries,

@@ -55,9 +55,10 @@ func TestRunTickHandledErrorObservable(t *testing.T) {
 	addPending(t, s, repo, "ship1", db.KindShip, []string{"internal/cli"})
 
 	tick := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
-	// statusErr forces RunOnce to fail closed on the live-fleet read — a handled error runTick
-	// logs and swallows. Nothing should be dispatched and the task must stay pending.
-	f := &fakeFleet{statusErr: errors.New("board read failed")}
+	// snapshotErr forces RunOnce to fail closed on the once-per-tick live-fleet snapshot read —
+	// a handled error runTick logs and swallows. Nothing should be dispatched and the task must
+	// stay pending.
+	f := &fakeFleet{snapshotErr: errors.New("board read failed")}
 	var log bytes.Buffer
 	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}, Dispatch: true, Log: &log, now: func() time.Time { return tick }}
 

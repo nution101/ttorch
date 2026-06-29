@@ -253,6 +253,40 @@ func TestCheckOverlap_OnlyLiveWorkers(t *testing.T) {
 	}
 }
 
+// TestSnapshotLivenessMatchesTmux proves the once-per-tick snapshot reads liveness from the
+// SAME tmux truth as Manager.Live / CheckOverlap: a spawned worker's window is Live in the
+// snapshot, and after teardown it is not. This is the decision-equivalence the scheduler's
+// snapshot-once overlap path relies on — liveness answered in memory from one ListWindows
+// probe must match the per-task WindowExists it replaced.
+func TestSnapshotLivenessMatchesTmux(t *testing.T) {
+	m, repo := deliveryHarness(t, "snap")
+	a, err := m.SpawnWithFootprint("a1", repo, false, "sleep 30", []string{"internal/cli"}, false)
+	if err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	snap, err := m.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if !snap.Live(a) {
+		t.Fatalf("a live worker's window must read Live in the snapshot")
+	}
+	// A task with a window that does not exist must not read Live.
+	if snap.Live(db.Task{ID: "ghost", Window: "wk-ghost"}) {
+		t.Fatalf("a window that does not exist must not read Live")
+	}
+	if _, err := m.Teardown("a1", true); err != nil {
+		t.Fatalf("teardown: %v", err)
+	}
+	snap2, err := m.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot after teardown: %v", err)
+	}
+	if snap2.Live(a) {
+		t.Fatalf("a torn-down worker's window must no longer read Live")
+	}
+}
+
 // TestSpawnPeekTeardown exercises the real runtime against tmux + git. It is
 // skipped where tmux is unavailable (e.g. CI without tmux installed).
 func TestSpawnPeekTeardown(t *testing.T) {

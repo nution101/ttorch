@@ -13,7 +13,6 @@ import (
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/orchestrator"
 	"github.com/nution101/ttorch/internal/review"
-	"github.com/nution101/ttorch/internal/state"
 	"github.com/nution101/ttorch/internal/worktree"
 )
 
@@ -25,22 +24,22 @@ type spawnCall struct {
 	footprint []string
 }
 
-// fakeFleet is a tmux-free stand-in for *orchestrator.Manager: Status returns a configured
-// live set, CheckOverlap faithfully models the manager's LIVENESS-GATED predicate
-// (state.FootprintOverlap, scoped by repo, excluding cc/empty footprints AND — like the
-// real m.Live gate — window-less tasks) over that set, and SpawnWithFootprint records the
-// call (and optionally forces an error / forwards to a shared sink for concurrency tests)
-// instead of standing up a worktree + tmux window.
+// fakeFleet is a tmux-free stand-in for *orchestrator.Manager: Snapshot returns a once-per-
+// tick view built from the configured live set — modelling tmux-liveness as "the task has a
+// non-empty Window" (the real Manager.Snapshot reads liveness from tmux ListWindows; a
+// window-less task is never live) — and SpawnWithFootprint records the call (and optionally
+// forces an error / forwards to a shared sink for concurrency tests) instead of standing up a
+// worktree + tmux window.
 type fakeFleet struct {
-	mu         sync.Mutex
-	live       []db.Task
-	calls      []spawnCall
-	spawnErr   map[string]error // per-task forced dispatch failure
-	landed     []string         // ids handed to LandSet, in call order
-	landErr    map[string]error // per-task forced land failure
-	record     func(id string)  // shared sink for the cross-instance race tests
-	statusErr  error            // forced Status (live-fleet read) failure — the fail-closed abort path
-	overlapErr error            // forced CheckOverlap (board read) failure — the fail-closed refuse path
+	mu            sync.Mutex
+	live          []db.Task
+	calls         []spawnCall
+	spawnErr      map[string]error // per-task forced dispatch failure
+	landed        []string         // ids handed to LandSet, in call order
+	landErr       map[string]error // per-task forced land failure
+	record        func(id string)  // shared sink for the cross-instance race tests
+	snapshotErr   error            // forced Snapshot (live-fleet read) failure — the fail-closed abort path
+	snapshotCalls int              // how many times Snapshot was called (proves one read per tick)
 
 	panes   map[string]string // pane content Peek returns, by task id (idle-nudge tests)
 	peekErr map[string]error  // per-task forced Peek failure (e.g. a gone window)
@@ -63,38 +62,31 @@ type gateIdem struct {
 	recorded map[string]bool
 }
 
-func (f *fakeFleet) Status() ([]db.Task, error) {
+func (f *fakeFleet) Snapshot() (*orchestrator.LiveSnapshot, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.statusErr != nil {
-		return nil, f.statusErr
+	f.snapshotCalls++
+	if f.snapshotErr != nil {
+		return nil, f.snapshotErr
 	}
-	out := make([]db.Task, len(f.live))
-	copy(out, f.live)
-	return out, nil
+	tasks := make([]db.Task, len(f.live))
+	copy(tasks, f.live)
+	// Model tmux-liveness exactly as the real Manager.Snapshot does — a task is live iff its
+	// window is present — by feeding every non-empty Window in the live set as a live window.
+	// A window-less task (claimed but not yet spawned) is therefore not live.
+	var wins []string
+	for _, t := range f.live {
+		if t.Window != "" {
+			wins = append(wins, t.Window)
+		}
+	}
+	return orchestrator.NewLiveSnapshot(tasks, wins), nil
 }
 
-func (f *fakeFleet) CheckOverlap(repo string, proposed []string) ([]orchestrator.Conflict, error) {
-	if len(proposed) == 0 {
-		return nil, nil
-	}
+func (f *fakeFleet) snapshotReads() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.overlapErr != nil {
-		return nil, f.overlapErr
-	}
-	var out []orchestrator.Conflict
-	for _, t := range f.live {
-		// The real CheckOverlap is liveness-gated (m.Live ⇒ a tmux window exists), so a
-		// window-less task is invisible to it — model that with t.Window == "".
-		if t.Project != repo || t.Kind == db.KindCC || len(t.Footprint) == 0 || t.Window == "" {
-			continue
-		}
-		if ov := state.FootprintOverlap(proposed, t.Footprint); len(ov) > 0 {
-			out = append(out, orchestrator.Conflict{TaskID: t.ID, Window: t.Window, Project: t.Project, Overlaps: ov})
-		}
-	}
-	return out, nil
+	return f.snapshotCalls
 }
 
 func (f *fakeFleet) SpawnWithFootprint(taskID, projectPath string, scout bool, rawCmd string, footprint []string, forceOverlap bool) (db.Task, error) {
@@ -460,23 +452,80 @@ func TestRunOnceSkipsClaimedButNotYetLive(t *testing.T) {
 	}
 }
 
-// TestRunOnceAbortsOnStatusReadError is the core fail-closed guarantee: when the live-fleet
-// read fails (a transient DB error — lock timeout under contention, a WAL hiccup), the tick
-// ABORTS, returning the error and dispatching NOTHING. It must never read an unreadable board
-// as an empty fleet (no live workers ⇒ full free capacity ⇒ no overlap) and claim+dispatch a
-// pool of tasks against that phantom view — the silent fail-open this guards against.
-func TestRunOnceAbortsOnStatusReadError(t *testing.T) {
+// TestRunOnceSkipsOverlapWithLiveNonActiveWorker proves the snapshot's liveness arm reproduces
+// the old liveness-gated CheckOverlap exactly: a worker that is NOT status=active (e.g. done,
+// awaiting land) but still holds a LIVE tmux window blocks an overlapping ready task — the
+// contribution CheckOverlap made over the active-only occupied seed. The decision is identical
+// to today; only the read is now in-memory from the one snapshot.
+func TestRunOnceSkipsOverlapWithLiveNonActiveWorker(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	addPending(t, s, repo, "newcomer", db.KindShip, []string{"internal/db/task.go"})
+
+	// A DONE worker (not active) whose window is still live, holding internal/db. The active
+	// seed would miss it; the snapshot's liveness (Window != "") catches it, just as the old
+	// liveness-gated CheckOverlap did.
+	f := &fakeFleet{live: []db.Task{
+		{ID: "winding-down", Window: "wk-wd", Project: repo, Kind: db.KindShip, Status: db.StatusDone, Footprint: []string{"internal/db"}},
+	}}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}}
+	if _, err := sc.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if contains(f.dispatched(), "newcomer") {
+		t.Error("a task overlapping a live-windowed (non-active) worker must be skipped")
+	}
+	if status(t, s, "newcomer") != db.StatusPending {
+		t.Error("the skipped task must remain pending")
+	}
+}
+
+// TestRunOnceDispatchesPastGoneWindowWorker is the converse of the live-non-active case: a
+// non-active worker (done) whose window is GONE no longer occupies its footprint — neither the
+// old active-seed nor the old liveness-gated CheckOverlap caught it, and the snapshot must not
+// either — so a ready task on those files dispatches. This pins that the new liveness arm did
+// not start blocking on stale (window-gone) workers.
+func TestRunOnceDispatchesPastGoneWindowWorker(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	addPending(t, s, repo, "newcomer", db.KindShip, []string{"internal/db/task.go"})
+
+	// A done worker with NO live window (its window is gone) holding internal/db. Not active,
+	// not live ⇒ not occupied ⇒ must not block.
+	f := &fakeFleet{live: []db.Task{
+		{ID: "gone", Window: "", Project: repo, Kind: db.KindShip, Status: db.StatusDone, Footprint: []string{"internal/db"}},
+	}}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}}
+	if _, err := sc.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if !contains(f.dispatched(), "newcomer") {
+		t.Error("a task overlapping only a gone-window (non-active) worker must dispatch")
+	}
+}
+
+// TestRunOnceAbortsOnSnapshotReadError is the core fail-closed guarantee (C2): when the
+// once-per-tick live-fleet snapshot read fails (a transient DB error — lock timeout under
+// contention, a WAL hiccup — or a tmux read error), the tick ABORTS, returning the error and
+// dispatching NOTHING. It must never read an unreadable board as an empty fleet (no live
+// workers ⇒ full free capacity ⇒ no overlap) and claim+dispatch a pool of tasks against that
+// phantom view — the silent fail-open this guards against. The snapshot is the single board/
+// liveness read of the tick, so its failure aborts everything rather than leaving a per-task
+// read that could fail independently.
+func TestRunOnceAbortsOnSnapshotReadError(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
 	repo := "/repo"
 	addPending(t, s, repo, "a", db.KindShip, []string{"internal/cli"})
 
-	f := &fakeFleet{statusErr: errors.New("database is locked")}
+	f := &fakeFleet{snapshotErr: errors.New("database is locked")}
 	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}}
 
 	n, err := sc.RunOnce(ctx)
 	if err == nil {
-		t.Fatal("RunOnce must surface the live-fleet read error, not swallow it")
+		t.Fatal("RunOnce must surface the snapshot read error, not swallow it")
 	}
 	if n != 0 {
 		t.Fatalf("dispatched %d, want 0 — an unreadable board must dispatch nothing", n)
@@ -490,35 +539,72 @@ func TestRunOnceAbortsOnStatusReadError(t *testing.T) {
 	}
 }
 
-// TestRunOnceSkipsOnOverlapReadError proves the per-task overlap gate fails closed: when
-// CheckOverlap cannot read the board, the scheduler cannot PROVE the footprint disjoint, so it
-// REFUSES the task — skipping it this tick and leaving it pending — rather than reading the
-// empty conflict list of a read failure as a genuine "no conflict" and dispatching onto
-// possibly-shared files. The tick itself does not fail (a per-task read can fail
-// independently of the whole-board Status read), so other ready tasks are unaffected.
-func TestRunOnceSkipsOnOverlapReadError(t *testing.T) {
+// TestRunOnceSnapshotsLiveFleetOncePerTick proves the hot-path optimization: regardless of how
+// many ready tasks (N) and live workers (M) a tick faces, the scheduler reads the live fleet
+// EXACTLY ONCE — it does not re-read the board or re-probe tmux per (ready × live) pair (the
+// old O(N×M) CheckOverlap-per-task path). Overlap, capacity, and liveness all resolve from that
+// single snapshot, so the per-pair work is pure in-memory FootprintOverlap.
+func TestRunOnceSnapshotsLiveFleetOncePerTick(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
 	repo := "/repo"
-	addPending(t, s, repo, "a", db.KindShip, []string{"internal/cli"})
-
-	// Status succeeds (empty live fleet) so the tick reaches the per-task overlap check; that
-	// check then fails to read the board.
-	f := &fakeFleet{overlapErr: errors.New("database is locked")}
+	// N ready tasks, all disjoint from each other and from the live fleet, so the tick walks
+	// every one through the overlap check.
+	for _, id := range []string{"r1", "r2", "r3", "r4", "r5"} {
+		addPending(t, s, repo, id, db.KindShip, []string{"pkg/" + id})
+	}
+	// M live workers, each with a footprint, so the old path would have probed liveness N×M times.
+	var live []db.Task
+	for _, id := range []string{"w1", "w2", "w3"} {
+		live = append(live, db.Task{ID: id, Window: "wk-" + id, Project: repo, Kind: db.KindShip, Status: db.StatusActive, Footprint: []string{"live/" + id}})
+	}
+	f := &fakeFleet{live: live}
 	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}}
+
+	if _, err := sc.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if got := f.snapshotReads(); got != 1 {
+		t.Fatalf("snapshot read %d times, want exactly 1 — the tick must read the live fleet once, not per (ready × live) pair", got)
+	}
+	// Sanity: every disjoint ready task still dispatched (the optimization changed cost, not decisions).
+	if got := len(f.dispatched()); got != 5 {
+		t.Fatalf("dispatched %d, want 5 — all disjoint ready tasks should dispatch", got)
+	}
+}
+
+// TestRunOnceCapsClaimsPerTick proves the per-tick claim ceiling: with MaxClaimsPerTick set,
+// a tick claims at most that many tasks from a larger disjoint backlog and leaves the rest
+// pending for the next tick — so one tick never fires an unbounded burst of heavy spawns.
+func TestRunOnceCapsClaimsPerTick(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	for _, id := range []string{"c1", "c2", "c3", "c4", "c5", "c6"} {
+		addPending(t, s, repo, id, db.KindShip, []string{"pkg/" + id})
+	}
+	f := &fakeFleet{}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}, MaxClaimsPerTick: 2}
 
 	n, err := sc.RunOnce(ctx)
 	if err != nil {
-		t.Fatalf("RunOnce: a per-task overlap read error must skip the task, not fail the tick: %v", err)
+		t.Fatalf("RunOnce: %v", err)
 	}
-	if n != 0 {
-		t.Fatalf("dispatched %d, want 0 — disjointness could not be proven", n)
+	if n != 2 {
+		t.Fatalf("dispatched %d, want 2 — the tick must stop at the claim cap", n)
 	}
-	if got := f.dispatched(); len(got) != 0 {
-		t.Fatalf("a task whose disjointness can't be proven must not dispatch, got %v", got)
+	if got := len(f.dispatched()); got != 2 {
+		t.Fatalf("spawned %d, want 2 — the cap bounds heavy spawns per tick", got)
 	}
-	if status(t, s, "a") != db.StatusPending {
-		t.Fatalf("the refused task must remain pending, got %q", status(t, s, "a"))
+	// The remaining four are untouched (still pending), available to the next tick.
+	pending := 0
+	for _, id := range []string{"c1", "c2", "c3", "c4", "c5", "c6"} {
+		if status(t, s, id) == db.StatusPending {
+			pending++
+		}
+	}
+	if pending != 4 {
+		t.Fatalf("%d tasks still pending, want 4 — over-cap tasks must remain pending for the next tick", pending)
 	}
 }
 
