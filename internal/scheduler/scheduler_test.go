@@ -801,3 +801,316 @@ func TestRunTickLandsOnlyWhenEnabled(t *testing.T) {
 		t.Fatalf("a tick with land enabled landed %v, want [ship1]", got)
 	}
 }
+
+// --- supervise pass (phase 3) ------------------------------------------------------
+
+// addActiveWorker creates an active task with a window and a 'spawned' event — a dispatched
+// worker the supervisor can later find dead. The footprint lets the dispatch pass re-dispatch
+// it. It carries no lease (so the lease-expiry sweep ignores it); window-gone tests drive the
+// death via markWindowGone, lease tests via addExpiredLeaseWorker.
+func addActiveWorker(t *testing.T, s *db.Store, repo, id string, footprint []string) {
+	t.Helper()
+	ctx := context.Background()
+	proj, err := s.UpsertProject(ctx, repo, "")
+	if err != nil {
+		t.Fatalf("UpsertProject: %v", err)
+	}
+	if _, err := s.CreateTask(ctx, db.Task{
+		ID: id, ProjectID: proj.ID, Status: db.StatusActive, Kind: db.KindShip,
+		Owner: "worker:" + id, Window: "wk-" + id, Footprint: footprint,
+	}, db.ActorManager); err != nil {
+		t.Fatalf("CreateTask %s: %v", id, err)
+	}
+	appendSpawned(t, s, id)
+}
+
+// addExpiredLeaseWorker creates an active task whose lease has ALREADY lapsed — a worker that
+// stopped heartbeating — without needing a clock seam: the expiry is stamped in the past, so
+// the real-clock ReclaimExpiredLeases sees it expired immediately.
+func addExpiredLeaseWorker(t *testing.T, s *db.Store, repo, id string, footprint []string) {
+	t.Helper()
+	ctx := context.Background()
+	proj, err := s.UpsertProject(ctx, repo, "")
+	if err != nil {
+		t.Fatalf("UpsertProject: %v", err)
+	}
+	past := time.Now().Add(-time.Hour)
+	if _, err := s.CreateTask(ctx, db.Task{
+		ID: id, ProjectID: proj.ID, Status: db.StatusActive, Kind: db.KindShip,
+		Owner: "worker:" + id, Window: "wk-" + id, Footprint: footprint,
+		LeaseOwner: "worker:" + id, LeaseExpiresAt: &past,
+	}, db.ActorManager); err != nil {
+		t.Fatalf("CreateTask %s: %v", id, err)
+	}
+	appendSpawned(t, s, id)
+}
+
+// appendSpawned mimics the spawn path's 'spawned' audit event (every (re-)dispatch emits one,
+// the anchor the window-gone freshness check measures against).
+func appendSpawned(t *testing.T, s *db.Store, id string) {
+	t.Helper()
+	if _, err := s.AppendEvent(context.Background(), db.Event{
+		EntityType: db.EntityTypeTask, EntityID: id, Type: db.EventSpawned, Actor: db.ActorManager,
+		Payload: "kind=ship window=wk-" + id,
+	}); err != nil {
+		t.Fatalf("AppendEvent spawned %s: %v", id, err)
+	}
+}
+
+// markWindowGone mimics the watcher's liveness poll recording a confirmed-gone window.
+func markWindowGone(t *testing.T, s *db.Store, id string) {
+	t.Helper()
+	if _, err := s.AppendEvent(context.Background(), db.Event{
+		EntityType: db.EntityTypeTask, EntityID: id, Type: db.EventWindowGone, Actor: db.ActorSystem,
+		Actionable: true, Payload: "wk-" + id,
+	}); err != nil {
+		t.Fatalf("AppendEvent window_gone %s: %v", id, err)
+	}
+}
+
+func retryCount(t *testing.T, s *db.Store, id string) int {
+	t.Helper()
+	tk, ok, err := s.GetTask(context.Background(), id)
+	if err != nil || !ok {
+		t.Fatalf("GetTask %s: ok=%v err=%v", id, ok, err)
+	}
+	return tk.RetryCount
+}
+
+// TestRunSuperviseReclaimsWindowGone proves the window-gone fast path: an active worker whose
+// window is confirmed gone is reclaimed to pending (re-dispatchable), retry_count++.
+func TestRunSuperviseReclaimsWindowGone(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	addActiveWorker(t, s, repo, "g1", []string{"pkg/g1"})
+	markWindowGone(t, s, "g1")
+
+	f := &fakeFleet{}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}}
+	n, err := sc.RunSuperviseOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunSuperviseOnce: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("reclaimed count = %d, want 1", n)
+	}
+	if status(t, s, "g1") != db.StatusPending {
+		t.Errorf("status = %q, want pending (re-dispatchable)", status(t, s, "g1"))
+	}
+	if retryCount(t, s, "g1") != 1 {
+		t.Errorf("retry_count = %d, want 1", retryCount(t, s, "g1"))
+	}
+}
+
+// TestRunSuperviseReclaimsExpiredLease proves the lease-expiry backstop is wired into the
+// supervise pass: a worker whose lease has lapsed is reclaimed to pending.
+func TestRunSuperviseReclaimsExpiredLease(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	addExpiredLeaseWorker(t, s, repo, "x1", []string{"pkg/x1"})
+
+	f := &fakeFleet{}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}}
+	n, err := sc.RunSuperviseOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunSuperviseOnce: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("reclaimed count = %d, want 1", n)
+	}
+	if status(t, s, "x1") != db.StatusPending {
+		t.Errorf("status = %q, want pending (reclaimed)", status(t, s, "x1"))
+	}
+}
+
+// TestRunSupervisePoisonPill is the headline bounded-retry SAFETY test: a crashed worker at
+// its retry ceiling is poison-pilled to the terminal 'failed' status — NOT reclaimed for
+// retry and NOT re-dispatched — and is not counted as reclaimed.
+func TestRunSupervisePoisonPill(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	proj, _ := s.UpsertProject(ctx, repo, "")
+	if _, err := s.CreateTask(ctx, db.Task{
+		ID: "p1", ProjectID: proj.ID, Status: db.StatusActive, Kind: db.KindShip,
+		Owner: "worker:p1", Window: "wk-p1", Footprint: []string{"pkg/p1"},
+		RetryCount: 3, MaxRetries: 3, // retries exhausted
+	}, db.ActorManager); err != nil {
+		t.Fatal(err)
+	}
+	appendSpawned(t, s, "p1")
+	markWindowGone(t, s, "p1")
+
+	f := &fakeFleet{}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}, Supervise: true, Dispatch: true}
+	// A full tick: supervise poison-pills, then dispatch must NOT pick the terminal task up.
+	sc.runTick(ctx)
+
+	if status(t, s, "p1") != db.StatusFailed {
+		t.Errorf("status = %q, want failed (poison-pilled, terminal)", status(t, s, "p1"))
+	}
+	if got := f.dispatched(); len(got) != 0 {
+		t.Errorf("a poison-pilled task must never be re-dispatched, got %v", got)
+	}
+}
+
+// TestRunSuperviseLeavesLiveWorker is the core never-touch-a-live-worker test: an active
+// worker with NO window_gone signal and a still-valid (future) lease — i.e. still
+// heartbeating — is neither reclaimed nor re-dispatched by a full supervise+dispatch tick.
+func TestRunSuperviseLeavesLiveWorker(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	addActiveWorker(t, s, repo, "live1", []string{"pkg/live1"})
+	if err := s.GrantLease(ctx, "live1", "worker:live1"); err != nil { // a fresh, future-dated lease
+		t.Fatal(err)
+	}
+
+	f := &fakeFleet{live: []db.Task{
+		{ID: "live1", Window: "wk-live1", Project: repo, Kind: db.KindShip, Status: db.StatusActive, Footprint: []string{"pkg/live1"}},
+	}}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}, Supervise: true, Dispatch: true}
+	sc.runTick(ctx)
+
+	if status(t, s, "live1") != db.StatusActive {
+		t.Errorf("a live, heartbeating worker must stay active, got %q", status(t, s, "live1"))
+	}
+	if retryCount(t, s, "live1") != 0 {
+		t.Errorf("a live worker must not accrue a retry, got retry_count %d", retryCount(t, s, "live1"))
+	}
+	if got := f.dispatched(); len(got) != 0 {
+		t.Errorf("a live worker must never be re-dispatched, got %v", got)
+	}
+}
+
+// TestRunSuperviseRespectsResumedWorker is the resume-safety test for the never-reclaim-a-live-
+// worker property: a worker whose window was flagged gone but that has since reported progress
+// (a worker-authored heartbeat — e.g. resumed in place by `ttorch resume`, which rebuilds the
+// window but writes no event of its own) is neither reclaimed nor re-dispatched by a full
+// supervise+dispatch tick.
+func TestRunSuperviseRespectsResumedWorker(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	addActiveWorker(t, s, repo, "r1", []string{"pkg/r1"})
+	markWindowGone(t, s, "r1")
+	// The worker is alive again and reports progress — a sign of life AFTER the window_gone.
+	if _, err := s.SetStage(ctx, "r1", "resumed, back to work", "worker:r1"); err != nil {
+		t.Fatal(err)
+	}
+
+	f := &fakeFleet{}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}, Supervise: true, Dispatch: true}
+	sc.runTick(ctx)
+
+	if status(t, s, "r1") != db.StatusActive {
+		t.Errorf("a resumed-and-reporting worker must stay active, got %q", status(t, s, "r1"))
+	}
+	if retryCount(t, s, "r1") != 0 {
+		t.Errorf("a resumed worker must not accrue a retry, got retry_count %d", retryCount(t, s, "r1"))
+	}
+	if got := f.dispatched(); len(got) != 0 {
+		t.Errorf("a resumed-and-reporting worker must not be re-dispatched, got %v", got)
+	}
+}
+
+// TestRunSuperviseIgnoresStaleWindowGone proves incarnation safety: a window_gone from a prior
+// incarnation that was already re-dispatched (a newer 'spawned' event follows it) does not
+// reclaim the now-live worker — the freshness anchor prevents a restart loop on a stale crash.
+func TestRunSuperviseIgnoresStaleWindowGone(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	addActiveWorker(t, s, repo, "s1", []string{"pkg/s1"}) // spawned #1
+	markWindowGone(t, s, "s1")                            // crash of incarnation #1
+	appendSpawned(t, s, "s1")                             // re-dispatched: spawned #2 ⇒ live again
+
+	f := &fakeFleet{}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}}
+	n, err := sc.RunSuperviseOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunSuperviseOnce: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("a stale window_gone must reclaim nothing, got n=%d", n)
+	}
+	if status(t, s, "s1") != db.StatusActive {
+		t.Errorf("status = %q, want active (the re-dispatched worker is live)", status(t, s, "s1"))
+	}
+}
+
+// TestRunTickReDispatchesWindowGone is the headline acceptance test: a full supervise+dispatch
+// tick RECLAIMS a window-gone worker and RE-DISPATCHES it through the manager's spawn path.
+func TestRunTickReDispatchesWindowGone(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	addActiveWorker(t, s, repo, "g1", []string{"pkg/g1"})
+	markWindowGone(t, s, "g1")
+
+	f := &fakeFleet{} // no live workers ⇒ capacity is free for the re-dispatch
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}, Supervise: true, Dispatch: true}
+	sc.runTick(ctx)
+
+	if !contains(f.dispatched(), "g1") {
+		t.Fatalf("a window-gone worker must be re-dispatched, got %v", f.dispatched())
+	}
+	// Re-dispatched ⇒ claimed back to active, with the retry recorded.
+	if status(t, s, "g1") != db.StatusActive {
+		t.Errorf("status = %q, want active after re-dispatch", status(t, s, "g1"))
+	}
+	if retryCount(t, s, "g1") != 1 {
+		t.Errorf("retry_count = %d, want 1 after one recovery", retryCount(t, s, "g1"))
+	}
+}
+
+// TestRunTickReDispatchesExpiredLease proves the same recovery for the lease-expiry signal: a
+// supervise+dispatch tick reclaims and re-dispatches a worker whose lease lapsed.
+func TestRunTickReDispatchesExpiredLease(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	addExpiredLeaseWorker(t, s, repo, "x1", []string{"pkg/x1"})
+
+	f := &fakeFleet{}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}, Supervise: true, Dispatch: true}
+	sc.runTick(ctx)
+
+	if !contains(f.dispatched(), "x1") {
+		t.Fatalf("an expired-lease worker must be re-dispatched, got %v", f.dispatched())
+	}
+	if status(t, s, "x1") != db.StatusActive {
+		t.Errorf("status = %q, want active after re-dispatch", status(t, s, "x1"))
+	}
+}
+
+// TestRunTickSupervisesOnlyWhenEnabled proves the supervise pass is OFF by default: a tick
+// reclaims a window-gone worker only when sc.Supervise is set, so enabling recovery is an
+// explicit opt-in with no behavior change otherwise.
+func TestRunTickSupervisesOnlyWhenEnabled(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	addActiveWorker(t, s, repo, "g1", []string{"pkg/g1"})
+	markWindowGone(t, s, "g1")
+
+	// Supervise disabled (the zero value): the tick must not reclaim, even with a window_gone.
+	f := &fakeFleet{}
+	off := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}} // Supervise=false, Dispatch=false
+	off.runTick(ctx)
+	if status(t, s, "g1") != db.StatusActive {
+		t.Fatalf("a tick with supervise disabled reclaimed g1 (status %q); it must be untouched", status(t, s, "g1"))
+	}
+	if retryCount(t, s, "g1") != 0 {
+		t.Fatalf("a tick with supervise disabled bumped retry_count to %d; it must be untouched", retryCount(t, s, "g1"))
+	}
+
+	// Supervise enabled: the tick reclaims the window-gone worker.
+	on := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}, Supervise: true}
+	on.runTick(ctx)
+	if status(t, s, "g1") != db.StatusPending {
+		t.Fatalf("a tick with supervise enabled left g1 %q, want pending (reclaimed)", status(t, s, "g1"))
+	}
+}

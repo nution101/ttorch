@@ -1343,35 +1343,44 @@ func cmdWatchdog(args []string) error {
 	}
 }
 
-// cmdScheduler runs the deterministic dispatch+land daemon (roadmap item A). Each tick it runs
-// whichever passes are enabled:
+// cmdScheduler runs the deterministic dispatch+land+supervise daemon (roadmap item A). Each
+// tick it runs whichever passes are enabled, in this order:
 //
+//   - SUPERVISE (phase 3, opt-in via --supervise): reclaim workers that have VERIFIABLY died —
+//     a tmux window the watcher confirmed gone, or an expired lease (never pane-output
+//     inference) — and re-dispatch them within a bounded retry ceiling; a task that exceeds
+//     the ceiling is poison-pilled to the terminal 'failed' status with an actionable event
+//     for the lead, never restarted forever. It NEVER reclaims a live worker. Runs first so a
+//     reclaimed task re-dispatches in the same tick.
 //   - DISPATCH (phase 1, on by default): re-derive ready pending backlog from SQLite, atomically
 //     claim the tasks it can prove safe to run in parallel (a declared footprint disjoint from
 //     every live and just-claimed worker, within free worktree capacity), and dispatch them
-//     through the SAME spawn path the manager uses — so disjoint ready work never sits idle.
+//     through the SAME spawn path the manager uses — so disjoint ready work (including a
+//     supervisor-reclaimed task) never sits idle.
 //   - LAND (phase 2a, opt-in via --land): find done tasks that ALREADY carry a passing durable
 //     verdict and land them through the SAME pipeline `ttorch land` runs (rebase, re-validate,
 //     carry verdict+approval, per-repo fast-forward, teardown) — so green, gated work merges
 //     without the manager doing it by hand. It NEVER lands ungated work: a passing verdict is
 //     required to attempt a task and the land path's own commit-pinned gate is the authority.
 //
-// The two passes are independent (--dispatch defaults on; --land opt-in), so it can run as a
-// dispatch-only daemon, a land-only daemon, or both. It is OPT-IN: nothing starts it
-// automatically, and existing manager/worker behavior is unchanged unless it is run. Its log
-// lines go to ITS stdout, never the manager pane (no TTY injection). --once runs a single tick
-// then exits (tests / cron); otherwise it loops on --interval until Ctrl-C/SIGTERM.
+// The three passes are independent (--dispatch defaults on; --land and --supervise opt-in), so
+// it can run as a dispatch-only daemon, a land-only daemon, a supervisor, or any combination. It
+// is OPT-IN: nothing starts it automatically, and existing manager/worker behavior is unchanged
+// unless it is run. Its log lines go to ITS stdout, never the manager pane (no TTY injection).
+// --once runs a single tick then exits (tests / cron); otherwise it loops on --interval until
+// Ctrl-C/SIGTERM.
 func cmdScheduler(args []string) error {
 	fs := flag.NewFlagSet("scheduler", flag.ContinueOnError)
 	interval := fs.Duration("interval", scheduler.DefaultInterval, "tick cadence: re-derive the board and act every interval")
 	once := fs.Bool("once", false, "run a single tick (act on what is ready now), then exit")
-	dispatch := fs.Bool("dispatch", true, "claim + dispatch ready pending backlog (on by default; pass --dispatch=false for a land-only daemon)")
+	dispatch := fs.Bool("dispatch", true, "claim + dispatch ready pending backlog (on by default; pass --dispatch=false for a land-/supervise-only daemon)")
 	land := fs.Bool("land", false, "also LAND done tasks that already carry a passing verdict, via the same pipeline as 'ttorch land' (off by default)")
+	supervise := fs.Bool("supervise", false, "also SUPERVISE the fleet: reclaim workers that verifiably died (window gone / lease expired) and re-dispatch within a bounded retry ceiling, poison-pilling the rest (off by default)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if !*dispatch && !*land {
-		return errors.New("scheduler: nothing to do — enable at least one of --dispatch (default) or --land")
+	if !*dispatch && !*land && !*supervise {
+		return errors.New("scheduler: nothing to do — enable at least one of --dispatch (default), --land, or --supervise")
 	}
 	m, err := mgr()
 	if err != nil {
@@ -1382,14 +1391,24 @@ func cmdScheduler(args []string) error {
 	sch := scheduler.New(m, *interval, os.Stdout)
 	sch.Dispatch = *dispatch
 	sch.Land = *land
+	sch.Supervise = *supervise
 	// Ctrl-C and SIGTERM cancel the loop and let it exit cleanly.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	if *once {
-		if *dispatch {
-			n, err := sch.RunOnce(ctx)
+		// Supervise FIRST (mirroring runTick): reclaim dead workers so the dispatch pass can
+		// re-dispatch them in this same one-shot tick.
+		if *supervise {
+			n, err := sch.RunSuperviseOnce(ctx)
 			// A clean cancel mid-tick is a normal exit, not an error.
+			if err != nil && ctx.Err() == nil {
+				return err
+			}
+			fmt.Printf("scheduler: reclaimed %d task(s) for retry\n", n)
+		}
+		if *dispatch && ctx.Err() == nil {
+			n, err := sch.RunOnce(ctx)
 			if err != nil && ctx.Err() == nil {
 				return err
 			}
@@ -1404,7 +1423,7 @@ func cmdScheduler(args []string) error {
 		}
 		return nil
 	}
-	fmt.Fprintf(os.Stdout, "scheduler: %s every %s (Ctrl-C to stop)\n", schedulerModes(*dispatch, *land), *interval)
+	fmt.Fprintf(os.Stdout, "scheduler: %s every %s (Ctrl-C to stop)\n", schedulerModes(*dispatch, *land, *supervise), *interval)
 	if err := sch.Run(ctx); err != nil {
 		// A clean cancel/SIGTERM is a normal exit, not an error.
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -1415,16 +1434,21 @@ func cmdScheduler(args []string) error {
 	return nil
 }
 
-// schedulerModes describes the enabled passes for the daemon's startup banner.
-func schedulerModes(dispatch, land bool) string {
-	switch {
-	case dispatch && land:
-		return "dispatching ready backlog and landing gated work"
-	case land:
-		return "landing gated work"
-	default:
-		return "dispatching ready backlog"
+// schedulerModes describes the enabled passes for the daemon's startup banner, in tick order
+// (supervise → dispatch → land). The caller has already refused an all-off config, so the
+// result is never empty.
+func schedulerModes(dispatch, land, supervise bool) string {
+	var parts []string
+	if supervise {
+		parts = append(parts, "recovering dead workers")
 	}
+	if dispatch {
+		parts = append(parts, "dispatching ready backlog")
+	}
+	if land {
+		parts = append(parts, "landing gated work")
+	}
+	return strings.Join(parts, ", ")
 }
 
 func cmdValidate(args []string) error {
@@ -1959,16 +1983,20 @@ Supervision:
     [--interval d]          channel 'watch' uses — never a keystroke). Idle-aware, so it
     [--quiet]               no-ops when nothing waits; one-shot unless --interval loops
                             it as a daemon. Run from launchd/cron.
-  scheduler               deterministic dispatch+land daemon (opt-in; nothing auto-starts it):
-    [--interval d]          DISPATCH (on): each tick re-derive ready pending backlog and
-    [--once]                atomically claim + dispatch the tasks it can prove safe — a
-    [--dispatch]            declared footprint, disjoint from every live and just-claimed
-    [--land]                worker, within free worktree capacity — via the manager's own
-                            spawn path. Skips (never fails) overlapping or capacity-blocked
-                            tasks and footprint-less tasks (left for the manager).
+  scheduler               deterministic dispatch+land+supervise daemon (opt-in; nothing
+    [--interval d]          auto-starts it). DISPATCH (on): each tick re-derive ready pending
+    [--once]                backlog and atomically claim + dispatch the tasks it can prove
+    [--dispatch]            safe — a declared footprint, disjoint from every live and
+    [--land]                just-claimed worker, within free worktree capacity — via the
+    [--supervise]           manager's own spawn path. Skips (never fails) overlapping or
+                            capacity-blocked and footprint-less tasks (left for the manager).
                             LAND (--land, off): also land done tasks that ALREADY carry a
                             passing verdict, via the same pipeline as 'ttorch land'; never
-                            lands ungated work. --dispatch/--land toggle the passes
+                            lands ungated work. SUPERVISE (--supervise, off): reclaim workers
+                            that verifiably died — a confirmed-gone window or an expired lease,
+                            never pane inference — and re-dispatch them within a bounded retry
+                            ceiling, poison-pilling a task that exceeds it to 'failed' with an
+                            actionable event; never reclaims a live worker. The three toggle
                             independently (--dispatch=false --land = land-only). Logs to its
                             own stdout, never the manager pane. --once runs one tick.
 

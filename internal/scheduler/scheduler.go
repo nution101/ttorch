@@ -8,17 +8,24 @@
 // sitting idle while the manager is mid-turn or stalled — parallelism becomes deterministic
 // code, not a rule the manager must remember.
 //
-// Phase 1 DISPATCHES ready backlog; phase 2a additionally LANDS work that has already
-// passed the trust gate. With the land pass enabled, each tick also finds done tasks that
-// already carry a passing durable verdict and lands them through the manager's EXISTING land
-// pipeline (the same code `ttorch land` runs), so a green, gated task merges without the LLM
-// manager doing it by hand — the core throughput/anti-stall win. The two passes are
-// independent: a tick runs whichever are enabled, dispatch defaults on (`ttorch scheduler`)
-// and land is opt-in (`--land`). Autonomous GATING (spawning the reviewers, recording the
-// verdict) and a supervisor remain deliberate follow-on phases — this phase automates only
-// the LAND once a passing verdict already exists; it NEVER lands ungated work. The daemon is
-// OPT-IN: nothing starts it automatically (see `ttorch scheduler`); existing manager/worker
-// behavior is unchanged unless it is run.
+// Phase 1 DISPATCHES ready backlog; phase 2a additionally LANDS work that has already passed
+// the trust gate; phase 3 additionally SUPERVISES the fleet — it reclaims workers that have
+// VERIFIABLY died (a tmux window the watcher confirmed gone, or an expired lease — never
+// pane-output inference) and re-dispatches them within a bounded retry ceiling, poison-pilling
+// a task that exceeds the ceiling to the terminal 'failed' status with an actionable event for
+// the lead rather than restarting it forever. With the land pass enabled, each tick also finds
+// done tasks that already carry a passing durable verdict and lands them through the manager's
+// EXISTING land pipeline (the same code `ttorch land` runs), so a green, gated task merges
+// without the LLM manager doing it by hand — the core throughput/anti-stall win. The three
+// passes are independent: a tick runs whichever are enabled, dispatch defaults on
+// (`ttorch scheduler`) while land (`--land`) and supervise (`--supervise`) are opt-in.
+// Autonomous GATING (spawning the reviewers, recording the verdict) and auto-starting the
+// daemon from the manager remain deliberate follow-on phases. The LAND pass NEVER lands ungated
+// work; the SUPERVISE pass reclaims only a worker that has shown no sign of life (no re-dispatch
+// and no heartbeat) since its window was flagged gone, or whose lease genuinely lapsed, and
+// never restarts a task past its retry ceiling. The daemon is OPT-IN: nothing starts it
+// automatically (see `ttorch scheduler`); existing manager/worker behavior is unchanged unless
+// it is run.
 //
 // Concurrency model: the scheduler is self-consistent and safe to run as multiple
 // instances against one DB — the atomic dispatch claim (db.ClaimTask: BEGIN IMMEDIATE +
@@ -91,14 +98,19 @@ type Scheduler struct {
 	Interval time.Duration
 	Log      io.Writer
 
-	// Dispatch and Land select which passes each tick runs, independently. Dispatch (the
-	// phase-1 behavior) claims and dispatches ready pending backlog; Land claims and lands
-	// done tasks that already carry a passing verdict. New() turns Dispatch on (today's
-	// default); Land is OFF unless explicitly enabled (the autonomous-land opt-in) so there is
-	// no behavior change unless the scheduler is run with land turned on. RunOnce/RunLandOnce
-	// are unconditional primitives — these toggles gate only which the loop (runTick) drives.
-	Dispatch bool
-	Land     bool
+	// Dispatch, Land, and Supervise select which passes each tick runs, independently.
+	// Dispatch (the phase-1 behavior) claims and dispatches ready pending backlog; Land claims
+	// and lands done tasks that already carry a passing verdict; Supervise (phase 3) reclaims
+	// workers that have verifiably died — a confirmed-gone tmux window or an expired lease —
+	// re-dispatching them within a bounded retry ceiling and poison-pilling the ones that
+	// exceed it. New() turns Dispatch on (today's default); Land and Supervise are OFF unless
+	// explicitly enabled (the autonomous-land / autonomous-recovery opt-ins) so there is no
+	// behavior change unless the scheduler is run with them turned on. RunOnce/RunLandOnce/
+	// RunSuperviseOnce are unconditional primitives — these toggles gate only which the loop
+	// (runTick) drives.
+	Dispatch  bool
+	Land      bool
+	Supervise bool
 }
 
 // New builds the production Scheduler from a Manager: it dispatches through the manager's
@@ -138,12 +150,30 @@ func (sc *Scheduler) Run(ctx context.Context) error {
 	}
 }
 
-// runTick runs one tick of each enabled pass (dispatch, then land) and logs the outcome.
-// The passes are independent: a transient error in one is logged and swallowed so the daemon
-// survives a DB hiccup and still runs the other (the next tick re-derives from scratch). A
-// cancellation error is left for Run's select to surface (not logged as a failure), and a
-// cancellation between passes halts the rest of the tick promptly.
+// runTick runs one tick of each enabled pass (supervise, then dispatch, then land) and logs
+// the outcome. The passes are independent: a transient error in one is logged and swallowed
+// so the daemon survives a DB hiccup and still runs the others (the next tick re-derives from
+// scratch). A cancellation error is left for Run's select to surface (not logged as a
+// failure), and a cancellation between passes halts the rest of the tick promptly.
+//
+// Supervise runs FIRST so the tasks it reclaims to pending — and the worktree slots a dead
+// worker frees — are visible to THIS tick's dispatch pass, which re-dispatches them as
+// ordinary ready backlog. Recovery is thus reclaim (supervise) + re-dispatch (dispatch): a
+// dispatch-disabled run still reclaims and poison-pills, it just defers the restart to a tick
+// with dispatch on.
 func (sc *Scheduler) runTick(ctx context.Context) {
+	if sc.Supervise {
+		if n, err := sc.RunSuperviseOnce(ctx); err != nil {
+			if ctx.Err() == nil {
+				sc.logf("supervise tick error: %v", err)
+			}
+		} else if n > 0 {
+			sc.logf("tick reclaimed %d task(s) for retry", n)
+		}
+	}
+	if ctx.Err() != nil {
+		return
+	}
 	if sc.Dispatch {
 		if n, err := sc.RunOnce(ctx); err != nil {
 			if ctx.Err() == nil {
@@ -403,6 +433,71 @@ func (sc *Scheduler) RunLandOnce(ctx context.Context) (int, error) {
 		sc.logf("landed %s to %s", r.TaskID, r.Repo)
 	}
 	return landed, nil
+}
+
+// RunSuperviseOnce performs one supervision pass and returns how many dead workers' tasks it
+// reclaimed to pending (the re-dispatchable count). It AUTO-RECOVERS workers that have
+// VERIFIABLY died, by two independent signals — never pane-output inference:
+//
+//   - WINDOW GONE (fast path, Store.ReclaimWindowGone): a worker whose tmux window the
+//     watcher confirmed absent (a crash). Recovered promptly, without waiting out the lease.
+//   - LEASE EXPIRED (backstop, Store.ReclaimExpiredLeases): a worker that has not extended its
+//     lease within the lease window — the universal signal that needs no watcher running.
+//
+// Both reclaim through the SAME bounded transition: a task under its retry ceiling goes back
+// to pending (retry_count++), so the dispatch pass re-dispatches it onto a fresh, clean
+// worktree via the manager's spawn path; a task that has EXCEEDED the ceiling — including one
+// that repeatedly kills its worker, since each death consumes a retry — is poison-pilled to
+// the terminal 'failed' status with an actionable event for the lead, and is NOT re-dispatched.
+// The retry ceiling is the restart-storm bound (mirroring Sidekiq's max-retries ⇒ dead set):
+// a flapping task can only burn its bounded retries before it goes terminal, never loop forever.
+//
+// It does not reclaim a worker that has shown a SIGN OF LIFE. Each reclaim's verifiable signal
+// IS a liveness signal — a confirmed-gone window with no later sign of life (no re-dispatch,
+// no heartbeat), or a lapsed lease a heartbeat would have extended — re-checked under the
+// per-task write lock, so a worker still heartbeating, re-dispatched, or resumed-and-reporting
+// since the scan is left untouched (see Store.ReclaimWindowGone for the sign-of-life anchor and
+// the one residual `ttorch resume` co-running boundary). And the pass does not itself
+// re-dispatch: it only moves a dead worker's task to pending or failed, leaving the actual
+// restart to the dispatch pass (which acts on pending tasks only) — so a still-active worker is
+// never re-spawned. Reclaiming is idempotent and safe across instances (the atomic per-task
+// claims in the db layer), so two ticks/instances can never double-reclaim. It is a no-op
+// (returns 0) when nothing has died.
+func (sc *Scheduler) RunSuperviseOnce(ctx context.Context) (int, error) {
+	// Window-gone first: a confirmed-gone window is the promptest death signal, so recover it
+	// without waiting out the (much longer) lease.
+	gone, err := sc.Store.ReclaimWindowGone(ctx)
+	if err != nil {
+		return 0, err
+	}
+	reclaimed := sc.logReclaims(gone, "window gone")
+	if err := ctx.Err(); err != nil {
+		return reclaimed, err
+	}
+	// Lease-expiry backstop: catches a worker that died without its window vanishing (a hung
+	// process), or any run with no watcher emitting window_gone events.
+	expired, err := sc.Store.ReclaimExpiredLeases(ctx)
+	if err != nil {
+		return reclaimed, err
+	}
+	reclaimed += sc.logReclaims(expired, "lease expired")
+	return reclaimed, nil
+}
+
+// logReclaims logs each reclaim outcome — a retry reclaim or a terminal poison-pill — and
+// returns how many were reclaimed to pending (re-dispatchable). Poison-pilled tasks are
+// terminal and excluded from the count (they are not re-dispatched).
+func (sc *Scheduler) logReclaims(outcomes []db.ReclaimOutcome, cause string) int {
+	reclaimed := 0
+	for _, oc := range outcomes {
+		if oc.Failed {
+			sc.logf("poison-pilled %s to failed (%s; retries exhausted)", oc.TaskID, cause)
+			continue
+		}
+		sc.logf("reclaimed %s for retry %d (%s)", oc.TaskID, oc.RetryCount, cause)
+		reclaimed++
+	}
+	return reclaimed
 }
 
 // overlaps reports whether footprint conflicts with any LIVE worker (Fleet.CheckOverlap,

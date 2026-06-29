@@ -184,45 +184,65 @@ func (s *Store) reclaimTask(ctx context.Context, id string, now time.Time) (Recl
 		if !expiry.Before(now) {
 			return nil
 		}
-
-		nowStr := formatTime(now)
-		from := StatusActive
-		if retry >= maxRetries {
-			// Poison-pill: retries exhausted ⇒ terminal failed, surfaced actionably.
-			to := StatusFailed
-			if _, err := tx.ExecContext(ctx,
-				`UPDATE tasks SET status = ?, lease_owner = '', lease_expires_at = NULL, updated_at = ? WHERE id = ?`,
-				to, nowStr, id); err != nil {
-				return err
-			}
-			if _, err := appendEvent(ctx, tx, now, Event{
-				EntityType: EntityTypeTask, EntityID: id, Type: EventTaskFailed, Actor: ActorSystem,
-				FromStatus: &from, ToStatus: &to, Actionable: true,
-				Payload: fmt.Sprintf("lease expired; retries exhausted (%d/%d)", retry, maxRetries),
-			}); err != nil {
-				return err
-			}
-			oc = ReclaimOutcome{TaskID: id, Failed: true, RetryCount: retry}
-		} else {
-			// Reclaim for retry: back to the re-dispatchable backlog state, retry_count++.
-			to := StatusPending
-			newRetry := retry + 1
-			if _, err := tx.ExecContext(ctx,
-				`UPDATE tasks SET status = ?, retry_count = ?, lease_owner = '', lease_expires_at = NULL, updated_at = ? WHERE id = ?`,
-				to, newRetry, nowStr, id); err != nil {
-				return err
-			}
-			if _, err := appendEvent(ctx, tx, now, Event{
-				EntityType: EntityTypeTask, EntityID: id, Type: EventLeaseExpired, Actor: ActorSystem,
-				FromStatus: &from, ToStatus: &to, Actionable: true,
-				Payload: fmt.Sprintf("lease expired; reclaimed for retry %d/%d", newRetry, maxRetries),
-			}); err != nil {
-				return err
-			}
-			oc = ReclaimOutcome{TaskID: id, Failed: false, RetryCount: newRetry}
+		oc, err = applyReclaimTransitionTx(ctx, tx, now, id, retry, maxRetries, EventLeaseExpired, "lease expired")
+		if err != nil {
+			return err
 		}
 		changed = true
 		return nil
 	})
 	return oc, changed, err
+}
+
+// applyReclaimTransitionTx performs the bounded retry/poison-pill transition for a task the
+// caller has ALREADY verified dead (still active, with the death signal — an expired lease
+// or a confirmed-gone window — re-checked under THIS write lock). It is the shared core of
+// the two recovery sweeps (lease-expiry: reclaimTask; window-gone: reclaimWindowGoneTask),
+// so both bound retries and poison-pill identically:
+//
+//   - retry_count < max_retries ⇒ back to StatusPending (re-dispatchable), retry_count++,
+//     lease cleared, with retryEvent (active → pending, actionable, system actor); or
+//   - retry_count >= max_retries ⇒ the terminal StatusFailed (poison-pill — never
+//     re-dispatched forever), lease cleared, with a task_failed event (active → failed).
+//
+// reason names the cause ("lease expired" / "window gone (worker crashed)") and is woven
+// into both payloads, so the two paths share one transition with path-specific narration.
+// It clears only the lease fields (lease_owner/lease_expires_at), leaving worktree/window
+// for the re-dispatch path — matching reclaimTask's original contract.
+func applyReclaimTransitionTx(ctx context.Context, tx *sql.Tx, now time.Time, id string, retry, maxRetries int, retryEvent, reason string) (ReclaimOutcome, error) {
+	nowStr := formatTime(now)
+	from := StatusActive
+	if retry >= maxRetries {
+		// Poison-pill: retries exhausted ⇒ terminal failed, surfaced actionably.
+		to := StatusFailed
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE tasks SET status = ?, lease_owner = '', lease_expires_at = NULL, updated_at = ? WHERE id = ?`,
+			to, nowStr, id); err != nil {
+			return ReclaimOutcome{}, err
+		}
+		if _, err := appendEvent(ctx, tx, now, Event{
+			EntityType: EntityTypeTask, EntityID: id, Type: EventTaskFailed, Actor: ActorSystem,
+			FromStatus: &from, ToStatus: &to, Actionable: true,
+			Payload: fmt.Sprintf("%s; retries exhausted (%d/%d)", reason, retry, maxRetries),
+		}); err != nil {
+			return ReclaimOutcome{}, err
+		}
+		return ReclaimOutcome{TaskID: id, Failed: true, RetryCount: retry}, nil
+	}
+	// Reclaim for retry: back to the re-dispatchable backlog state, retry_count++.
+	to := StatusPending
+	newRetry := retry + 1
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE tasks SET status = ?, retry_count = ?, lease_owner = '', lease_expires_at = NULL, updated_at = ? WHERE id = ?`,
+		to, newRetry, nowStr, id); err != nil {
+		return ReclaimOutcome{}, err
+	}
+	if _, err := appendEvent(ctx, tx, now, Event{
+		EntityType: EntityTypeTask, EntityID: id, Type: retryEvent, Actor: ActorSystem,
+		FromStatus: &from, ToStatus: &to, Actionable: true,
+		Payload: fmt.Sprintf("%s; reclaimed for retry %d/%d", reason, newRetry, maxRetries),
+	}); err != nil {
+		return ReclaimOutcome{}, err
+	}
+	return ReclaimOutcome{TaskID: id, Failed: false, RetryCount: newRetry}, nil
 }
