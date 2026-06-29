@@ -13,8 +13,10 @@ import (
 
 	"github.com/nution101/ttorch/internal/approval"
 	"github.com/nution101/ttorch/internal/db"
+	"github.com/nution101/ttorch/internal/harness"
 	"github.com/nution101/ttorch/internal/projectinit"
 	"github.com/nution101/ttorch/internal/review"
+	"github.com/nution101/ttorch/internal/tmux"
 	"github.com/nution101/ttorch/internal/worktree"
 )
 
@@ -554,4 +556,481 @@ func (m *Manager) QAReview(taskID, sha string, ttl time.Duration) (review.Verdic
 // without consuming it.
 func (m *Manager) QAReviewShow(taskID string) (review.Verdict, bool) {
 	return review.Load(m.qaVerdictPath(taskID))
+}
+
+// ---------------------------------------------------------------------------------------
+// Daemon gate-pass (roadmap A1): make GATING daemon-drivable.
+//
+// The manager's hand-run gate is a fixed choreography — `ttorch trust prep`, fan out the
+// sized reviewer subagents, `ttorch trust record` — that the scheduler can drive instead, so
+// a stalled or absent LLM manager no longer halts the steady-state land path. GateOnce is the
+// single-task, single-tick state machine the scheduler's `--gate` pass calls; it AUTOMATES the
+// orchestration only — it CALLS the unchanged TrustPrep / review.Aggregate / TrustRecord and
+// never touches the merge/land authority (MergeLocal) or what makes a verdict valid.
+//
+// FAIL CLOSED: only an all-pass aggregate is ever recorded (via TrustRecord, exactly as the
+// manager's `trust record`). A blocking finding, a prep refusal, a missing/mismatched report,
+// or a stalled reviewer is NEVER recorded — the daemon surfaces an actionable gate_blocked
+// event for the manager to adjudicate and leaves the task untouched. The manager's only
+// remaining gate role becomes adjudicating those blocks; the all-pass happy path records and
+// (via the land pass) lands hands-off.
+
+// GateOutcome is one tick's result for a single task's daemon gate. It is advisory to the
+// caller (the scheduler logs it and counts records); the durable state lives in the DB verdict
+// row, the review-inputs dir, and the reviewer windows.
+type GateOutcome string
+
+const (
+	// GateSkipped: not a daemon-gate candidate this tick — the repo is not trusted, the head
+	// is unreadable, a verdict already covers the current head (the land pass or the manager
+	// owns it), or this head was already surfaced as blocked/recorded (terminal for the head).
+	GateSkipped GateOutcome = "skipped"
+	// GateDispatched: reviewers were (re)dispatched this tick for one or more dimensions; the
+	// gate is now waiting on their reports.
+	GateDispatched GateOutcome = "dispatched"
+	// GateWaiting: reviewers are running but not all reports are in yet (no new dispatch this
+	// tick).
+	GateWaiting GateOutcome = "waiting"
+	// GateRecorded: every required dimension passed; the durable verdict was recorded through
+	// the unchanged TrustRecord (and, in trusted mode, the approval token auto-minted), so the
+	// land pass can land it hands-off.
+	GateRecorded GateOutcome = "recorded"
+	// GateBlocked: the gate could not pass this task hands-off (a blocking reviewer finding, a
+	// prep refusal, or a stalled/failed reviewer). NOTHING was recorded; an actionable
+	// gate_blocked event was surfaced for the manager.
+	GateBlocked GateOutcome = "blocked"
+)
+
+// gate-pass tunables. Verdicts are content-pinned and never expire by age, so the TTL only
+// bounds the short-lived approval token TrustRecord mints in trusted mode — it mirrors the
+// `ttorch trust record` default. maxReviewerAttempts bounds how many times a reviewer that
+// dies WITHOUT writing a report (window gone, no report) is respawned before the gate gives up
+// and surfaces a stall — the reviewer restart-storm bound. reviewerTimeout bounds how long the
+// gate waits on running reviewers before surfacing a stall, so a wedged reviewer never strands
+// a done task in a silent forever-wait.
+const (
+	defaultGateTTL             = 30 * time.Minute
+	defaultMaxReviewerAttempts = 2
+	defaultReviewerTimeout     = 30 * time.Minute
+	// reviewerEffort is the reasoning effort the daemon launches each reviewer at. Review is
+	// load-bearing judgment over a diff that may merge unread, so it runs high (not the worker
+	// default), matching the manager's own reviewer subagents.
+	reviewerEffort = "high"
+)
+
+// gateProgressFile is the daemon gate's per-task, crash-safe progress record, kept beside the
+// review inputs (ReviewInputsDir) so a daemon restart re-derives exactly where the gate was:
+// which head's episode is in flight, which dimensions it requires, how many times each
+// reviewer has been dispatched, when the reviewers were first launched (the stall clock), and
+// whether the head reached a terminal outcome (recorded / blocked). Together with the reviewer
+// windows and the per-dimension report files it is the source of truth that makes the pass
+// idempotent — never double-dispatching a reviewer or double-recording a verdict across a
+// restart.
+const gateProgressFile = "gate-progress.json"
+
+// gate-progress terminal outcomes (the Outcome field). An empty Outcome means the episode for
+// Head is still in flight.
+const (
+	gateOutcomeRecorded = "recorded" // an all-pass verdict was recorded for Head (land owns it)
+	gateOutcomeBlocked  = "blocked"  // a block/refusal/stall was surfaced for Head (manager owns it)
+)
+
+// gateProgress is the persisted per-task gate state for one head's gating episode.
+type gateProgress struct {
+	Head         string         `json:"head"`         // the reviewed commit this episode gates
+	Dims         []string       `json:"dims"`         // the prepared, size-scaled reviewer set
+	Attempts     map[string]int `json:"attempts"`     // per-dimension reviewer (re)dispatch count
+	DispatchedAt int64          `json:"dispatchedAt"` // unix nano of the first reviewer dispatch (stall clock); 0 until dispatched
+	Outcome      string         `json:"outcome"`      // "" in flight | gateOutcomeRecorded | gateOutcomeBlocked
+}
+
+// reviewerDispatcher is the seam the daemon gate dispatches a reviewer through; production
+// wiring is (*Manager).spawnReviewer (a real tmux + harness launch). It is a package var so a
+// test can substitute a stand-in that writes a stub <dimension>.json into the inputs dir
+// instead of standing up a Claude session — exactly how the acceptance tests exercise the
+// happy/fail-closed/idempotent paths without a live reviewer.
+var reviewerDispatcher = (*Manager).spawnReviewer
+
+// GateOnce drives one tick of the daemon gate for taskID at the default tunables and the
+// current wall clock. It is the Fleet entry point the scheduler's gate pass calls; the
+// caller must already have decided taskID is a candidate (a done task in a trusted repo with
+// no passing verdict) and claimed it. See gateOnceAt for the state machine.
+func (m *Manager) GateOnce(taskID string) (GateOutcome, error) {
+	return m.gateOnceAt(taskID, defaultGateTTL, defaultMaxReviewerAttempts, defaultReviewerTimeout, time.Now())
+}
+
+// gateOnceAt is the testable core: one tick of the daemon gate for taskID. now and the
+// tunables are injected so a test can drive the stall clock deterministically. It returns the
+// tick's GateOutcome and a hard error only for a board-read failure (which aborts the pass);
+// every per-task obstruction (a prep refusal, a blocking verdict, a stalled reviewer) is
+// surfaced via a gate_blocked event and returned as GateBlocked, never as an error.
+func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttempts int, reviewerTimeout time.Duration, now time.Time) (GateOutcome, error) {
+	ctx := context.Background()
+	t, ok, err := m.Store.GetTask(ctx, taskID)
+	if err != nil {
+		return GateSkipped, err
+	}
+	if !ok {
+		return GateSkipped, nil // vanished between selection and gate — not ours to gate
+	}
+	// Only a trusted repo gates hands-off: there a recorded pass auto-mints the approval token
+	// and the land pass merges without a human. In any other mode the verdict is advisory and a
+	// human still approves, so daemon-recording it would not advance delivery — leave it for the
+	// manager. (The scheduler's Gateable pre-filter already screens these out; this is the
+	// fail-safe second check so gateOnceAt is correct if called directly.)
+	if projectinit.ReadMode(t.Project) != "trusted" {
+		return GateSkipped, nil
+	}
+	// The committed object the reviewers must cover and the merge will fast-forward — never the
+	// mutable worktree. An unreadable head (e.g. a torn-down worktree) is not gateable this tick.
+	head, err := worktree.Head(t.Worktree)
+	if err != nil {
+		return GateSkipped, nil
+	}
+	// Already gated for THIS head, by the daemon earlier or the manager by hand: a verdict row
+	// pinned to head means the decision exists — a passing one is the land pass's to land, a
+	// blocking one is the manager's to resolve. Either way the gate does not re-run.
+	if v, ok, err := m.Store.GetVerdict(ctx, taskID); err != nil {
+		return GateSkipped, err
+	} else if ok && v.ReviewedSHA == head {
+		return GateSkipped, nil
+	}
+
+	dir := m.P.ReviewInputsDir(taskID)
+	prog := m.readGateProgress(dir)
+
+	// Episode boundary: a first-ever gate, or the worker advanced past a prior episode's head
+	// (a re-gate). Reset the episode for the new head — clear any stale per-dimension reports
+	// and tear down the prior head's reviewer windows so a present report can only ever be one
+	// for THIS head — then run prep. A prep refusal (dirty worktree / stale base) is the
+	// worker's to fix (commit / rebase), not the daemon's: surface it once and mark the head
+	// terminal so the pass does not re-prep every tick.
+	if prog.Head != head {
+		m.clearStaleReviewerReports(dir, head)
+		m.teardownReviewers(taskID, prog.Dims)
+		if _, err := m.TrustPrep(taskID); err != nil {
+			m.surfaceGateBlocked(taskID, head, "gate prep refused: "+err.Error())
+			m.writeGateProgress(dir, gateProgress{Head: head, Outcome: gateOutcomeBlocked})
+			return GateBlocked, nil
+		}
+		prog = gateProgress{Head: head, Dims: m.ReviewersFor(taskID), Attempts: map[string]int{}}
+		m.writeGateProgress(dir, prog)
+	}
+
+	// Terminal for this head: a block was already surfaced (manager owns it) or a verdict was
+	// already recorded (land owns it; the early verdict check covers the not-yet-consumed case,
+	// this covers the post-consume window before the task leaves the done set). Nothing to do.
+	if prog.Outcome != "" {
+		return GateSkipped, nil
+	}
+
+	// Re-derive the required reviewer set from the AUTHORITATIVE record (reviewers.json, what
+	// TrustPrep wrote) every tick rather than trusting the persisted prog.Dims, so the daemon
+	// dispatches, polls, AND aggregates EXACTLY the set TrustRecord will aggregate (which also
+	// reads ReviewersFor). That alignment removes any chance of recording a verdict over a
+	// different set than was reviewed: GateOnce's pass-decision and TrustRecord's record fold the
+	// identical dimensions. reviewers.json is stable within an episode (TrustPrep writes it once
+	// per head) and ReviewersFor fail-safes to the full three-dimension set if it is ever missing
+	// or malformed, so this never under-reviews. prog.Dims remains only the cache the NEXT
+	// episode's reset tears down.
+	dims := m.ReviewersFor(taskID)
+	if prog.Attempts == nil {
+		prog.Attempts = map[string]int{}
+	}
+
+	// Dispatch step. For each required dimension that has neither a pinned report nor a live
+	// reviewer window, (re)dispatch a reviewer — bounded by maxReviewerAttempts so a reviewer
+	// that keeps dying without producing a report cannot respawn forever. A present report or a
+	// live window is left alone, which is exactly what makes the pass idempotent across a daemon
+	// restart: it never double-dispatches a reviewer that is already running or already done.
+	var toDispatch []string
+	allReady := true
+	for _, dim := range dims {
+		if m.reviewReportPinned(dir, dim, head) {
+			continue // this dimension's report is in and pinned to head
+		}
+		allReady = false
+		if m.reviewerWindowAlive(taskID, dim) {
+			continue // its reviewer is still running
+		}
+		if prog.Attempts[dim] >= maxReviewerAttempts {
+			m.surfaceGateBlocked(taskID, head, fmt.Sprintf("reviewer %q produced no report after %d attempt(s)", dim, maxReviewerAttempts))
+			prog.Outcome = gateOutcomeBlocked
+			m.writeGateProgress(dir, prog)
+			m.teardownReviewers(taskID, dims)
+			return GateBlocked, nil
+		}
+		toDispatch = append(toDispatch, dim)
+	}
+
+	if len(toDispatch) > 0 {
+		dispatched := false
+		for _, dim := range toDispatch {
+			if err := reviewerDispatcher(m, taskID, dim, dir, head, t.Project, t.Worktree); err != nil {
+				// A launch failure this tick is non-fatal and does not burn an attempt (nothing
+				// started): the next tick retries this dimension. Other dimensions still launch.
+				fmt.Fprintf(os.Stderr, "ttorch: gate could not dispatch reviewer %s/%s: %v\n", taskID, dim, err)
+				continue
+			}
+			prog.Attempts[dim]++
+			dispatched = true
+		}
+		if dispatched && prog.DispatchedAt == 0 {
+			prog.DispatchedAt = now.UnixNano()
+		}
+		m.writeGateProgress(dir, prog)
+		return GateDispatched, nil
+	}
+
+	if !allReady {
+		// Reviewers are running but not all reports are in. Bound the wait: a reviewer wedged
+		// past reviewerTimeout (alive but never reporting) is surfaced as a stall rather than
+		// leaving the done task in a silent forever-wait.
+		if prog.DispatchedAt != 0 && reviewerTimeout > 0 && now.Sub(time.Unix(0, prog.DispatchedAt)) > reviewerTimeout {
+			m.surfaceGateBlocked(taskID, head, fmt.Sprintf("reviewers did not all report within %s", reviewerTimeout))
+			prog.Outcome = gateOutcomeBlocked
+			m.writeGateProgress(dir, prog)
+			m.teardownReviewers(taskID, dims)
+			return GateBlocked, nil
+		}
+		return GateWaiting, nil
+	}
+
+	// Every required dimension has a report pinned to head. Aggregate to decide pass vs block.
+	// review.Aggregate is the SAME deterministic fold the manager's `trust record` uses; the
+	// daemon does not fork it.
+	v, err := review.Aggregate(dir, head, dims)
+	if err != nil {
+		// Only a stale-sha mismatch makes Aggregate error, which reviewReportPinned already
+		// excludes — so this is unexpected. Treat it as not-yet-ready (record nothing); the next
+		// tick re-derives. Never downgrade an aggregate error to a pass.
+		fmt.Fprintf(os.Stderr, "ttorch: gate aggregate for %s deferred: %v\n", taskID, err)
+		return GateWaiting, nil
+	}
+	if v.Overall != review.Pass {
+		// FAIL CLOSED: a blocking verdict is NEVER recorded by the daemon. Surface it for the
+		// manager and mark the head terminal so the pass does not re-loop on the same reports.
+		m.surfaceGateBlocked(taskID, head, "adversarial review blocked: "+strings.Join(review.Describe(v), "; "))
+		prog.Outcome = gateOutcomeBlocked
+		m.writeGateProgress(dir, prog)
+		m.teardownReviewers(taskID, dims)
+		return GateBlocked, nil
+	}
+
+	// PASS. Record the durable verdict through the UNCHANGED TrustRecord, which re-aggregates,
+	// pins to head, persists the verdict row, and — in trusted mode over a still-green, clean
+	// worktree — auto-mints the approval token, exactly as a manager-run `ttorch trust record`
+	// would. The merge/land authority is untouched; the land pass lands it hands-off.
+	if _, err := m.TrustRecord(taskID, head, ttl); err != nil {
+		// A record-time refusal (most likely the worker advanced HEAD between our read and
+		// TrustRecord's own re-check) is transient and recoverable — record nothing terminal, do
+		// not surface a block; the next tick re-derives (a moved head re-preps cleanly).
+		fmt.Fprintf(os.Stderr, "ttorch: gate trust-record for %s deferred: %v\n", taskID, err)
+		return GateWaiting, nil
+	}
+	prog.Outcome = gateOutcomeRecorded
+	m.writeGateProgress(dir, prog)
+	m.teardownReviewers(taskID, dims)
+	m.audit(fmt.Sprintf("gate-record task=%s commit=%s verdict=pass actor=daemon", taskID, short(head)))
+	return GateRecorded, nil
+}
+
+// Gateable reports whether repo is a daemon-gate candidate: a trusted repo, where a recorded
+// pass auto-authorizes the merge. The scheduler's gate pass uses it to skip claiming done tasks
+// in non-trusted repos (where a daemon-recorded verdict would not advance delivery).
+func (m *Manager) Gateable(repo string) bool {
+	return projectinit.ReadMode(repo) == "trusted"
+}
+
+// reviewerWindow is the tmux window name for one dimension's daemon-dispatched reviewer:
+// stable and deterministic so the gate can recognize a still-running reviewer (idempotent
+// dispatch) and tear it down when the episode ends. Distinct prefix ("rv-") from worker
+// windows ("wk-") so the two fleets never collide.
+func reviewerWindow(taskID, dim string) string { return "rv-" + taskID + "-" + dim }
+
+// reviewerWindowAlive reports whether a dimension's reviewer window is still present.
+func (m *Manager) reviewerWindowAlive(taskID, dim string) bool {
+	return tmux.WindowExists(m.Session, reviewerWindow(taskID, dim))
+}
+
+// reviewReportPinned reports whether dimension dim's report exists in dir and is a parseable
+// review.Report pinned to head — i.e. a completed review for THIS commit. A missing,
+// unparseable, or stale-pinned report reads as not-ready (the gate re-dispatches), so a report
+// left over from a prior head can never be mistaken for this head's. This is the same pin
+// review.Aggregate enforces; checking it here lets the gate treat a stale report as "absent"
+// and re-dispatch rather than hit Aggregate's hard stale-sha error.
+func (m *Manager) reviewReportPinned(dir, dim, head string) bool {
+	b, err := os.ReadFile(filepath.Join(dir, dim+".json"))
+	if err != nil {
+		return false
+	}
+	var r review.Report
+	if err := json.Unmarshal(b, &r); err != nil {
+		return false
+	}
+	return r.ReviewedSHA == head
+}
+
+// clearStaleReviewerReports removes per-dimension report files that are NOT pinned to head, at
+// the start of an episode, so a report left over from a PRIOR head is never present for the new
+// one — while a report already (validly) written for head is PRESERVED. Pinning the removal to
+// head matters because the episode reset also fires on the rare best-effort gate-progress write
+// loss for the CURRENT head: there, blindly deleting would discard a surviving same-head
+// reviewer's work and force a needless re-dispatch; head-aware removal keeps it. (Correctness
+// never depended on the delete — reviewReportPinned already treats a stale-pinned report as
+// absent — so this is purely hygiene + avoiding wasted re-review.) The gate's three dimensions'
+// files are considered; the advisory security/qa verdict files live under different names and
+// are untouched.
+func (m *Manager) clearStaleReviewerReports(dir, head string) {
+	for _, dim := range requiredReviewers {
+		if !m.reviewReportPinned(dir, dim, head) {
+			_ = os.Remove(filepath.Join(dir, dim+".json"))
+		}
+	}
+}
+
+// teardownReviewers reaps and kills any reviewer windows for the given dimensions. Best-effort:
+// a reviewer that has written its report has done its job, so a failed kill is harmless (the
+// window is idle and holds no pool slot). Called when the episode reaches a terminal outcome.
+func (m *Manager) teardownReviewers(taskID string, dims []string) {
+	for _, dim := range dims {
+		window := reviewerWindow(taskID, dim)
+		if !tmux.WindowExists(m.Session, window) {
+			continue
+		}
+		m.killPaneProcesses(window)
+		_ = tmux.KillWindow(m.Session, window)
+	}
+}
+
+// surfaceGateBlocked records an ACTIONABLE gate_blocked event (actor=system) so `ttorch watch`
+// wakes the manager to adjudicate — the daemon gate's only handoff back to the LLM manager. It
+// is the single place the gate signals "I could not pass this hands-off"; it NEVER records a
+// verdict. Best-effort on the event append (the audit line is the durable trail), so a failed
+// append is logged, not fatal.
+func (m *Manager) surfaceGateBlocked(taskID, head, reason string) {
+	payload := fmt.Sprintf("sha=%s %s", short(head), reason)
+	if _, err := m.Store.AppendEvent(context.Background(), db.Event{
+		EntityType: db.EntityTypeTask, EntityID: taskID, Type: db.EventGateBlocked,
+		Actor: db.ActorSystem, Actionable: true, Payload: payload,
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "ttorch: could not record the gate_blocked event for %s: %v\n", taskID, err)
+	}
+	m.audit(fmt.Sprintf("gate-blocked task=%s commit=%s actor=daemon reason=%q", taskID, short(head), reason))
+}
+
+// readGateProgress loads the per-task gate progress record, returning a zero gateProgress (a
+// fresh episode) when it is absent or unparseable — fail-safe, since a missing/garbled record
+// just re-preps and re-derives from the live reviewer windows and report files.
+func (m *Manager) readGateProgress(dir string) gateProgress {
+	var p gateProgress
+	b, err := os.ReadFile(filepath.Join(dir, gateProgressFile))
+	if err != nil {
+		return gateProgress{}
+	}
+	if err := json.Unmarshal(b, &p); err != nil {
+		return gateProgress{}
+	}
+	if p.Attempts == nil {
+		p.Attempts = map[string]int{}
+	}
+	return p
+}
+
+// writeGateProgress persists the gate progress record beside the review inputs. Best-effort: a
+// failed write degrades safely — the next tick re-derives episode state from the reviewer
+// windows and report files (a live window still suppresses re-dispatch), so the worst case is a
+// lost attempt counter, never a double-record.
+func (m *Manager) writeGateProgress(dir string, p gateProgress) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "ttorch: could not create the gate progress dir for %s: %v\n", dir, err)
+		return
+	}
+	b, err := json.MarshalIndent(p, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(filepath.Join(dir, gateProgressFile), append(b, '\n'), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "ttorch: could not write the gate progress for %s: %v\n", dir, err)
+	}
+}
+
+// spawnReviewer launches one dimension's adversarial reviewer as a Claude session in a tmux
+// window — the production wiring behind reviewerDispatcher. It is the daemon analogue of the
+// manager fanning out a `ttorch-reviewer-<dim>` subagent: the launched session reads the same
+// materialized inputs (inputsDir) and the same pinned commit (head), reviews ONLY its
+// dimension, and writes the same commit-pinned <dim>.json report — so the daemon orchestrates
+// the real adversarial reviewers, it does not replace them with a rubber stamp.
+//
+// It runs in the worker's worktree (wt), at the reviewed commit, so the reviewer can read the
+// source the diff touches; it never edits the tree (review is read-only). It is idempotent —
+// it no-ops when the dimension's window already exists — so a re-dispatch never doubles a
+// running reviewer.
+func (m *Manager) spawnReviewer(taskID, dim, inputsDir, head, repo, wt string) error {
+	if err := m.requireTmux(); err != nil {
+		return err
+	}
+	window := reviewerWindow(taskID, dim)
+	if tmux.WindowExists(m.Session, window) {
+		return nil // already running — idempotent
+	}
+	if err := tmux.EnsureSession(m.Session); err != nil {
+		return err
+	}
+	h := harness.Resolve()
+	sid := harness.NewSessionID()
+	// Pre-accept the harness folder-trust prompt and write the trimmed worker settings (no AI
+	// co-author trailer) so the reviewer runs autonomously, exactly like a worker spawn.
+	_ = harness.WriteWorkerSettings(h, wt)
+	harness.TrustWorktree(h, repo, wt)
+	briefPath := filepath.Join(inputsDir, dim+".reviewer-brief.md")
+	if err := os.WriteFile(briefPath, []byte(reviewerBrief(taskID, dim, inputsDir, head)), 0o644); err != nil {
+		return err
+	}
+	if err := m.newWindow(window, wt, "review · "+dim+" · "+taskID); err != nil {
+		return err
+	}
+	cmd := harness.BriefCommand(h, briefPath, sid, reviewerEffort)
+	if err := tmux.SendLine(m.Session, window, cmd); err != nil {
+		m.killPaneProcesses(window)
+		_ = tmux.KillWindow(m.Session, window)
+		return err
+	}
+	m.audit(fmt.Sprintf("gate-dispatch-reviewer task=%s dim=%s commit=%s actor=daemon", taskID, dim, short(head)))
+	return nil
+}
+
+// reviewerBrief is the initial prompt for a daemon-dispatched reviewer. It dispatches the real
+// `ttorch-reviewer-<dim>` adversarial subagent over the materialized inputs at the pinned head
+// (with a self-review fallback if that subagent is unavailable), and requires the single output
+// the gate consumes: a commit-pinned <dim>.json following the findings contract. Go owns the
+// verdict aggregation, so a missing or malformed report fails the gate closed regardless of
+// what the session does.
+func reviewerBrief(taskID, dim, inputsDir, head string) string {
+	reportPath := filepath.Join(inputsDir, dim+".json")
+	return fmt.Sprintf(`# Adversarial trust-gate review — %s dimension (task %s)
+
+You are the **%s** reviewer in ttorch's adversarial trust gate, dispatched by the scheduler
+daemon. A passing verdict may merge this diff WITHOUT a human reading it, so your judgment is
+load-bearing. Review ONLY the %s dimension — the other dimensions are other reviewers' jobs.
+You NEVER edit, commit, or push code; review is a static read of the diff.
+
+Use the Task tool to dispatch the `+"`ttorch-reviewer-%s`"+` subagent, giving it exactly:
+- review inputs dir: %s
+- reviewed commit (head): %s
+
+It must read %s/{diff.patch, brief.md, validate.json, head.txt}, review only the %s dimension,
+trust the green validate.json (do NOT re-run the build/test suite), and write its findings to
+%s following the findings contract:
+
+    {"dimension": "%s", "reviewedSha": "%s", "findings": [ ... ]}
+
+where each finding is {"dimension","severity","reviewer","summary"}, severity is one of
+low|medium|high|critical (high/critical block the merge; bias to high on uncertainty), a clean
+review is "findings": [], and reviewedSha MUST equal %s verbatim.
+
+If the `+"`ttorch-reviewer-%s`"+` subagent is unavailable, perform the review yourself per the
+exact same contract and write %s. Either way the ONLY required output is that file. When it is
+written, you are done — do not modify the repository.
+`, dim, taskID, dim, dim, dim, inputsDir, head, inputsDir, dim, reportPath, dim, head, head, dim, reportPath)
 }

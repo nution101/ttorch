@@ -46,6 +46,21 @@ type fakeFleet struct {
 	peekErr map[string]error  // per-task forced Peek failure (e.g. a gone window)
 	sendErr map[string]error  // per-task forced Send failure
 	sends   []string          // task ids Send was called on, in order
+
+	gateable  map[string]bool                     // repo -> trusted (Gateable); absent ⇒ false
+	gateOut   map[string]orchestrator.GateOutcome // per-task GateOnce outcome (default GateRecorded)
+	gateErr   map[string]error                    // per-task forced GateOnce error
+	gateCalls []string                            // task ids GateOnce was called on, in order
+	idem      *gateIdem                           // shared cross-instance idempotency (see GateOnce)
+}
+
+// gateIdem models the real GateOnce's idempotency for the concurrency test: a task whose verdict
+// is already recorded gates to GateSkipped, so a second actor that runs after the first never
+// re-records it. It is shared (by pointer) across the two instances, mirroring the DB-backed
+// verdict check the real GateOnce consults.
+type gateIdem struct {
+	mu       sync.Mutex
+	recorded map[string]bool
 }
 
 func (f *fakeFleet) Status() ([]db.Task, error) {
@@ -153,6 +168,63 @@ func (f *fakeFleet) Send(taskID, text string) error {
 		f.record(taskID)
 	}
 	return f.sendErr[taskID]
+}
+
+// Gateable reports whether repo was configured as a daemon-gate candidate (trusted). Absent
+// ⇒ false, so a test must explicitly opt a repo in.
+func (f *fakeFleet) Gateable(repo string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.gateable[repo]
+}
+
+// GateOnce records the gate ATTEMPT (the seam the scheduler's gate claim feeds) and returns the
+// per-task configured outcome (defaulting to GateRecorded — the headline happy path) or a
+// forced error. The real GateOnce's orchestration is exercised in internal/orchestrator; here
+// the fake isolates the scheduler's candidate-filter / claim / release / count logic.
+func (f *fakeFleet) GateOnce(taskID string) (orchestrator.GateOutcome, error) {
+	f.mu.Lock()
+	f.gateCalls = append(f.gateCalls, taskID)
+	gerr := f.gateErr[taskID]
+	out, hasOut := f.gateOut[taskID]
+	f.mu.Unlock()
+	if gerr != nil {
+		return orchestrator.GateSkipped, gerr
+	}
+	// Idempotency model (the real GateOnce skips when a verdict already covers head): a task
+	// already recorded by some actor gates to GateSkipped and is not re-recorded. Shared by
+	// pointer across instances so the concurrency test sees the cross-instance guarantee.
+	if f.idem != nil {
+		f.idem.mu.Lock()
+		already := f.idem.recorded[taskID]
+		if !already {
+			f.idem.recorded[taskID] = true
+		}
+		f.idem.mu.Unlock()
+		if already {
+			return orchestrator.GateSkipped, nil
+		}
+		if f.record != nil {
+			f.record(taskID)
+		}
+		return orchestrator.GateRecorded, nil
+	}
+	if f.record != nil {
+		f.record(taskID)
+	}
+	if hasOut {
+		return out, nil
+	}
+	return orchestrator.GateRecorded, nil
+}
+
+// gatedIDs returns the task ids GateOnce was called on, in order.
+func (f *fakeFleet) gatedIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.gateCalls))
+	copy(out, f.gateCalls)
+	return out
 }
 
 // setPane updates the pane Peek will return for a task — used between ticks to model a worker

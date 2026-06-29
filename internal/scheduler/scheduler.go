@@ -140,6 +140,20 @@ type Fleet interface {
 	// idle-nudge pass calls it with "continue" to resume an alive-but-idle worker. It refuses
 	// (errors) when the worker has no live window, so a nudge is never injected into a dead one.
 	Send(taskID, text string) error
+	// Gateable reports whether repo is a daemon-gate candidate (trusted delivery mode, where a
+	// recorded pass auto-authorizes the merge). The gate pass uses it to skip claiming done
+	// tasks in repos where a daemon-recorded verdict would not advance delivery.
+	Gateable(repo string) bool
+	// GateOnce drives one tick of the daemon gate for an already-claimed candidate task: it
+	// runs the trust prep, dispatches the size-scaled reviewers, and — once every per-dimension
+	// report is in and pinned to the prepped head — aggregates and, on an all-pass, records the
+	// durable verdict through the UNCHANGED trust-record path (the same one a manager runs).
+	// It records NOTHING on a block, missing/mismatched report, or stall — it surfaces an
+	// actionable gate_blocked event for the manager to adjudicate. It is idempotent across ticks
+	// and a daemon restart (the review dir + reviewer windows are its source of truth), so a
+	// reviewer is never double-dispatched and a verdict never double-recorded. See
+	// orchestrator.GateOnce.
+	GateOnce(taskID string) (orchestrator.GateOutcome, error)
 }
 
 // Scheduler is the dispatch loop. Store is the task board (ready selection + atomic claim),
@@ -166,6 +180,17 @@ type Scheduler struct {
 	Dispatch  bool
 	Land      bool
 	Supervise bool
+
+	// Gate selects the daemon GATE pass (roadmap A1): for a done task in a trusted repo with no
+	// passing verdict, run the trust prep, dispatch the size-scaled adversarial reviewers, and —
+	// once their reports are in — aggregate and record an all-pass verdict through the UNCHANGED
+	// trust-record path, so the LLM manager is no longer on the steady-state critical path for
+	// the mechanical prep→dispatch→aggregate→record step. It FAILS CLOSED: a blocking finding, a
+	// prep refusal, or a stalled reviewer is never recorded — it surfaces a gate_blocked event
+	// for the manager to adjudicate. OFF by default (a bare struct and New() both leave it
+	// false), so existing manager-driven gating is unchanged unless the daemon is run with
+	// --gate; RunGateOnce is an unconditional primitive that this toggle only gates the loop on.
+	Gate bool
 
 	// IdleNudgeGrace and MaxIdleNudges configure the alive-but-idle recovery pass that runs
 	// inside Supervise (§roadmap H2). An alive worker (live window, valid lease, status
@@ -267,8 +292,8 @@ func (sc *Scheduler) Run(ctx context.Context) error {
 	}
 }
 
-// runTick runs one tick of each enabled pass (supervise, then dispatch, then land) and logs
-// the outcome. The passes are independent: a transient error in one is logged and swallowed
+// runTick runs one tick of each enabled pass (supervise, then dispatch, then gate, then land)
+// and logs the outcome. The passes are independent: a transient error in one is logged and swallowed
 // so the daemon survives a DB hiccup and still runs the others (the next tick re-derives from
 // scratch). A cancellation error is left for Run's select to surface (not logged as a
 // failure), and a cancellation between passes halts the rest of the tick promptly.
@@ -310,6 +335,21 @@ func (sc *Scheduler) runTick(ctx context.Context) {
 			}
 		} else if n > 0 {
 			sc.logf("tick dispatched %d task(s)", n)
+		}
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	// Gate runs AFTER dispatch and BEFORE land: dispatch surfaces new work, gate produces the
+	// verdict, land consumes it — so a task whose reviewers' reports are all in this tick can be
+	// recorded by the gate pass and then landed by the land pass in the SAME tick.
+	if sc.Gate {
+		if n, err := sc.RunGateOnce(ctx); err != nil {
+			if ctx.Err() == nil {
+				sc.logf("gate tick error: %v", err)
+			}
+		} else if n > 0 {
+			sc.logf("tick gated %d task(s)", n)
 		}
 	}
 	if ctx.Err() != nil {
