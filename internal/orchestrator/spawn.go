@@ -81,7 +81,14 @@ func (m *Manager) SpawnWithEffort(taskID, projectPath string, scout bool, rawCmd
 	// files a live worker already holds. Done before acquiring any resource so a
 	// refusal has no side effects; --force-overlap is the explicit manager override.
 	if len(footprint) > 0 && !forceOverlap {
-		if conflicts := m.CheckOverlap(repo, footprint); len(conflicts) > 0 {
+		conflicts, err := m.CheckOverlap(repo, footprint)
+		if err != nil {
+			// Fail closed: the overlap gate could not read the live fleet, so it cannot prove
+			// this footprint is disjoint. Refuse rather than dispatch onto possibly-shared files
+			// (--force-overlap is the explicit override). Before any side effect, like a conflict.
+			return zero, fmt.Errorf("spawn %q: cannot verify footprint %q is disjoint from live workers: %w", taskID, strings.Join(footprint, ","), err)
+		}
+		if len(conflicts) > 0 {
 			return zero, ConflictError(footprint, conflicts)
 		}
 	}
@@ -94,7 +101,14 @@ func (m *Manager) SpawnWithEffort(taskID, projectPath string, scout bool, rawCmd
 	// read-only notice it replaced — leaves the lead's checkout untouched.
 	autoInit(repo)
 
-	wt, err := m.Pool.Acquire(repo, m.inUseWorktrees(repo))
+	// Fail closed: if the in-use worktree set can't be read, refuse rather than acquire on an
+	// incomplete view (which could reuse a worktree a live worker still holds). This is after the
+	// overlap gate but still before any side effect, so a refusal leaves nothing behind.
+	inUse, err := m.inUseWorktrees(repo)
+	if err != nil {
+		return zero, fmt.Errorf("spawn %q: cannot read in-use worktrees: %w", taskID, err)
+	}
+	wt, err := m.Pool.Acquire(repo, inUse)
 	if err != nil {
 		return zero, err
 	}

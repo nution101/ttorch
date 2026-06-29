@@ -30,29 +30,37 @@ type spawnCall struct {
 // call (and optionally forces an error / forwards to a shared sink for concurrency tests)
 // instead of standing up a worktree + tmux window.
 type fakeFleet struct {
-	mu       sync.Mutex
-	live     []db.Task
-	calls    []spawnCall
-	spawnErr map[string]error // per-task forced dispatch failure
-	landed   []string         // ids handed to LandSet, in call order
-	landErr  map[string]error // per-task forced land failure
-	record   func(id string)  // shared sink for the cross-instance race tests
+	mu         sync.Mutex
+	live       []db.Task
+	calls      []spawnCall
+	spawnErr   map[string]error // per-task forced dispatch failure
+	landed     []string         // ids handed to LandSet, in call order
+	landErr    map[string]error // per-task forced land failure
+	record     func(id string)  // shared sink for the cross-instance race tests
+	statusErr  error            // forced Status (live-fleet read) failure — the fail-closed abort path
+	overlapErr error            // forced CheckOverlap (board read) failure — the fail-closed refuse path
 }
 
 func (f *fakeFleet) Status() ([]db.Task, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.statusErr != nil {
+		return nil, f.statusErr
+	}
 	out := make([]db.Task, len(f.live))
 	copy(out, f.live)
 	return out, nil
 }
 
-func (f *fakeFleet) CheckOverlap(repo string, proposed []string) []orchestrator.Conflict {
+func (f *fakeFleet) CheckOverlap(repo string, proposed []string) ([]orchestrator.Conflict, error) {
 	if len(proposed) == 0 {
-		return nil
+		return nil, nil
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.overlapErr != nil {
+		return nil, f.overlapErr
+	}
 	var out []orchestrator.Conflict
 	for _, t := range f.live {
 		// The real CheckOverlap is liveness-gated (m.Live ⇒ a tmux window exists), so a
@@ -64,7 +72,7 @@ func (f *fakeFleet) CheckOverlap(repo string, proposed []string) []orchestrator.
 			out = append(out, orchestrator.Conflict{TaskID: t.ID, Window: t.Window, Project: t.Project, Overlaps: ov})
 		}
 	}
-	return out
+	return out, nil
 }
 
 func (f *fakeFleet) SpawnWithFootprint(taskID, projectPath string, scout bool, rawCmd string, footprint []string, forceOverlap bool) (db.Task, error) {
@@ -301,6 +309,68 @@ func TestRunOnceSkipsClaimedButNotYetLive(t *testing.T) {
 	}
 	if status(t, s, "newcomer") != db.StatusPending {
 		t.Error("the skipped task must remain pending")
+	}
+}
+
+// TestRunOnceAbortsOnStatusReadError is the core fail-closed guarantee: when the live-fleet
+// read fails (a transient DB error — lock timeout under contention, a WAL hiccup), the tick
+// ABORTS, returning the error and dispatching NOTHING. It must never read an unreadable board
+// as an empty fleet (no live workers ⇒ full free capacity ⇒ no overlap) and claim+dispatch a
+// pool of tasks against that phantom view — the silent fail-open this guards against.
+func TestRunOnceAbortsOnStatusReadError(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	addPending(t, s, repo, "a", db.KindShip, []string{"internal/cli"})
+
+	f := &fakeFleet{statusErr: errors.New("database is locked")}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}}
+
+	n, err := sc.RunOnce(ctx)
+	if err == nil {
+		t.Fatal("RunOnce must surface the live-fleet read error, not swallow it")
+	}
+	if n != 0 {
+		t.Fatalf("dispatched %d, want 0 — an unreadable board must dispatch nothing", n)
+	}
+	if got := f.dispatched(); len(got) != 0 {
+		t.Fatalf("a read-error tick must dispatch nothing, got %v", got)
+	}
+	// The ready task is never claimed against the phantom empty view — it stays pending.
+	if status(t, s, "a") != db.StatusPending {
+		t.Fatalf("a must remain pending after an aborted tick, got %q", status(t, s, "a"))
+	}
+}
+
+// TestRunOnceSkipsOnOverlapReadError proves the per-task overlap gate fails closed: when
+// CheckOverlap cannot read the board, the scheduler cannot PROVE the footprint disjoint, so it
+// REFUSES the task — skipping it this tick and leaving it pending — rather than reading the
+// empty conflict list of a read failure as a genuine "no conflict" and dispatching onto
+// possibly-shared files. The tick itself does not fail (a per-task read can fail
+// independently of the whole-board Status read), so other ready tasks are unaffected.
+func TestRunOnceSkipsOnOverlapReadError(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	addPending(t, s, repo, "a", db.KindShip, []string{"internal/cli"})
+
+	// Status succeeds (empty live fleet) so the tick reaches the per-task overlap check; that
+	// check then fails to read the board.
+	f := &fakeFleet{overlapErr: errors.New("database is locked")}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}}
+
+	n, err := sc.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunOnce: a per-task overlap read error must skip the task, not fail the tick: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("dispatched %d, want 0 — disjointness could not be proven", n)
+	}
+	if got := f.dispatched(); len(got) != 0 {
+		t.Fatalf("a task whose disjointness can't be proven must not dispatch, got %v", got)
+	}
+	if status(t, s, "a") != db.StatusPending {
+		t.Fatalf("the refused task must remain pending, got %q", status(t, s, "a"))
 	}
 }
 

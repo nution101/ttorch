@@ -925,7 +925,12 @@ func cmdCheckOverlap(args []string) error {
 		return err
 	}
 	defer m.Close()
-	renderOverlap(os.Stdout, footprint, m.CheckOverlap(repo, footprint))
+	conflicts, err := m.CheckOverlap(repo, footprint)
+	if err != nil {
+		// Fail closed: report the read failure rather than render a misleading "no conflicts".
+		return fmt.Errorf("check-overlap: cannot read the live fleet to check for conflicts: %w", err)
+	}
+	renderOverlap(os.Stdout, footprint, conflicts)
 	return nil
 }
 

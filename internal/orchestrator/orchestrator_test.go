@@ -242,14 +242,14 @@ func TestCheckOverlap_OnlyLiveWorkers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("spawn: %v", err)
 	}
-	if got := m.CheckOverlap(a.Project, []string{"internal/cli"}); len(got) != 1 {
-		t.Fatalf("a live worker on internal/cli should conflict, got %v", got)
+	if got, err := m.CheckOverlap(a.Project, []string{"internal/cli"}); err != nil || len(got) != 1 {
+		t.Fatalf("a live worker on internal/cli should conflict, got %v (err %v)", got, err)
 	}
 	if _, err := m.Teardown("a1", true); err != nil {
 		t.Fatalf("teardown: %v", err)
 	}
-	if got := m.CheckOverlap(a.Project, []string{"internal/cli"}); len(got) != 0 {
-		t.Fatalf("a torn-down worker must no longer conflict, got %v", got)
+	if got, err := m.CheckOverlap(a.Project, []string{"internal/cli"}); err != nil || len(got) != 0 {
+		t.Fatalf("a torn-down worker must no longer conflict, got %v (err %v)", got, err)
 	}
 }
 

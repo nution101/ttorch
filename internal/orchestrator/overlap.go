@@ -53,25 +53,41 @@ func footprintCandidate(t db.Task, repo, excludeID string) bool {
 
 // liveFootprintTasks returns the live worker tasks eligible for overlap, scoped to
 // repo when non-empty. Liveness depends on tmux, so this impure half is kept out of
-// footprintCandidate / computeConflicts.
-func (m *Manager) liveFootprintTasks(repo, excludeID string) []db.Task {
+// footprintCandidate / computeConflicts. It propagates the liveTasks read error so a
+// transient board-read failure cannot masquerade as "no live workers" (an empty set the
+// caller would read as "no overlap" — a fail-open on the one invariant overlap protects).
+func (m *Manager) liveFootprintTasks(repo, excludeID string) ([]db.Task, error) {
+	live, err := m.liveTasks()
+	if err != nil {
+		return nil, err
+	}
 	var out []db.Task
-	for _, t := range m.liveTasks() {
+	for _, t := range live {
 		if footprintCandidate(t, repo, excludeID) && m.Live(t) {
 			out = append(out, t)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // CheckOverlap reports which live workers a proposed footprint would conflict
 // with, scoped to repo when non-empty. It is the single source of truth shared by
 // the spawn guard and the `ttorch check-overlap` planning command.
-func (m *Manager) CheckOverlap(repo string, proposed []string) []Conflict {
+//
+// It returns an error — and the scheduler/spawn callers treat that as "cannot prove
+// disjoint" and REFUSE — whenever the board cannot be read. Without this, a read failure
+// would yield an empty conflict list indistinguishable from a genuine "no conflict", and
+// the daemon would dispatch onto files a live worker may already hold. Fail closed: an
+// overlap check that cannot read must never report safety it has not verified.
+func (m *Manager) CheckOverlap(repo string, proposed []string) ([]Conflict, error) {
 	if len(proposed) == 0 {
-		return nil
+		return nil, nil
 	}
-	return computeConflicts(proposed, m.liveFootprintTasks(repo, ""))
+	tasks, err := m.liveFootprintTasks(repo, "")
+	if err != nil {
+		return nil, err
+	}
+	return computeConflicts(proposed, tasks), nil
 }
 
 // OverlapString renders a conflict's path pairs as "proposed↔existing" entries,

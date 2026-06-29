@@ -158,7 +158,11 @@ func TestTeardown_RetainsRowBlanksWorktreeAndClosesTab(t *testing.T) {
 	}
 
 	// It drops out of the live fleet.
-	for _, lt := range m.liveTasks() {
+	lts, err := m.liveTasks()
+	if err != nil {
+		t.Fatalf("liveTasks: %v", err)
+	}
+	for _, lt := range lts {
 		if lt.ID == "td1" {
 			t.Error("a torn-down task must not appear in the live fleet")
 		}

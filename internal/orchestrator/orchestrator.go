@@ -77,8 +77,18 @@ func (m *Manager) Close() error {
 // exhausted its lease retries, §roadmap 2), so it is filtered out alongside the others —
 // otherwise a poison-pilled task would keep occupying a fleet slot and holding its
 // worktree in inUseWorktrees.
-func (m *Manager) liveTasks() []db.Task {
-	tasks, _ := m.Store.ListTasks(context.Background(), db.TaskFilter{})
+//
+// It PROPAGATES the ListTasks error rather than swallowing it: this is the board-read
+// underpinning every occupancy/overlap/capacity decision (Status, CheckOverlap,
+// inUseWorktrees), so a transient read failure (a lock timeout under contention, a WAL
+// hiccup) must FAIL CLOSED — surface the error so callers refuse to act — never return an
+// empty fleet that the scheduler would read as "no live workers, full capacity, no
+// overlap" and dispatch against.
+func (m *Manager) liveTasks() ([]db.Task, error) {
+	tasks, err := m.Store.ListTasks(context.Background(), db.TaskFilter{})
+	if err != nil {
+		return nil, err
+	}
 	var out []db.Task
 	for _, t := range tasks {
 		if t.Status == db.StatusTornDown || t.Status == db.StatusAbandoned || t.Status == db.StatusFailed {
@@ -86,18 +96,25 @@ func (m *Manager) liveTasks() []db.Task {
 		}
 		out = append(out, t)
 	}
-	return out
+	return out, nil
 }
 
-// inUseWorktrees returns the worktree paths held by active tasks for a repo.
-func (m *Manager) inUseWorktrees(repo string) []string {
+// inUseWorktrees returns the worktree paths held by active tasks for a repo. It
+// propagates the liveTasks read error so a caller never mistakes an unreadable board for
+// "no worktrees in use" (which would read as full pool capacity and let a fresh acquire
+// reuse a worktree a live worker still holds).
+func (m *Manager) inUseWorktrees(repo string) ([]string, error) {
+	live, err := m.liveTasks()
+	if err != nil {
+		return nil, err
+	}
 	var out []string
-	for _, t := range m.liveTasks() {
+	for _, t := range live {
 		if t.Project == repo && t.Worktree != "" {
 			out = append(out, t.Worktree)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // killPaneProcesses reaps a window's pane process group so a returned worktree is
@@ -145,8 +162,11 @@ func (m *Manager) Live(t db.Task) bool {
 	return tmux.WindowExists(m.Session, t.Window)
 }
 
-// Status returns the live (non-terminal) tracked tasks.
-func (m *Manager) Status() ([]db.Task, error) { return m.liveTasks(), nil }
+// Status returns the live (non-terminal) tracked tasks. It propagates the board-read
+// error from liveTasks so a consumer that drives dispatch off the live fleet (the
+// scheduler's RunOnce) ABORTS the tick on a read failure instead of dispatching against an
+// empty view — the fail-closed contract the scheduler's `if err != nil { return }` relies on.
+func (m *Manager) Status() ([]db.Task, error) { return m.liveTasks() }
 
 // DeriveState classifies a worker from observable inputs: whether its tmux window
 // is live and a recent capture of its pane. It is the pure core of TaskState, kept
@@ -458,7 +478,12 @@ func (m *Manager) StartManager() error {
 	}
 
 	_, ok, _ := m.Store.GetManager(context.Background())
-	tasks := m.liveTasks()
+	tasks, err := m.liveTasks()
+	if err != nil {
+		// Fail closed: a board-read failure must not be read as "no saved tasks" and start a
+		// fresh manager over a live session. Surface it so the lead retries `ttorch`.
+		return fmt.Errorf("could not read the saved session: %w", err)
+	}
 	if ok || len(tasks) > 0 {
 		notes := m.restore()
 		fmt.Fprintln(os.Stderr, "ttorch: restoring your saved session — manager and workers resume where they left off.")
@@ -541,8 +566,14 @@ func (m *Manager) restore() []string {
 	}
 
 	// Workers: rebuild each task window whose worktree still exists. liveTasks already
-	// excludes torn-down rows; cc sessions are skipped (ad-hoc, lead-driven, §7).
-	tasks := m.liveTasks()
+	// excludes torn-down rows; cc sessions are skipped (ad-hoc, lead-driven, §7). A board-read
+	// failure is surfaced as a note and stops the worker rebuild rather than being read as "no
+	// workers to restore" (which would silently skip every worker).
+	tasks, err := m.liveTasks()
+	if err != nil {
+		notes = append(notes, "could not list tasks to restore: "+err.Error())
+		return notes
+	}
 	for _, t := range tasks {
 		if t.Kind == "cc" {
 			continue // ad-hoc, lead-driven sessions are not auto-restored
@@ -691,8 +722,13 @@ func (m *Manager) OpenCC(isolated bool) error {
 	window := id
 	if isolated {
 		if repo, err := worktree.RepoRoot(dir); err == nil {
-			if wt, err := m.Pool.Acquire(repo, m.inUseWorktrees(repo)); err == nil {
-				dir = wt
+			// Fail closed: if the in-use set can't be read, do NOT acquire a pooled worktree —
+			// an incomplete in-use list could hand back one a live worker still holds. The cc
+			// session falls back to the cwd (non-isolated) rather than risk a collision.
+			if inUse, ierr := m.inUseWorktrees(repo); ierr == nil {
+				if wt, err := m.Pool.Acquire(repo, inUse); err == nil {
+					dir = wt
+				}
 			}
 		}
 	}
@@ -793,7 +829,12 @@ func (m *Manager) Recovery() ([]string, error) {
 	for _, w := range windows {
 		winSet[w] = true
 	}
-	tasks := m.liveTasks()
+	// Fail closed: a reconciliation that cannot read the board must surface the error, not
+	// report "nothing to recover" — a false all-clear is worse than a loud failure here.
+	tasks, err := m.liveTasks()
+	if err != nil {
+		return nil, fmt.Errorf("could not read the live fleet to reconcile: %w", err)
+	}
 	hasMeta := map[string]bool{}
 	for _, t := range tasks {
 		hasMeta[t.Window] = true

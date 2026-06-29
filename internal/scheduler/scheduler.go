@@ -79,8 +79,10 @@ type Fleet interface {
 	// gate consults.
 	Status() ([]db.Task, error)
 	// CheckOverlap reports which LIVE workers a proposed footprint conflicts with in repo —
-	// the same deterministic gate the manager's spawn uses.
-	CheckOverlap(repo string, proposed []string) []orchestrator.Conflict
+	// the same deterministic gate the manager's spawn uses. It returns an error when the board
+	// cannot be read; the scheduler treats that as "cannot prove disjoint" and refuses to
+	// dispatch the task this tick (fail closed), never as "no conflict".
+	CheckOverlap(repo string, proposed []string) ([]orchestrator.Conflict, error)
 	// SpawnWithFootprint dispatches a worker for an already-claimed task via the manager's
 	// spawn path (worktree + tmux window + harness launch).
 	SpawnWithFootprint(taskID, projectPath string, scout bool, rawCmd string, footprint []string, forceOverlap bool) (db.Task, error)
@@ -290,7 +292,17 @@ func (sc *Scheduler) RunOnce(ctx context.Context) (int, error) {
 		if freeOf(repo) <= 0 {
 			continue // no capacity in this repo right now — try the next ready task
 		}
-		if sc.overlaps(repo, t.Footprint, occupied[repo]) {
+		conflict, err := sc.overlaps(repo, t.Footprint, occupied[repo])
+		if err != nil {
+			// Fail closed: the overlap gate could not read the board, so disjointness is
+			// unproven. Skip this task THIS tick (leave it pending for a future tick) rather
+			// than read the read-failure as "no conflict" and dispatch onto possibly-shared
+			// files. A whole-board read failure surfaces earlier via Fleet.Status (which aborts
+			// the tick); this guards the per-task overlap read that can fail independently.
+			sc.logf("skip %s: cannot verify overlap (board read failed): %v", t.ID, err)
+			continue
+		}
+		if conflict {
 			continue // overlaps a live or already-claimed worker — skip, leave pending
 		}
 
@@ -517,16 +529,24 @@ func (sc *Scheduler) logReclaims(outcomes []db.ReclaimOutcome, cause string) int
 // claimed earlier this tick). The occupied set is checked with the same pure predicate the
 // manager's overlap core uses (state.FootprintOverlap), so the daemon's disjointness
 // matches the manager's exactly. Callers only reach this with a non-empty footprint.
-func (sc *Scheduler) overlaps(repo string, footprint []string, occupied [][]string) bool {
-	if len(sc.Fleet.CheckOverlap(repo, footprint)) > 0 {
-		return true
+//
+// It returns the CheckOverlap read error unchanged (rather than collapsing it to false):
+// a board-read failure means disjointness is UNPROVEN, and the caller must fail closed
+// (skip the task) rather than treat an empty conflict list as "safe to dispatch".
+func (sc *Scheduler) overlaps(repo string, footprint []string, occupied [][]string) (bool, error) {
+	conflicts, err := sc.Fleet.CheckOverlap(repo, footprint)
+	if err != nil {
+		return false, err
+	}
+	if len(conflicts) > 0 {
+		return true, nil
 	}
 	for _, fp := range occupied {
 		if len(state.FootprintOverlap(footprint, fp)) > 0 {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 func (sc *Scheduler) logf(format string, args ...any) {
