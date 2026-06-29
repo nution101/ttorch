@@ -56,7 +56,7 @@ conventions — match these when changing code here.
 - Lint/format: `gofmt -l .`, `go vet ./...`
 - Tests: standard `testing` package; tests in *_test.go beside sources
 - Layout: cmd/, content/, docs/, internal/
-- Match the style of: internal/learnings/learnings.go, internal/paths/paths.go, internal/selfupdate/selfupdate.go
+- Match the style of: internal/db/windowgone.go, internal/manifest/manifest.go, internal/watch/watchdog.go
 <!-- END ttorch-profile -->
 
 <!-- BEGIN ttorch-managed -->
