@@ -209,6 +209,28 @@ type Scheduler struct {
 	// a send. <1 is treated as 1 (nudge on first idle observation). New() sets it to 2.
 	IdleConfirmations int
 
+	// Backpressure governor (roadmap H4) — a machine-aware throttle layered ON TOP of the hard
+	// worktree-pool cap and the disjoint-footprint invariant; it only ever dispatches FEWER
+	// workers, never more, so it cannot weaken any correctness gate. MaxActiveWorkers caps how
+	// many heavy workers may run concurrently across the fleet (counted as live 'active' tasks);
+	// at the cap a dispatch tick spawns nothing more and LOGS the deferral. LoadCeiling, when > 0,
+	// additionally defers a tick whose 1-minute system load average exceeds it (fail OPEN — an
+	// unreadable loadavg never wedges dispatch; only the always-enforceable MaxActiveWorkers cap
+	// gates such a tick). MaxLandConcurrency bounds how many gated tasks the LAND pass hands to
+	// the concurrent land pipeline per tick, so a burst of gated work cannot launch many heavy
+	// validate suites at once. All three are zero on a bare struct (governor OFF — existing
+	// hand-built Schedulers and tests see no new behavior); New() populates them from the
+	// env-or-default. A value <= 0 DISABLES that knob. See governor.go for the full knob docs.
+	MaxActiveWorkers   int
+	LoadCeiling        float64
+	MaxLandConcurrency int
+
+	// loadAvg reads the host's 1-minute load average for the LoadCeiling check; nil means
+	// systemLoadAvg (the real darwin/linux reader). A test injects a fake to drive the ceiling
+	// deterministically. It returns ok=false when load is unreadable, which loadDefersDispatch
+	// treats as "no limit" (fail open).
+	loadAvg func() (float64, bool)
+
 	// idleSeen tracks, per task, the last idle pane hash observed and how many consecutive
 	// ticks it has held — the in-memory backing for the IdleConfirmations stability gate. It is
 	// touched only from the (single-threaded) tick loop, so it needs no lock; it is best-effort
@@ -243,6 +265,13 @@ func New(m *orchestrator.Manager, interval time.Duration, log io.Writer) *Schedu
 		IdleNudgeGrace:    idleNudgeGraceFromEnv(),
 		MaxIdleNudges:     maxIdleNudgesFromEnv(),
 		IdleConfirmations: defaultIdleConfirmations,
+
+		// Backpressure governor (H4): default-on machine-load throttle (env-overridable). The
+		// active-worker cap is sized from the worktree pool; the land cap and load ceiling take
+		// their package defaults. See governor.go.
+		MaxActiveWorkers:   maxActiveWorkersFromEnv(m.Pool.Max),
+		LoadCeiling:        loadCeilingFromEnv(),
+		MaxLandConcurrency: maxLandConcurrencyFromEnv(),
 	}
 }
 
@@ -403,6 +432,22 @@ func (sc *Scheduler) RunOnce(ctx context.Context) (int, error) {
 		return 0, err
 	}
 
+	// Backpressure governor (H4): a machine-load throttle layered ON TOP of the pool cap and
+	// the disjoint-footprint invariant below — it only ever dispatches FEWER workers, never
+	// more. Checked BEFORE building the occupancy maps so a deferred tick is a cheap fast path.
+	// The load ceiling fails OPEN (an unreadable loadavg never defers); the max-active cap is
+	// always enforceable. Both leave ready tasks pending (never failed) and LOG the deferral so
+	// backpressure is never a silent stall. See governor.go.
+	if over, load := sc.loadDefersDispatch(); over {
+		sc.logf("dispatch deferred: load %.2f >= ceiling %.2f (%d ready task(s) left pending)", load, sc.LoadCeiling, len(ready))
+		return 0, nil
+	}
+	budget, active := sc.dispatchBudget(live)
+	if budget <= 0 {
+		sc.logf("dispatch deferred: %d active >= max-active %d (%d ready task(s) left pending)", active, sc.MaxActiveWorkers, len(ready))
+		return 0, nil
+	}
+
 	// Per-repo free worktree capacity at tick start. In-use accounting mirrors
 	// freeSlotsByRepo / Manager.inUseWorktrees: a live task occupies a slot for as long as
 	// it HOLDS a worktree (even after its window is gone, before teardown releases it).
@@ -436,6 +481,7 @@ func (sc *Scheduler) RunOnce(ctx context.Context) (int, error) {
 	}
 
 	dispatched := 0
+	govCapHit := false
 	for _, t := range ready {
 		select {
 		case <-ctx.Done():
@@ -480,6 +526,14 @@ func (sc *Scheduler) RunOnce(ctx context.Context) (int, error) {
 		if conflict {
 			continue // overlaps a live or already-claimed worker — skip, leave pending
 		}
+		// Governor cap (H4): this task is otherwise dispatchable (footprint declared, brief
+		// stored, capacity free, disjoint), but the machine-load throttle's per-tick budget is
+		// spent. Stop dispatching this tick and leave the rest pending — dispatching FEWER than
+		// capacity allows, never more. The deferral is logged after the loop.
+		if dispatched >= budget {
+			govCapHit = true
+			break
+		}
 
 		owner := "worker:" + t.ID
 		claimed, won, err := sc.Store.ClaimTask(ctx, t.ID, owner)
@@ -515,6 +569,12 @@ func (sc *Scheduler) RunOnce(ctx context.Context) (int, error) {
 		occupied[repo] = append(occupied[repo], claimed.Footprint)
 		dispatched++
 		sc.logf("dispatched %s to %s (footprint: %s)", claimed.ID, repo, strings.Join(claimed.Footprint, ", "))
+	}
+	if govCapHit {
+		// Backpressure was applied this tick: we filled the max-active budget and left the
+		// remaining ready, dispatchable tasks pending so the next tick (or a worker finishing)
+		// can pick them up. Logged so the throttle is observable, never a silent stall.
+		sc.logf("dispatch deferred: reached max-active %d (%d already active + %d dispatched this tick); remaining ready task(s) left pending", sc.MaxActiveWorkers, active, dispatched)
 	}
 	return dispatched, nil
 }
@@ -567,6 +627,7 @@ func (sc *Scheduler) RunLandOnce(ctx context.Context) (int, error) {
 	// freed even when the tick's own ctx is the reason we are unwinding (a SIGTERM cancel), so a
 	// half-claimed batch never strands done tasks until the lease lapses.
 	var ids []string
+	landDeferred := false
 	owners := map[string]string{}
 	release := func(id string) {
 		if owner := owners[id]; owner != "" {
@@ -598,6 +659,14 @@ func (sc *Scheduler) RunLandOnce(ctx context.Context) (int, error) {
 		if !ok || v.Overall != review.Pass {
 			continue
 		}
+		// Bounded land fan-out (H4): cap how many gated tasks this tick hands to the concurrent
+		// land pipeline, so a burst of gated work cannot launch many heavy (offloaded) validate
+		// suites at once. The remaining gated tasks land on later ticks (the board is re-derived
+		// each tick). A cap of <= 0 disables the bound (today's behavior — claim the whole set).
+		if sc.landCapReached(len(ids)) {
+			landDeferred = true
+			break
+		}
 		owner := "lander:" + t.ID
 		won, err := sc.Store.ClaimForLand(ctx, t.ID, owner)
 		if err != nil {
@@ -609,6 +678,11 @@ func (sc *Scheduler) RunLandOnce(ctx context.Context) (int, error) {
 		}
 		ids = append(ids, t.ID)
 		owners[t.ID] = owner
+	}
+	if landDeferred {
+		// Backpressure was applied: we capped this tick's land fan-out and left the remaining
+		// gated tasks for a later tick. Logged so the bound is observable, never a silent stall.
+		sc.logf("land deferred: capped at %d task(s) this tick; remaining gated work left for a later tick", sc.MaxLandConcurrency)
 	}
 	if len(ids) == 0 {
 		return 0, nil

@@ -1389,6 +1389,13 @@ func cmdScheduler(args []string) error {
 	supervise := fs.Bool("supervise", false, "also SUPERVISE the fleet: reclaim workers that verifiably died (window gone / lease expired) and re-dispatch within a bounded retry ceiling, poison-pilling the rest (off by default)")
 	gate := fs.Bool("gate", false, "also GATE done tasks in a trusted repo with no passing verdict: run the trust prep, dispatch the adversarial reviewers, and on an all-pass record the verdict via the unchanged trust-record path — fails closed (a blocking finding/prep refusal/stalled reviewer is surfaced for the manager, never recorded) (off by default)")
 	single := fs.Bool("singleton", false, "hold a per-~/.ttorch singleton lock and exit quietly if another scheduler daemon already holds it (used by the manager's auto-start; a plain 'ttorch scheduler' stays safe to run as multiple instances)")
+	// Backpressure governor (H4): machine-load throttle on TOP of the worktree-pool cap. Each
+	// defaults to -1 (sentinel for "not set on the command line"); when set it OVERRIDES the
+	// env-or-default value scheduler.New resolved (TTORCH_MAX_ACTIVE_WORKERS / TTORCH_LOAD_CEILING
+	// / TTORCH_MAX_LAND_CONCURRENCY). A value <= 0 DISABLES that knob.
+	maxActive := fs.Int("max-active", -1, "max heavy workers running concurrently across the fleet before dispatch defers this tick (a machine-load throttle BELOW the worktree-pool cap); <=0 disables it. Default: NumCPU/2, floored at 2, capped at the pool size (env: TTORCH_MAX_ACTIVE_WORKERS)")
+	loadCeiling := fs.Float64("load-ceiling", -1, "defer a dispatch tick whose 1-minute system load average exceeds this value (fail-open: an unreadable loadavg never defers); <=0 disables it (the default). Set relative to core count (env: TTORCH_LOAD_CEILING)")
+	maxLand := fs.Int("max-land-concurrency", -1, "max gated tasks the land pass hands to the concurrent land pipeline per tick, bounding how many heavy validate suites launch at once; <=0 disables the per-tick bound. Default 2 (env: TTORCH_MAX_LAND_CONCURRENCY)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1422,6 +1429,20 @@ func cmdScheduler(args []string) error {
 	sch.Land = *land
 	sch.Supervise = *supervise
 	sch.Gate = *gate
+	// Override the governor's env-or-default knobs only when the flag was EXPLICITLY passed, so a
+	// flag beats the env, the env beats the built-in default, and an unset flag leaves New()'s
+	// resolution intact (fs.Visit only visits flags that were set). The auto-start daemon passes
+	// none of these, so it runs on the env-or-default governor.
+	fs.Visit(func(fl *flag.Flag) {
+		switch fl.Name {
+		case "max-active":
+			sch.MaxActiveWorkers = *maxActive
+		case "load-ceiling":
+			sch.LoadCeiling = *loadCeiling
+		case "max-land-concurrency":
+			sch.MaxLandConcurrency = *maxLand
+		}
+	})
 	// Ctrl-C and SIGTERM cancel the loop and let it exit cleanly.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -2055,6 +2076,17 @@ Supervision:
                             actionable event; never reclaims a live worker. The four toggle
                             independently (--dispatch=false --land = land-only). Logs to its
                             own stdout, never the manager pane. --once runs one tick.
+    [--max-active n]        BACKPRESSURE GOVERNOR (H4): a machine-load throttle layered ON TOP
+    [--load-ceiling x]      of the worktree-pool cap — it only ever dispatches FEWER workers,
+    [--max-land-concurrency n]  never more. --max-active caps heavy workers running concurrently
+                            (default NumCPU/2, floored at 2, capped at the pool; <=0 disables);
+                            at the cap a tick defers + LOGS, leaving tasks pending. --load-ceiling
+                            (off by default) defers a tick whose 1-min load average exceeds it,
+                            failing OPEN if loadavg is unreadable. --max-land-concurrency (default
+                            2) bounds gated tasks handed to the land pipeline per tick so a burst
+                            cannot launch many heavy validates at once. Each also reads an env var
+                            (TTORCH_MAX_ACTIVE_WORKERS / TTORCH_LOAD_CEILING /
+                            TTORCH_MAX_LAND_CONCURRENCY); an explicit flag overrides the env.
 
 Delivery:
   validate <id>               run the repo's build/test/lint checks on a worker
