@@ -80,6 +80,15 @@ func (p Paths) BriefPath(id string) string { return filepath.Join(p.DataDir(), i
 // reap (§4.5).
 func (p Paths) WatchPIDFile() string { return filepath.Join(p.StateDir(), "watch.pid") }
 
+// SchedulerPIDFile holds the auto-started scheduler daemon's singleton lock + pid (one daemon
+// per ~/.ttorch). The daemon takes an exclusive flock on it; a redundant start (e.g. a second
+// `ttorch` session) finds the lock held and exits quietly, so the manager never runs two daemons.
+func (p Paths) SchedulerPIDFile() string { return filepath.Join(p.StateDir(), "scheduler.pid") }
+
+// SchedulerLog is where the auto-started scheduler daemon's diagnostic output goes — a file under
+// ~/.ttorch, NEVER the manager pane (no TTY injection).
+func (p Paths) SchedulerLog() string { return filepath.Join(p.Home, "scheduler.log") }
+
 // ApprovalFile holds a short-lived approval token authorizing a merge for a task.
 // The adversarial-review VERDICT it sits beside is no longer a file — it is durable,
 // content-pinned SQLite state (the verdicts table), so a merge is never forced to

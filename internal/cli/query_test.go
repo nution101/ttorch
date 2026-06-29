@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/nution101/ttorch/internal/db"
+	"github.com/nution101/ttorch/internal/paths"
+	"github.com/nution101/ttorch/internal/singleton"
 )
 
 // withSeedDB creates an isolated SQLite store at a temp path, points $TTORCH_DB at
@@ -332,6 +334,95 @@ func TestCmdTaskAddPendingBacklog(t *testing.T) {
 	if len(all) != 1 || all[0].ID != "backlog-1" {
 		t.Fatalf("ListTasks = %+v, want [backlog-1] (pending backlog included)", all)
 	}
+}
+
+// TestCmdTaskAddStoresBrief: `task add --brief/--brief-file` persists the brief keyed by task
+// id (paths.BriefPath), so the scheduler daemon's dispatch — and a later manual spawn — launch
+// the worker WITH the full brief as its initial prompt instead of the stub. A task added with
+// no brief stores none (and dispatches on the stub, unchanged); both flags at once is a loud
+// error that creates no task.
+func TestCmdTaskAddStoresBrief(t *testing.T) {
+	var projID int64
+	withSeedDB(t, func(ctx context.Context, s *db.Store) {
+		p, _ := s.UpsertProject(ctx, "/r", "r")
+		projID = p.ID
+	})
+	const inline = "# Real brief\n\nImplement part C.\n"
+	if _, err := captureStdout(t, func() error {
+		return cmdTaskAdd([]string{"brief-inline", "--project", itoa(projID), "--brief", inline})
+	}); err != nil {
+		t.Fatalf("task add --brief: %v", err)
+	}
+	if got := mustReadFile(t, paths.Default().BriefPath("brief-inline")); got != inline {
+		t.Fatalf("stored brief = %q, want %q", got, inline)
+	}
+
+	// --brief-file stores the file's contents.
+	file := filepath.Join(t.TempDir(), "brief.md")
+	const fromFile = "# File brief\n\nImplement part C from a file.\n"
+	if err := os.WriteFile(file, []byte(fromFile), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := captureStdout(t, func() error {
+		return cmdTaskAdd([]string{"brief-file", "--project", itoa(projID), "--brief-file", file})
+	}); err != nil {
+		t.Fatalf("task add --brief-file: %v", err)
+	}
+	if got := mustReadFile(t, paths.Default().BriefPath("brief-file")); got != fromFile {
+		t.Fatalf("stored brief = %q, want %q", got, fromFile)
+	}
+
+	// No brief flag stores no brief — dispatch then falls back to the stub.
+	if _, err := captureStdout(t, func() error {
+		return cmdTaskAdd([]string{"brief-none", "--project", itoa(projID)})
+	}); err != nil {
+		t.Fatalf("task add (no brief): %v", err)
+	}
+	if _, err := os.Stat(paths.Default().BriefPath("brief-none")); !os.IsNotExist(err) {
+		t.Fatalf("a task added with no brief must not store one; stat err = %v", err)
+	}
+
+	// Both flags at once is ambiguous: a loud error, and nothing is written (resolveBrief
+	// refuses before the task row or brief file is created).
+	if err := cmdTaskAdd([]string{"brief-both", "--project", itoa(projID), "--brief", inline, "--brief-file", file}); err == nil {
+		t.Fatal("task add with both --brief and --brief-file must error")
+	}
+	if _, err := os.Stat(paths.Default().BriefPath("brief-both")); !os.IsNotExist(err) {
+		t.Fatalf("the ambiguous add must not store a brief; stat err = %v", err)
+	}
+}
+
+// TestCmdSchedulerSingletonExitsWhenHeld: `ttorch scheduler --singleton` exits quietly (a no-op
+// success, with a clear notice) when another daemon already holds the per-~/.ttorch lock — the
+// guard that lets the manager auto-start the daemon without ever running two. The lock is
+// pre-held here to simulate a running daemon, and is left held after the command returns (the
+// command never took it).
+func TestCmdSchedulerSingletonExitsWhenHeld(t *testing.T) {
+	withSeedDB(t, nil) // points TTORCH_DB at a temp store; TestMain pins TTORCH_HOME
+	lock, acquired, err := singleton.Acquire(paths.Default().SchedulerPIDFile())
+	if err != nil || !acquired {
+		t.Fatalf("setup: pre-acquire the scheduler singleton: acquired=%v err=%v", acquired, err)
+	}
+	defer singleton.Release(lock)
+
+	out, err := captureStdout(t, func() error {
+		return cmdScheduler([]string{"--once", "--singleton"})
+	})
+	if err != nil {
+		t.Fatalf("scheduler --singleton must exit cleanly when the lock is held: %v", err)
+	}
+	if !strings.Contains(out, "already holds the singleton") {
+		t.Fatalf("expected the singleton-held notice, got: %q", out)
+	}
+}
+
+func mustReadFile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(b)
 }
 
 func TestCmdTaskAddValidations(t *testing.T) {

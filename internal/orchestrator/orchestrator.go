@@ -446,6 +446,12 @@ func (m *Manager) StartManager() error {
 	if err := tmux.EnsureSession(m.Session); err != nil {
 		return err
 	}
+	// Auto-start the deterministic scheduler daemon (config-gated, default-on, singleton) so a
+	// normal `ttorch` session drives the board autonomously — dispatch + land + supervise — while
+	// the LLM manager plans, gates, and answers decisions. Run for every start path (re-attach,
+	// restore, fresh) so a missing daemon is (re)started; the singleton makes a redundant launch a
+	// no-op. Best-effort and non-blocking: it never fails or delays the attach below.
+	m.autoStartScheduler()
 	if tmux.WindowExists(m.Session, "manager") {
 		fmt.Fprintln(os.Stderr, "ttorch: attaching to your running manager — 'ttorch stop' to end it (then 'ttorch' in another folder to restart there).")
 		return m.attachManager()

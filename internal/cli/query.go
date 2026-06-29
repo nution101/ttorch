@@ -674,7 +674,7 @@ func parseSetStatusArgs(kind string, args []string) (int64, string, error) {
 
 // --- ttorch task add ---------------------------------------------------------
 
-const taskAddUsage = `usage: ttorch task add <id> --project <id> [--epic <id>] [--phase <id>] [--title "…"] [--touches "a,b"]`
+const taskAddUsage = `usage: ttorch task add <id> --project <id> [--epic <id>] [--phase <id>] [--title "…"] [--touches "a,b"] [--brief-file <path> | --brief "…"]`
 
 func cmdTask(args []string) error {
 	if len(args) < 1 || args[0] != "add" {
@@ -696,11 +696,23 @@ func cmdTaskAdd(args []string) error {
 	phase := fs.Int64("phase", 0, "optional phase id")
 	title := fs.String("title", "", "one-line task title")
 	touches := fs.String("touches", "", "comma-separated files/prefixes the task will touch")
+	briefFile := fs.String("brief-file", "", "path to a file whose contents become the worker's initial prompt (the full brief) when this task is dispatched, instead of the generic stub")
+	brief := fs.String("brief", "", "inline brief text used as the worker's initial prompt when this task is dispatched, instead of the generic stub")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
 	if *project == 0 {
 		return errors.New("task add: --project <id> is required")
+	}
+	// Resolve the brief before any side effect so a bad --brief/--brief-file fails the add
+	// loudly. Storing it now (below, after the row is created) means the deterministic scheduler
+	// daemon — and a later manual `ttorch spawn` — launch the worker WITH the full brief as its
+	// initial prompt (equivalent to `spawn --brief-file`), instead of the stub that waits for a
+	// manager `ttorch send`. A task added without a brief still dispatches: it falls back to the
+	// stub, exactly as today.
+	briefContent, err := resolveBrief("task add", *brief, *briefFile)
+	if err != nil {
+		return err
 	}
 	m, err := mgr()
 	if err != nil {
@@ -776,7 +788,21 @@ func cmdTaskAdd(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("added backlog task %s (project %d, status %s) — spawn it with: ttorch spawn %s <repo>\n", t.ID, t.ProjectID, t.Status, t.ID)
+	// Persist the brief (keyed by task id) so dispatch — by the scheduler daemon or a manual
+	// spawn — launches the worker with it as the initial prompt. Done after the row exists, so a
+	// failed CreateTask never strands an orphan brief; a failure here is loud (the task is added
+	// but its brief is missing, which the lead should know to re-supply).
+	briefNote := ""
+	if briefContent != "" {
+		if err := m.WriteBrief(t.ID, briefContent); err != nil {
+			// The row exists but has no brief, so dispatch would fall back to the stub. Fail
+			// loudly with the recovery path rather than silently leave a brief-less task that the
+			// scheduler then dispatches on the stub.
+			return fmt.Errorf("task add: created %s but could not store its brief (%w); set it before dispatch with 'ttorch spawn %s <repo> --brief-file <path>', or remove the task with 'ttorch teardown %s'", t.ID, err, t.ID, t.ID)
+		}
+		briefNote = " with a stored brief"
+	}
+	fmt.Printf("added backlog task %s%s (project %d, status %s) — spawn it with: ttorch spawn %s <repo>\n", t.ID, briefNote, t.ProjectID, t.Status, t.ID)
 	return nil
 }
 

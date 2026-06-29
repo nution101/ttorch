@@ -193,31 +193,48 @@ func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error)
 	if !worktree.IsAncestor(repo, defHead, workerHead) {
 		return "", fmt.Errorf("worker %q is not a fast-forward of %q; have the worker rebase first", taskID, def)
 	}
-	// Consume the approval only now — immediately before the state change — so a
-	// recoverable refusal above leaves it intact for a retry, and require it to
-	// authorize exactly the commit being merged (no changes since the lead reviewed).
-	approvedData, ok := approval.Consume(m.P.ApprovalFile(taskID))
+	// Validate the approval — but DO NOT consume it yet. Read its bound provenance + reviewed
+	// sha WITHOUT removing the token, and require it to authorize exactly the commit being
+	// merged (no changes since the lead reviewed). Consuming is DEFERRED until after the
+	// fast-forward succeeds (below), so a refusal here, a failed verdict/audit check, or a
+	// failed fast-forward all leave the approval (and verdict) intact for a retry —
+	// consume-once on SUCCESS only. A failed land must never strand the gate tokens.
+	approvedData, ok := approval.Data(m.P.ApprovalFile(taskID))
 	if !ok {
 		return "", fmt.Errorf("approval for %q expired before merge; run 'ttorch approve %s' again", taskID, taskID)
 	}
 	approvedBy, approvedHead := splitApprovalPayload(approvedData)
 	if approvedHead != workerHead {
+		// A commit-MISMATCHED approval is dead: the worker advanced past the approved commit,
+		// so this token can never authorize the current head. Consume it (it cannot linger to
+		// authorize anything) and refuse — the lead must re-review the new commit and approve
+		// it. This is distinct from a VALID approval hitting a recoverable failure below, which
+		// is preserved for a retry (consume-once on SUCCESS only): a dead token has nothing to
+		// retry. (Land's own pre-merge gateCoversRebased refuses a rebase-moved worker WITHOUT
+		// consuming, so a re-approvable rebase never reaches here — only a genuine worker
+		// advance does.)
+		m.consumeApproval(taskID)
 		return "", fmt.Errorf("worker %q changed since approval (approved %s, now %s); re-review with 'ttorch review-diff %s' and approve again", taskID, short(approvedHead), short(workerHead), taskID)
 	}
 	if !gated {
 		if err := worktree.MergeFastForward(repo, workerHead); err != nil {
 			return "", err
 		}
+		// The fast-forward succeeded and is irreversible: consume the approval now
+		// (consume-once on SUCCESS only). A failed removal is surfaced, never fatal — the
+		// lingering token is pinned to the just-merged commit, so the most it could ever
+		// re-authorize is re-merging that identical commit (a no-op), never unreviewed content.
+		m.consumeApproval(taskID)
 		m.audit(fmt.Sprintf("merge-local task=%s repo=%s %s -> %s", taskID, repo, def, short(workerHead)))
 		m.recordDelivered(taskID, db.EventDelivered, fmt.Sprintf("%s -> %s", def, short(workerHead)))
 		return fmt.Sprintf("fast-forwarded %s to %s for task %s", def, short(workerHead), taskID), nil
 	}
-	// Consume the durable verdict and pin it to the merged commit — the second commit-pin,
-	// parallel to approvedHead==workerHead, so a commit pushed after review can never ride
-	// in unreviewed. Re-read it (it must still be present and passing — fail closed if a
-	// re-record turned it blocking since the load above) and require its reviewed_sha to
-	// equal the commit being merged; then delete the row so the same verdict can never
-	// authorize a second merge.
+	// Re-read the durable verdict and require it still present, passing, and pinned to the
+	// commit being merged — the second commit-pin, parallel to approvedHead==workerHead, so a
+	// commit pushed after review can never ride in unreviewed. This is a NON-consuming check
+	// (fail closed if a re-record turned it blocking or moved its reviewed_sha since the load
+	// above); like the approval, the row is DELETED only after the fast-forward succeeds, so a
+	// failed merge never orphans the verdict either.
 	cv, ok, cerr := m.Store.GetVerdict(context.Background(), taskID)
 	if cerr != nil {
 		return "", fmt.Errorf("trust gate: could not read the review verdict for %q: %w", taskID, cerr)
@@ -228,10 +245,7 @@ func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error)
 	if cv.ReviewedSHA != workerHead {
 		return "", fmt.Errorf("trust gate: the verdict for %q covers %s but the worker is now %s; re-review and re-record", taskID, short(cv.ReviewedSHA), short(workerHead))
 	}
-	if err := m.Store.DeleteVerdict(context.Background(), taskID); err != nil {
-		return "", fmt.Errorf("trust gate: could not consume the review verdict for %q: %w", taskID, err)
-	}
-	// Attribute the audit to the consumed token's provenance, and fail closed if it is
+	// Attribute the audit to the approval token's provenance, and fail closed if it is
 	// unknown (a legacy token with no provenance must not merge through the gate).
 	var approver string
 	switch approvedBy {
@@ -241,8 +255,10 @@ func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error)
 		return "", fmt.Errorf("trust gate: the approval for %q has no recorded provenance; re-approve with 'ttorch approve %s'", taskID, taskID)
 	}
 	// A trusted merge MUST be auditable (every trusted merge must be reconstructable):
-	// write + flush the record BEFORE the fast-forward and abort if it cannot be
-	// persisted — for finance, an unrecorded merge is not acceptable.
+	// write + flush the record BEFORE the fast-forward and abort if it cannot be persisted —
+	// for finance, an unrecorded merge is not acceptable. Because the gate tokens are not
+	// consumed until AFTER the fast-forward, an audit-write failure here likewise leaves the
+	// approval + verdict intact for a retry.
 	auditLine := fmt.Sprintf("merge-local task=%s repo=%s %s -> %s gate=verdict approver=%s", taskID, repo, def, short(workerHead), approver)
 	if err := m.writeAudit(auditLine); err != nil {
 		return "", fmt.Errorf("trust gate: cannot record the merge for %q in the audit log (%v); refusing to merge unaudited", taskID, err)
@@ -250,8 +266,38 @@ func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error)
 	if err := worktree.MergeFastForward(repo, workerHead); err != nil {
 		return "", err
 	}
+	// The fast-forward succeeded and is irreversible: NOW consume both gate tokens so neither
+	// can authorize a second merge (consume-once on SUCCESS only). Both are pinned to the
+	// just-merged commit, so a failed removal is surfaced but never fatal — the most a lingering
+	// token could re-authorize is re-merging that identical commit (a no-op); a later worker
+	// advance moves its HEAD off the pinned sha and is refused, so unreviewed content never rides.
+	m.consumeApproval(taskID)
+	m.consumeVerdict(taskID)
 	m.recordDelivered(taskID, db.EventDelivered, fmt.Sprintf("%s -> %s gate=verdict approver=%s", def, short(workerHead), approver))
 	return fmt.Sprintf("fast-forwarded %s to %s for task %s", def, short(workerHead), taskID), nil
+}
+
+// consumeApproval removes the approval token for taskID. It is called when the token is spent
+// or dead: after a successful, irreversible fast-forward (consume-once on SUCCESS), or when the
+// token is commit-mismatched (the worker advanced past the approved commit, so it can never
+// authorize the current head). The removal is best-effort: a failed unlink is surfaced but
+// never fails the operation — and a lingering token is pinned to a commit that is either the
+// just-merged one (re-merging it is a no-op) or stale (it cannot match the current head), so it
+// can never authorize unreviewed content.
+func (m *Manager) consumeApproval(taskID string) {
+	if err := os.Remove(m.P.ApprovalFile(taskID)); err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "ttorch: warning: could not remove the consumed approval token for %s after merge: %v (it is pinned to the merged commit and cannot authorize unreviewed content)\n", taskID, err)
+	}
+}
+
+// consumeVerdict deletes the durable review verdict for taskID after a successful,
+// irreversible fast-forward (consume-once on SUCCESS only), so the same verdict can never
+// authorize a second merge. Best-effort for the same reason as consumeApproval: a failed
+// delete is surfaced but never fails the merge, and the row is pinned to the merged commit.
+func (m *Manager) consumeVerdict(taskID string) {
+	if err := m.Store.DeleteVerdict(context.Background(), taskID); err != nil {
+		fmt.Fprintf(os.Stderr, "ttorch: warning: could not consume the review verdict for %s after merge: %v (it is pinned to the merged commit and cannot authorize an unreviewed merge)\n", taskID, err)
+	}
 }
 
 // approvalPayload packs the grant provenance ("human"|"auto") with the reviewed sha into
@@ -275,6 +321,15 @@ func splitApprovalPayload(data string) (by, sha string) {
 // so the only way to drive the mismatch alarm in-process is to inject one).
 var landIntegrate = func(m *Manager, t db.Task, mode string, requireVerdict bool, rebasedHead string) (string, error) {
 	return m.integrate(t, mode, requireVerdict, rebasedHead)
+}
+
+// landRebase rebases the worker's worktree onto base during landPrep. It is a package-level
+// seam (like landIntegrate) so a test can substitute a rebase that REWRITES the commit sha —
+// the real-world fork-point/committer-rewrite behavior that motivated the fast-forward
+// fast-path — and prove landPrep skips it when the worker is already a fast-forward of the
+// base. Production wiring is worktree.Rebase, unchanged.
+var landRebase = func(wt, base string) error {
+	return worktree.Rebase(wt, base)
 }
 
 // Land turns the manual push/PR/merge/fetch/ff/verify dance into one safe, atomic command
@@ -449,8 +504,18 @@ func (m *Manager) landPrep(t db.Task, spec landSpec, fetchMu *sync.Mutex) (landP
 		}
 	}
 
-	// (2) Rebase the worker onto the current default tip. On conflict ABORT and report the real
-	// overlap rather than blind-merging a far-behind branch whose diff reads as a phantom deletion.
+	// (2) Rebase the worker onto the current default tip — but ONLY when it is genuinely behind.
+	// When the worker is ALREADY a fast-forward of the base (the base is an ancestor of the
+	// worker HEAD), there is nothing to replay, so take the fast-forward fast-path and skip the
+	// rebase entirely, leaving the worker's commit — and thus the verdict + approval pinned to
+	// it — exactly where it is. Rebasing an already-fast-forwardable worker is NOT a harmless
+	// no-op: git can still rewrite the commit (new committer metadata / fork-point replay ⇒ a
+	// new sha), which moves the worker off the commit its verdict + approval cover and forces a
+	// needless re-gate/re-approval — or, for the daemon's autonomous land, a hard failure ("no
+	// valid approval covers the rebased commit"). This mirrors MergeLocal's fast-forward-only
+	// contract: what merges is exactly the reviewed, approved commit. Only a worker genuinely
+	// behind the advanced default is rebased; on conflict ABORT and report the real overlap
+	// rather than blind-merging a far-behind branch whose diff reads as a phantom deletion.
 	base, baseSha, err := landBase(spec.repo, spec.def, spec.hasOrigin)
 	if err != nil {
 		return zero, fmt.Errorf("land: %w", err)
@@ -459,15 +524,18 @@ func (m *Manager) landPrep(t db.Task, spec landSpec, fetchMu *sync.Mutex) (landP
 	if err != nil {
 		return zero, err
 	}
-	if err := worktree.Rebase(spec.wt, base); err != nil {
-		if abErr := worktree.RebaseAbort(spec.wt); abErr != nil {
-			return zero, fmt.Errorf("land: rebasing %q onto %s hit conflicts AND the abort failed (%v); the worktree %s is left mid-rebase — run 'git -C %s rebase --abort' by hand, resolve the overlap in the worker, then re-run land: %w", spec.taskID, base, abErr, spec.wt, spec.wt, err)
+	rebasedHead := preRebase
+	if !worktree.IsAncestor(spec.repo, baseSha, preRebase) {
+		if err := landRebase(spec.wt, base); err != nil {
+			if abErr := worktree.RebaseAbort(spec.wt); abErr != nil {
+				return zero, fmt.Errorf("land: rebasing %q onto %s hit conflicts AND the abort failed (%v); the worktree %s is left mid-rebase — run 'git -C %s rebase --abort' by hand, resolve the overlap in the worker, then re-run land: %w", spec.taskID, base, abErr, spec.wt, spec.wt, err)
+			}
+			return zero, fmt.Errorf("land: rebasing %q onto %s hit conflicts (real overlap with changes already on %s); aborted the rebase and restored the worktree — resolve the overlap in the worker, then re-run land: %w", spec.taskID, base, spec.def, err)
 		}
-		return zero, fmt.Errorf("land: rebasing %q onto %s hit conflicts (real overlap with changes already on %s); aborted the rebase and restored the worktree — resolve the overlap in the worker, then re-run land: %w", spec.taskID, base, spec.def, err)
-	}
-	rebasedHead, err := worktree.Head(spec.wt)
-	if err != nil {
-		return zero, err
+		rebasedHead, err = worktree.Head(spec.wt)
+		if err != nil {
+			return zero, err
+		}
 	}
 
 	// (3) Validate the REBASED tree. Must be green; no checks detected is a hard block.

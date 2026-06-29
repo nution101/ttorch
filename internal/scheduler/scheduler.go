@@ -19,13 +19,16 @@
 // without the LLM manager doing it by hand — the core throughput/anti-stall win. The three
 // passes are independent: a tick runs whichever are enabled, dispatch defaults on
 // (`ttorch scheduler`) while land (`--land`) and supervise (`--supervise`) are opt-in.
-// Autonomous GATING (spawning the reviewers, recording the verdict) and auto-starting the
-// daemon from the manager remain deliberate follow-on phases. The LAND pass NEVER lands ungated
-// work; the SUPERVISE pass reclaims only a worker that has shown no sign of life (no re-dispatch
-// and no heartbeat) since its window was flagged gone, or whose lease genuinely lapsed, and
-// never restarts a task past its retry ceiling. The daemon is OPT-IN: nothing starts it
-// automatically (see `ttorch scheduler`); existing manager/worker behavior is unchanged unless
-// it is run.
+// Autonomous GATING (spawning the reviewers, recording the verdict) remains the LLM manager's
+// job — the LAND pass deliberately lands only work that ALREADY carries a passing verdict, so
+// recording it stays a deliberate, human-or-LLM gate. The LAND pass NEVER lands ungated work;
+// the SUPERVISE pass reclaims only a worker that has shown no sign of life (no re-dispatch and no
+// heartbeat) since its window was flagged gone, or whose lease genuinely lapsed, and never
+// restarts a task past its retry ceiling. The daemon now AUTO-STARTS by default from the manager
+// session (Manager.StartManager, config-gated by TTORCH_SCHEDULER_AUTOSTART, singleton via
+// `scheduler --singleton`), with dispatch+land+supervise enabled, so a normal `ttorch` session
+// drives the board autonomously; the manual `ttorch scheduler` subcommand stays available for
+// running it by hand or with a different pass mix.
 //
 // Concurrency model: the scheduler is self-consistent and safe to run as multiple
 // instances against one DB — the atomic dispatch claim (db.ClaimTask: BEGIN IMMEDIATE +
@@ -38,10 +41,13 @@
 // boundary in this phase: a HUMAN/LLM manager running `ttorch spawn` for the exact id the
 // scheduler has just claimed (active, window not yet up) won't see that claim in its own
 // liveness-gated overlap gate; the worst case is a window-name collision that fails one of
-// the two spawns (never a silent double-dispatch). Full manager↔scheduler co-running
-// coordination — including auto-starting the scheduler from the manager — is a later,
-// deliberate phase; until then, run the scheduler as the dispatcher OR drive spawns from
-// the manager, not both onto the same ids.
+// the two spawns (never a silent double-dispatch). The manager↔scheduler co-running model is
+// now the DEFAULT: the auto-started daemon drives dispatch/land/recovery while the LLM manager
+// plans, gates, and answers decisions, coexisting purely through the DB's atomic claims. A
+// manager-driven `ttorch spawn` and the daemon's dispatch can still collide on the exact same
+// id only in the brief claimed-but-window-not-yet-up window above (a loud spawn failure, never a
+// silent double-dispatch); in normal operation the manager leaves routine dispatch to the daemon
+// and spawns directly only for work the daemon will not pick up.
 package scheduler
 
 import (
@@ -298,6 +304,11 @@ func (sc *Scheduler) RunOnce(ctx context.Context) (int, error) {
 		}
 
 		scout := claimed.Kind == db.KindScout
+		// Dispatch through the manager's spawn path with an empty rawCmd (a harness launch). The
+		// worker's initial prompt is the brief stored for this task (by `ttorch task add
+		// --brief/--brief-file`), which the spawn reads from the task's brief file — so an
+		// autonomously-dispatched worker starts on its FULL brief, not the stub that waits for a
+		// manager `ttorch send`. A task with no stored brief falls back to the stub, unchanged.
 		if _, err := sc.Fleet.SpawnWithFootprint(claimed.ID, repo, scout, "", claimed.Footprint, false); err != nil {
 			// Dispatch failed after the claim. Revert so the task is not a phantom (active +
 			// lease, no window): back to pending with the lease cleared. The guarded revert

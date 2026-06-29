@@ -199,7 +199,7 @@ func TestResolveBrief(t *testing.T) {
 		{name: "empty file errors", briefFile: empty, wantErr: true},
 	}
 	for _, c := range cases {
-		got, err := resolveBrief(c.brief, c.briefFile)
+		got, err := resolveBrief("spawn", c.brief, c.briefFile)
 		if c.wantErr {
 			if err == nil {
 				t.Errorf("%s: expected an error, got nil", c.name)

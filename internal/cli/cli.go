@@ -36,6 +36,7 @@ import (
 	"github.com/nution101/ttorch/internal/review"
 	"github.com/nution101/ttorch/internal/scheduler"
 	"github.com/nution101/ttorch/internal/selfupdate"
+	"github.com/nution101/ttorch/internal/singleton"
 	"github.com/nution101/ttorch/internal/skills"
 	"github.com/nution101/ttorch/internal/tmux"
 	"github.com/nution101/ttorch/internal/validate"
@@ -369,7 +370,7 @@ func cmdSpawn(args []string) error {
 	}
 	// Resolve the brief before any side effect so a bad --brief/--brief-file fails the
 	// spawn loudly rather than silently launching the worker on the generic stub.
-	briefContent, err := resolveBrief(*brief, *briefFile)
+	briefContent, err := resolveBrief("spawn", *brief, *briefFile)
 	if err != nil {
 		return err
 	}
@@ -433,21 +434,22 @@ func parseTouches(s string) []string {
 	return out
 }
 
-// resolveBrief returns the brief content from the spawn --brief / --brief-file flags,
-// or "" when neither is set (the worker then gets the generic stub). It errors if both
-// are set (ambiguous) or if --brief-file is unreadable or empty, so a bad invocation
-// fails before the spawn rather than silently launching the worker on the stub.
-func resolveBrief(brief, briefFile string) (string, error) {
+// resolveBrief returns the brief content from the --brief / --brief-file flags, or "" when
+// neither is set (the worker then gets the generic stub). cmd names the calling subcommand for
+// error messages (e.g. "spawn", "task add"), which `ttorch spawn` and `ttorch task add` share.
+// It errors if both are set (ambiguous) or if --brief-file is unreadable or empty, so a bad
+// invocation fails before any side effect rather than silently launching the worker on the stub.
+func resolveBrief(cmd, brief, briefFile string) (string, error) {
 	if brief != "" && briefFile != "" {
-		return "", errors.New("spawn: pass only one of --brief or --brief-file")
+		return "", fmt.Errorf("%s: pass only one of --brief or --brief-file", cmd)
 	}
 	if briefFile != "" {
 		b, err := os.ReadFile(briefFile)
 		if err != nil {
-			return "", fmt.Errorf("spawn: reading --brief-file: %w", err)
+			return "", fmt.Errorf("%s: reading --brief-file: %w", cmd, err)
 		}
 		if strings.TrimSpace(string(b)) == "" {
-			return "", fmt.Errorf("spawn: --brief-file %q is empty", briefFile)
+			return "", fmt.Errorf("%s: --brief-file %q is empty", cmd, briefFile)
 		}
 		return string(b), nil
 	}
@@ -1364,11 +1366,15 @@ func cmdWatchdog(args []string) error {
 //     required to attempt a task and the land path's own commit-pinned gate is the authority.
 //
 // The three passes are independent (--dispatch defaults on; --land and --supervise opt-in), so
-// it can run as a dispatch-only daemon, a land-only daemon, a supervisor, or any combination. It
-// is OPT-IN: nothing starts it automatically, and existing manager/worker behavior is unchanged
-// unless it is run. Its log lines go to ITS stdout, never the manager pane (no TTY injection).
-// --once runs a single tick then exits (tests / cron); otherwise it loops on --interval until
-// Ctrl-C/SIGTERM.
+// it can run as a dispatch-only daemon, a land-only daemon, a supervisor, or any combination.
+// The manager AUTO-STARTS this daemon by default with all three passes on (config-gated by
+// TTORCH_SCHEDULER_AUTOSTART; see Manager.StartManager), so a normal `ttorch` session is already
+// driving the board — this subcommand stays for running it by hand or with a different pass mix.
+// --singleton takes a per-~/.ttorch lock and exits quietly if another daemon already holds it
+// (how the manager's auto-start avoids running two); a plain `ttorch scheduler` stays safe to run
+// as multiple instances. Its log lines go to ITS stdout, never the manager pane (no TTY
+// injection). --once runs a single tick then exits (tests / cron); otherwise it loops on
+// --interval until Ctrl-C/SIGTERM.
 func cmdScheduler(args []string) error {
 	fs := flag.NewFlagSet("scheduler", flag.ContinueOnError)
 	interval := fs.Duration("interval", scheduler.DefaultInterval, "tick cadence: re-derive the board and act every interval")
@@ -1376,6 +1382,7 @@ func cmdScheduler(args []string) error {
 	dispatch := fs.Bool("dispatch", true, "claim + dispatch ready pending backlog (on by default; pass --dispatch=false for a land-/supervise-only daemon)")
 	land := fs.Bool("land", false, "also LAND done tasks that already carry a passing verdict, via the same pipeline as 'ttorch land' (off by default)")
 	supervise := fs.Bool("supervise", false, "also SUPERVISE the fleet: reclaim workers that verifiably died (window gone / lease expired) and re-dispatch within a bounded retry ceiling, poison-pilling the rest (off by default)")
+	single := fs.Bool("singleton", false, "hold a per-~/.ttorch singleton lock and exit quietly if another scheduler daemon already holds it (used by the manager's auto-start; a plain 'ttorch scheduler' stays safe to run as multiple instances)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1387,6 +1394,22 @@ func cmdScheduler(args []string) error {
 		return err
 	}
 	defer m.Close()
+
+	// --singleton: take the per-~/.ttorch scheduler lock so the manager's auto-start can never run
+	// two daemons. If another daemon already holds it, exit quietly (a no-op success). A plain
+	// `ttorch scheduler` (no --singleton) is unaffected and remains safe to run as multiple
+	// instances, since the DB's atomic claims already prevent double-dispatch/double-land.
+	if *single {
+		lock, acquired, err := singleton.Acquire(m.P.SchedulerPIDFile())
+		if err != nil {
+			return fmt.Errorf("scheduler: could not take the singleton lock: %w", err)
+		}
+		if !acquired {
+			fmt.Fprintln(os.Stdout, "scheduler: another scheduler daemon already holds the singleton lock for this ~/.ttorch; exiting.")
+			return nil
+		}
+		defer singleton.Release(lock)
+	}
 
 	sch := scheduler.New(m, *interval, os.Stdout)
 	sch.Dispatch = *dispatch

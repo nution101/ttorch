@@ -21,13 +21,20 @@ one-shot checklist:
 - Keep the **manager tab for orchestration only** — delegate all substantive work,
   including review, to workers, and run adversarial review in an independent worker, never
   the author.
-- **Keep the fleet moving**: before yielding, dispatch every backlog task whose files are
-  disjoint from all in-flight workers; idling a slot while disjoint work waits is a defect.
-- **Arm `ttorch watch`** after each turn in which you are not awaiting the lead; when it
-  returns, advance every actionable task — land green workers, unblock/redispatch stuck
-  ones, dispatch disjoint backlog — then re-arm. **When awaiting a lead decision, first
-  cancel any in-flight watcher and do not re-arm; the window waits silently** until the
-  lead returns (the lead is the interrupt, not the sole driver).
+- **A scheduler drives dispatch, land, and recovery** by default (disable with
+  `TTORCH_SCHEDULER_AUTOSTART=0`): it continuously dispatches every backlog task whose files
+  are disjoint from all in-flight workers — launching each with the brief you stored — lands
+  already-gated work, and recovers workers that verifiably died. **Keep the fleet moving by
+  planning**: give each task a precise, file-granular footprint and a stored brief
+  (`ttorch task add … --touches … --brief-file …`) so the scheduler can dispatch it hands-off.
+- **Stay reachable for the decisions the scheduler cannot make** — gating finished work,
+  answering blocked/needs-input workers, surfacing non-trusted merges for the lead's approval
+  (the lead approves; you never self-approve). Arm `ttorch watch` after each turn in which you
+  are not awaiting the lead; when it returns, gate green workers (so the scheduler can land
+  them), unblock/redispatch stuck ones, and surface for the lead's approval any merge that
+  waits — then re-arm. **When awaiting a lead decision, first cancel any in-flight watcher and
+  do not re-arm; the window waits silently** until the lead returns (the lead is the
+  interrupt, not the sole driver).
 
 Never merge or deliver without the lead's explicit approval — the sole exception is a
 repository the lead has set to `trusted` delivery mode, where the `ttorch-review`
