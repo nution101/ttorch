@@ -560,6 +560,22 @@ func (m *Manager) restore() []string {
 		}
 		_ = tmux.SendLine(m.Session, t.Window, harness.WorkerResumeOrFresh(h, t.SessionID, m.P.BriefPath(t.ID), t.Effort))
 		_ = termtab.Open(m.Session, t.Window)
+		// Refresh the supervisor's sign-of-life anchor for the worker just rebuilt in place. A
+		// resume re-drives the window but, on its own, appends no event — so a window_gone
+		// recorded before the resume would remain the worker's LATEST signal and the supervisor
+		// (db.ReclaimWindowGone / hasFreshWindowGoneTx) could reclaim a worker that is in fact
+		// alive again. Appending the SAME 'spawned' sign-of-life event the spawn path emits puts
+		// a newer-than-window_gone anchor on the task, so the reclaim correctly skips the live
+		// resumed worker. It does NOT mask a genuinely dead worker: one that dies AFTER the
+		// resume gets a later window_gone, which again becomes the latest anchor. Like the spawn
+		// path's mirror, this is a best-effort audit append — the window is already rebuilt and
+		// the worker resuming — so a failure is surfaced and carried, never aborting the restore.
+		if _, err := m.Store.AppendEvent(context.Background(), db.Event{
+			EntityType: db.EntityTypeTask, EntityID: t.ID, Type: db.EventSpawned, Actor: db.ActorManager,
+			Payload: fmt.Sprintf("resume kind=%s window=%s", t.Kind, t.Window),
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "ttorch: could not record the resume sign-of-life event for %s: %v\n", t.ID, err)
+		}
 		notes = append(notes, "restored "+t.ID)
 	}
 	return notes

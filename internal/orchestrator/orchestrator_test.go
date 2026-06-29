@@ -521,6 +521,110 @@ func TestSend_DeliversMessageVerbatim(t *testing.T) {
 	}
 }
 
+// TestRestoreRefreshesWindowGoneAnchor proves the resume path closes the supervisor boundary:
+// when restore() rebuilds a worker window in place, it appends the SAME 'spawned' sign-of-life
+// event the spawn path emits, so a window_gone recorded BEFORE the resume is no longer the
+// worker's latest anchor and the supervisor (db.ReclaimWindowGone) does NOT reclaim the live
+// resumed worker — while a worker that dies AFTER the resume (a later window_gone) is still
+// reclaimed. Hermetic via fakeTmux — the fake reports only the "manager" window as present, so
+// restore skips the manager rebuild and rebuilds the (absent) worker window, exercising the
+// real path.
+func TestRestoreRefreshesWindowGoneAnchor(t *testing.T) {
+	fakeTmux(t, "manager")
+	store, err := db.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	ctx := context.Background()
+	m := &Manager{Session: "ttorch-restore", Store: store}
+
+	proj, err := store.UpsertProject(ctx, "/repo", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An active worker that was spawned, then had its window confirmed gone (a crash, or a
+	// `ttorch stop`). Without the resume refresh, this stale window_gone would still read as the
+	// latest signal and the supervisor would reclaim the worker the instant resume revived it.
+	// The worktree must exist so restore rebuilds the window rather than skipping it.
+	if _, err := store.CreateTask(ctx, db.Task{
+		ID: "r1", ProjectID: proj.ID, Status: db.StatusActive, Kind: db.KindShip,
+		Owner: "worker:r1", Window: "wk-r1", Worktree: t.TempDir(),
+	}, db.ActorManager); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AppendEvent(ctx, db.Event{
+		EntityType: db.EntityTypeTask, EntityID: "r1", Type: db.EventSpawned, Actor: db.ActorManager,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AppendEvent(ctx, db.Event{
+		EntityType: db.EntityTypeTask, EntityID: "r1", Type: db.EventWindowGone,
+		Actor: db.ActorSystem, Actionable: true, Payload: "wk-r1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	notes := m.restore()
+	restored := false
+	for _, n := range notes {
+		if n == "restored r1" {
+			restored = true
+		}
+	}
+	if !restored {
+		t.Fatalf("restore did not rebuild the worker window; notes=%v", notes)
+	}
+
+	// restore must append a 'spawned' sign-of-life event tagged as a resume — the precise append
+	// that refreshes the anchor (the setup's pre-resume 'spawned' carries no such payload).
+	evs, err := store.EventsSince(ctx, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumeSignOfLife := false
+	for _, e := range evs {
+		if e.EntityID == "r1" && e.Type == db.EventSpawned && strings.HasPrefix(e.Payload, "resume ") {
+			resumeSignOfLife = true
+		}
+	}
+	if !resumeSignOfLife {
+		t.Fatalf("restore must append a 'spawned' resume sign-of-life event for r1; events=%+v", evs)
+	}
+
+	// AC1: a freshly-resumed worker is NOT reclaimed — the resume's sign-of-life outranks the
+	// stale window_gone in the freshness anchor.
+	out, err := store.ReclaimWindowGone(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 0 {
+		t.Fatalf("a freshly-resumed worker must not be reclaimed, got %+v", out)
+	}
+	if tk, _, _ := store.GetTask(ctx, "r1"); tk.Status != db.StatusActive {
+		t.Errorf("status = %q, want still active (the resumed worker is live)", tk.Status)
+	}
+
+	// AC2: a worker that genuinely dies AFTER the resume (a later window_gone, newer than the
+	// resume sign-of-life) IS still reclaimed — the refresh does not mask a real crash.
+	if _, err := store.AppendEvent(ctx, db.Event{
+		EntityType: db.EntityTypeTask, EntityID: "r1", Type: db.EventWindowGone,
+		Actor: db.ActorSystem, Actionable: true, Payload: "wk-r1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	out, err = store.ReclaimWindowGone(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1 || out[0].TaskID != "r1" {
+		t.Fatalf("a worker that died after resume must be reclaimed, got %+v", out)
+	}
+	if tk, _, _ := store.GetTask(ctx, "r1"); tk.Status != db.StatusPending {
+		t.Errorf("status = %q, want pending (reclaimed after the post-resume crash)", tk.Status)
+	}
+}
+
 func TestTeardownRefusesDirtyWorktree(t *testing.T) {
 	if !tmux.Available() {
 		t.Skip("tmux not installed")
