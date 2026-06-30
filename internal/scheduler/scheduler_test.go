@@ -37,6 +37,7 @@ type fakeFleet struct {
 	live          []db.Task
 	calls         []spawnCall
 	spawnErr      map[string]error // per-task forced dispatch failure
+	spawnAttempts map[string]int   // per-task count of SpawnWithFootprint calls, including failures
 	landed        []string         // ids handed to LandSet, in call order
 	landErr       map[string]error // per-task forced land failure
 	record        func(id string)  // shared sink for the cross-instance race tests
@@ -94,6 +95,10 @@ func (f *fakeFleet) snapshotReads() int {
 func (f *fakeFleet) SpawnWithFootprint(taskID, projectPath string, scout bool, rawCmd string, footprint []string, forceOverlap bool) (db.Task, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.spawnAttempts == nil {
+		f.spawnAttempts = map[string]int{}
+	}
+	f.spawnAttempts[taskID]++
 	if err := f.spawnErr[taskID]; err != nil {
 		return db.Task{}, err
 	}
@@ -112,6 +117,23 @@ func (f *fakeFleet) dispatched() []string {
 		ids[i] = c.id
 	}
 	return ids
+}
+
+// attempts returns how many times SpawnWithFootprint was called for a task, INCLUDING failed
+// spawns (which never reach f.calls), so a test can assert a parked/backed-off task is not
+// re-attempted every tick.
+func (f *fakeFleet) attempts(id string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.spawnAttempts[id]
+}
+
+// clearSpawnErr removes a task's forced spawn failure (so a later tick succeeds), modelling a
+// transient condition that has resolved.
+func (f *fakeFleet) clearSpawnErr(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.spawnErr, id)
 }
 
 // callFor returns the recorded spawn call for a task id (and whether it was dispatched), so a
@@ -947,6 +969,186 @@ func TestRunOnceRevertsOnDispatchFailure(t *testing.T) {
 	}
 	if tk.LeaseOwner != "" || tk.LeaseExpiresAt != nil {
 		t.Errorf("lease must be cleared on revert: %+v", tk)
+	}
+}
+
+// TestClassifyDispatchError checks the permanent/transient classification of representative
+// spawn errors — the basis for park-vs-backoff. It documents the conservative bias: only the
+// specific fatal git/worktree conditions are permanent; a bare "exit status 128" is NOT.
+func TestClassifyDispatchError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool // true ⇒ permanent
+	}{
+		{"already used by worktree (observed bug)", errors.New("spawn \"x\": preparing a fresh task branch: ... 'ttorch/x' is already used by worktree at '/p': exit status 128"), true},
+		{"branch already exists", errors.New("checkout: a branch named 'ttorch/x' already exists"), true},
+		{"not a git repository", errors.New("fatal: not a git repository (or any of the parent directories)"), true},
+		{"repository not found", errors.New("repository not found at /gone"), true},
+		{"missing repo path", errors.New("open /gone/repo: no such file or directory"), true},
+		{"transient tmux", errors.New("tmux unavailable"), false},
+		{"bare exit 128 without a permanent signature", errors.New("git checkout: exit status 128"), false},
+		{"nil", nil, false},
+	}
+	for _, c := range cases {
+		if got := classifyDispatchError(c.err); got != c.want {
+			t.Errorf("%s: classifyDispatchError = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestRunOncePermanentDispatchFailureParks proves a PERMANENT spawn failure (e.g. the observed
+// "already used by worktree" git error) is NOT retried every tick: the task is attempted once,
+// parked to 'blocked', and surfaced once with an actionable dispatch_failed event — the fix for
+// the unbacked-off dispatch hot loop.
+func TestRunOncePermanentDispatchFailureParks(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	addPending(t, s, repo, "stuck", db.KindShip, []string{"internal/scheduler"})
+
+	// The exact shape of the observed failure: git reporting the branch is already used by another
+	// worktree, exit status 128 — a condition no retry can clear.
+	permErr := fmt.Errorf("spawn %q: preparing a fresh task branch: checkout ttorch/stuck off origin/main: git -C /pool/wt checkout -q --no-track -B ttorch/stuck origin/main: exit status 128: fatal: 'ttorch/stuck' is already used by worktree at '/pool/wt2'", "stuck")
+	f := &fakeFleet{spawnErr: map[string]error{"stuck": permErr}}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}}
+
+	// Three ticks: a permanent failure must be attempted exactly once and then parked, never
+	// re-dispatched on subsequent ticks (the hot loop the fix prevents).
+	for i := 0; i < 3; i++ {
+		n, err := sc.RunOnce(ctx)
+		if err != nil {
+			t.Fatalf("RunOnce[%d] must not surface a per-task dispatch failure: %v", i, err)
+		}
+		if n != 0 {
+			t.Fatalf("RunOnce[%d] dispatched %d, want 0 — a permanently-failing spawn never counts", i, n)
+		}
+	}
+
+	if got := f.attempts("stuck"); got != 1 {
+		t.Errorf("spawn attempts = %d, want exactly 1 — a parked task must not be re-attempted every tick", got)
+	}
+	if st := status(t, s, "stuck"); st != db.StatusBlocked {
+		t.Errorf("status = %q, want blocked after a permanent dispatch failure", st)
+	}
+	// (The lease is intentionally not asserted: RecordTransition leaves it set, but a blocked
+	// task's lease is inert — the reclaim sweeps act only on active tasks — and the guarantee
+	// that matters is the task left the pending set, asserted via the blocked status above.)
+	// Exactly one ACTIONABLE dispatch_failed event for the task (surfaced once, not per tick).
+	if has, err := s.HasEventType(ctx, "stuck", eventDispatchFailed); err != nil || !has {
+		t.Fatalf("want a dispatch_failed event (has=%v err=%v)", has, err)
+	}
+	evs, err := s.EventsSince(ctx, 0, true)
+	if err != nil {
+		t.Fatalf("EventsSince: %v", err)
+	}
+	count := 0
+	for _, e := range evs {
+		if e.EntityID == "stuck" && e.Type == eventDispatchFailed {
+			if !e.Actionable {
+				t.Error("the dispatch_failed event must be actionable")
+			}
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("got %d dispatch_failed events, want exactly 1 (surfaced once, not every tick)", count)
+	}
+}
+
+// TestRunOnceTransientDispatchFailureBacksOffThenRecovers proves a TRANSIENT spawn failure is
+// retried with backoff — NOT every tick — and that a successful dispatch once the condition
+// clears leaves no parked/blocked/backoff state behind (successful dispatch unchanged).
+func TestRunOnceTransientDispatchFailureBacksOffThenRecovers(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	addPending(t, s, repo, "flaky", db.KindShip, []string{"internal/scheduler"})
+
+	clk := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+	now := &clk
+	f := &fakeFleet{spawnErr: map[string]error{"flaky": errors.New("tmux: server not running right now")}}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}, now: func() time.Time { return *now }}
+
+	// Tick 1: the spawn fails transiently — reverted to pending, lease cleared, and backed off.
+	if n, err := sc.RunOnce(ctx); err != nil || n != 0 {
+		t.Fatalf("tick 1: n=%d err=%v, want 0/nil", n, err)
+	}
+	if st := status(t, s, "flaky"); st != db.StatusPending {
+		t.Errorf("after a transient failure status = %q, want pending (re-dispatchable)", st)
+	}
+	if lo := leaseOwner(t, s, "flaky"); lo != "" {
+		t.Errorf("lease must be cleared on a transient revert, got %q", lo)
+	}
+	if got := f.attempts("flaky"); got != 1 {
+		t.Fatalf("attempts after tick 1 = %d, want 1", got)
+	}
+
+	// Tick 2, still inside the backoff window: the task must be SKIPPED, not re-attempted.
+	*now = now.Add(5 * time.Second)
+	if n, err := sc.RunOnce(ctx); err != nil || n != 0 {
+		t.Fatalf("tick 2: n=%d err=%v, want 0/nil", n, err)
+	}
+	if got := f.attempts("flaky"); got != 1 {
+		t.Errorf("attempts within the backoff window = %d, want still 1 — backoff must suppress the every-tick retry", got)
+	}
+
+	// Tick 3, past the backoff and with the transient condition resolved: the task dispatches.
+	f.clearSpawnErr("flaky")
+	*now = now.Add(dispatchBackoffBase + time.Second)
+	if n, err := sc.RunOnce(ctx); err != nil || n != 1 {
+		t.Fatalf("tick 3: n=%d err=%v, want 1/nil after the backoff elapsed", n, err)
+	}
+	if got := f.attempts("flaky"); got != 2 {
+		t.Errorf("attempts after recovery = %d, want 2 (the single backed-off retry)", got)
+	}
+	if st := status(t, s, "flaky"); st != db.StatusActive {
+		t.Errorf("status after a successful dispatch = %q, want active", st)
+	}
+	if _, ok := sc.dispatchFailures["flaky"]; ok {
+		t.Error("a recovered task must have its backoff state cleared")
+	}
+}
+
+// TestRunOnceTransientDispatchFailureGivesUpAfterCeiling proves a TRANSIENT failure that never
+// resolves is bounded: after maxTransientDispatchRetries attempts the task is parked to 'blocked'
+// and surfaced, never retried forever.
+func TestRunOnceTransientDispatchFailureGivesUpAfterCeiling(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	addPending(t, s, repo, "never", db.KindShip, []string{"internal/scheduler"})
+
+	clk := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+	now := &clk
+	f := &fakeFleet{spawnErr: map[string]error{"never": errors.New("tmux: transient hiccup")}}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}, now: func() time.Time { return *now }}
+
+	// Advance well past any backoff (> dispatchBackoffMax) before each tick so every attempt fires.
+	for i := 0; i < maxTransientDispatchRetries; i++ {
+		if n, err := sc.RunOnce(ctx); err != nil || n != 0 {
+			t.Fatalf("tick %d: n=%d err=%v, want 0/nil", i, n, err)
+		}
+		*now = now.Add(dispatchBackoffMax + time.Minute)
+	}
+
+	if got := f.attempts("never"); got != maxTransientDispatchRetries {
+		t.Errorf("attempts = %d, want exactly %d before giving up", got, maxTransientDispatchRetries)
+	}
+	if st := status(t, s, "never"); st != db.StatusBlocked {
+		t.Errorf("status = %q, want blocked after the transient retry ceiling", st)
+	}
+	if has, err := s.HasEventType(ctx, "never", eventDispatchFailed); err != nil || !has {
+		t.Fatalf("want a dispatch_failed event after giving up (has=%v err=%v)", has, err)
+	}
+
+	// One more tick: the parked task is blocked (off the pending set) and never attempted again.
+	*now = now.Add(dispatchBackoffMax + time.Minute)
+	if n, err := sc.RunOnce(ctx); err != nil || n != 0 {
+		t.Fatalf("post-park tick: n=%d err=%v, want 0/nil", n, err)
+	}
+	if got := f.attempts("never"); got != maxTransientDispatchRetries {
+		t.Errorf("attempts after park = %d, want still %d", got, maxTransientDispatchRetries)
 	}
 }
 

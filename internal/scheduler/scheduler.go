@@ -116,6 +116,29 @@ const (
 	envSerializeOverlap = "TTORCH_SERIALIZE_OVERLAP"
 )
 
+// Dispatch-failure backoff/park bounds — the fix for an unbacked-off dispatch hot loop. When a
+// spawn fails AFTER its claim, the failure is classified (classifyDispatchError): a PERMANENT
+// failure (a condition a retry cannot change — e.g. the task's branch/worktree is already
+// checked out elsewhere, or the repo is missing) is PARKED immediately; a TRANSIENT failure is
+// reverted to pending and retried on a widening exponential backoff, and is parked once it has
+// failed maxTransientDispatchRetries times without resolving. "Park" means move the task to
+// 'blocked' AND surface an actionable dispatch_failed event for the manager — never re-dispatch
+// it on the next tick. The backoff curve starts at dispatchBackoffBase and doubles per
+// consecutive failure up to dispatchBackoffMax, so even the first retry waits several ticks
+// rather than firing again immediately. All three bound the loop: nothing ever retries unbacked.
+const (
+	dispatchBackoffBase         = 30 * time.Second
+	dispatchBackoffMax          = 5 * time.Minute
+	maxTransientDispatchRetries = 5
+)
+
+// eventDispatchFailed is the actionable event the dispatch pass surfaces when it PARKS a task it
+// cannot dispatch (a permanent spawn failure, or a transient one that never resolved). It is
+// defined here — not in internal/db — for the same reason eventLandRebaseConflict is: db treats
+// Event.Type as an opaque string and the event originates solely from this pass. The manager
+// (woken by the watcher) investigates the parked, now-'blocked' task and re-dispatches or fixes it.
+const eventDispatchFailed = "dispatch_failed"
+
 // Fleet is the orchestrator surface the scheduler drives. *orchestrator.Manager satisfies
 // it; tests substitute a fake so the selection/claim logic runs without tmux or a real
 // worktree pool. Every method is one the manager already exposes — the scheduler reuses
@@ -305,6 +328,19 @@ type Scheduler struct {
 	// first idle-nudge pass lazily initializes it.
 	idleSeen map[string]idleObservation
 
+	// dispatchFailures tracks, per task id, the backoff state for a task whose last spawn hit a
+	// TRANSIENT dispatch failure: the consecutive-failure count (which drives the exponential
+	// backoff) and the earliest time it may be re-dispatched. RunOnce skips a task while
+	// now.Before(retryAfter), so a transient failure retries on a widening curve instead of every
+	// tick. A PERMANENT failure does not rely on this map to be held off — it is parked to
+	// 'blocked' (off the pending set entirely) — but a give-up entry is still recorded as a
+	// safety net so even a failed park can never hot-loop. The entry is dropped on a successful
+	// dispatch (the task recovered) and pruned when the task leaves the pending set. Touched only
+	// from the single-threaded tick loop, so it needs no lock; best-effort across a restart (a
+	// restart costs at most one extra dispatch attempt before the task re-fails and is re-parked).
+	// nil until the first dispatch failure lazily initializes it.
+	dispatchFailures map[string]dispatchFailure
+
 	// now returns the current time; nil means time.Now. It is the single clock the idle-nudge
 	// pass reads so a test can drive grace deterministically without sleeping.
 	now func() time.Time
@@ -321,6 +357,14 @@ type Scheduler struct {
 type idleObservation struct {
 	hash  string
 	count int
+}
+
+// dispatchFailure is one task's dispatch-failure backoff state: how many consecutive times its
+// spawn has failed (driving the exponential backoff curve) and the earliest time it may be
+// re-dispatched. See the Scheduler.dispatchFailures field.
+type dispatchFailure struct {
+	failures   int       // consecutive dispatch failures (drives dispatchBackoff)
+	retryAfter time.Time // earliest time the task may be re-dispatched
 }
 
 // New builds the production Scheduler from a Manager: it dispatches through the manager's
@@ -578,6 +622,12 @@ func (sc *Scheduler) RunOnce(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	// One clock read per tick drives the dispatch-failure backoff timing (testable via sc.now).
+	now := sc.clock()
+	// Drop backoff state for tasks no longer pending (dispatched, parked to 'blocked', or moved
+	// by the manager), so the in-memory map never grows without bound. With an empty ready set
+	// this clears every entry — there is nothing left to back off.
+	sc.pruneDispatchFailures(ready)
 	if len(ready) == 0 {
 		return 0, nil // nothing ready — the common idle-tick fast path
 	}
@@ -675,6 +725,14 @@ func (sc *Scheduler) RunOnce(ctx context.Context) (int, error) {
 			sc.logf("skip %s: no stored brief (left for the manager)", t.ID)
 			continue
 		}
+		// Dispatch-failure backoff: a task whose last spawn hit a TRANSIENT failure is held off
+		// until its backoff elapses, so a transient failure retries on a widening curve rather
+		// than every tick. (A PERMANENT failure was parked to 'blocked' and is no longer pending,
+		// so it never reaches here.) Skipped SILENTLY — the backoff was already logged once when it
+		// was set, not re-logged every tick (the "log once, not every tick" requirement).
+		if fail, ok := sc.dispatchFailures[t.ID]; ok && now.Before(fail.retryAfter) {
+			continue
+		}
 		if freeOf(repo) <= 0 {
 			continue // no capacity in this repo right now — try the next ready task
 		}
@@ -729,19 +787,20 @@ func (sc *Scheduler) RunOnce(ctx context.Context) (int, error) {
 		// depth. In serialize mode overlaps is always false here (the skip above already left
 		// overlapping tasks pending), so this is forceOverlap=false exactly as before.
 		if _, err := sc.Fleet.SpawnWithFootprint(claimed.ID, repo, scout, "", claimed.Footprint, overlaps); err != nil {
-			// Dispatch failed after the claim. Revert so the task is not a phantom (active +
-			// lease, no window): back to pending with the lease cleared. The guarded revert
-			// never clobbers a concurrent change; if it declines or errors, the lease still
-			// makes the task reclaimable as a backstop.
-			sc.logf("dispatch of %s failed: %v", claimed.ID, err)
-			if _, rerr := sc.Store.ReleaseClaim(ctx, claimed.ID, owner); rerr != nil {
-				sc.logf("could not release claim on %s after failed dispatch: %v", claimed.ID, rerr)
-			}
+			// Dispatch failed after the claim. Classify and handle it WITHOUT re-dispatching on the
+			// next tick: a PERMANENT failure (a condition a retry cannot change) is parked to
+			// 'blocked' and surfaced for the manager; a TRANSIENT failure is reverted to pending and
+			// retried on a bounded exponential backoff (then parked once it never resolves). This is
+			// the fix for the unbacked-off hot loop where a failed spawn was reverted straight to
+			// pending and re-dispatched every tick forever.
+			sc.handleDispatchFailure(ctx, claimed, owner, err, now)
 			continue
 		}
 
 		// Won and dispatched: it now holds a worktree slot and its footprint is in play for
-		// the rest of this tick.
+		// the rest of this tick. A task that previously failed and now dispatched has recovered —
+		// clear its backoff so it starts clean if it ever fails again.
+		delete(sc.dispatchFailures, claimed.ID)
 		free[repo]--
 		occupied[repo] = append(occupied[repo], claimed.Footprint)
 		dispatched++
@@ -1218,6 +1277,161 @@ func (sc *Scheduler) surfaceLandRebaseConflict(taskID, detail string) {
 		Actor: db.ActorSystem, Actionable: true, Payload: detail,
 	}); err != nil {
 		sc.logf("could not surface the land_rebase_conflict event for %s: %v", taskID, err)
+	}
+}
+
+// permanentDispatchSignatures are the (lowercased) substrings of a spawn/dispatch error that
+// mark a PERMANENT failure — a condition that re-running the SAME dispatch will keep hitting,
+// because nothing about a retry changes it. They are deterministic git/worktree-prep conditions:
+// the task's branch or worktree is already checked out in another worktree (the observed bug),
+// a branch/ref/worktree already exists, or the repo path is missing / not a git repository. A
+// task that fails on one of these is PARKED (blocked + surfaced) rather than retried, since
+// retrying only re-churns the scheduler.
+//
+// The list is deliberately CONSERVATIVE: it matches specific fatal conditions, NOT the bare
+// "exit status 128" git emits, because that same exit code also covers transient races (e.g. a
+// momentary .git/index.lock) that a retry WOULD clear. Biasing toward "transient" is the safe
+// default — a transient failure misclassified as such still gives up after
+// maxTransientDispatchRetries (it is parked then), whereas a transient failure misclassified as
+// PERMANENT would wrongly park a recoverable task for the manager. The observed bug
+// ("'ttorch/<id>' is already used by worktree at '<path>': exit status 128") matches the first
+// signature; its co-occurring "exit status 128" is not needed and is intentionally not matched
+// on its own.
+var permanentDispatchSignatures = []string{
+	"already used by worktree",  // the branch/worktree is checked out in another worktree (observed)
+	"already exists",            // a branch / worktree / ref already exists
+	"not a git repository",      // the repo path is missing or misconfigured
+	"repository not found",      // the repo is gone
+	"no such file or directory", // the repo / worktree path no longer exists
+}
+
+// classifyDispatchError reports whether a spawn/dispatch error is PERMANENT (won't resolve by
+// retrying — see permanentDispatchSignatures) versus TRANSIENT (a retry may succeed). Matching
+// is case-insensitive substring over the full wrapped error chain. A nil error is treated as
+// transient (the caller only classifies a real failure).
+func classifyDispatchError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, sig := range permanentDispatchSignatures {
+		if strings.Contains(msg, sig) {
+			return true
+		}
+	}
+	return false
+}
+
+// dispatchBackoff returns the transient-failure backoff for the n-th consecutive failure:
+// dispatchBackoffBase doubled (n-1) times, capped at dispatchBackoffMax. n < 1 is treated as 1.
+func dispatchBackoff(n int) time.Duration {
+	if n < 1 {
+		n = 1
+	}
+	d := dispatchBackoffBase
+	for i := 1; i < n; i++ {
+		d *= 2
+		if d >= dispatchBackoffMax {
+			return dispatchBackoffMax
+		}
+	}
+	return d
+}
+
+// handleDispatchFailure owns the spawn-failure path: it classifies the error and either parks
+// the task (a permanent failure, or a transient one that has exhausted its retries) or reverts
+// it to pending under a bounded exponential backoff (a transient failure with retries left). It
+// is THE fix for the unbacked-off hot loop — no path returns a task to immediate, every-tick
+// re-dispatch. now is the tick's single clock read; cause is the spawn error.
+func (sc *Scheduler) handleDispatchFailure(ctx context.Context, t db.Task, owner string, cause error, now time.Time) {
+	if sc.dispatchFailures == nil {
+		sc.dispatchFailures = make(map[string]dispatchFailure)
+	}
+	fail := sc.dispatchFailures[t.ID]
+	fail.failures++
+	permanent := classifyDispatchError(cause)
+	giveUp := permanent || fail.failures >= maxTransientDispatchRetries
+	if giveUp {
+		// Park the task and stop auto-retrying it. Record a long give-up backoff FIRST as a
+		// safety net: a successful park moves the task to 'blocked' (out of the pending set), so
+		// this entry is pruned on the next tick — but if the park write itself fails, the backoff
+		// still holds the task off rather than letting it hot-loop. Never an unbacked-off retry.
+		fail.retryAfter = now.Add(dispatchBackoffMax)
+		sc.dispatchFailures[t.ID] = fail
+		reason := "permanent dispatch failure"
+		if !permanent {
+			reason = fmt.Sprintf("transient dispatch failure unresolved after %d attempts", fail.failures)
+		}
+		sc.logf("dispatch of %s failed (%s): %v — parking as blocked for the manager (no further auto-retry)", t.ID, reason, cause)
+		sc.parkFailedDispatch(t, owner, fmt.Sprintf("%s: %v", reason, cause))
+		return
+	}
+	// Transient with retries left: revert to pending (clearing the lease, so it is
+	// re-dispatchable) but hold it off until the backoff elapses, so it never retries every tick.
+	backoff := dispatchBackoff(fail.failures)
+	fail.retryAfter = now.Add(backoff)
+	sc.dispatchFailures[t.ID] = fail
+	sc.logf("dispatch of %s failed (transient, attempt %d/%d): %v — retrying after %s", t.ID, fail.failures, maxTransientDispatchRetries, cause, backoff.Round(time.Second))
+	if _, rerr := sc.Store.ReleaseClaim(ctx, t.ID, owner); rerr != nil {
+		sc.logf("could not release claim on %s after a failed dispatch: %v", t.ID, rerr)
+	}
+}
+
+// parkFailedDispatch moves a task that cannot be dispatched to 'blocked' so no tick re-dispatches
+// it, and surfaces an actionable dispatch_failed event so the manager investigates (the watchdog
+// also counts a blocked task as outstanding work). It uses context.Background() for the writes —
+// like surfaceLandRebaseConflict — so a SIGTERM cancel mid-park cannot strand the task as a
+// phantom (active + lease, no window) that would be reclaimed and hot-loop again. If the
+// transition fails, it falls back to releasing the claim (the lease backstop also covers it). The
+// lingering lease on a blocked task is inert: the reclaim sweeps act only on active tasks, and a
+// later manager-driven re-dispatch (blocked → pending → ClaimTask) re-arms the lease afresh.
+func (sc *Scheduler) parkFailedDispatch(t db.Task, owner, detail string) {
+	bg := context.Background()
+	if _, err := sc.Store.RecordTransition(bg, t.ID, db.StatusBlocked, db.TaskFields{}, db.EventStatusChanged, db.ActorSystem, detail); err != nil {
+		sc.logf("could not park %s as blocked after a dispatch failure: %v", t.ID, err)
+		if _, rerr := sc.Store.ReleaseClaim(bg, t.ID, owner); rerr != nil {
+			sc.logf("could not release claim on %s after a failed park: %v", t.ID, rerr)
+		}
+		return
+	}
+	sc.surfaceDispatchFailed(t.ID, detail)
+}
+
+// surfaceDispatchFailed appends an ACTIONABLE dispatch_failed event (so the watcher wakes the
+// manager) for a task the dispatch pass parked. It is deduped by event TYPE (HasEventType) —
+// mirroring surfaceLandRebaseConflict — so a task that the pass somehow re-parks appends the
+// event once, never per tick. It uses context.Background() so a SIGTERM cancel cannot strand the
+// surfacing; a failed append is logged, never fatal (the park's status change already left the
+// task safely blocked).
+func (sc *Scheduler) surfaceDispatchFailed(taskID, detail string) {
+	ctx := context.Background()
+	if has, err := sc.Store.HasEventType(ctx, taskID, eventDispatchFailed); err == nil && has {
+		return
+	}
+	if _, err := sc.Store.AppendEvent(ctx, db.Event{
+		EntityType: db.EntityTypeTask, EntityID: taskID, Type: eventDispatchFailed,
+		Actor: db.ActorSystem, Actionable: true, Payload: detail,
+	}); err != nil {
+		sc.logf("could not surface the dispatch_failed event for %s: %v", taskID, err)
+	}
+}
+
+// pruneDispatchFailures drops backoff state for any task that is no longer in the pending ready
+// set (it dispatched, was parked to 'blocked', or the manager moved it), so the in-memory map
+// never grows without bound across a long-running daemon. Called once per tick with the freshly
+// read ready set; an empty ready set clears every entry.
+func (sc *Scheduler) pruneDispatchFailures(ready []db.Task) {
+	if len(sc.dispatchFailures) == 0 {
+		return
+	}
+	inReady := make(map[string]bool, len(ready))
+	for _, t := range ready {
+		inReady[t.ID] = true
+	}
+	for id := range sc.dispatchFailures {
+		if !inReady[id] {
+			delete(sc.dispatchFailures, id)
+		}
 	}
 }
 
