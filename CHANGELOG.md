@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.14.0](https://github.com/nution101/ttorch/compare/v0.13.0...v0.14.0) (2026-06-30)
+
+
+### Features
+
+* **codegraph:** opt-in, default-off worker code-navigation ([ab4da1e](https://github.com/nution101/ttorch/commit/ab4da1e54d2437771ba99c257daefa6914d67f84))
+* **scheduler:** activate manager-window API-stall recovery ([c4516c0](https://github.com/nution101/ttorch/commit/c4516c0b7cbe437a278ce647009970e4f6916197))
+
+
+### Bug Fixes
+
+* **worktree:** never recycle a pool slot that still holds unlanded work ([fda599d](https://github.com/nution101/ttorch/commit/fda599dbf7f01913e488d2cffd1ed2717faa5889))
+
 ## [0.13.0](https://github.com/nution101/ttorch/compare/v0.12.0...v0.13.0) (2026-06-30)
 
 
