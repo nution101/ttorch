@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.11.0](https://github.com/nution101/ttorch/compare/v0.10.0...v0.11.0) (2026-06-29)
+
+
+### Features
+
+* **scheduler:** add a load-aware dispatch backpressure governor ([436530c](https://github.com/nution101/ttorch/commit/436530c1f79fd226ca6ebbe77e85358f30922817))
+* **scheduler:** add opt-in daemon gate-pass to take the manager off the steady-state land path ([d15cf2f](https://github.com/nution101/ttorch/commit/d15cf2f4c4b6ec2a72f5eecb78a4573d27f40ab0))
+* **scheduler:** auto-nudge alive-but-idle workers in the supervise pass ([0722229](https://github.com/nution101/ttorch/commit/07222295348160523d30de099ea71b07099d7b38))
+* **scheduler:** make a stalled or idle daemon observable (heartbeat + status row + status cmd) ([db8253f](https://github.com/nution101/ttorch/commit/db8253f981cb1884ae4103bc995df6348f2be5dd))
+
+
+### Bug Fixes
+
+* **gate:** make the durable verdict the single merge authority; stop gated tasks retry-looping on token expiry ([d599c85](https://github.com/nution101/ttorch/commit/d599c85915a749b4bcb859f97b5df2c74554c871))
+* **orchestrator:** fail closed when the occupancy/overlap board can't be read ([bf0d369](https://github.com/nution101/ttorch/commit/bf0d36924bb67bee28a4a72f7d25b1e10085679f))
+* **orchestrator:** refresh the lease anchor on resume ([539d02b](https://github.com/nution101/ttorch/commit/539d02bb1128fdfef04285f8ee14a30faafad26b))
+* **orchestrator:** refresh the window-gone anchor on resume ([c16dcde](https://github.com/nution101/ttorch/commit/c16dcde2e4608efe4c79cdbb08bdbda2079c5528))
+* **scheduler:** require a stored brief before auto-dispatching a task ([a3ff7bc](https://github.com/nution101/ttorch/commit/a3ff7bc553453800bd817c74e7a75749d745cbbe))
+* **scheduler:** stop the window-gone fast path repeat-reclaiming a re-dispatched worker ([1281676](https://github.com/nution101/ttorch/commit/12816769a248017ad37eba989706dbbba323fe64))
+* **watch:** harden the singleton instance token against pane-pid reuse ([6399b4a](https://github.com/nution101/ttorch/commit/6399b4a8366af26148291cf5afb73537ba970e04))
+
+
+### Performance Improvements
+
+* **scheduler:** snapshot the live fleet once per dispatch tick ([fab69d8](https://github.com/nution101/ttorch/commit/fab69d8a1eac4bb92845e90f9f3b6cbcf469209e))
+
 ## [0.10.0](https://github.com/nution101/ttorch/compare/v0.9.0...v0.10.0) (2026-06-29)
 
 
