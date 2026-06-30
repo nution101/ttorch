@@ -86,3 +86,46 @@ func TestStalled(t *testing.T) {
 		})
 	}
 }
+
+func TestAPIStalled(t *testing.T) {
+	// A realistic stalled capture: the error, then the harness's redrawn input box.
+	boxedStall := "API Error: Response stalled mid-stream. The response above may be incomplete.\n" +
+		"╭──────────────────────────────────────╮\n" +
+		"│ > Try \"edit this file\"                │\n" +
+		"╰──────────────────────────────────────╯\n" +
+		"  ? for shortcuts"
+	cases := []struct {
+		name string
+		pane string
+		want bool
+	}{
+		{"empty", "", false},
+		{"clean idle prompt, no error", "all done\n│ > ", false},
+		{"busy is never stalled", "API Error: Response stalled mid-stream\n✶ Working… (3s · esc to interrupt)", false},
+		// Stall as the last significant output, at the prompt → the recovery signal.
+		{"stall then bare caret", "API Error: Response stalled mid-stream\n│ > ", true},
+		{"stall then redrawn input box", boxedStall, true},
+		{"connection closed mid-response", "API Error: Connection closed mid-response\n│ > ", true},
+		{"generic response stalled", "Response stalled, retrying\n│ > ", true},
+		{"stream disconnected", "API Error: stream disconnected\n│ > ", true},
+		{"stream watchdog timeout", "stream watchdog: no data for 60s\n│ > ", true},
+		{"case insensitive", "API ERROR: RESPONSE STALLED MID-STREAM\n│ > ", true},
+		// Conservatism: a stall marker present but the turn is NOT at the prompt (no caret) →
+		// the turn has not really ended, so never nudged.
+		{"stall without a prompt caret", "API Error: Response stalled mid-stream", false},
+		// Recovered: the stall is buried ABOVE newer real output, so the session is cleanly idle,
+		// not stalled — it must NOT read as stalled (the idle path owns it, not stall-recovery).
+		{"stall buried above newer output", "API Error: Response stalled mid-stream\nHere is the finished analysis.\nAll done.\n│ > ", false},
+		// Non-stall API errors a "continue" cannot fix → never stalled (left for the manager).
+		{"non-stall rate limit", "API Error: 429 rate limit exceeded\n│ > ", false},
+		{"non-stall auth", "API Error: 401 invalid x-api-key\n│ > ", false},
+		{"non-stall request timeout", "API Error: Request timed out\n│ > ", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := APIStalled(c.pane); got != c.want {
+				t.Errorf("APIStalled(%q) = %v, want %v", c.pane, got, c.want)
+			}
+		})
+	}
+}

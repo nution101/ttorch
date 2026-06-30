@@ -2025,10 +2025,12 @@ func TestNudgeIdle_StabilityGate(t *testing.T) {
 	}
 }
 
-// TestNudgeIdle_SkipsNonRecoverableAPIError proves a worker sitting at the prompt after a
-// non-recoverable API error (rate-limit/auth) is NOT nudged — "continue" cannot fix it — while
-// a recoverable mid-stream stall (livestate.Stalled) IS nudged, matching the watcher.
-func TestNudgeIdle_SkipsNonRecoverableAPIError(t *testing.T) {
+// TestNudgeIdle_SkipsAPIErrorPanes proves the idle-nudge pass acts ONLY on a clean idle prompt:
+// a worker at the prompt after a non-recoverable API error (rate-limit/auth) — "continue" cannot
+// fix it — AND a worker showing a recoverable mid-stream stall are BOTH skipped here. The
+// recoverable stall is no longer the idle pass's to nudge: the faster, dedicated stall-recovery
+// pass (stallrecovery.go) owns it now, so the two passes act on disjoint pane states.
+func TestNudgeIdle_SkipsAPIErrorPanes(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
 	past := time.Now().Add(-10 * time.Minute)
@@ -2044,10 +2046,10 @@ func TestNudgeIdle_SkipsNonRecoverableAPIError(t *testing.T) {
 		t.Fatalf("RunNudgeIdleOnce: %v", err)
 	}
 	if f.sendCount("ratelimited") != 0 {
-		t.Errorf("rate-limited worker nudged %d times, want 0 (non-recoverable)", f.sendCount("ratelimited"))
+		t.Errorf("rate-limited worker nudged %d times, want 0 (non-recoverable, left for the manager)", f.sendCount("ratelimited"))
 	}
-	if f.sendCount("stalled") != 1 {
-		t.Errorf("recoverable-stall worker nudged %d times, want 1", f.sendCount("stalled"))
+	if f.sendCount("stalled") != 0 {
+		t.Errorf("API-stalled worker nudged %d times by the idle pass, want 0 (stall-recovery owns it)", f.sendCount("stalled"))
 	}
 }
 

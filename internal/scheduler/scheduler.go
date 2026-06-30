@@ -218,6 +218,38 @@ type Scheduler struct {
 	// a send. <1 is treated as 1 (nudge on first idle observation). New() sets it to 2.
 	IdleConfirmations int
 
+	// StallNudgeGrace and MaxStallNudges configure the API-stall recovery pass (stallrecovery.go)
+	// — the explicit, faster complement to the idle-nudge pass, also driven inside Supervise. A
+	// session (a worker OR the manager window) whose pane shows a recoverable API-stall error at
+	// an idle prompt (livestate.APIStalled) for longer than StallNudgeGrace is nudged once with
+	// "continue", up to MaxStallNudges times per stall episode before the pass stands down and
+	// leaves it for the manager. Both are zero on a bare struct (the pass is OFF — existing tests
+	// and any hand-built Scheduler see no new behavior); New() populates them from the
+	// env-or-default (15s / 2). A MaxStallNudges <= 0 disables the pass entirely (the off-switch).
+	StallNudgeGrace time.Duration
+	MaxStallNudges  int
+
+	// mgrPeek / mgrSend reach the MANAGER tmux window for the stall-recovery pass. The manager
+	// has no task row, so Fleet.Peek/Send (keyed by task id) cannot address it; these seams would.
+	// mgrPeek captures the manager pane (ok=false ⇒ unobservable — no tmux, the window is gone,
+	// or the pane could not be read — and is NEVER nudged); mgrSend types a line into it. A send
+	// is issued ONLY when the pane is APIStalled, so a healthy manager is never injected into
+	// (silent-wake). BOTH are deliberately left nil by New() in production — see stallrecovery.go:
+	// nudging the manager means a tmux write INTO the manager window, which the increment-6
+	// security invariant forbids until it is evolved to admit this one bounded resume nudge (a
+	// lead decision). The manager half is therefore dormant in production and exercised only
+	// through injected test seams; the WORKER half (Fleet.Send to a worker window) is unaffected.
+	mgrPeek func(lines int) (string, bool)
+	mgrSend func(text string) error
+
+	// stallSeen tracks, per session key (a worker's task id, or managerStallKey for the manager),
+	// the current API-stall episode (first-observed time, nudges sent, whether the budget is
+	// spent). Touched only from the single-threaded tick loop, so it needs no lock. An entry is
+	// dropped the moment its session is observed NOT stalled (revived / gone / now busy), so a
+	// recovered session starts a fresh episode; it is best-effort across a daemon restart (a
+	// restart costs at most one extra nudge). nil until the first stall-recovery pass initializes it.
+	stallSeen map[string]stallObservation
+
 	// MaxClaimsPerTick caps how many tasks a single dispatch tick will claim+dispatch, so one
 	// tick can never claim an unbounded burst — each dispatch is a heavy spawn (worktree + tmux
 	// window + harness launch), and the next tick (DefaultInterval later) drains the rest of the
@@ -311,6 +343,17 @@ func New(m *orchestrator.Manager, interval time.Duration, log io.Writer) *Schedu
 		// Parallel-overlap dispatch is the default; TTORCH_SERIALIZE_OVERLAP=1 restores the
 		// pre-parallel serialize-on-dispatch behavior. See the SerializeOverlap field.
 		SerializeOverlap: serializeOverlapFromEnv(),
+
+		// API-stall recovery (stallrecovery.go): the env-or-default grace/budget for the WORKER
+		// half (live — worker nudges go through Fleet.Send to a worker window). The MANAGER half's
+		// seams (mgrPeek/mgrSend) are deliberately left NIL here, so it stays dormant in
+		// production: nudging the manager means typing "continue" INTO the manager window, which
+		// the increment-6 security invariant (orchestrator.TestNoInjectionIntoManagerSession)
+		// forbids. Activating it requires that invariant to admit this one bounded resume nudge —
+		// a cross-cutting decision for the lead, not a worker's to ship through trusted auto-merge.
+		// The manager logic is complete and test-covered via injected seams; see stallrecovery.go.
+		StallNudgeGrace: stallNudgeGraceFromEnv(),
+		MaxStallNudges:  maxStallNudgesFromEnv(),
 
 		// Backpressure governor (H4): default-on machine-load throttle (env-overridable). The
 		// active-worker cap is sized from the worktree pool; the land cap and load ceiling take
@@ -426,6 +469,19 @@ func (sc *Scheduler) runTick(ctx context.Context) {
 				}
 			} else if n > 0 {
 				sc.logf("tick nudged %d idle worker(s)", n)
+			}
+		}
+		if ctx.Err() == nil {
+			// API-stall recovery sits beside the idle-nudge (it acts on a DISJOINT pane state —
+			// an API-stalled idle prompt, which the idle-nudge skips) and nudges a worker OR the
+			// manager window back to life. See stallrecovery.go.
+			if n, err := sc.RunStallRecoveryOnce(ctx); err != nil {
+				if ctx.Err() == nil {
+					sc.logf("stall-recovery tick error: %v", err)
+					stats.noteErr(err)
+				}
+			} else if n > 0 {
+				sc.logf("tick recovered %d API-stalled session(s)", n)
 			}
 		}
 	}
@@ -1024,10 +1080,13 @@ func (sc *Scheduler) nudgeIfIdle(ctx context.Context, t db.Task, now time.Time) 
 		sc.forgetIdle(t.ID) // unobservable — reset stability so a later idle run starts fresh
 		return false, nil   // window gone/unreadable — reclaim owns dead windows
 	}
-	if !livestate.Idle(pane) || nonRecoverableError(pane) {
-		// Busy/working, not at the input prompt, or showing a non-recoverable API error
-		// (rate-limit/auth) that "continue" cannot fix — never inject, and reset the stability
-		// count so a transient idle frame must re-stabilize before a nudge.
+	if !livestate.Idle(pane) || nonRecoverableError(pane) || livestate.APIStalled(pane) {
+		// Busy/working, not at the input prompt, showing a non-recoverable API error
+		// (rate-limit/auth) that "continue" cannot fix, OR showing a recoverable API-stall that
+		// the faster stall-recovery pass (stallrecovery.go) owns — never inject here, and reset
+		// the stability count so a transient idle frame must re-stabilize before a nudge. Skipping
+		// APIStalled keeps the idle and stall passes acting on DISJOINT pane states, so a session
+		// is nudged by exactly one of them.
 		sc.forgetIdle(t.ID)
 		return false, nil
 	}
