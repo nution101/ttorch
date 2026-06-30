@@ -87,6 +87,12 @@ func Run(out io.Writer, in io.Reader, autoYes bool) error {
 		}
 	}
 
+	// codegraph backs the opt-in, default-off worker code-navigation feature. It is never
+	// required: report it informationally so enabling without it installed reads as a clean
+	// no-op rather than a missing dependency.
+	cgPath, cgFound := FindCodegraph()
+	reportCodegraph(out, CodegraphEnabled(), cgPath, cgFound)
+
 	switch d.WSL {
 	case "wsl2":
 		fmt.Fprintln(out, "  runtime: WSL2 (supported)")

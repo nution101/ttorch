@@ -323,6 +323,16 @@ func cmdInit(args []string) error {
 		}
 		fmt.Printf("  wrote project profile (stack: %s) — commit AGENTS.md so workers pick it up\n", stack)
 	}
+	// Opt-in, default-off, evidence-gated codegraph worker code-navigation. When the feature
+	// is disabled (the default) or codegraph is not installed, this is a clean no-op that
+	// prints nothing — `ttorch init` behaves exactly as it does without codegraph.
+	if notes, err := projectinit.SetupCodegraph(dir); err != nil {
+		fmt.Printf("  note: codegraph setup: %v\n", err)
+	} else {
+		for _, n := range notes {
+			fmt.Println("  " + n)
+		}
+	}
 	return nil
 }
 
@@ -2217,9 +2227,10 @@ Setup:
   install                 install/update managed skills, agents, and guidance
   update [--content-only] self-update the binary, then re-apply content
   uninstall [--purge]     remove managed files (keeps files you edited)
-  doctor [--yes]          check/install tmux, git, gh, claude
+  doctor [--yes]          check/install tmux, git, gh, claude (+ optional codegraph)
   skills [install]        list / install recommended agent skills (e.g. axi)
   init [--mode m]         set up a repo's AGENTS.md + CLAUDE.md + delivery mode
+                          (+ codegraph nav when TTORCH_CODEGRAPH=1; opt-in, default off)
   profile [dir]           derive the repo's stack/commands/conventions into AGENTS.md
   version | help          version / this message
 

@@ -23,6 +23,11 @@ workspace. Scope and conduct:
   (the "Match the style of:" list in AGENTS.md) and use its stack's exact build, test, and
   lint commands. Make your code and tests read like the surrounding code — same idioms,
   naming, structure, and test layout.
+- If a `codegraph` code-navigation MCP tool is available in your session, prefer it for
+  locating symbols, callers, callees, and definitions, and for impact analysis, before
+  falling back to plain text search — it reflects this repo's indexed code graph. If no
+  such tool is present, ignore this and navigate as usual; it is an opt-in convenience, not
+  a requirement.
 - Before you report done, sync your branch: fetch origin and rebase your feature branch
   onto the latest default branch, resolving any conflicts, so it fast-forwards cleanly
   with no phantom content in your diff. Then run the repo's own build/test/lint and
