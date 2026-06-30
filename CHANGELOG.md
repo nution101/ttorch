@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.12.0](https://github.com/nution101/ttorch/compare/v0.11.0...v0.12.0) (2026-06-30)
+
+
+### Features
+
+* **scheduler:** auto-recover API-stalled sessions (worker live; manager pending invariant) ([085f29d](https://github.com/nution101/ttorch/commit/085f29dc0c166de69506924a0e6bc462f5c2d5a1))
+* **scheduler:** dispatch file-overlapping tasks in parallel; surface land-rebase conflicts ([f2fe980](https://github.com/nution101/ttorch/commit/f2fe9803f3ef930e12a8ca2f7d9ce8051c7b8383))
+* **validate:** retry a severed-transport failure instead of failing the gate ([044672b](https://github.com/nution101/ttorch/commit/044672b748f7b6f5bef737934a9f9f91fbdee09d))
+
+
+### Bug Fixes
+
+* **cli:** show the enforced delivery mode in `project ls`, sync it on init ([0ee85fd](https://github.com/nution101/ttorch/commit/0ee85fd234e89e84c227f36f6afd257da2a9014d))
+
 ## [0.11.0](https://github.com/nution101/ttorch/compare/v0.10.0...v0.11.0) (2026-06-29)
 
 
