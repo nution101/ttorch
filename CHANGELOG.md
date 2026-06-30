@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.13.0](https://github.com/nution101/ttorch/compare/v0.12.0...v0.13.0) (2026-06-30)
+
+
+### Features
+
+* **scheduler:** count H4 governor deferrals in the scheduler-status deferred counter ([19fcf3a](https://github.com/nution101/ttorch/commit/19fcf3a51590b980bd2f6b718d1483f0553de9be))
+
+
+### Bug Fixes
+
+* **gate:** diff trust-prep review against the branch's true base, not stale local main ([a57ad51](https://github.com/nution101/ttorch/commit/a57ad5185ae7b88c7f903234f1584d86ee2d6364))
+* **scheduler:** classify dispatch failures; park permanent, back off transient ([bb9c989](https://github.com/nution101/ttorch/commit/bb9c989536ac21967c152e9e3e955065221369ad))
+* **tmux:** dedupe windows on create so recovery never stacks a duplicate ([740933c](https://github.com/nution101/ttorch/commit/740933cfc1f19c239794696851c760608bc08a96))
+
 ## [0.12.0](https://github.com/nution101/ttorch/compare/v0.11.0...v0.12.0) (2026-06-30)
 
 
