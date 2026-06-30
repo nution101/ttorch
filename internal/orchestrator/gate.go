@@ -96,6 +96,42 @@ func mergeBaseDiff(dir, base, rev string) (string, error) {
 	return gitOut(dir, "diff", base+"..."+rev)
 }
 
+// reviewBase resolves the ref the trust gate diffs a worker's branch against — the TRUE
+// base of the branch, i.e. the up-to-date default tip the merge will fast-forward onto,
+// chosen exactly as the land path picks it (see landBase). Diffing against this base rather
+// than the raw local <default> branch is what keeps the reviewed three-dot diff honest:
+// when the LOCAL default is BEHIND origin (a release merged on origin but never pulled
+// locally), the commits already on origin are part of the worker's branch history, so a
+// diff rooted at the stale local default surfaces them as the worker's OWN changes —
+// phantom scope-creep that burns a re-gate and misleads reviewers. origin/<default> shares
+// the branch's real fork point, so the three-dot diff there is ONLY the worker's changes.
+//
+// When fetch is true a best-effort `git fetch` first refreshes origin/<default> so a
+// release that landed AFTER the worker spawned is seen too. The fetch is non-fatal: offline
+// (or a repo with no origin) it degrades to the last-known origin/<default> and ultimately
+// the local default, so review still works without a network. landBase already falls back
+// to the local default when origin is absent or behind (an unpushed local fast-forward), so
+// this never bases a diff on a ref the merge would not actually target; the merge gate's own
+// authoritative fetch+rebase catches a base that is still behind here.
+func reviewBase(repo string, fetch bool) (string, error) {
+	def := worktree.DefaultBranch(repo)
+	hasOrigin := worktree.RemoteExists(repo, "origin")
+	if fetch && hasOrigin {
+		// Best-effort: a stale origin/<default> still beats the local default, and a branch
+		// that is genuinely behind is caught by the merge gate's own fetch+rebase. Unlike
+		// landPrep's fetch (guarded by fetchMu against the concurrent LandSet fan-out), this
+		// one is intentionally unguarded: TrustPrep/TrustRecord are serialized manager gate
+		// steps, and `git fetch` takes its own ref-store locks, so a redundant concurrent
+		// fetch is at worst wasted work, never corrupting.
+		_ = worktree.Fetch(repo)
+	}
+	ref, _, err := landBase(repo, def, hasOrigin)
+	if err != nil {
+		return "", err
+	}
+	return ref, nil
+}
+
 // diffFiles returns the AUTHORITATIVE list of paths the committed three-dot diff base...rev
 // touches, via `git diff --name-only -z`: NUL-separated and UNQUOTED regardless of
 // core.quotePath, so a path with tabs, control characters, quotes, backslashes, or
@@ -152,17 +188,23 @@ func diffLineStat(dir, base, rev string) (lines int, binary, ok bool) {
 }
 
 // TrustPrep materializes the inputs the adversarial reviewers read for taskID into
-// ReviewInputsDir: the COMMITTED three-dot diff against the default branch (diff.patch),
+// ReviewInputsDir: the COMMITTED three-dot diff against the branch's TRUE base (diff.patch),
 // the brief (brief.md, if one was written), a fresh validate of the committed sha
 // (validate.json), and the reviewed HEAD (head.txt). It refuses a dirty worktree and reads
 // only committed objects, so the reviewers see exactly the commit that will fast-forward —
 // a worker cannot present a benign working tree while a different commit merges.
 //
-// It also refuses a STALE BASE up front: if the default branch carries commits the worker's
-// HEAD lacks, prep fails (staging nothing) and tells the manager to rebase the worker first.
-// Reviewing a stale-base branch diffs against a base that no longer matches what merges, the
-// merge gate would refuse the fast-forward anyway, and the diff would otherwise surface the
-// default's own lead as phantom reverts. It returns the inputs dir.
+// The diff base is the up-to-date default tip the merge actually targets (reviewBase:
+// origin/<default> when current, fetched best-effort), NOT the raw local <default> branch.
+// A local default that is behind origin (e.g. a release merged on origin but never pulled
+// locally) would otherwise root the diff before commits already on origin and surface them
+// as the worker's own changes — phantom scope-creep that burns a re-gate and misleads
+// reviewers.
+//
+// It also refuses a STALE BASE up front: if that base carries commits the worker's HEAD
+// lacks, prep fails (staging nothing) and tells the manager to rebase the worker first.
+// Reviewing a stale-base branch diffs against a base that no longer matches what merges, and
+// the merge gate would refuse the fast-forward anyway. It returns the inputs dir.
 func (m *Manager) TrustPrep(taskID string) (string, error) {
 	t, ok, err := m.Store.GetTask(context.Background(), taskID)
 	if err != nil || !ok {
@@ -177,16 +219,24 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 		return "", err
 	}
 	def := worktree.DefaultBranch(t.Project)
+	// Resolve the branch's TRUE base — the up-to-date default tip the merge targets, not the
+	// raw local <default> which may be behind origin (see reviewBase). A best-effort fetch
+	// refreshes origin/<default> first so a release that landed after the worker spawned is
+	// caught here too.
+	base, err := reviewBase(t.Project, true)
+	if err != nil {
+		return "", fmt.Errorf("trust prep %q: could not resolve the branch's base against %s: %w", taskID, def, err)
+	}
 
-	// Stale-base guard — run BEFORE staging any inputs or dispatching reviewers. If the
-	// default branch carries commits the worker's HEAD lacks, the branch was cut from an
-	// older base: the merge gate would refuse the fast-forward anyway, and a base-relative
-	// review diff would render the default's own lead as phantom reverts — which burned a
-	// full three-reviewer pass and nearly masked a real bug (the cosign-strict /
-	// liveness-dwell near-miss). `git rev-list <head>..<def>` lists exactly the commits the
-	// default has that the worker lacks; any output means the base is stale. Fail loudly so
-	// the manager rebases the worker onto the current default first, and stage nothing.
-	behind, err := gitOut(t.Worktree, "rev-list", head+".."+def)
+	// Stale-base guard — run BEFORE staging any inputs or dispatching reviewers. If the base
+	// carries commits the worker's HEAD lacks, the branch was cut from an older base: the
+	// merge gate would refuse the fast-forward anyway, and a base-relative review diff would
+	// render the base's own lead as phantom reverts — which burned a full three-reviewer pass
+	// and nearly masked a real bug (the cosign-strict / liveness-dwell near-miss). `git
+	// rev-list <head>..<base>` lists exactly the commits the base has that the worker lacks;
+	// any output means the base is stale. Fail loudly so the manager rebases the worker onto
+	// the current default first, and stage nothing.
+	behind, err := gitOut(t.Worktree, "rev-list", head+".."+base)
 	if err != nil {
 		return "", fmt.Errorf("trust prep %q: could not check whether the branch is based on the current %s: %w", taskID, def, err)
 	}
@@ -198,13 +248,14 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	// The reviewers' diff is the COMMITTED three-dot diff `git diff <def>...<head>` (the
-	// merge-base diff), so it contains ONLY the branch's own changes — never any lead the
-	// default gained since the branch was cut. The stale-base guard above makes <def> an
-	// ancestor of <head> here, but the three-dot form is the correct, intent-revealing way
-	// to diff a branch against its base, and is defense in depth against a phantom-revert
-	// diff. Reads committed objects only, never the working tree.
-	diff, err := mergeBaseDiff(t.Worktree, def, head)
+	// The reviewers' diff is the COMMITTED three-dot diff `git diff <base>...<head>` (the
+	// merge-base diff against the branch's true base), so it contains ONLY the branch's own
+	// changes — never any lead the default gained since the branch was cut. The stale-base
+	// guard above makes <base> an ancestor of <head> here, but the three-dot form is the
+	// correct, intent-revealing way to diff a branch against its base, and is defense in
+	// depth against a phantom-revert diff. Reads committed objects only, never the working
+	// tree.
+	diff, err := mergeBaseDiff(t.Worktree, base, head)
 	if err != nil {
 		return "", err
 	}
@@ -222,8 +273,8 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 	// malicious code file behind a quoted/non-ASCII name to misclassify a code diff as
 	// docs-only and skip the security reviewer. Any git failure fails closed to the full
 	// set via the ok flags.
-	files, filesOK := diffFiles(t.Worktree, def, head)
-	lines, binary, statOK := diffLineStat(t.Worktree, def, head)
+	files, filesOK := diffFiles(t.Worktree, base, head)
+	lines, binary, statOK := diffLineStat(t.Worktree, base, head)
 	size, dims := review.Classify(files, lines, binary, filesOK && statOK)
 	sb, err := json.MarshalIndent(scaledReviewers{Size: size, Dimensions: dims}, "", "  ")
 	if err != nil {
@@ -294,9 +345,19 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 	}
 	// Pin the reviewed diff's content identity onto the verdict (the committed three-dot diff
 	// the reviewers read) so a later clean rebase onto an advanced default can carry the
-	// verdict forward without re-running the reviewers — see carryVerdictForward. Computed from
-	// committed objects, so it is independent of the worktree state.
-	patch, derr := mergeBaseDiff(t.Worktree, worktree.DefaultBranch(t.Project), sha)
+	// verdict forward without re-running the reviewers — see carryVerdictForward. It MUST be
+	// computed against the SAME true base prep staged the reviewed diff against (reviewBase),
+	// so the fingerprint identifies exactly the worker's own changes and matches what
+	// carryVerdictForward recomputes against the land base at merge time; pinning against a
+	// stale local <default> would fingerprint phantom commits and force a needless re-gate.
+	// No fetch here: prep just refreshed origin/<default>, and the three-dot diff against it
+	// is stable as origin advances (the merge-base stays the branch's fork point). Computed
+	// from committed objects, so it is independent of the worktree state.
+	reviewedBase, berr := reviewBase(t.Project, false)
+	if berr != nil {
+		return zero, fmt.Errorf("trust record %q: could not resolve the reviewed diff base: %w", taskID, berr)
+	}
+	patch, derr := mergeBaseDiff(t.Worktree, reviewedBase, sha)
 	if derr != nil {
 		return zero, fmt.Errorf("trust record %q: could not compute the reviewed diff identity: %w", taskID, derr)
 	}
