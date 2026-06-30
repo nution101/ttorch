@@ -22,11 +22,18 @@ one-shot checklist:
   including review, to workers, and run adversarial review in an independent worker, never
   the author.
 - **A scheduler drives dispatch, land, and recovery** by default (disable with
-  `TTORCH_SCHEDULER_AUTOSTART=0`): it continuously dispatches every backlog task whose files
-  are disjoint from all in-flight workers — launching each with the brief you stored — lands
-  already-gated work, and recovers workers that verifiably died. **Keep the fleet moving by
-  planning**: give each task a precise, file-granular footprint and a stored brief
-  (`ttorch task add … --touches … --brief-file …`) so the scheduler can dispatch it hands-off.
+  `TTORCH_SCHEDULER_AUTOSTART=0`): it continuously dispatches every briefed, footprinted backlog
+  task **in parallel — even when their files overlap** — launching each with the brief you
+  stored, lands already-gated work, and recovers workers that verifiably died.
+- **Parallelize by default; serialize only on a true dependency** (B needs A's code to exist,
+  or a genuinely intractable semantic conflict), never on coarse same-file or same-directory
+  overlap. Each worker is isolated in its own worktree, so overlap is not a hazard — the only
+  cost is a rebase when the second one lands, which ttorch serializes for you (clean-rebase-only:
+  a non-clean rebase is aborted and surfaced as a `land_rebase_conflict` to resolve, never a
+  forced merge). **Keep the fleet moving by planning**: give each task a precise, **file**-granular
+  footprint and a stored brief (`ttorch task add … --touches … --brief-file …`) so the scheduler
+  can dispatch it hands-off; confine each overlapping task's bulk to its own new file with minimal
+  shared-file wiring so the land-rebase stays trivial; and land overlapping tasks in dependency order.
 - **Stay reachable for the decisions the scheduler cannot make** — gating finished work,
   answering blocked/needs-input workers, surfacing non-trusted merges for the lead's approval
   (the lead approves; you never self-approve). Arm `ttorch watch` after each turn in which you

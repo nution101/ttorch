@@ -31,12 +31,14 @@ machinery and LLM judgment:
   review gate, answer blocked workers, surface decisions to you. It delegates all coding and
   review to workers; it never writes code itself.
 - **The scheduler daemon.** A plain Go loop with **no LLM in it**, auto-started with the
-  manager by default. It deterministically **dispatches** ready disjoint backlog, **lands**
-  work that already passed the gate, and **supervises** (recovers) crashed workers.
+  manager by default. It deterministically **dispatches** ready backlog **in parallel
+  (overlapping work included)**, **lands** work that already passed the gate, and
+  **supervises** (recovers) crashed workers.
 - **Workers.** Claude Code sessions, one per task, each in its own isolated git worktree.
 
 The dividing line: the daemon only does work whose safety it can *prove* from the store (a
-declared file footprint, a disjoint file set, a passing verdict, a confirmed-dead window).
+declared file footprint, free worktree capacity, a passing verdict, a clean land-rebase, a
+confirmed-dead window).
 Everything else — *what* the tasks are, *whether* a diff is good, *whether* to approve — is
 the manager's and your judgment. That's why **gating** (recording a passing verdict) is
 always separate from **landing** (merging gated work): the daemon never gates, and it never
@@ -105,9 +107,9 @@ lands, and recovers; the manager bridges the two with judgment.
 2. **Plan.** Tell the manager a goal. It breaks the work into tasks, giving each a precise
    **file footprint** (`--touches`) and a stored **brief** so the scheduler can dispatch it
    hands-off (`ttorch task add … --touches … --brief-file …`).
-3. **Dispatch (automatic).** The scheduler launches a worker for every backlog task whose
-   files are disjoint from all in-flight work, within worktree capacity — no manual `spawn`
-   needed. You can still dispatch by hand (`ttorch spawn`) when you want to.
+3. **Dispatch (automatic).** The scheduler launches a worker for every briefed, footprinted
+   backlog task within worktree capacity — **in parallel, even when their files overlap** — no
+   manual `spawn` needed. You can still dispatch by hand (`ttorch spawn`) when you want to.
 4. **Supervise (automatic + you).** `ttorch tasks` shows the whole board; `ttorch status`
    shows live workers; `ttorch peek <id>` reads a worker's output. The manager wakes only on
    real worker events (a zero-token watcher), so an idle team costs nothing. Crashed workers
@@ -208,11 +210,13 @@ reference; this table covers the surface a lead and manager use day to day.
 ticker (default every 5s). Each tick runs up to three independent, error-isolated passes
 in fixed order — **supervise → dispatch → land**:
 
-- **Dispatch** — claim and launch every `pending` task it can *prove* safe to run in
-  parallel: a **declared footprint**, disjoint from every live and just-claimed worker,
-  within free worktree capacity. It claims atomically before spawning, so two ticks (or two
-  daemons) can never double-dispatch. Overlapping, no-capacity, or footprint-less tasks are
-  **skipped** (left for the manager), never failed.
+- **Dispatch** — claim and launch every `pending` task that has a **declared footprint**, a
+  **stored brief**, and free worktree capacity — **in parallel, even when footprints overlap**
+  (each worker is git-isolated in its own worktree, so overlap costs only a rebase at land
+  time). It claims atomically before spawning, so two ticks (or two daemons) can never
+  double-dispatch. The `TTORCH_SERIALIZE_OVERLAP` off-switch restores the pre-parallel
+  skip-on-overlap behavior. No-capacity, footprint-less, or brief-less tasks are **skipped**
+  (left for the manager), never failed.
 - **Land** — land `done` tasks that **already carry a passing verdict**, through the same
   pipeline as `ttorch land`. It never lands ungated work.
 - **Supervise** — reclaim only **verifiably-dead** workers (a confirmed-gone window or an
@@ -278,11 +282,13 @@ Each worker runs in a git worktree drawn from a per-repository **pool** under
 to the pool for reuse; the pool's free-slot count is the dispatch capacity the scheduler
 respects.
 
-A task's **footprint** (`--touches`) — a set of file paths/prefixes — is how parallel safety
-is proven without reading code. `spawn` and the scheduler refuse to dispatch a task onto
-files a live worker already holds (override with `--force-overlap`); `ttorch check-overlap`
-previews the conflicts. Declare footprints at **file granularity** — a whole-package
-footprint needlessly serializes disjoint tasks.
+A task's **footprint** (`--touches`) — a set of file paths/prefixes — declares the files it
+will change. `spawn` refuses to dispatch a task onto files a live worker already holds
+(override with `--force-overlap`); the **scheduler dispatches overlapping footprints in
+parallel by default** (each worker isolated in its own worktree), serializing them only at
+land time via rebase. `ttorch check-overlap` previews the overlap. Declare footprints at
+**file granularity** — a whole-package footprint reports false overlap and inflates needless
+land-rebases.
 
 ## Validation
 

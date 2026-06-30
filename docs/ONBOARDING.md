@@ -53,13 +53,14 @@ ttorch coordinates four roles through a single SQLite store (the source of truth
   briefs them, gates finished work, answers blocked workers, and surfaces decisions to you.
   It delegates all coding and review — it never writes code itself.
 - **The scheduler daemon.** A plain Go loop (no LLM), auto-started with the manager. It
-  dispatches ready disjoint backlog, lands already-gated work, and recovers crashed workers.
+  dispatches ready backlog **in parallel — overlapping work included** — lands already-gated
+  work, and recovers crashed workers.
 - **Workers.** Claude Code sessions, one per task, each in its own isolated git worktree.
 
-The key idea: the daemon does only what it can *prove* safe (a declared file footprint, a
-disjoint file set, a passing verdict); the manager and you do everything that needs
-judgment. So **gating** (recording a passing verdict) is always separate from **landing**
-(merging gated work).
+The key idea: the daemon does only what it can *prove* safe (a declared file footprint and
+free worktree capacity, a passing verdict, a clean land-rebase); the manager and you do
+everything that needs judgment. So **gating** (recording a passing verdict) is always separate
+from **landing** (merging gated work).
 
 ## 4. First run
 
@@ -93,9 +94,9 @@ lands, and recovers, and the manager bridges the two with judgment.
 
 1. **Plan.** Tell the manager what you want; it breaks the work into tasks, giving each a
    precise **file footprint** and a stored **brief** (§6).
-2. **Dispatch (automatic).** The scheduler launches a worker for every backlog task whose
-   files are disjoint from all in-flight work, within worktree capacity — hands-off. You can
-   still dispatch by hand with `ttorch spawn <id> <repo>` (add `--scout` for
+2. **Dispatch (automatic).** The scheduler launches a worker for every briefed, footprinted
+   backlog task within worktree capacity — **in parallel, even when their files overlap** —
+   hands-off. You can still dispatch by hand with `ttorch spawn <id> <repo>` (add `--scout` for
    investigation-only tasks that produce a report, not code).
 3. **Supervise.** `ttorch tasks` shows the whole board (including pending backlog);
    `ttorch status` lists live workers; `ttorch peek <id>` reads a worker's output;
@@ -128,10 +129,12 @@ inspect with `ttorch tasks --tree`. The task is the unit of work. Most planning 
 manager's job, but two things make a task **dispatchable hands-off** by the scheduler:
 
 - A **file footprint** (`--touches "path/a.go,path/b/"`) — the files (or prefixes) the task
-  will change. The scheduler dispatches a task only when its footprint is disjoint from every
-  live worker, so footprints are how parallel safety is proven without reading code. Declare
-  them at **file granularity** — a whole-package footprint needlessly serializes disjoint
-  tasks. Preview conflicts with `ttorch check-overlap "<paths>"`.
+  will change. The scheduler dispatches footprinted tasks **in parallel even when they overlap**
+  (each worker is isolated in its own worktree); overlap only matters when the second one lands,
+  where ttorch rebases it onto the first and serializes a clean fast-forward (a non-clean rebase
+  surfaces a `land_rebase_conflict`, never a forced merge). Declare footprints at **file
+  granularity** — a whole-package footprint reports false overlap and inflates needless
+  land-rebases. Preview overlap with `ttorch check-overlap "<paths>"`.
 - A **stored brief** (`--brief-file <path>` or `--brief "…"`) — the full instructions the
   worker launches on. Without a brief, a dispatched worker only gets a generic stub.
 

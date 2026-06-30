@@ -58,14 +58,14 @@ This is the central design idea. Two kinds of work happen in a ttorch session:
 
 | Deterministic (the daemon, in Go) | Judgment (the manager, an LLM) |
 | --- | --- |
-| Dispatch backlog whose files are provably disjoint | Decide *what* the tasks are and write their briefs |
+| Dispatch briefed, footprinted backlog in parallel (overlap and all) | Decide *what* the tasks are and write their briefs |
 | Land work that **already** carries a passing verdict | **Produce** that verdict (run the review gate) |
 | Reclaim a worker that **verifiably** died, within a retry budget | Decide whether a blocked worker should change course |
-| Hold the worktree pool, enforce footprint disjointness | Approve a non-trusted merge; talk to the lead |
+| Hold the worktree pool (never two workers in one worktree) | Approve a non-trusted merge; talk to the lead |
 
 The daemon never makes a judgment call: it only does work whose safety it can *prove* from
-the store (a declared footprint, a disjoint file set, a passing verdict, a confirmed-dead
-window). Anything it cannot prove, it leaves for the manager. That boundary is what lets
+the store (a declared footprint, free worktree capacity, a passing verdict, a clean
+land-rebase, a confirmed-dead window). Anything it cannot prove, it leaves for the manager. That boundary is what lets
 the fleet run hands-off without an LLM in the dispatch loop — and is why "gating" (a human
 or the manager recording a verdict) is always separate from "landing" (the daemon merging
 gated work).
@@ -111,18 +111,26 @@ supervise, then dispatch, then land** — each guarded by its own toggle and err
 so a transient failure in one never stops the others.
 
 - **Dispatch** (`--dispatch`). Re-derive the ready backlog and dispatch every `pending`
-  task it can *prove* safe to run in parallel: it must declare a non-empty footprint, that
-  footprint must be disjoint from every live worker **and** every task already claimed this
-  same tick, and the task's repo must have a free worktree slot. Each selected task is
-  claimed atomically (a `BEGIN IMMEDIATE` status re-check) *before* the expensive spawn, so
-  two ticks — or two daemons, or the daemon and the manager — can never double-dispatch. A
-  task that overlaps, has no capacity, or **declares no footprint** is silently skipped and
-  left for the manager; it is never failed.
+  task that declares a non-empty footprint, has a stored brief, and whose repo has a free
+  worktree slot — **in parallel, even when footprints overlap**. Overlap across separate
+  worktrees is not a dispatch hazard: each worker is git-isolated in its own pooled worktree,
+  so two tasks editing one file never see each other; the only cost is a rebase when the
+  second one lands, which the land pass serializes (below). The off-switch
+  `TTORCH_SERIALIZE_OVERLAP` restores the pre-parallel behavior of skipping an overlapping
+  task until the holder finishes. Each selected task is claimed atomically (a `BEGIN
+  IMMEDIATE` status re-check) *before* the expensive spawn, so two ticks — or two daemons, or
+  the daemon and the manager — can never double-dispatch. The "never two workers in the same
+  worktree" invariant is held by per-tick capacity accounting and the file-locked worktree
+  pool, **not** by the footprint check. A task that **declares no footprint**, **has no stored
+  brief**, or has no free capacity is silently skipped and left for the manager; it is never
+  failed.
 - **Land** (`--land`). Find `done` tasks that **already carry a passing verdict** and land
   them through the same pipeline as `ttorch land` (with the verdict requirement on). It
   never lands ungated work: a missing or non-passing verdict is skipped, and the
   commit-pinned verdict + single-use approval check inside the land path is the real
-  authority.
+  authority. Overlapping lands serialize here: each task rebases onto the current default
+  before its fast-forward, and a non-clean rebase is always aborted (never force-merged) and
+  surfaced as an actionable `land_rebase_conflict` for the manager to resolve.
 - **Supervise** (`--supervise`). Reclaim only **verifiably-dead** workers — a
   watcher-recorded "window gone" event that is still the task's latest sign of life, or a
   genuinely-expired lease re-checked under a write lock. It is *never* pane-output
@@ -300,11 +308,13 @@ clean idle slot or creates a new one, always re-anchored on the freshly-fetched 
 slot to the pool rather than destroying it). The pool's free-slot count is the dispatch
 **capacity** the scheduler respects.
 
-A task's **footprint** (`--touches`, a set of file paths/prefixes) is how parallel safety is
-proven without reading any code. `spawn` and the scheduler refuse to dispatch a task onto
-files a live worker already holds; `ttorch check-overlap` previews the conflicts for a
-proposed footprint. Footprints must be declared at **file granularity** — a whole-package
-footprint falsely serializes disjoint tasks and idles scheduler slots.
+A task's **footprint** (`--touches`, a set of file paths/prefixes) declares the files it will
+change. `spawn` refuses to dispatch a task onto files a live worker already holds unless you
+pass `--force-overlap`; the **scheduler dispatches overlapping footprints in parallel by
+default** (each worker isolated in its own worktree), serializing them only at land time via
+rebase. `ttorch check-overlap` previews the overlap for a proposed footprint. Footprints must
+be declared at **file granularity** — a whole-package footprint reports false overlap and
+inflates needless land-rebases (and, under `TTORCH_SERIALIZE_OVERLAP`, idles scheduler slots).
 
 ## 8. Sessions and reasoning effort
 
