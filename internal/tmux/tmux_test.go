@@ -254,7 +254,32 @@ func TestNewWindow(t *testing.T) {
 	if err := NewWindow("s", "w", "/work/dir"); err != nil {
 		t.Fatalf("NewWindow: %v", err)
 	}
+	// It dedupes first (an empty session lists nothing to kill), then creates and pins.
 	want := [][]string{
+		{"list-windows", "-t", "s", "-F", "#{window_id} #{window_name}"},
+		{"new-window", "-d", "-t", "s", "-n", "w", "-c", "/work/dir"},
+		{"set-option", "-w", "-t", "s:w", "automatic-rename", "off"},
+		{"set-option", "-w", "-t", "s:w", "allow-rename", "off"},
+	}
+	if got := readInvocations(t, log); !reflect.DeepEqual(got, want) {
+		t.Errorf("invocations =\n%v\nwant\n%v", got, want)
+	}
+}
+
+// TestNewWindow_DedupesExistingSameName proves the duplicate-window guard: when a window of the
+// same name already exists (a stale incarnation a recovery re-spawn would otherwise stack a
+// duplicate on), NewWindow kills it — by its unambiguous window id — BEFORE creating the new
+// one, so exactly one window of that name remains afterward.
+func TestNewWindow_DedupesExistingSameName(t *testing.T) {
+	log := installFakeTmux(t)
+	// One stale "w" (plus an unrelated window that must be left alone).
+	t.Setenv("FAKE_LIST_WINDOWS", "@4 w\n@7 other")
+	if err := NewWindow("s", "w", "/work/dir"); err != nil {
+		t.Fatalf("NewWindow: %v", err)
+	}
+	want := [][]string{
+		{"list-windows", "-t", "s", "-F", "#{window_id} #{window_name}"},
+		{"kill-window", "-t", "@4"}, // the stale same-name window, killed by id (not "@7 other")
 		{"new-window", "-d", "-t", "s", "-n", "w", "-c", "/work/dir"},
 		{"set-option", "-w", "-t", "s:w", "automatic-rename", "off"},
 		{"set-option", "-w", "-t", "s:w", "allow-rename", "off"},
@@ -266,13 +291,15 @@ func TestNewWindow(t *testing.T) {
 
 func TestNewWindow_FailsBeforePinning(t *testing.T) {
 	log := installFakeTmux(t)
-	t.Setenv("FAKE_GENERIC_EXIT", "1") // new-window fails
+	t.Setenv("FAKE_GENERIC_EXIT", "1") // new-window fails (list-windows has its own exit knob)
 	if err := NewWindow("s", "w", "/x"); err == nil {
 		t.Fatal("NewWindow err = nil, want failure")
 	}
-	// It must return before pinning the window name.
-	if got := readInvocations(t, log); len(got) != 1 || got[0][0] != "new-window" {
-		t.Errorf("invocations = %v, want only new-window", got)
+	// It dedupes (an empty list-windows kills nothing), then new-window fails — and it must
+	// return before pinning the window name.
+	got := readInvocations(t, log)
+	if len(got) != 2 || got[0][0] != "list-windows" || got[1][0] != "new-window" {
+		t.Errorf("invocations = %v, want dedup list-windows then new-window only", got)
 	}
 }
 
@@ -488,6 +515,88 @@ func TestKillWindow(t *testing.T) {
 	want := []string{"kill-window", "-t", "s:w"}
 	if inv := readInvocations(t, log); len(inv) != 1 || !reflect.DeepEqual(inv[0], want) {
 		t.Errorf("invocation = %v, want %v", inv, want)
+	}
+}
+
+// TestKillWindows_KillsEveryMatchByID proves the unambiguous multi-match kill: every window
+// sharing the name is killed by its window id (@N) — the one target that disambiguates a
+// duplicate — and unrelated windows are left untouched.
+func TestKillWindows_KillsEveryMatchByID(t *testing.T) {
+	log := installFakeTmux(t)
+	t.Setenv("FAKE_LIST_WINDOWS", "@0 manager\n@1 wk-foo\n@2 wk-foo\n@3 wk-bar")
+	killed, err := KillWindows("s", "wk-foo")
+	if err != nil {
+		t.Fatalf("KillWindows: %v", err)
+	}
+	if killed != 2 {
+		t.Fatalf("killed = %d, want 2 (both duplicates)", killed)
+	}
+	want := [][]string{
+		{"list-windows", "-t", "s", "-F", "#{window_id} #{window_name}"},
+		{"kill-window", "-t", "@1"},
+		{"kill-window", "-t", "@2"},
+	}
+	if got := readInvocations(t, log); !reflect.DeepEqual(got, want) {
+		t.Errorf("invocations =\n%v\nwant\n%v", got, want)
+	}
+}
+
+// TestKillWindows_NoMatch proves a no-op when nothing matches: it lists once and kills nothing.
+func TestKillWindows_NoMatch(t *testing.T) {
+	log := installFakeTmux(t)
+	t.Setenv("FAKE_LIST_WINDOWS", "@0 manager\n@1 wk-bar")
+	killed, err := KillWindows("s", "wk-foo")
+	if err != nil || killed != 0 {
+		t.Fatalf("KillWindows = (%d,%v), want (0,nil)", killed, err)
+	}
+	if got := readInvocations(t, log); len(got) != 1 || got[0][0] != "list-windows" {
+		t.Errorf("invocations = %v, want only the list-windows probe", got)
+	}
+}
+
+// TestKillWindows_ListError proves an enumeration failure is surfaced (count 0, error) so a
+// caller can tell "could not look" from "nothing to kill" — and no kill is attempted blindly.
+func TestKillWindows_ListError(t *testing.T) {
+	log := installFakeTmux(t)
+	t.Setenv("FAKE_LIST_WINDOWS_EXIT", "1")
+	killed, err := KillWindows("s", "wk-foo")
+	if killed != 0 || err == nil {
+		t.Fatalf("KillWindows on list error = (%d,%v), want (0,err)", killed, err)
+	}
+	if got := readInvocations(t, log); len(got) != 1 || got[0][0] != "list-windows" {
+		t.Errorf("invocations = %v, want only the failed list-windows probe", got)
+	}
+}
+
+// TestKillWindows_KillError proves a per-window kill failure is reported (with a zero killed
+// count) rather than swallowed.
+func TestKillWindows_KillError(t *testing.T) {
+	installFakeTmux(t)
+	t.Setenv("FAKE_LIST_WINDOWS", "@1 wk-foo")
+	t.Setenv("FAKE_GENERIC_EXIT", "1") // kill-window fails (list-windows has its own exit knob)
+	killed, err := KillWindows("s", "wk-foo")
+	if killed != 0 || err == nil {
+		t.Fatalf("KillWindows on kill error = (%d,%v), want (0,err)", killed, err)
+	}
+}
+
+// TestWindowCount proves the explicit multi-match view: 0 (absent), 1 (healthy), 2 (the
+// duplicate pathology) — and a read failure surfaced as an error, never a phantom 0.
+func TestWindowCount(t *testing.T) {
+	installFakeTmux(t)
+	t.Setenv("FAKE_LIST_WINDOWS", "@0 manager\n@1 wk-foo\n@2 wk-foo")
+	if n, err := WindowCount("s", "wk-foo"); n != 2 || err != nil {
+		t.Errorf("WindowCount wk-foo = (%d,%v), want (2,nil)", n, err)
+	}
+	if n, err := WindowCount("s", "manager"); n != 1 || err != nil {
+		t.Errorf("WindowCount manager = (%d,%v), want (1,nil)", n, err)
+	}
+	if n, err := WindowCount("s", "absent"); n != 0 || err != nil {
+		t.Errorf("WindowCount absent = (%d,%v), want (0,nil)", n, err)
+	}
+	t.Setenv("FAKE_LIST_WINDOWS_EXIT", "1")
+	if n, err := WindowCount("s", "wk-foo"); n != 0 || err == nil {
+		t.Errorf("WindowCount on read failure = (%d,%v), want (0,err)", n, err)
 	}
 }
 

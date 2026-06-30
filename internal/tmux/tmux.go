@@ -123,7 +123,9 @@ func WindowExists(session, window string) bool {
 // WindowExistsErr reports whether a named window exists, distinguishing a window that
 // is genuinely absent (false, nil) from a tmux read that failed (false, err). Callers
 // that must not treat a transient `tmux list-windows` hiccup as "the window is gone"
-// (e.g. Spawn's readiness wait) use this instead of WindowExists.
+// (e.g. Spawn's readiness wait) use this instead of WindowExists. It treats a name shared
+// by MORE than one window as "exists" (true) — a duplicate is a present window, never a
+// gone one — so a multi-match capture/send failure is never misread as a dead worker.
 func WindowExistsErr(session, window string) (bool, error) {
 	ws, err := ListWindows(session)
 	if err != nil {
@@ -137,13 +139,106 @@ func WindowExistsErr(session, window string) (bool, error) {
 	return false, nil
 }
 
+// windowRef pairs a window's stable, server-unique id (@N) with its name, as read from one
+// list-windows enumeration. The id — unlike a bare name (tmux permits duplicates) and unlike
+// the positional index (reused as windows come and go) — addresses EXACTLY one window for the
+// life of the server, so it is the unambiguous target dedup and multi-match kills use.
+type windowRef struct {
+	id   string
+	name string
+}
+
+// listWindowRefs enumerates a session's windows as (id, name) pairs. Splitting on the first
+// space is safe: a window_id is always "@<n>" (no space), and any space in the name stays with
+// the name (ttorch window names never contain one). A read failure propagates so a transient
+// hiccup is never mistaken for an empty session.
+func listWindowRefs(session string) ([]windowRef, error) {
+	out, err := run("list-windows", "-t", session, "-F", "#{window_id} #{window_name}")
+	if err != nil {
+		return nil, err
+	}
+	if out == "" {
+		return nil, nil
+	}
+	var refs []windowRef
+	for _, line := range strings.Split(out, "\n") {
+		id, name, ok := strings.Cut(line, " ")
+		if !ok || id == "" {
+			continue
+		}
+		refs = append(refs, windowRef{id: id, name: name})
+	}
+	return refs, nil
+}
+
+// WindowCount returns how many windows in the session carry the given name. tmux permits
+// duplicate window names, so this distinguishes "absent" (0), the healthy "exactly one" (1),
+// and the duplicate pathology (>1) that makes every name-targeted op (capture/send/kill)
+// ambiguous — the explicit multi-match view WindowExists's bool cannot give. A read failure
+// is surfaced (rather than reported as 0) so a transient hiccup is never read as "absent".
+func WindowCount(session, name string) (int, error) {
+	refs, err := listWindowRefs(session)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, r := range refs {
+		if r.name == name {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// KillWindows removes EVERY window in the session that carries the given name and returns how
+// many it killed. Where KillWindow targets by name — ambiguous, and so unreliable, the moment
+// two windows share that name — this enumerates the matches and kills each by its server-unique
+// window id (@N), the only target that stays unambiguous under duplicates. It is the dedup
+// primitive NewWindow uses to guarantee at most one window per name, and the reliable cleanup
+// for a duplicate a name-targeted KillWindow could not disambiguate. A failure to ENUMERATE
+// (list-windows error) returns a zero count and that error, so a caller can tell "nothing to
+// kill" from "could not look"; a per-window kill error is returned after attempting the rest.
+func KillWindows(session, name string) (int, error) {
+	refs, err := listWindowRefs(session)
+	if err != nil {
+		return 0, err
+	}
+	killed := 0
+	var firstErr error
+	for _, r := range refs {
+		if r.name != name {
+			continue
+		}
+		if _, err := run("kill-window", "-t", r.id); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		killed++
+	}
+	return killed, firstErr
+}
+
 // NewWindow creates a detached window with the given working directory. The
 // window's name is pinned (automatic-rename and allow-rename off) so the running
 // command cannot overwrite it: ttorch uses the name as a stable tmux target and as
 // a discovery key, while the friendly tab title is carried separately via the
 // @ttorch_label window option (see LabelWindow and TitleFormat). Pinning is
 // best-effort; only the window creation can fail the caller.
+//
+// It DEDUPES first: tmux's `new-window -n` does NOT enforce unique names, so a stale window
+// left from a prior incarnation — e.g. a recovery re-spawn after a transient list-windows read
+// made the caller's WindowExists guard miss the still-present window — would otherwise leave TWO
+// windows sharing this name. Every name-targeted op (capture/send/kill) against such a pair then
+// fails ambiguously, which a recovery pass can misread as "the worker is gone" and re-spawn yet
+// again — a self-feeding duplicate-window loop. Killing any existing same-name window BEFORE
+// creating guarantees at most one window of this name afterward, so a re-spawn REUSES (replaces)
+// the stale window instead of stacking a duplicate on it. The dedup is best-effort: if the
+// windows cannot be enumerated we still create (no worse than the un-deduped original), and the
+// caller's own pre-check remains the first line of defense.
 func NewWindow(session, window, cwd string) error {
+	_, _ = KillWindows(session, window)
 	if _, err := run("new-window", "-d", "-t", session, "-n", window, "-c", cwd); err != nil {
 		return err
 	}
