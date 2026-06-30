@@ -74,11 +74,15 @@ func (p Pool) dir(repo string) string { return filepath.Join(p.Root, poolName(re
 
 // Acquire returns a worktree for a new task, based on the up-to-date default tip. It
 // first refreshes origin and resolves the fresh base once (see fetchAndBase), then
-// reuses a clean idle slot (one not in inUse and free of tracked changes), resetting it
-// to origin/<default> while keeping untracked caches; otherwise it creates a new slot at
-// that base, up to Max. Resetting a recycled slot to the lead's possibly-stale local
-// HEAD was the stale-base bug — a worker could start several commits behind origin — so
-// reuse and creation both anchor on the freshly fetched default instead.
+// reuses a clean idle slot — one not in inUse, free of tracked changes, AND free of
+// committed-but-unmerged work (hasUnlandedWork) — resetting it to origin/<default> while
+// keeping untracked caches; otherwise it creates a new slot at that base, up to Max, and
+// when none is free it refuses (pool full) rather than clobber a held slot. Resetting a
+// recycled slot to the lead's possibly-stale local HEAD was the stale-base bug — a worker
+// could start several commits behind origin — so reuse and creation both anchor on the
+// freshly fetched default instead. The unlanded-work skip is the defense in depth behind
+// "never reuse a slot that still holds another task's work": inUse is the primary guard,
+// but a lost task→worktree mapping must never let a recycle clobber a prior task's commit.
 func (p Pool) Acquire(repo string, inUse []string) (string, error) {
 	poolDir := p.dir(repo)
 	if err := os.MkdirAll(poolDir, 0o755); err != nil {
@@ -113,6 +117,22 @@ func (p Pool) Acquire(repo string, inUse []string) (string, error) {
 		if err != nil || tracked {
 			continue // skip slots with orphaned uncommitted work or unreadable state
 		}
+		// Defense in depth beyond the inUse set: never reset a slot that still holds
+		// committed-but-unmerged work out from under whatever task left it there. inUse is
+		// the primary occupancy guard, but if a task→worktree mapping is ever lost (a
+		// half-finished teardown, a crashed dispatch), a slot can hold a prior task's commit
+		// yet be absent from inUse — and committed work leaves no tracked changes, so the
+		// check above waves it through. Recycling it would clobber that branch and let the
+		// next StartBranch stack a new task on top of the leftover commit: the exact
+		// cross-task contamination this skip prevents. A clean slot (freshly created, or
+		// properly released to the default tip) has no unlanded commits and is still reused.
+		if hasUnlandedWork(repo, s) {
+			continue
+		}
+		// The slot is provably free of unlanded work; park it detached and drop any leftover
+		// task branch BEFORE resetting, so a recycle never moves a stale branch ref and no
+		// orphaned ttorch/<id> ref accumulates across reuse (mappings stay consistent).
+		detachTaskBranch(s)
 		if err := resetTo(s, base); err != nil {
 			continue
 		}
@@ -218,6 +238,35 @@ func IsClean(path string) (bool, error) {
 	return strings.TrimSpace(out) == "", nil
 }
 
+// hasUnlandedWork reports whether slot's checked-out HEAD carries commit(s) that are not
+// already reachable from a SAFE base — committed work a recycle would clobber. Acquire uses
+// it as the committed-work counterpart to HasTrackedChanges: a slot still holding a prior
+// task's unlanded commit (its task→worktree mapping lost, or never torn down) must NOT be
+// reused/reset, even when it is clean of uncommitted changes and absent from the inUse set.
+//
+// The safe bases are the default branch, origin/<default>, AND the lead repo's current
+// checkout HEAD. The repo-HEAD base is essential: Release parks a freed slot at the lead's
+// checkout HEAD (reset → headCommit(repo)), which is routinely a feature branch AHEAD of the
+// default branch (the normal state of a ttorch-managed repo mid-task). That is not unlanded
+// task work — just the base the lead sits on — so without repo HEAD as a base every cleanly
+// released slot would be wrongly skipped, proliferating slots and, at Max, starving dispatch.
+// A genuine prior-task commit lives on a worker's ttorch/<id> line and is never the lead's
+// HEAD unless it has landed, so contamination protection is preserved.
+//
+// It fails safe — if merge status cannot be determined (no base resolves, or git errors) it
+// reports true, so an indeterminate slot is left alone rather than reset. The slot is a
+// linked worktree sharing the repo's refs/objects, so each base resolves from it directly
+// (repo HEAD is passed as a resolved SHA, reachable via the shared object store).
+func hasUnlandedWork(repo, slot string) bool {
+	def := DefaultBranch(slot)
+	bases := []string{def, "origin/" + def}
+	if head, err := headCommit(repo); err == nil {
+		bases = append(bases, head)
+	}
+	unmerged, err := UnmergedCommits(slot, "HEAD", bases...)
+	return err != nil || len(unmerged) > 0
+}
+
 // reset hard-resets a slot to the repo's local HEAD. Release uses it to park a finished
 // slot clean; the next Acquire re-anchors a reused slot on the freshly fetched default
 // (resetTo + fetchAndBase), so an idle slot's local-HEAD parking is always superseded
@@ -253,6 +302,23 @@ func resetTo(slot, ref string) error {
 // than silently reusing prior state.
 func StartBranch(repo, slot, branch string) error {
 	base := fetchAndBase(repo)
+	// Loud guard (never silently stack): a fresh start force-creates branch at base, which
+	// would discard any commits an already-existing branch of the same name carries. If
+	// branch already exists AHEAD of base, that is an inconsistent lifecycle — a prior
+	// incarnation of this task, or a contaminated slot — not a clean start, so refuse and
+	// let the caller surface it rather than silently clobber the leftover commits. A resume
+	// reuses its worktree and never calls StartBranch, so this only fires on a fresh
+	// dispatch; a branch sitting exactly at base (e.g. a just-re-created task branch with no
+	// commits yet) is fully merged and allowed through.
+	if RefExists(repo, branch) {
+		ahead, err := UnmergedCommits(repo, branch, base)
+		if err != nil {
+			return fmt.Errorf("start %s: cannot verify it sits at the base %s: %w", branch, base, err)
+		}
+		if len(ahead) > 0 {
+			return fmt.Errorf("refusing to start %s: it already exists with %d commit(s) ahead of %s; land or tear down the prior work first (a fresh start would silently discard it)", branch, len(ahead), base)
+		}
+	}
 	if _, err := git("-C", slot, "checkout", "-q", "--no-track", "-B", branch, base); err != nil {
 		return fmt.Errorf("checkout %s off %s: %w", branch, base, err)
 	}

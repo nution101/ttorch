@@ -58,6 +58,262 @@ func TestPool_ReuseAndDistinctWhenBusy(t *testing.T) {
 	}
 }
 
+// makeRepoWithOrigin builds a repo wired to a bare origin with the default branch pushed,
+// so tests exercise the fetch + origin/<default> base path the real spawn lifecycle uses.
+func makeRepoWithOrigin(t *testing.T) (repo, bare, def string) {
+	t.Helper()
+	repo = makeRepo(t)
+	def = DefaultBranch(repo)
+	bare = t.TempDir()
+	gitT(t, bare, "init", "--bare", "-q")
+	gitT(t, repo, "remote", "add", "origin", bare)
+	gitT(t, repo, "push", "-q", "origin", def)
+	return repo, bare, def
+}
+
+// TestAcquire_NeverRecyclesSlotHoldingUnlandedCommit reproduces the cross-task
+// contamination this fix exists to prevent: a pooled slot left holding task A's
+// committed-but-unmerged work must NEVER be recycled and reset for a different task B,
+// EVEN when A's task→worktree mapping is lost (so the slot is absent from inUse — passed as
+// nil here). Acquire must skip it (committed work leaves no tracked changes, so the
+// defense-in-depth unlanded-work guard is what protects it), leave A's branch and commit
+// untouched, and hand B a different slot whose fresh branch contains ONLY B's base —
+// never A's commit.
+func TestAcquire_NeverRecyclesSlotHoldingUnlandedCommit(t *testing.T) {
+	repo, bare, def := makeRepoWithOrigin(t)
+	p := Pool{Root: t.TempDir(), Max: 4}
+
+	// Task A acquires a slot and commits unlanded work on its branch.
+	slotA, err := p.Acquire(repo, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := StartBranch(repo, slotA, "ttorch/A"); err != nil {
+		t.Fatalf("StartBranch A: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(slotA, "a.txt"), []byte("A work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, slotA, "add", "-A")
+	gitT(t, slotA, "commit", "-q", "-m", "task A work")
+	aTip := gitT(t, slotA, "rev-parse", "HEAD")
+
+	// Task B acquires with A's mapping LOST (inUse=nil). It must not recycle slotA.
+	slotB, err := p.Acquire(repo, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slotB == slotA {
+		t.Fatal("Acquire must not recycle a slot still holding another task's unlanded commit")
+	}
+
+	// A's commit and branch survive — the slot was never reset out from under it.
+	if got := gitT(t, slotA, "rev-parse", "HEAD"); got != aTip {
+		t.Fatalf("A's unlanded work was clobbered: HEAD %s != %s", got, aTip)
+	}
+	if br := gitT(t, slotA, "rev-parse", "--abbrev-ref", "HEAD"); br != "ttorch/A" {
+		t.Fatalf("A's branch must be preserved, got %q", br)
+	}
+
+	// B starts clean: its fresh branch sits at the origin default tip and is NOT built on
+	// top of A's commit — the exact contamination (B's branch carrying A's commit) is gone.
+	if err := StartBranch(repo, slotB, "ttorch/B"); err != nil {
+		t.Fatalf("StartBranch B: %v", err)
+	}
+	originTip := gitT(t, bare, "rev-parse", "refs/heads/"+def)
+	bTip := gitT(t, slotB, "rev-parse", "HEAD")
+	if bTip != originTip {
+		t.Fatalf("B should start at the origin default tip %s, got %s", originTip, bTip)
+	}
+	if IsAncestor(repo, aTip, bTip) {
+		t.Fatal("B's branch must not be built on top of A's commit (cross-task contamination)")
+	}
+}
+
+// TestAcquire_SkipsDetachedSlotHoldingUnlandedCommit covers the detached-HEAD shape of the
+// same hazard: a slot carrying an unlanded commit on a DETACHED head (no task branch) must
+// also be skipped — hasUnlandedWork keys off HEAD reachability, not a branch name.
+func TestAcquire_SkipsDetachedSlotHoldingUnlandedCommit(t *testing.T) {
+	repo, _, _ := makeRepoWithOrigin(t)
+	p := Pool{Root: t.TempDir(), Max: 4}
+
+	slotA, err := p.Acquire(repo, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A fresh slot is detached at base; commit directly on the detached HEAD.
+	if br := gitT(t, slotA, "rev-parse", "--abbrev-ref", "HEAD"); br != "HEAD" {
+		t.Fatalf("a fresh slot should be detached, got %q", br)
+	}
+	if err := os.WriteFile(filepath.Join(slotA, "d.txt"), []byte("detached work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, slotA, "add", "-A")
+	gitT(t, slotA, "commit", "-q", "-m", "detached unlanded work")
+	aTip := gitT(t, slotA, "rev-parse", "HEAD")
+
+	other, err := p.Acquire(repo, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other == slotA {
+		t.Fatal("Acquire must not recycle a detached slot holding an unlanded commit")
+	}
+	if got := gitT(t, slotA, "rev-parse", "HEAD"); got != aTip {
+		t.Fatalf("the detached slot's unlanded commit was clobbered: HEAD %s != %s", got, aTip)
+	}
+}
+
+// TestStartBranch_RefusesExistingAheadBranch is the loud guard (requirement 4): starting a
+// task whose branch already exists with commits AHEAD of the base must FAIL loudly rather
+// than silently force-recreate it (which would discard those commits and mask a
+// contaminated lifecycle). The leftover commit must be left intact.
+func TestStartBranch_RefusesExistingAheadBranch(t *testing.T) {
+	repo, _, _ := makeRepoWithOrigin(t)
+	p := Pool{Root: t.TempDir(), Max: 4}
+	slot, err := p.Acquire(repo, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := StartBranch(repo, slot, "ttorch/dup"); err != nil {
+		t.Fatalf("first StartBranch: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(slot, "dup.txt"), []byte("ahead\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, slot, "add", "-A")
+	gitT(t, slot, "commit", "-q", "-m", "commit ahead of base")
+	aheadTip := gitT(t, slot, "rev-parse", "HEAD")
+
+	err = StartBranch(repo, slot, "ttorch/dup")
+	if err == nil {
+		t.Fatal("StartBranch must refuse a branch that already exists ahead of the base")
+	}
+	if !strings.Contains(err.Error(), "ahead of") {
+		t.Fatalf("refusal must name the ahead-of-base condition, got: %v", err)
+	}
+	// The refusal preserves the leftover commit — it is not silently discarded.
+	if got := gitT(t, repo, "rev-parse", "ttorch/dup"); got != aheadTip {
+		t.Fatalf("the refused branch's commit must be preserved: %s != %s", got, aheadTip)
+	}
+}
+
+// TestRelease_LeavesSlotCleanAndReusable is the pool-level teardown-cleanliness guarantee:
+// after Release the slot is detached at the default tip, its task branch is gone, it has no
+// tracked changes and no leftover unlanded commit, and the very next Acquire reuses it —
+// so a released slot can never feed dirty state into the next task.
+func TestRelease_LeavesSlotCleanAndReusable(t *testing.T) {
+	repo, _, _ := makeRepoWithOrigin(t)
+	p := Pool{Root: t.TempDir(), Max: 4}
+	slot, err := p.Acquire(repo, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := StartBranch(repo, slot, "ttorch/rel"); err != nil {
+		t.Fatalf("StartBranch: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(slot, "rel.txt"), []byte("work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, slot, "add", "-A")
+	gitT(t, slot, "commit", "-q", "-m", "work")
+
+	if err := p.Release(repo, slot); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if br := gitT(t, slot, "rev-parse", "--abbrev-ref", "HEAD"); br != "HEAD" {
+		t.Fatalf("released slot should be detached, got branch %q", br)
+	}
+	if RefExists(repo, "refs/heads/ttorch/rel") {
+		t.Fatal("the per-task branch must be deleted on release")
+	}
+	if tracked, _ := HasTrackedChanges(slot); tracked {
+		t.Fatal("a released slot must have no tracked changes")
+	}
+	if hasUnlandedWork(repo, slot) {
+		t.Fatal("a released slot must hold no leftover unlanded commit")
+	}
+	// The clean slot is genuinely free: the next Acquire reuses it rather than skipping it.
+	reused, err := p.Acquire(repo, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reused != slot {
+		t.Fatalf("a clean released slot must be reusable, got %q want %q", reused, slot)
+	}
+}
+
+// TestAcquire_ReusesReleasedSlotWhenLeadOnFeatureBranch guards the availability regression
+// the unlanded-work skip could otherwise introduce: Release parks a freed slot at the lead
+// repo's checkout HEAD, which is routinely a FEATURE branch ahead of the default branch (the
+// normal ttorch state mid-task). Such a slot is genuinely clean and must still be reused —
+// it must NOT be mistaken for a slot holding unlanded task work. Max=1 makes the failure
+// unambiguous: a wrongly-skipped slot would surface as a spurious "pool full" rather than a
+// silent extra slot.
+func TestAcquire_ReusesReleasedSlotWhenLeadOnFeatureBranch(t *testing.T) {
+	repo, _, _ := makeRepoWithOrigin(t)
+	// The lead's checkout sits on a feature branch carrying a commit on neither the default
+	// branch nor origin — exactly the state of a ttorch-managed repo with work in flight.
+	gitT(t, repo, "checkout", "-q", "-b", "lead/feature")
+	if err := os.WriteFile(filepath.Join(repo, "lead.txt"), []byte("lead work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, repo, "add", "-A")
+	gitT(t, repo, "commit", "-q", "-m", "lead feature commit")
+
+	p := Pool{Root: t.TempDir(), Max: 1}
+	slot, err := p.Acquire(repo, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Release parks the slot at the lead's HEAD (lead/feature tip), ahead of the default.
+	if err := p.Release(repo, slot); err != nil {
+		t.Fatal(err)
+	}
+	if hasUnlandedWork(repo, slot) {
+		t.Fatal("a cleanly released slot parked at the lead's feature-branch HEAD must not read as unlanded work")
+	}
+	reused, err := p.Acquire(repo, nil)
+	if err != nil {
+		t.Fatalf("a clean released slot must be reusable (not reported pool-full) when the lead is on a feature branch: %v", err)
+	}
+	if reused != slot {
+		t.Fatalf("the clean released slot %q must be reused, got a different slot %q (slot proliferation)", slot, reused)
+	}
+}
+
+// TestAcquire_ReusesReleasedSlotNoOriginLeadAhead is the origin-absent shape of the same
+// guarantee: with no remote and the lead's local HEAD ahead of the local default branch, a
+// released slot (parked at the lead's HEAD) must still be reused rather than skipped.
+func TestAcquire_ReusesReleasedSlotNoOriginLeadAhead(t *testing.T) {
+	repo := makeRepo(t) // no origin remote
+	gitT(t, repo, "checkout", "-q", "-b", "lead/ahead")
+	if err := os.WriteFile(filepath.Join(repo, "lead.txt"), []byte("ahead\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, repo, "add", "-A")
+	gitT(t, repo, "commit", "-q", "-m", "lead ahead commit")
+
+	p := Pool{Root: t.TempDir(), Max: 1}
+	slot, err := p.Acquire(repo, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Release(repo, slot); err != nil {
+		t.Fatal(err)
+	}
+	if hasUnlandedWork(repo, slot) {
+		t.Fatal("a cleanly released slot must not read as unlanded in a no-origin repo with the lead ahead")
+	}
+	reused, err := p.Acquire(repo, nil)
+	if err != nil {
+		t.Fatalf("a clean released slot must be reusable in a no-origin repo: %v", err)
+	}
+	if reused != slot {
+		t.Fatalf("the clean released slot %q must be reused, got %q", slot, reused)
+	}
+}
+
 func TestPool_RespectsMax(t *testing.T) {
 	repo := makeRepo(t)
 	p := Pool{Root: t.TempDir(), Max: 1}

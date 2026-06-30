@@ -126,6 +126,34 @@ func TestTeardown_ForceMergedBranchSavesNoRecoveryRef(t *testing.T) {
 	}
 }
 
+// TestTeardown_LeavesWorktreeCleanAndReusable is the lifecycle-level cleanliness guarantee:
+// after a task is torn down, the worktree it returns to the pool is clean — detached, its
+// task branch deleted, no tracked changes — so the next acquire can never inherit a prior
+// task's branch or commit. The work is landed first so the no-force teardown is allowed.
+func TestTeardown_LeavesWorktreeCleanAndReusable(t *testing.T) {
+	m, repo := deliveryHarness(t, "tdclean")
+	task, err := m.Spawn("tc1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := task.Worktree
+	tip := commitFeature(t, wt, "feature.txt", "work\n")
+	gitIn(t, repo, "merge", "--ff-only", tip) // land it so the data-loss guard passes
+
+	if _, err := m.Teardown("tc1", false); err != nil {
+		t.Fatalf("teardown of landed work: %v", err)
+	}
+	if tracked, _ := worktree.HasTrackedChanges(wt); tracked {
+		t.Fatal("a torn-down worktree must have no tracked changes")
+	}
+	if worktree.RefExists(repo, taskBranch("tc1")) {
+		t.Fatal("teardown must delete the task branch")
+	}
+	if br := gitIn(t, wt, "rev-parse", "--abbrev-ref", "HEAD"); br != "HEAD" {
+		t.Fatalf("a torn-down worktree must be detached, got branch %q", br)
+	}
+}
+
 // --- PART B: spawn launches with the manager's brief, not the generic stub ------------
 
 // TestWriteBrief_WritesBriefPath confirms WriteBrief stores the brief at the path Spawn
