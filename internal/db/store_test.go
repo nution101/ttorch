@@ -69,6 +69,45 @@ func TestTaskCRUDRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSetProjectModeByRepo: the by-repo display-cache update flips a registered
+// project's delivery_mode, and no-ops (nil error, updated=false) when no project is
+// registered for the path — the graceful shape `ttorch init` relies on.
+func TestSetProjectModeByRepo(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	proj, err := s.UpsertProject(ctx, "/repo/foo", "foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proj.DeliveryMode != "pr" {
+		t.Fatalf("seed delivery_mode = %q, want pr", proj.DeliveryMode)
+	}
+
+	updated, err := s.SetProjectModeByRepo(ctx, "/repo/foo", "trusted")
+	if err != nil {
+		t.Fatalf("SetProjectModeByRepo: %v", err)
+	}
+	if !updated {
+		t.Fatal("SetProjectModeByRepo reported no row updated for a registered repo")
+	}
+	got, ok, err := s.GetProjectByRepo(ctx, "/repo/foo")
+	if err != nil || !ok {
+		t.Fatalf("GetProjectByRepo: ok=%v err=%v", ok, err)
+	}
+	if got.DeliveryMode != "trusted" {
+		t.Fatalf("delivery_mode = %q, want trusted", got.DeliveryMode)
+	}
+
+	// An unregistered repo is a benign no-op, not an error.
+	updated, err = s.SetProjectModeByRepo(ctx, "/repo/missing", "trusted")
+	if err != nil {
+		t.Fatalf("SetProjectModeByRepo on unregistered repo errored: %v", err)
+	}
+	if updated {
+		t.Fatal("SetProjectModeByRepo reported a row updated for an unregistered repo")
+	}
+}
+
 func TestFootprintNilRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)

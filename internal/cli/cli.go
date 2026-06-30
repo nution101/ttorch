@@ -307,6 +307,15 @@ func cmdInit(args []string) error {
 	for _, n := range notes {
 		fmt.Println("  " + n)
 	}
+	// Keep the DB delivery-mode DISPLAY cache in step with the block we just wrote, so
+	// `ttorch project ls` stops showing a stale mode for an already-registered repo.
+	// Best-effort: the gate always re-reads the authoritative mode from AGENTS.md
+	// (§0.3), so a DB sync failure must never fail `init`.
+	if note, err := syncProjectModeCache(dir, *mode); err != nil {
+		fmt.Printf("  note: could not sync project delivery-mode cache: %v\n", err)
+	} else if note != "" {
+		fmt.Println("  " + note)
+	}
 	if p, err := profile.Apply(dir); err == nil {
 		stack := p.Stack
 		if stack == "" {
@@ -315,6 +324,32 @@ func cmdInit(args []string) error {
 		fmt.Printf("  wrote project profile (stack: %s) — commit AGENTS.md so workers pick it up\n", stack)
 	}
 	return nil
+}
+
+// syncProjectModeCache refreshes the DB delivery-mode DISPLAY cache for the repo at
+// dir to match the block `ttorch init` just wrote. It is best-effort and never the
+// source of truth: a dir outside any git repo, or a repo with no registered project
+// row, is a benign no-op; the gate always resolves the enforced mode from AGENTS.md
+// (§0.3), never from this cache. It returns a human-readable note only when a row was
+// actually updated.
+func syncProjectModeCache(dir, mode string) (string, error) {
+	repoRoot, err := worktree.RepoRoot(dir)
+	if err != nil {
+		return "", nil // not inside a git repo → no project row to refresh
+	}
+	m, err := mgr()
+	if err != nil {
+		return "", err
+	}
+	defer m.Close()
+	updated, err := m.Store.SetProjectModeByRepo(context.Background(), repoRoot, mode)
+	if err != nil {
+		return "", err
+	}
+	if !updated {
+		return "", nil // repo not registered as a project (run `ttorch project add`)
+	}
+	return "synced project delivery-mode cache → " + mode, nil
 }
 
 func cmdProfile(args []string) error {

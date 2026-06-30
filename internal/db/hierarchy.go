@@ -97,6 +97,26 @@ func (s *Store) SetProjectMode(ctx context.Context, id int64, mode string) error
 	return requireRows(res, fmt.Sprintf("project %d", id))
 }
 
+// SetProjectModeByRepo refreshes the cached delivery_mode for the project registered
+// at repoPath, reporting whether a row matched. Like SetProjectMode this is the
+// DISPLAY CACHE ONLY (§0.3) — gates resolve the authoritative mode from AGENTS.md.
+// Unlike SetProjectMode it does NOT require a matching row: it no-ops (updated=false,
+// nil error) when repoPath is not a registered project, so `ttorch init` can refresh
+// the cache for a registered repo without failing on an unregistered one.
+func (s *Store) SetProjectModeByRepo(ctx context.Context, repoPath, mode string) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE projects SET delivery_mode = ?, updated_at = ? WHERE repo_path = ?`,
+		mode, formatTime(s.now()), repoPath)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 const epicColumns = `id, project_id, title, description, status, owner, position, created_at, updated_at`
 
 func scanEpic(sc rowScanner) (Epic, error) {

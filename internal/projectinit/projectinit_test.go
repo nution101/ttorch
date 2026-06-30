@@ -190,3 +190,35 @@ func TestReadMode(t *testing.T) {
 		t.Fatalf("unrecognized mode: ReadMode = %q, want pr", got)
 	}
 }
+
+func TestLiveMode(t *testing.T) {
+	// A readable, initialized repo reports the same mode the gate's ReadMode resolves.
+	dir := t.TempDir()
+	if _, err := Init(dir, "trusted"); err != nil {
+		t.Fatal(err)
+	}
+	if mode, ok := LiveMode(dir); !ok || mode != "trusted" {
+		t.Fatalf("LiveMode(initialized) = (%q, %v), want (trusted, true)", mode, ok)
+	}
+
+	// A readable but uninitialized dir is genuinely live "pr" (ok=true), not a fallback.
+	if mode, ok := LiveMode(t.TempDir()); !ok || mode != "pr" {
+		t.Fatalf("LiveMode(uninitialized) = (%q, %v), want (pr, true)", mode, ok)
+	}
+
+	// A missing path reports ok=false so the caller falls back to a cached value
+	// instead of masking a vanished repo as ReadMode's "pr" default.
+	missing := filepath.Join(t.TempDir(), "gone")
+	if mode, ok := LiveMode(missing); ok || mode != "" {
+		t.Fatalf("LiveMode(missing) = (%q, %v), want (\"\", false)", mode, ok)
+	}
+
+	// A regular file is not a readable repo directory either.
+	file := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := LiveMode(file); ok {
+		t.Fatal("LiveMode(regular file) reported ok=true")
+	}
+}

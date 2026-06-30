@@ -86,6 +86,21 @@ func ReadAutoMintMaxAge(dir string) (time.Duration, bool) {
 	return 0, false
 }
 
+// LiveMode reports the delivery mode currently in force for the repo at dir — the
+// SAME value the merge/land gate resolves via ReadMode — and whether dir could be
+// read at all. ok is false when dir is missing or is not a directory; a caller (e.g.
+// `ttorch project ls`) should then fall back to a stored/cached mode rather than to
+// ReadMode's "pr" default, which would otherwise mask a vanished repo as an explicit
+// pr. This is a thin DISPLAY helper over ReadMode; it does not change how the gate
+// reads or enforces the mode.
+func LiveMode(dir string) (mode string, ok bool) {
+	fi, err := os.Stat(dir)
+	if err != nil || !fi.IsDir() {
+		return "", false
+	}
+	return ReadMode(dir), true
+}
+
 // Initialized reports whether dir already carries the ttorch-managed block in its
 // AGENTS.md, i.e. `ttorch init` has been run there.
 func Initialized(dir string) bool {

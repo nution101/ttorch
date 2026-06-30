@@ -424,15 +424,32 @@ func projectDisplayName(p db.Project) string {
 	return filepath.Base(p.RepoPath)
 }
 
+// projectDisplayMode returns the delivery mode to SHOW for p: the LIVE mode the gate
+// will enforce (projectinit.ReadMode of the repo, via LiveMode), so the listing can
+// never drift from enforcement the way the stored cache can. When the repo path is
+// missing/unreadable it falls back to the stored DB cache marked "(stored)" — both so
+// `project ls` never crashes on a deleted repo and so a stale cache is never silently
+// presented as the live mode.
+func projectDisplayMode(p db.Project) string {
+	if mode, ok := projectinit.LiveMode(p.RepoPath); ok {
+		return mode
+	}
+	stored := p.DeliveryMode
+	if stored == "" {
+		stored = "pr"
+	}
+	return stored + " (stored)"
+}
+
 func renderProjects(w io.Writer, projects []db.Project) {
 	if len(projects) == 0 {
 		fmt.Fprintln(w, "no projects yet. add one with: ttorch project add <repo>")
 		return
 	}
-	const format = "%-4s %-16s %-10s %-9s %s\n"
+	const format = "%-4s %-16s %-18s %-9s %s\n"
 	fmt.Fprintf(w, format, "ID", "NAME", "MODE", "STATUS", "REPO")
 	for _, p := range projects {
-		fmt.Fprintf(w, format, fmtID(p.ID), projectDisplayName(p), p.DeliveryMode, p.Status, p.RepoPath)
+		fmt.Fprintf(w, format, fmtID(p.ID), projectDisplayName(p), projectDisplayMode(p), p.Status, p.RepoPath)
 	}
 }
 

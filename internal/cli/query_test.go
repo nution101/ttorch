@@ -304,6 +304,81 @@ func TestCmdProjectAddPopulatesModeCache(t *testing.T) {
 	}
 }
 
+// TestCmdInitSyncsProjectModeCache: `ttorch init -mode trusted` on an already-
+// registered repo flips the DB delivery-mode DISPLAY cache to match the block it
+// writes, and `project ls` then shows trusted — the drift this change fixes.
+func TestCmdInitSyncsProjectModeCache(t *testing.T) {
+	repo := initGitRepo(t)
+	dbPath := withSeedDB(t, nil)
+
+	// Register the repo first; with no managed block yet it caches the "pr" default.
+	if _, err := captureStdout(t, func() error { return cmdProjectAdd([]string{repo}) }); err != nil {
+		t.Fatal(err)
+	}
+	store := reopen(t, dbPath)
+	pre, err := store.ListProjects(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pre) != 1 || pre[0].DeliveryMode != "pr" {
+		t.Fatalf("seed state = %+v, want one project cached as pr", pre)
+	}
+
+	// init -mode trusted writes the block AND must sync the stale cache to trusted.
+	if _, err := captureStdout(t, func() error { return cmdInit([]string{"-mode", "trusted", repo}) }); err != nil {
+		t.Fatal(err)
+	}
+	store = reopen(t, dbPath)
+	post, err := store.ListProjects(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(post) != 1 || post[0].DeliveryMode != "trusted" {
+		t.Fatalf("after init -mode trusted, cache = %+v, want trusted", post)
+	}
+
+	// And the listing reflects trusted (and is not marked as a stored fallback, since
+	// the repo is readable).
+	out, err := captureStdout(t, func() error { return cmdProjectLs(nil) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "trusted") || strings.Contains(out, "(stored)") {
+		t.Fatalf("project ls should show live trusted (no stored marker), got:\n%s", out)
+	}
+}
+
+// TestRenderProjectsLiveMode: the listing shows the LIVE mode the gate enforces (repo
+// AGENTS.md), overriding a stale stored cache, so display can't drift from enforcement.
+func TestRenderProjectsLiveMode(t *testing.T) {
+	repo := t.TempDir()
+	agents := "# r\n\n<!-- BEGIN ttorch-managed -->\n- delivery-mode: trusted\n<!-- END ttorch-managed -->\n"
+	if err := os.WriteFile(filepath.Join(repo, "AGENTS.md"), []byte(agents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	// Stored cache is the stale "pr"; the live block says trusted.
+	renderProjects(&b, []db.Project{{ID: 1, Name: "r", DeliveryMode: "pr", Status: "active", RepoPath: repo}})
+	out := b.String()
+	if !strings.Contains(out, "trusted") {
+		t.Fatalf("listing should show live trusted mode, got:\n%s", out)
+	}
+	if strings.Contains(out, "(stored)") {
+		t.Fatalf("a readable repo must not be marked (stored), got:\n%s", out)
+	}
+}
+
+// TestRenderProjectsUnreadableRepoFallsBack: a project whose repo path is gone does
+// not crash the listing; it falls back to the stored cache marked "(stored)".
+func TestRenderProjectsUnreadableRepoFallsBack(t *testing.T) {
+	var b strings.Builder
+	renderProjects(&b, []db.Project{{ID: 1, Name: "ghost", DeliveryMode: "trusted", Status: "active", RepoPath: "/no/such/repo/xyz-ttorch"}})
+	out := b.String()
+	if !strings.Contains(out, "trusted (stored)") {
+		t.Fatalf("unreadable repo should fall back to the stored mode marked (stored), got:\n%s", out)
+	}
+}
+
 // TestCmdTaskAddPendingBacklog: task add creates a window-less PENDING row that the
 // tasks query then includes (the backlog), and it never spawns.
 func TestCmdTaskAddPendingBacklog(t *testing.T) {
