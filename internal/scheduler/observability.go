@@ -43,9 +43,11 @@ type tickStats struct {
 	landed     int
 	gated      int
 	recovered  int
-	// deferred is the load-backpressure-deferred dispatch count. It is reserved for the sibling
-	// load-backpressure pass (task H4) and stays 0 until that pass wires it through; the durable
-	// column and the status output carry it now so the schema is complete when H4 lands.
+	// deferred is the H4 load-backpressure deferral count for the tick: how many times the
+	// governor deferred work this tick — a dispatch deferred at the max-active cap or over the
+	// load ceiling, or a land deferred at the per-tick fan-out cap. runTick folds the per-tick
+	// accumulator (Scheduler.tickDeferrals, bumped at each governor-defer site) into this field so
+	// `ttorch scheduler status` reflects real backpressure activity.
 	deferred int
 	errors   int
 	lastErr  string

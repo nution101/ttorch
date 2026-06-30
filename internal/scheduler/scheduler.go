@@ -350,6 +350,17 @@ type Scheduler struct {
 	// the human-readable heartbeat is throttled to ~heartbeatInterval regardless of the tick
 	// cadence. Zero until the first tick, so the first tick after a start/restart emits a heartbeat.
 	lastHeartbeatAt time.Time
+
+	// tickDeferrals counts the H4 governor deferrals observed during the CURRENT tick — a dispatch
+	// deferred at the max-active cap or over the load ceiling (RunOnce), or a land deferred at the
+	// per-tick fan-out cap (RunLandOnce). The deferral is detected deep inside those passes, BELOW
+	// the (int, error) return their dispatched/landed counts ride, so it cannot ride that return;
+	// instead each defer site bumps this counter and runTick folds it into the tick's deferred stat
+	// that recordTick persists (the same per-tick fold dispatched/landed/recovered/errors get). It
+	// is reset at the top of every runTick and touched only from the single-threaded tick loop, so
+	// it needs no lock. (The unconditional RunOnce/RunLandOnce primitives — e.g. `scheduler --once`
+	// — bump it too, harmlessly: nothing reads it outside runTick's per-tick fold.)
+	tickDeferrals int
 }
 
 // idleObservation is one task's idle-stability state: the last idle pane hash seen and how
@@ -491,7 +502,8 @@ func (sc *Scheduler) Run(ctx context.Context) error {
 // dispatch-disabled run still reclaims and poison-pills, it just defers the restart to a tick
 // with dispatch on.
 func (sc *Scheduler) runTick(ctx context.Context) {
-	var stats tickStats // §roadmap H5: accumulate this tick's outcome for one durable status write
+	var stats tickStats  // §roadmap H5: accumulate this tick's outcome for one durable status write
+	sc.tickDeferrals = 0 // §roadmap H4: reset the per-tick governor-deferral accumulator (folded into stats below)
 	if sc.Supervise {
 		if n, err := sc.RunSuperviseOnce(ctx); err != nil {
 			if ctx.Err() == nil {
@@ -582,6 +594,9 @@ func (sc *Scheduler) runTick(ctx context.Context) {
 	// what lets `ttorch scheduler status` and the watchdog tell a healthy idle daemon from a
 	// wedged one. A cancelled tick (any early return above) is the daemon shutting down — it
 	// deliberately leaves the last completed tick's record standing rather than writing a partial.
+	// Fold this tick's H4 governor deferrals (counted by the dispatch/land defer paths into
+	// tickDeferrals) into the durable row's deferred counter, like the other per-tick counts.
+	stats.deferred = sc.tickDeferrals
 	sc.recordTick(ctx, stats)
 }
 
@@ -650,11 +665,13 @@ func (sc *Scheduler) RunOnce(ctx context.Context) (int, error) {
 	// backpressure is never a silent stall. See governor.go.
 	if over, load := sc.loadDefersDispatch(); over {
 		sc.logf("dispatch deferred: load %.2f >= ceiling %.2f (%d ready task(s) left pending)", load, sc.LoadCeiling, len(ready))
+		sc.tickDeferrals++ // §roadmap H4→H5: count this load-ceiling deferral in the status row
 		return 0, nil
 	}
 	budget, active := sc.dispatchBudget(live)
 	if budget <= 0 {
 		sc.logf("dispatch deferred: %d active >= max-active %d (%d ready task(s) left pending)", active, sc.MaxActiveWorkers, len(ready))
+		sc.tickDeferrals++ // §roadmap H4→H5: count this max-active-cap deferral in the status row
 		return 0, nil
 	}
 
@@ -822,6 +839,7 @@ func (sc *Scheduler) RunOnce(ctx context.Context) (int, error) {
 		// remaining ready, dispatchable tasks pending so the next tick (or a worker finishing)
 		// can pick them up. Logged so the throttle is observable, never a silent stall.
 		sc.logf("dispatch deferred: reached max-active %d (%d already active + %d dispatched this tick); remaining ready task(s) left pending", sc.MaxActiveWorkers, active, dispatched)
+		sc.tickDeferrals++ // §roadmap H4→H5: count this max-active-cap deferral in the status row
 	}
 	return dispatched, nil
 }
@@ -930,6 +948,7 @@ func (sc *Scheduler) RunLandOnce(ctx context.Context) (int, error) {
 		// Backpressure was applied: we capped this tick's land fan-out and left the remaining
 		// gated tasks for a later tick. Logged so the bound is observable, never a silent stall.
 		sc.logf("land deferred: capped at %d task(s) this tick; remaining gated work left for a later tick", sc.MaxLandConcurrency)
+		sc.tickDeferrals++ // §roadmap H4→H5: count this land fan-out-cap deferral in the status row
 	}
 	if len(ids) == 0 {
 		return 0, nil

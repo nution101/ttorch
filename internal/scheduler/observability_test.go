@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/nution101/ttorch/internal/db"
+	"github.com/nution101/ttorch/internal/review"
 	"github.com/nution101/ttorch/internal/worktree"
 )
 
@@ -41,6 +42,122 @@ func TestRunTickRecordsStatus(t *testing.T) {
 	}
 	if row.Errors != 0 || row.LastError != "" {
 		t.Errorf("a clean tick must record no error, got errors=%d last_error=%q", row.Errors, row.LastError)
+	}
+}
+
+// TestRunTickCountsMaxActiveDeferral proves the H4→H5 wiring: a tick whose dispatch the governor
+// defers at the max-active cap increments the durable status row's `deferred` counter (and
+// dispatches nothing), so `ttorch scheduler status` reflects real backpressure activity.
+func TestRunTickCountsMaxActiveDeferral(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	addPending(t, s, repo, "p1", db.KindShip, []string{"pkg/a"})
+
+	tick := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
+	// Two workers already running with the cap at 2 ⇒ budget spent ⇒ the dispatch tick defers.
+	f := &fakeFleet{live: []db.Task{liveActive("w1", repo), liveActive("w2", repo)}}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}, Dispatch: true, MaxActiveWorkers: 2, now: func() time.Time { return tick }}
+
+	sc.runTick(ctx)
+
+	row, has, err := s.GetSchedulerStatus(ctx)
+	if err != nil || !has {
+		t.Fatalf("GetSchedulerStatus: has=%v err=%v", has, err)
+	}
+	if row.Deferred != 1 {
+		t.Errorf("deferred = %d, want 1 (the max-active-cap deferral counted)", row.Deferred)
+	}
+	if row.Dispatched != 0 {
+		t.Errorf("dispatched = %d, want 0 (the tick deferred)", row.Dispatched)
+	}
+}
+
+// TestRunTickCountsLoadCeilingDeferral proves the load-ceiling defer path also feeds `deferred`:
+// a tick whose 1-minute load exceeds the ceiling defers dispatch and counts it.
+func TestRunTickCountsLoadCeilingDeferral(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	addPending(t, s, repo, "p1", db.KindShip, []string{"pkg/a"})
+
+	tick := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
+	f := &fakeFleet{}
+	sc := &Scheduler{
+		Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}, Dispatch: true,
+		LoadCeiling: 2.0,
+		loadAvg:     func() (float64, bool) { return 7.0, true }, // over the ceiling
+		now:         func() time.Time { return tick },
+	}
+
+	sc.runTick(ctx)
+
+	row, has, err := s.GetSchedulerStatus(ctx)
+	if err != nil || !has {
+		t.Fatalf("GetSchedulerStatus: has=%v err=%v", has, err)
+	}
+	if row.Deferred != 1 {
+		t.Errorf("deferred = %d, want 1 (the load-ceiling deferral counted)", row.Deferred)
+	}
+	if row.Dispatched != 0 {
+		t.Errorf("dispatched = %d, want 0 (the tick deferred)", row.Dispatched)
+	}
+}
+
+// TestRunTickCountsLandDeferral proves the land fan-out cap also feeds `deferred`: a land tick that
+// caps its fan-out (more gated tasks than MaxLandConcurrency) counts one deferral.
+func TestRunTickCountsLandDeferral(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	for _, id := range []string{"d1", "d2", "d3"} {
+		addDone(t, s, repo, id, db.KindShip, review.Pass)
+	}
+
+	tick := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
+	f := &fakeFleet{}
+	// Land-only tick (Dispatch off) so the count isolates the land fan-out deferral.
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}, Land: true, MaxLandConcurrency: 2, now: func() time.Time { return tick }}
+
+	sc.runTick(ctx)
+
+	row, has, err := s.GetSchedulerStatus(ctx)
+	if err != nil || !has {
+		t.Fatalf("GetSchedulerStatus: has=%v err=%v", has, err)
+	}
+	if row.Deferred != 1 {
+		t.Errorf("deferred = %d, want 1 (the land fan-out-cap deferral counted)", row.Deferred)
+	}
+	if row.Landed != 2 {
+		t.Errorf("landed = %d, want 2 (the capped fan-out)", row.Landed)
+	}
+}
+
+// TestRunTickNoDeferralOnNormalDispatch proves the converse: a tick that dispatches normally (the
+// governor slack, no load ceiling) leaves `deferred` at 0 — backpressure activity only, never a
+// false positive on a healthy tick.
+func TestRunTickNoDeferralOnNormalDispatch(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	addPending(t, s, repo, "p1", db.KindShip, []string{"pkg/a"})
+
+	tick := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
+	f := &fakeFleet{}
+	// Governor disabled (cap 0, no load ceiling) and ample capacity ⇒ the task dispatches cleanly.
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}, Dispatch: true, now: func() time.Time { return tick }}
+
+	sc.runTick(ctx)
+
+	row, has, err := s.GetSchedulerStatus(ctx)
+	if err != nil || !has {
+		t.Fatalf("GetSchedulerStatus: has=%v err=%v", has, err)
+	}
+	if row.Dispatched != 1 {
+		t.Errorf("dispatched = %d, want 1 (the ready task)", row.Dispatched)
+	}
+	if row.Deferred != 0 {
+		t.Errorf("deferred = %d, want 0 (a normal dispatching tick defers nothing)", row.Deferred)
 	}
 }
 
