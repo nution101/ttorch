@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/nution101/ttorch/internal/db"
+	"github.com/nution101/ttorch/internal/orchestrator"
 	"github.com/nution101/ttorch/internal/worktree"
 )
 
@@ -239,7 +240,7 @@ func TestStallRecovery_Disabled(t *testing.T) {
 	sc := newStallScheduler(s, f, nil, 15*time.Second, 0, &clk) // disabled
 	mgrSends := 0
 	sc.mgrPeek = func(int) (string, bool) { return stallPane, true }
-	sc.mgrSend = func(string) error { mgrSends++; return nil }
+	sc.mgrSend = func() error { mgrSends++; return nil }
 
 	clk = clk.Add(60 * time.Second)
 	n, err := sc.RunStallRecoveryOnce(ctx)
@@ -293,6 +294,22 @@ func TestStallRecovery_SendFailureCountedNotReSent(t *testing.T) {
 
 // --- Manager window recovery: the crux — the daemon nudges the manager that cannot nudge itself ---
 
+// TestNew_WiresManagerStallSeams is the production-wiring assertion: scheduler.New must WIRE the
+// manager-window stall-recovery seams (mgrPeek/mgrSend), so the manager half of RunStallRecoveryOnce
+// is LIVE in the real daemon — not dormant. The seams' behavior (nudge a stalled manager once per
+// episode, bounded; never inject into a healthy one) is covered by the injected-seam tests below;
+// this guards that production actually installs them, so a regression that drops the wiring (and
+// silently re-dormants the manager half) fails the build.
+func TestNew_WiresManagerStallSeams(t *testing.T) {
+	s := newStore(t)
+	m := &orchestrator.Manager{Session: "ttorch", Store: s, Pool: worktree.Pool{Max: 1}}
+	sc := New(m, DefaultInterval, nil)
+	if sc.mgrPeek == nil || sc.mgrSend == nil {
+		t.Fatalf("New did not wire the manager stall-recovery seams: mgrPeek wired=%v, mgrSend wired=%v "+
+			"(the manager half would stay dormant in production)", sc.mgrPeek != nil, sc.mgrSend != nil)
+	}
+}
+
 // TestStallRecovery_Manager_NudgedWhenStalled proves the manager pane, when API-stalled past the
 // grace, is detected and nudged with "continue" through the manager seams.
 func TestStallRecovery_Manager_NudgedWhenStalled(t *testing.T) {
@@ -304,13 +321,9 @@ func TestStallRecovery_Manager_NudgedWhenStalled(t *testing.T) {
 	sc := newStallScheduler(s, f, &log, 15*time.Second, 2, &clk)
 	mgrSends := 0
 	sc.mgrPeek = func(int) (string, bool) { return stallPane, true }
-	sc.mgrSend = func(text string) error {
-		if text != stallNudgeText {
-			t.Errorf("manager nudged with %q, want %q", text, stallNudgeText)
-		}
-		mgrSends++
-		return nil
-	}
+	// mgrSend takes no argument — the manager nudge is intrinsically the fixed "continue" resume
+	// (production hardcodes the literal; the source-scan invariant enforces it). The fake just counts.
+	sc.mgrSend = func() error { mgrSends++; return nil }
 
 	// Within grace → no nudge.
 	if _, err := sc.RunStallRecoveryOnce(ctx); err != nil {
@@ -346,7 +359,7 @@ func TestStallRecovery_Manager_HealthyNeverInjected(t *testing.T) {
 		p := healthy[tick%len(healthy)]
 		return p, true
 	}
-	sc.mgrSend = func(string) error { mgrSends++; return nil }
+	sc.mgrSend = func() error { mgrSends++; return nil }
 
 	for ; tick < 6; tick++ {
 		clk = clk.Add(30 * time.Second) // well past any grace
@@ -370,7 +383,7 @@ func TestStallRecovery_Manager_Unobservable(t *testing.T) {
 	sc := newStallScheduler(s, f, nil, 15*time.Second, 2, &clk)
 	mgrSends := 0
 	sc.mgrPeek = func(int) (string, bool) { return "", false } // unobservable
-	sc.mgrSend = func(string) error { mgrSends++; return nil }
+	sc.mgrSend = func() error { mgrSends++; return nil }
 
 	if _, err := sc.RunStallRecoveryOnce(ctx); err != nil { // observe the worker stall
 		t.Fatalf("observe tick: %v", err)

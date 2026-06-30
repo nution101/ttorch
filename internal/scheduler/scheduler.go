@@ -67,6 +67,7 @@ import (
 	"github.com/nution101/ttorch/internal/orchestrator"
 	"github.com/nution101/ttorch/internal/review"
 	"github.com/nution101/ttorch/internal/state"
+	"github.com/nution101/ttorch/internal/tmux"
 	"github.com/nution101/ttorch/internal/worktree"
 )
 
@@ -253,17 +254,21 @@ type Scheduler struct {
 	MaxStallNudges  int
 
 	// mgrPeek / mgrSend reach the MANAGER tmux window for the stall-recovery pass. The manager
-	// has no task row, so Fleet.Peek/Send (keyed by task id) cannot address it; these seams would.
+	// has no task row, so Fleet.Peek/Send (keyed by task id) cannot address it; these seams do.
 	// mgrPeek captures the manager pane (ok=false ⇒ unobservable — no tmux, the window is gone,
-	// or the pane could not be read — and is NEVER nudged); mgrSend types a line into it. A send
-	// is issued ONLY when the pane is APIStalled, so a healthy manager is never injected into
-	// (silent-wake). BOTH are deliberately left nil by New() in production — see stallrecovery.go:
-	// nudging the manager means a tmux write INTO the manager window, which the increment-6
-	// security invariant forbids until it is evolved to admit this one bounded resume nudge (a
-	// lead decision). The manager half is therefore dormant in production and exercised only
-	// through injected test seams; the WORKER half (Fleet.Send to a worker window) is unaffected.
+	// or the pane could not be read — and is NEVER nudged); mgrSend types the fixed "continue"
+	// resume into it (it takes NO argument — the manager nudge is intrinsically the one resume word,
+	// so there is nothing to interpolate). A send is issued ONLY when the pane is APIStalled, so a
+	// healthy manager is never injected into (silent-wake). New() WIRES both in production
+	// (wireManagerStallNudgeSeams), so the manager half is now LIVE: the lead authorized resuming a
+	// genuinely API-stalled manager, and the increment-6 manager-injection invariant
+	// (orchestrator.TestNoInjectionIntoManagerSession) was evolved to allow-list exactly this one
+	// bounded resume nudge — a fixed "continue" literal from the sanctioned wiring, nothing else. A
+	// bare struct still leaves them nil (the manager half stays dormant for any hand-built Scheduler /
+	// test that does not wire them); the injected test seams exercise the logic directly. The WORKER
+	// half (Fleet.Send to a worker window) is unaffected.
 	mgrPeek func(lines int) (string, bool)
-	mgrSend func(text string) error
+	mgrSend func() error
 
 	// stallSeen tracks, per session key (a worker's task id, or managerStallKey for the manager),
 	// the current API-stall episode (first-observed time, nudges sent, whether the budget is
@@ -382,7 +387,7 @@ type dispatchFailure struct {
 // spawn path, reads live occupancy and overlap from it, and sizes capacity from its
 // worktree pool. log receives the dispatch/diagnostic lines (the daemon's own stdout).
 func New(m *orchestrator.Manager, interval time.Duration, log io.Writer) *Scheduler {
-	return &Scheduler{
+	sc := &Scheduler{
 		Store:    m.Store,
 		Fleet:    m,
 		Pool:     m.Pool,
@@ -399,14 +404,9 @@ func New(m *orchestrator.Manager, interval time.Duration, log io.Writer) *Schedu
 		// pre-parallel serialize-on-dispatch behavior. See the SerializeOverlap field.
 		SerializeOverlap: serializeOverlapFromEnv(),
 
-		// API-stall recovery (stallrecovery.go): the env-or-default grace/budget for the WORKER
-		// half (live — worker nudges go through Fleet.Send to a worker window). The MANAGER half's
-		// seams (mgrPeek/mgrSend) are deliberately left NIL here, so it stays dormant in
-		// production: nudging the manager means typing "continue" INTO the manager window, which
-		// the increment-6 security invariant (orchestrator.TestNoInjectionIntoManagerSession)
-		// forbids. Activating it requires that invariant to admit this one bounded resume nudge —
-		// a cross-cutting decision for the lead, not a worker's to ship through trusted auto-merge.
-		// The manager logic is complete and test-covered via injected seams; see stallrecovery.go.
+		// API-stall recovery (stallrecovery.go): the env-or-default grace/budget. The WORKER half
+		// nudges through Fleet.Send to a worker window; the MANAGER half's seams (mgrPeek/mgrSend)
+		// are wired just below. A MaxStallNudges <= 0 disables BOTH halves.
 		StallNudgeGrace: stallNudgeGraceFromEnv(),
 		MaxStallNudges:  maxStallNudgesFromEnv(),
 
@@ -416,6 +416,56 @@ func New(m *orchestrator.Manager, interval time.Duration, log io.Writer) *Schedu
 		MaxActiveWorkers:   maxActiveWorkersFromEnv(m.Pool.Max),
 		LoadCeiling:        loadCeilingFromEnv(),
 		MaxLandConcurrency: maxLandConcurrencyFromEnv(),
+	}
+	// ACTIVATE the MANAGER half of API-stall recovery in production: wire the seams that let the
+	// daemon observe the manager pane and — ONLY when it is genuinely API-stalled — nudge it
+	// "continue", exactly as it does a worker. The lead authorized resuming a stalled manager (it
+	// cannot nudge itself), and the increment-6 manager-injection invariant was evolved to
+	// allow-list precisely this one bounded resume nudge. See wireManagerStallNudgeSeams.
+	wireManagerStallNudgeSeams(sc, m.Session)
+	return sc
+}
+
+// wireManagerStallNudgeSeams installs the production manager-window stall-recovery seams on sc,
+// addressing the manager tmux window (session, managerWindow) — the SAME window
+// orchestrator.StartManager creates and internal/watch identifies.
+//
+// This is the SOLE sanctioned path that types into the manager session (the increment-6 invariant
+// orchestrator.TestNoInjectionIntoManagerSession allow-lists exactly this file + function + payload).
+// Two guards make that safe and keep a healthy manager untouched:
+//
+//   - mgrSend's payload is the fixed "continue" string LITERAL — not an argument, not the
+//     stallNudgeText identifier (which a local could shadow), not an interpolation — so no arbitrary
+//     content can ever reach the manager pane, AND the source-scan invariant can statically PROVE it
+//     (a literal is value-evident; an identifier would not be). It deliberately matches stallNudgeText
+//     by value rather than referencing it, so the security guarantee does not hinge on a name; and
+//   - recoverStall (the only caller) invokes mgrSend ONLY when livestate.APIStalled(pane) holds
+//     (turn ended at the prompt + a recoverable API-stall signature) and bounds it to MaxStallNudges
+//     per episode — so a working, streaming, or cleanly-idle manager is never injected into.
+//
+// mgrPeek mirrors the watcher's manager-pane capture: a transient probe failure (tmux unavailable,
+// the window gone, or an unreadable pane) yields ok=false — unobservable, hence NEVER nudged — so a
+// hiccup can never be mistaken for a stall.
+func wireManagerStallNudgeSeams(sc *Scheduler, session string) {
+	sc.mgrPeek = func(lines int) (string, bool) {
+		if !tmux.Available() {
+			return "", false
+		}
+		exists, err := tmux.WindowExistsErr(session, managerWindow)
+		if err != nil || !exists {
+			return "", false
+		}
+		out, err := tmux.CapturePane(session, managerWindow, lines)
+		if err != nil {
+			return "", false
+		}
+		return out, true
+	}
+	sc.mgrSend = func() error {
+		// Fixed "continue" LITERAL (== stallNudgeText by value): see the doc above — a literal, not the
+		// constant identifier, is what lets the manager-injection invariant statically prove the pane
+		// can only ever receive the one recovery word.
+		return tmux.SendLine(session, managerWindow, "continue")
 	}
 }
 

@@ -15,24 +15,26 @@
 // pane states, so a session is nudged by exactly one of them.
 //
 // Manager window: the manager has no task row, so the per-task Fleet.Peek/Send cannot reach it.
-// The daemon — a SEPARATE process from the manager's harness — would read and nudge the manager
-// pane through the mgrPeek/mgrSend seams (the tmux window named "manager" on the Manager's
-// session, the SAME window orchestrator.StartManager and the watcher identify), sending ONLY
-// when the pane is APIStalled so a healthy manager is never injected into.
+// The daemon — a SEPARATE process from the manager's harness — reads and nudges the manager pane
+// through the mgrPeek/mgrSend seams (the tmux window named "manager" on the Manager's session, the
+// SAME window orchestrator.StartManager and the watcher identify), sending ONLY when the pane is
+// APIStalled so a healthy manager is never injected into.
 //
-// IMPORTANT — manager seams are UNWIRED in production pending a lead decision. Nudging the
-// manager means a `tmux.SendLine` of "continue" INTO the manager window, which the increment-6
-// security invariant TestNoInjectionIntoManagerSession (internal/orchestrator/inc6_test.go)
-// forbids outright: after the supervisor's keystroke poke was retired, NO code may type into
-// the manager session. This task asks to resume a STALLED manager (the lead's silent-wake
-// constraint forbids writing only to a HEALTHY manager), which requires admitting a narrow,
-// bounded exception to that invariant — a cross-cutting, security-relevant change in
-// internal/orchestrator, outside this task's footprint, that should not ship through trusted
-// auto-merge on a worker's judgement alone. So New() deliberately leaves mgrPeek/mgrSend nil
-// (the manager half stays dormant in production); the logic below is complete and fully
-// exercised through injected test seams, ready to activate the moment the invariant is evolved
-// to permit this one resume nudge. The WORKER half is unaffected — worker nudges go through
-// Fleet.Send to a WORKER window, which the invariant does not (and must not) touch.
+// The manager half is now LIVE in production: scheduler.New wires the seams (wireManagerStallNudgeSeams),
+// so a stalled manager — which cannot nudge itself — auto-recovers exactly like a worker. Nudging the
+// manager means a `tmux.SendLine` of "continue" INTO the manager window, which the increment-6 security
+// invariant TestNoInjectionIntoManagerSession (internal/orchestrator/inc6_test.go) once forbade
+// outright (after the supervisor's keystroke poke was retired, NO code could type into the manager
+// session). The lead authorized resuming a genuinely-stalled manager, and that invariant was EVOLVED to
+// allow-list exactly this one path — the sanctioned file + wiring function sending the fixed "continue"
+// string LITERAL, nothing else — while it still fails the build on any other manager send (a same-named
+// function/method elsewhere, an identifier payload, or interpolated/arbitrary content). The narrow
+// exception is held tight by two guards: the payload is the fixed "continue" literal (no interpolation,
+// and statically provable as such), and recoverStall sends ONLY when APIStalled holds,
+// bounded per episode — so a working/streaming/cleanly-idle manager is never written to (silent-wake).
+// The WORKER half is unaffected — worker nudges go through Fleet.Send to a WORKER window, which the
+// invariant does not (and must not) touch. A bare Scheduler still leaves the seams nil (dormant) and is
+// exercised through injected test seams.
 //
 // Bookkeeping is in-memory, per episode (stallSeen): the manager cannot use the durable
 // event-spine claim the idle-nudge uses (ClaimIdleNudge requires a task row), so for uniformity
@@ -174,13 +176,13 @@ func (sc *Scheduler) RunStallRecoveryOnce(ctx context.Context) (int, error) {
 	}
 
 	// --- Manager window: the daemon watches and nudges the manager that cannot nudge itself ---
-	// Gated on BOTH seams being wired. In production they are deliberately nil (see the file
-	// header: nudging the manager needs the increment-6 manager-injection invariant evolved
-	// first), so this half is dormant; a test injects both to exercise it end to end.
+	// Gated on BOTH seams being wired. scheduler.New wires them in production (the manager half is
+	// LIVE — see the file header); a bare Scheduler leaves them nil so this half stays dormant for
+	// any hand-built Scheduler, and a test injects both to exercise it end to end.
 	if sc.mgrPeek != nil && sc.mgrSend != nil {
 		if pane, ok := sc.mgrPeek(stallCaptureLines); ok {
 			observed[managerStallKey] = true
-			if sc.recoverStall(managerStallKey, pane, now, func() error { return sc.mgrSend(stallNudgeText) }, "manager") {
+			if sc.recoverStall(managerStallKey, pane, now, func() error { return sc.mgrSend() }, "manager") {
 				recovered++
 			}
 		} else {
