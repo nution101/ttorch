@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -37,6 +38,19 @@ const remintTTL = 30 * time.Minute
 // is never silently stuck in the land queue. It is defined here (not in internal/db) because
 // db treats Event.Type as an opaque string and the event originates solely from this gate.
 const eventApprovalRequired = "approval_required"
+
+// ErrLandRebaseConflict marks a land that failed because rebasing the worker's branch onto the
+// CURRENT default tip hit genuine git merge conflicts — a real overlapping edit already on the
+// default — as distinct from the other land failures (a stale/uncarryable verdict, a red
+// validate on the rebased tree, a lost fast-forward race). landPrep ALWAYS aborts the rebase
+// and restores the worktree on conflict and never merges a conflicted result; this sentinel
+// only CLASSIFIES that failure so the autonomous land pass (scheduler.RunLandOnce) can surface
+// an actionable land_rebase_conflict event for the manager to resolve, rather than just
+// logging-and-retrying it like a transient failure. It never authorizes a forced merge. It is
+// deliberately NOT attached to the clean-but-content-changed re-gate (carryVerdictForward),
+// which is the separate C1 fail-closed path: a clean rebase that changed the reviewed diff
+// re-gates, it is not a "rebase conflict".
+var ErrLandRebaseConflict = errors.New("land rebase hit conflicts with the current default")
 
 // Approve grants a short-lived approval token authorizing a merge for taskID.
 // This is intended for the lead to run, not the manager.
@@ -644,10 +658,14 @@ func (m *Manager) landPrep(t db.Task, spec landSpec, fetchMu *sync.Mutex) (landP
 	rebasedHead := preRebase
 	if !worktree.IsAncestor(spec.repo, baseSha, preRebase) {
 		if err := landRebase(spec.wt, base); err != nil {
+			// Genuine rebase conflict: ALWAYS abort and report — never blind-merge a conflicted
+			// result. Tag the returned error with ErrLandRebaseConflict (via a second %w) so the
+			// autonomous land pass can recognise it and surface an actionable land_rebase_conflict
+			// event, while preserving the existing detailed, hand-resolution guidance verbatim.
 			if abErr := worktree.RebaseAbort(spec.wt); abErr != nil {
-				return zero, fmt.Errorf("land: rebasing %q onto %s hit conflicts AND the abort failed (%v); the worktree %s is left mid-rebase — run 'git -C %s rebase --abort' by hand, resolve the overlap in the worker, then re-run land: %w", spec.taskID, base, abErr, spec.wt, spec.wt, err)
+				return zero, fmt.Errorf("land: rebasing %q onto %s hit conflicts AND the abort failed (%v); the worktree %s is left mid-rebase — run 'git -C %s rebase --abort' by hand, resolve the overlap in the worker, then re-run land: %w (%w)", spec.taskID, base, abErr, spec.wt, spec.wt, err, ErrLandRebaseConflict)
 			}
-			return zero, fmt.Errorf("land: rebasing %q onto %s hit conflicts (real overlap with changes already on %s); aborted the rebase and restored the worktree — resolve the overlap in the worker, then re-run land: %w", spec.taskID, base, spec.def, err)
+			return zero, fmt.Errorf("land: rebasing %q onto %s hit conflicts (real overlap with changes already on %s); aborted the rebase and restored the worktree — resolve the overlap in the worker, then re-run land: %w (%w)", spec.taskID, base, spec.def, err, ErrLandRebaseConflict)
 		}
 		rebasedHead, err = worktree.Head(spec.wt)
 		if err != nil {

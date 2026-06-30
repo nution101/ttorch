@@ -54,6 +54,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -112,6 +113,7 @@ const (
 	envIdleNudgeGrace   = "TTORCH_IDLE_NUDGE_GRACE"
 	envMaxIdleNudges    = "TTORCH_MAX_IDLE_NUDGES"
 	envMaxClaimsPerTick = "TTORCH_MAX_CLAIMS_PER_TICK"
+	envSerializeOverlap = "TTORCH_SERIALIZE_OVERLAP"
 )
 
 // Fleet is the orchestrator surface the scheduler drives. *orchestrator.Manager satisfies
@@ -226,6 +228,22 @@ type Scheduler struct {
 	// unchanged); New() sets the production default from the env-or-default.
 	MaxClaimsPerTick int
 
+	// SerializeOverlap is the safety off-switch for parallel-overlap dispatch. By DEFAULT (false)
+	// the scheduler dispatches file/prefix footprint-overlapping tasks in PARALLEL: two workers
+	// touching the same source file in SEPARATE pool worktrees are not a hazard — git isolates
+	// them and the only real cost is a rebase when the second one lands, which the LAND pass
+	// serializes (rebase onto the current default; clean + green ⇒ land, conflict ⇒ surface, never
+	// a forced merge). The "never two workers in the same worktree" invariant does NOT come from
+	// this footprint gate at all — it is held by the per-tick capacity accounting (freeOf +
+	// free[repo]-- after each dispatch, so a single tick never oversubscribes) and the file-locked
+	// worktree pool at spawn — so relaxing the footprint-overlap gate here leaves that invariant
+	// exactly as strong as it was (this change touches neither the pool, the capacity accounting,
+	// nor the singleton daemon model). Set this true (env TTORCH_SERIALIZE_OVERLAP) to fall back to
+	// the pre-parallel behavior: skip a ready task whose footprint overlaps any in-flight or
+	// already-claimed worker, leaving it pending until the holder finishes. A bare struct defaults
+	// to parallel (false); New() reads the env.
+	SerializeOverlap bool
+
 	// Backpressure governor (roadmap H4) — a machine-aware throttle layered ON TOP of the hard
 	// worktree-pool cap and the disjoint-footprint invariant; it only ever dispatches FEWER
 	// workers, never more, so it cannot weaken any correctness gate. MaxActiveWorkers caps how
@@ -290,6 +308,10 @@ func New(m *orchestrator.Manager, interval time.Duration, log io.Writer) *Schedu
 		IdleConfirmations: defaultIdleConfirmations,
 		MaxClaimsPerTick:  maxClaimsPerTickFromEnv(),
 
+		// Parallel-overlap dispatch is the default; TTORCH_SERIALIZE_OVERLAP=1 restores the
+		// pre-parallel serialize-on-dispatch behavior. See the SerializeOverlap field.
+		SerializeOverlap: serializeOverlapFromEnv(),
+
 		// Backpressure governor (H4): default-on machine-load throttle (env-overridable). The
 		// active-worker cap is sized from the worktree pool; the land cap and load ceiling take
 		// their package defaults. See governor.go.
@@ -332,6 +354,19 @@ func maxClaimsPerTickFromEnv() int {
 		}
 	}
 	return defaultMaxClaimsPerTick
+}
+
+// serializeOverlapFromEnv resolves the parallel-overlap off-switch from TTORCH_SERIALIZE_OVERLAP
+// (any truthy value strconv.ParseBool accepts — "1", "true", …). Unset, empty, or unparseable
+// ⇒ false, the default parallel-overlap dispatch. true restores the pre-parallel serialize-on-
+// dispatch behavior. See the SerializeOverlap field.
+func serializeOverlapFromEnv() bool {
+	if v := strings.TrimSpace(os.Getenv(envSerializeOverlap)); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
+		}
+	}
+	return false
 }
 
 // Run drives RunOnce on a ticker until ctx is cancelled, then returns ctx.Err(). The first
@@ -587,13 +622,28 @@ func (sc *Scheduler) RunOnce(ctx context.Context) (int, error) {
 		if freeOf(repo) <= 0 {
 			continue // no capacity in this repo right now — try the next ready task
 		}
-		if footprintConflicts(t.Footprint, occupied[repo]) {
-			continue // overlaps a live or already-claimed worker — skip, leave pending
+		// Footprint overlap with an in-flight or already-claimed worker. By DEFAULT this is not a
+		// dispatch hazard: the overlapping worker runs in its OWN pool worktree (git-isolated), so
+		// two workers editing the same file never see each other — the only real cost is a rebase
+		// when the second one lands, which the LAND pass serializes (rebase onto the current
+		// default; clean + green ⇒ land, conflict ⇒ surface, never a forced merge). So in parallel
+		// mode (the default) we dispatch the overlapping task anyway and LOG it; the off-switch
+		// (SerializeOverlap, env TTORCH_SERIALIZE_OVERLAP) restores the pre-parallel behavior of
+		// leaving it pending until the holder finishes. The "never two workers in the same worktree"
+		// invariant does NOT come from this footprint check — it is held by the per-tick capacity
+		// accounting (freeOf above + free[repo]-- after each dispatch) and the file-locked worktree
+		// pool at spawn — so relaxing the footprint-overlap gate leaves it exactly as strong as
+		// before (this change touches neither the pool, the capacity accounting, nor the singleton
+		// daemon model).
+		overlaps := footprintConflicts(t.Footprint, occupied[repo])
+		if overlaps && sc.SerializeOverlap {
+			continue // off-switch: serialize overlapping dispatch — skip, leave pending
 		}
 		// Governor cap (H4): this task is otherwise dispatchable (footprint declared, brief
-		// stored, capacity free, disjoint), but the machine-load throttle's per-tick budget is
-		// spent. Stop dispatching this tick and leave the rest pending — dispatching FEWER than
-		// capacity allows, never more. The deferral is logged after the loop.
+		// stored, capacity free, and either disjoint or parallel-overlap-allowed), but the
+		// machine-load throttle's per-tick budget is spent. Stop dispatching this tick and leave
+		// the rest pending — dispatching FEWER than capacity allows, never more. The deferral is
+		// logged after the loop.
 		if dispatched >= budget {
 			govCapHit = true
 			break
@@ -615,7 +665,14 @@ func (sc *Scheduler) RunOnce(ctx context.Context) (int, error) {
 		// autonomously-dispatched worker starts on its FULL brief, not the stub that waits for a
 		// manager `ttorch send`. The has_brief gate above guarantees a stored brief here; the
 		// autonomous spawn refuses (rather than stub) if it is ever somehow missing.
-		if _, err := sc.Fleet.SpawnWithFootprint(claimed.ID, repo, scout, "", claimed.Footprint, false); err != nil {
+		// forceOverlap=overlaps: a genuinely-overlapping parallel dispatch passes forceOverlap=true
+		// so the spawn-side footprint gate does not re-block the very task we intend to parallelize
+		// (it still acquires a distinct worktree — forceOverlap relaxes only the footprint check,
+		// never the pool's same-worktree / in-use fail-closed guard). A disjoint dispatch keeps
+		// forceOverlap=false, preserving that gate's fail-closed footprint check as defense in
+		// depth. In serialize mode overlaps is always false here (the skip above already left
+		// overlapping tasks pending), so this is forceOverlap=false exactly as before.
+		if _, err := sc.Fleet.SpawnWithFootprint(claimed.ID, repo, scout, "", claimed.Footprint, overlaps); err != nil {
 			// Dispatch failed after the claim. Revert so the task is not a phantom (active +
 			// lease, no window): back to pending with the lease cleared. The guarded revert
 			// never clobbers a concurrent change; if it declines or errors, the lease still
@@ -632,6 +689,11 @@ func (sc *Scheduler) RunOnce(ctx context.Context) (int, error) {
 		free[repo]--
 		occupied[repo] = append(occupied[repo], claimed.Footprint)
 		dispatched++
+		if overlaps {
+			// Observability: a dispatch that the pre-parallel gate would have blocked. The overlap
+			// is safe across separate worktrees; the land pass rebase-serializes the second lander.
+			sc.logf("dispatched %s despite footprint overlap with an in-flight worker (separate worktrees; rebase serialized at land)", claimed.ID)
+		}
 		sc.logf("dispatched %s to %s (footprint: %s)", claimed.ID, repo, strings.Join(claimed.Footprint, ", "))
 		if sc.MaxClaimsPerTick > 0 && dispatched >= sc.MaxClaimsPerTick {
 			// Per-tick claim ceiling reached — leave the rest of the ready backlog pending for
@@ -765,9 +827,22 @@ func (sc *Scheduler) RunLandOnce(ctx context.Context) (int, error) {
 	landed := 0
 	for _, r := range sc.Fleet.LandSet(ctx, ids, true) {
 		if r.Err != nil {
-			// Did not land (a stale/uncarryable verdict, a rebase conflict, a refused merge, or
-			// a lost fast-forward race): leave it safely done and release the claim so a later
-			// tick can retry once the obstruction clears.
+			if errors.Is(r.Err, orchestrator.ErrLandRebaseConflict) {
+				// A genuine rebase conflict: the worker's branch no longer rebases cleanly onto the
+				// advanced default (a real overlapping edit already landed there). landPrep already
+				// ABORTED the rebase and restored the worktree — nothing was merged. Unlike the
+				// transient failures below, re-running land would just re-conflict, so SURFACE it as
+				// an actionable event for the manager to resolve (fix the overlap in the worker and
+				// re-run land, or re-dispatch) rather than silently logging-and-retrying it forever.
+				// The task stays safely done/gated and the claim is released for after the manager acts.
+				sc.logf("land of %s blocked by a rebase conflict with the current default; surfaced for the manager: %v", r.TaskID, r.Err)
+				sc.surfaceLandRebaseConflict(r.TaskID, r.Err.Error())
+				release(r.TaskID)
+				continue
+			}
+			// Did not land for another reason (a stale/uncarryable verdict, a red validate, a
+			// refused merge, or a lost fast-forward race): leave it safely done and release the
+			// claim so a later tick can retry once the obstruction clears.
 			sc.logf("land of %s did not complete: %v", r.TaskID, r.Err)
 			release(r.TaskID)
 			continue
@@ -1056,6 +1131,35 @@ func footprintConflicts(footprint []string, occupied [][]string) bool {
 		}
 	}
 	return false
+}
+
+// eventLandRebaseConflict is the actionable event the autonomous land pass surfaces when a gated
+// task cannot land because rebasing it onto the current default hit genuine conflicts
+// (orchestrator.ErrLandRebaseConflict). It is defined here (not in internal/db) for the same
+// reason orchestrator's eventApprovalRequired is: db treats Event.Type as an opaque string and
+// the event originates solely from this pass. The manager (woken by the watcher) resolves it —
+// fix the overlap in the worker and re-run land, or re-dispatch the task.
+const eventLandRebaseConflict = "land_rebase_conflict"
+
+// surfaceLandRebaseConflict appends an ACTIONABLE land_rebase_conflict event (so the watcher
+// wakes the manager) for a task whose land aborted on a rebase conflict — the "never silently
+// stuck" guarantee for a conflict the daemon cannot auto-resolve. It is deduped by event TYPE
+// (HasEventType): a land pass that keeps re-conflicting the same task appends the event exactly
+// once (and the watcher surfaces it once) until the manager acts, rather than once per tick —
+// mirroring orchestrator.surfaceApprovalRequired. It uses context.Background() (not the tick's
+// ctx) so a SIGTERM cancel mid-pass cannot strand the surfacing. Best-effort: a failed append is
+// logged, never fatal — the caller still releases the claim, so the task is never stranded.
+func (sc *Scheduler) surfaceLandRebaseConflict(taskID, detail string) {
+	ctx := context.Background()
+	if has, err := sc.Store.HasEventType(ctx, taskID, eventLandRebaseConflict); err == nil && has {
+		return
+	}
+	if _, err := sc.Store.AppendEvent(ctx, db.Event{
+		EntityType: db.EntityTypeTask, EntityID: taskID, Type: eventLandRebaseConflict,
+		Actor: db.ActorSystem, Actionable: true, Payload: detail,
+	}); err != nil {
+		sc.logf("could not surface the land_rebase_conflict event for %s: %v", taskID, err)
+	}
 }
 
 func (sc *Scheduler) logf(format string, args ...any) {

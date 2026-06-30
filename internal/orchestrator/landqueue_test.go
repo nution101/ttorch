@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -176,6 +177,12 @@ func TestLandSet_SamePackageTasksSerialize(t *testing.T) {
 			// The loser fails on its re-rebase onto the winner's change — a real overlap.
 			if !strings.Contains(r.Err.Error(), "land:") {
 				t.Fatalf("the serialized task %q should fail with a land error, got: %v", r.TaskID, r.Err)
+			}
+			// That genuine rebase conflict must carry the ErrLandRebaseConflict sentinel (so the
+			// autonomous land pass can recognise it and surface a land_rebase_conflict event for the
+			// manager), while still containing the detailed "land:" hand-resolution guidance above.
+			if !errors.Is(r.Err, ErrLandRebaseConflict) {
+				t.Fatalf("the serialized task %q's conflict must wrap ErrLandRebaseConflict, got: %v", r.TaskID, r.Err)
 			}
 		}
 	}

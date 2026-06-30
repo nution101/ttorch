@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -18,10 +19,11 @@ import (
 
 // spawnCall records one dispatch the fake fleet received.
 type spawnCall struct {
-	id        string
-	repo      string
-	scout     bool
-	footprint []string
+	id           string
+	repo         string
+	scout        bool
+	footprint    []string
+	forceOverlap bool
 }
 
 // fakeFleet is a tmux-free stand-in for *orchestrator.Manager: Snapshot returns a once-per-
@@ -95,7 +97,7 @@ func (f *fakeFleet) SpawnWithFootprint(taskID, projectPath string, scout bool, r
 	if err := f.spawnErr[taskID]; err != nil {
 		return db.Task{}, err
 	}
-	f.calls = append(f.calls, spawnCall{id: taskID, repo: projectPath, scout: scout, footprint: footprint})
+	f.calls = append(f.calls, spawnCall{id: taskID, repo: projectPath, scout: scout, footprint: footprint, forceOverlap: forceOverlap})
 	if f.record != nil {
 		f.record(taskID)
 	}
@@ -110,6 +112,20 @@ func (f *fakeFleet) dispatched() []string {
 		ids[i] = c.id
 	}
 	return ids
+}
+
+// callFor returns the recorded spawn call for a task id (and whether it was dispatched), so a
+// test can assert how it was dispatched — e.g. that an overlapping parallel dispatch passed
+// forceOverlap=true so the spawn-side footprint gate would not re-block it.
+func (f *fakeFleet) callFor(id string) (spawnCall, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.calls {
+		if c.id == id {
+			return c, true
+		}
+	}
+	return spawnCall{}, false
 }
 
 // LandSet stands in for the manager's concurrent land pipeline: it records each id it was
@@ -381,10 +397,12 @@ func TestRunOnceDispatchesDisjointReady(t *testing.T) {
 	}
 }
 
-// TestRunOnceSkipsOverlapping proves overlap is skipped (not failed): a task overlapping a
-// LIVE worker stays pending, and of two ready tasks that overlap EACH OTHER only the first
-// (created/id order) is dispatched — the just-claimed sibling, invisible to CheckOverlap,
-// is caught by the in-tick footprint tracking.
+// TestRunOnceSkipsOverlapping proves the SERIALIZE-OVERLAP off-switch (SerializeOverlap: true):
+// overlap is skipped (not failed) — a task overlapping a LIVE worker stays pending, and of two
+// ready tasks that overlap EACH OTHER only the first (created/id order) is dispatched (the
+// just-claimed sibling is caught by the in-tick footprint tracking). This is the pre-parallel
+// behavior the env off-switch restores; the default (parallel) is covered by
+// TestRunOnceParallelDispatchesOverlapping.
 func TestRunOnceSkipsOverlapping(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
@@ -400,7 +418,7 @@ func TestRunOnceSkipsOverlapping(t *testing.T) {
 	f := &fakeFleet{live: []db.Task{
 		{ID: "w1", Window: "wk-w1", Project: repo, Kind: db.KindShip, Status: db.StatusActive, Footprint: []string{"internal/cli"}},
 	}}
-	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}, SerializeOverlap: true}
 
 	if _, err := sc.RunOnce(ctx); err != nil {
 		t.Fatalf("RunOnce: %v", err)
@@ -425,10 +443,10 @@ func TestRunOnceSkipsOverlapping(t *testing.T) {
 	}
 }
 
-// TestRunOnceSkipsClaimedButNotYetLive proves the gap closure beyond the liveness-gated
-// CheckOverlap: a task overlapping an ACTIVE worker that has no tmux window yet (a claim
-// from a prior tick or a second scheduler instance, invisible to CheckOverlap) is still
-// skipped, because the scheduler also consults active-claim footprints.
+// TestRunOnceSkipsClaimedButNotYetLive proves the SERIALIZE-OVERLAP off-switch closes the gap
+// beyond the liveness-gated overlap view: a task overlapping an ACTIVE worker that has no tmux
+// window yet (a claim from a prior tick or a second scheduler instance) is still skipped in
+// serialize mode, because the occupancy set also consults active-claim footprints.
 func TestRunOnceSkipsClaimedButNotYetLive(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
@@ -440,7 +458,7 @@ func TestRunOnceSkipsClaimedButNotYetLive(t *testing.T) {
 	f := &fakeFleet{live: []db.Task{
 		{ID: "claimed", Window: "", Project: repo, Kind: db.KindShip, Status: db.StatusActive, Footprint: []string{"internal/db"}},
 	}}
-	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}, SerializeOverlap: true}
 	if _, err := sc.RunOnce(ctx); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -452,11 +470,11 @@ func TestRunOnceSkipsClaimedButNotYetLive(t *testing.T) {
 	}
 }
 
-// TestRunOnceSkipsOverlapWithLiveNonActiveWorker proves the snapshot's liveness arm reproduces
-// the old liveness-gated CheckOverlap exactly: a worker that is NOT status=active (e.g. done,
-// awaiting land) but still holds a LIVE tmux window blocks an overlapping ready task — the
-// contribution CheckOverlap made over the active-only occupied seed. The decision is identical
-// to today; only the read is now in-memory from the one snapshot.
+// TestRunOnceSkipsOverlapWithLiveNonActiveWorker proves the SERIALIZE-OVERLAP off-switch's
+// liveness arm reproduces the old liveness-gated overlap view exactly: a worker that is NOT
+// status=active (e.g. done, awaiting land) but still holds a LIVE tmux window blocks an
+// overlapping ready task — the contribution liveness made over the active-only occupied seed.
+// The decision is identical to the pre-snapshot path; only the read is now in-memory.
 func TestRunOnceSkipsOverlapWithLiveNonActiveWorker(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
@@ -469,7 +487,7 @@ func TestRunOnceSkipsOverlapWithLiveNonActiveWorker(t *testing.T) {
 	f := &fakeFleet{live: []db.Task{
 		{ID: "winding-down", Window: "wk-wd", Project: repo, Kind: db.KindShip, Status: db.StatusDone, Footprint: []string{"internal/db"}},
 	}}
-	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}, SerializeOverlap: true}
 	if _, err := sc.RunOnce(ctx); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -481,11 +499,13 @@ func TestRunOnceSkipsOverlapWithLiveNonActiveWorker(t *testing.T) {
 	}
 }
 
-// TestRunOnceDispatchesPastGoneWindowWorker is the converse of the live-non-active case: a
+// TestRunOnceDispatchesPastGoneWindowWorker is the converse of the live-non-active case, pinned
+// in SERIALIZE-OVERLAP mode (so the occupancy computation is actually exercised as a gate): a
 // non-active worker (done) whose window is GONE no longer occupies its footprint — neither the
-// old active-seed nor the old liveness-gated CheckOverlap caught it, and the snapshot must not
-// either — so a ready task on those files dispatches. This pins that the new liveness arm did
-// not start blocking on stale (window-gone) workers.
+// active-seed nor the liveness arm catches it — so even in serialize mode a ready task on those
+// files dispatches. This pins that the liveness arm did not start blocking on stale (window-gone)
+// workers. (In the default parallel mode it would dispatch regardless, so serialize mode is the
+// stronger assertion here.)
 func TestRunOnceDispatchesPastGoneWindowWorker(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
@@ -497,12 +517,128 @@ func TestRunOnceDispatchesPastGoneWindowWorker(t *testing.T) {
 	f := &fakeFleet{live: []db.Task{
 		{ID: "gone", Window: "", Project: repo, Kind: db.KindShip, Status: db.StatusDone, Footprint: []string{"internal/db"}},
 	}}
-	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}, SerializeOverlap: true}
 	if _, err := sc.RunOnce(ctx); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
 	if !contains(f.dispatched(), "newcomer") {
 		t.Error("a task overlapping only a gone-window (non-active) worker must dispatch")
+	}
+}
+
+// TestRunOnceParallelDispatchesOverlapping is the headline acceptance for parallel-overlap
+// dispatch (the DEFAULT, SerializeOverlap=false): tasks whose footprints overlap a live worker OR
+// each other are ALL dispatched in the same tick — each onto its own pool worktree, where the
+// overlap is harmless (git-isolated) and the only cost is a land-time rebase the land pass
+// serializes. It is the direct contrast to the serialize-mode TestRunOnceSkipsOverlapping, which
+// leaves the same overlapping tasks pending. It also asserts the overlapping dispatches pass
+// forceOverlap=true (so the spawn-side footprint gate would not re-block the very tasks we mean to
+// parallelize against the real manager), while the disjoint-at-dispatch first task keeps it false.
+func TestRunOnceParallelDispatchesOverlapping(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	// a is disjoint from the live worker; b overlaps a (a same-tick sibling); c overlaps the live
+	// worker w1. In serialize mode only a would dispatch; in parallel mode all three do.
+	addPending(t, s, repo, "a", db.KindShip, []string{"internal/db"})
+	addPending(t, s, repo, "b", db.KindShip, []string{"internal/db/task.go"})
+	addPending(t, s, repo, "c", db.KindShip, []string{"internal/cli/cli.go"})
+
+	f := &fakeFleet{live: []db.Task{
+		{ID: "w1", Window: "wk-w1", Project: repo, Kind: db.KindShip, Status: db.StatusActive, Footprint: []string{"internal/cli"}},
+	}}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}} // default: parallel overlap
+
+	n, err := sc.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("dispatched %d, want 3 — all overlapping tasks must dispatch in parallel mode", n)
+	}
+	for _, id := range []string{"a", "b", "c"} {
+		if !contains(f.dispatched(), id) {
+			t.Errorf("%s must dispatch in parallel mode (got %v)", id, f.dispatched())
+		}
+		if status(t, s, id) != db.StatusActive {
+			t.Errorf("%s status = %q, want active after dispatch", id, status(t, s, id))
+		}
+	}
+	// a was disjoint when it dispatched (nothing in-flight on internal/db yet) ⇒ forceOverlap=false;
+	// b overlaps the just-claimed a, and c overlaps the live w1 ⇒ forceOverlap=true.
+	assertForce := func(id string, want bool) {
+		c, ok := f.callFor(id)
+		if !ok {
+			t.Fatalf("%s was not dispatched", id)
+		}
+		if c.forceOverlap != want {
+			t.Errorf("%s dispatched with forceOverlap=%v, want %v", id, c.forceOverlap, want)
+		}
+	}
+	assertForce("a", false)
+	assertForce("b", true)
+	assertForce("c", true)
+}
+
+// TestRunOnceParallelRespectsCapacity proves parallel-overlap dispatch is still bounded by
+// worktree-pool capacity — the scheduler-layer half of the "never two workers in the same
+// worktree" invariant. Two MUTUALLY overlapping ready tasks plus a live worker already holding one
+// of two pool slots leaves exactly one free slot: overlap no longer blocks them, but capacity
+// does, so exactly one dispatches and the other stays pending (never oversubscribed onto a shared
+// or nonexistent worktree).
+func TestRunOnceParallelRespectsCapacity(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	// Two ready tasks that overlap each other AND the live worker, all on internal/db.
+	addPending(t, s, repo, "a", db.KindShip, []string{"internal/db"})
+	addPending(t, s, repo, "b", db.KindShip, []string{"internal/db/task.go"})
+
+	// One of two pool slots already held by a live worker on internal/db ⇒ exactly one free slot.
+	f := &fakeFleet{live: []db.Task{
+		{ID: "w1", Window: "wk-w1", Project: repo, Kind: db.KindShip, Status: db.StatusActive, Worktree: "/wt/0", Footprint: []string{"internal/db"}},
+	}}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 2}} // default: parallel overlap
+
+	n, err := sc.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("dispatched %d, want 1 — parallel overlap must still be bounded by free worktree capacity", n)
+	}
+	// The first in order (a) takes the single free slot; b stays pending (capacity, not overlap).
+	if !contains(f.dispatched(), "a") {
+		t.Errorf("a should have taken the single free slot, got %v", f.dispatched())
+	}
+	if status(t, s, "b") != db.StatusPending {
+		t.Errorf("b must stay pending — capacity bounds parallel overlap (got %q)", status(t, s, "b"))
+	}
+}
+
+// TestSerializeOverlapFromEnv proves the parallel-overlap off-switch reads TTORCH_SERIALIZE_OVERLAP:
+// a truthy value selects serialize-on-dispatch; unset/empty/unparseable defaults to false
+// (parallel). New() wires this resolver into Scheduler.SerializeOverlap.
+func TestSerializeOverlapFromEnv(t *testing.T) {
+	t.Setenv(envSerializeOverlap, "1")
+	if !serializeOverlapFromEnv() {
+		t.Error(`TTORCH_SERIALIZE_OVERLAP="1" must select serialize mode (true)`)
+	}
+	t.Setenv(envSerializeOverlap, "true")
+	if !serializeOverlapFromEnv() {
+		t.Error(`TTORCH_SERIALIZE_OVERLAP="true" must select serialize mode (true)`)
+	}
+	t.Setenv(envSerializeOverlap, "0")
+	if serializeOverlapFromEnv() {
+		t.Error(`TTORCH_SERIALIZE_OVERLAP="0" must be parallel (false)`)
+	}
+	t.Setenv(envSerializeOverlap, "not-a-bool")
+	if serializeOverlapFromEnv() {
+		t.Error("an unparseable value must default to parallel (false)")
+	}
+	t.Setenv(envSerializeOverlap, "")
+	if serializeOverlapFromEnv() {
+		t.Error("an unset/empty value must default to parallel (false)")
 	}
 }
 
@@ -513,7 +649,9 @@ func TestRunOnceDispatchesPastGoneWindowWorker(t *testing.T) {
 // workers ⇒ full free capacity ⇒ no overlap) and claim+dispatch a pool of tasks against that
 // phantom view — the silent fail-open this guards against. The snapshot is the single board/
 // liveness read of the tick, so its failure aborts everything rather than leaving a per-task
-// read that could fail independently.
+// read that could fail independently. It uses the DEFAULT scheduler (parallel-overlap mode), so
+// it ALSO pins that decoupling dispatch-overlap did not weaken the fail-closed read: parallel
+// mode still aborts the whole tick on an unreadable board, exactly as serialize mode does.
 func TestRunOnceAbortsOnSnapshotReadError(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
@@ -1028,6 +1166,70 @@ func TestRunLandOnceReleasesClaimOnFailure(t *testing.T) {
 	}
 	if lo := leaseOwner(t, s, "stale"); lo != "" {
 		t.Errorf("land claim must be released after a failed land, got lease %q", lo)
+	}
+}
+
+// TestRunLandOnceSurfacesRebaseConflict proves the autonomous land pass distinguishes a GENUINE
+// rebase conflict from the routine retry-later land failures: when LandSet returns an error
+// wrapping orchestrator.ErrLandRebaseConflict, the pass appends an ACTIONABLE land_rebase_conflict
+// event for the manager (deduped by type — a second tick that re-conflicts adds no new event),
+// releases the claim, and leaves the task safely done — never a forced merge, never counted as
+// landed.
+func TestRunLandOnceSurfacesRebaseConflict(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	addDone(t, s, repo, "conflicted", db.KindShip, review.Pass)
+
+	// LandSet reports a rebase conflict, wrapped exactly as merge.go's landPrep does: the detailed
+	// "land: ..." guidance plus the ErrLandRebaseConflict sentinel (a second %w).
+	landFail := fmt.Errorf("land: rebasing %q onto main hit conflicts (real overlap); aborted the rebase: %w (%w)",
+		"conflicted", errors.New("CONFLICT (content): merge conflict in internal/db/task.go"), orchestrator.ErrLandRebaseConflict)
+	f := &fakeFleet{landErr: map[string]error{"conflicted": landFail}}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}}
+
+	// Two passes: the conflict must surface, and the dedup must keep it to exactly one event.
+	for i := 0; i < 2; i++ {
+		n, err := sc.RunLandOnce(ctx)
+		if err != nil {
+			t.Fatalf("RunLandOnce[%d] must not surface a per-task land failure: %v", i, err)
+		}
+		if n != 0 {
+			t.Fatalf("RunLandOnce[%d] landed %d, want 0 — a conflicted land never lands", i, n)
+		}
+	}
+
+	// The task stays done and its land claim is released for after the manager resolves the conflict.
+	if st := status(t, s, "conflicted"); st != db.StatusDone {
+		t.Errorf("status = %q, want done after a surfaced rebase conflict", st)
+	}
+	if lo := leaseOwner(t, s, "conflicted"); lo != "" {
+		t.Errorf("land claim must be released after a conflicted land, got lease %q", lo)
+	}
+
+	// Exactly one ACTIONABLE land_rebase_conflict event for the task (deduped across both passes).
+	has, err := s.HasEventType(ctx, "conflicted", eventLandRebaseConflict)
+	if err != nil {
+		t.Fatalf("HasEventType: %v", err)
+	}
+	if !has {
+		t.Fatal("a conflicted land must surface an actionable land_rebase_conflict event")
+	}
+	evs, err := s.EventsSince(ctx, 0, true)
+	if err != nil {
+		t.Fatalf("EventsSince: %v", err)
+	}
+	count := 0
+	for _, e := range evs {
+		if e.EntityID == "conflicted" && e.Type == eventLandRebaseConflict {
+			if !e.Actionable {
+				t.Error("the land_rebase_conflict event must be actionable")
+			}
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("got %d land_rebase_conflict events, want exactly 1 (deduped by type across ticks)", count)
 	}
 }
 
