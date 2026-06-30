@@ -20,9 +20,24 @@ jobs:
         run: |
           git config --global user.email "ci@ttorch.local"
           git config --global user.name "ttorch ci"
+      # The slow internal/orchestrator integration (e2e) tests skip themselves when tmux is
+      # absent. The local trusted gate (.ttorch/validate.sh) skips them via `go test -short`
+      # for fast turnaround, so CI is the ONLY place the full suite runs — it must have tmux
+      # or the e2e would silently skip everywhere and the gate would be weakened. Install it
+      # explicitly (no-op when the runner image already ships it) and assert it is present.
+      - name: ensure tmux (required by the orchestrator integration tests)
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y tmux
+          else
+            brew list tmux >/dev/null 2>&1 || brew install tmux
+          fi
+          tmux -V
       - name: gofmt
         run: test -z "$(gofmt -l .)" || { echo 'run gofmt -w .'; gofmt -l .; exit 1; }
       - name: vet
         run: go vet ./...
+      # The FULL suite, including the slow orchestrator e2e tests the local fast lane skips.
+      # This is the authoritative gate; keep it running the whole suite (never -short).
       - name: test
-        run: go test -race ./...
+        run: make test TESTFLAGS=-race

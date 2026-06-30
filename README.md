@@ -445,11 +445,20 @@ under `~/.ttorch/state.db` and `~/.ttorch/data` is never touched.
 ## Development
 
 ```sh
-make build    # build ./bin/ttorch
-make test     # go test ./...
-make lint     # go vet + gofmt check
-make dist     # cross-compile all targets + checksums into ./dist
+make build      # build ./bin/ttorch
+make test       # full suite — go test ./... (incl. the slow orchestrator e2e tests)
+make test-fast  # fast lane — go test -short ./... (skips the slow e2e tests)
+make lint       # go vet + gofmt check
+make dist       # cross-compile all targets + checksums into ./dist
 ```
+
+The test surface is split into a **fast lane** and the **full suite**. `make test-fast`
+(`go test -short`) skips the slow `internal/orchestrator` integration (e2e) tests, which
+drive real tmux/git/rebase/validate and dominate the wall-clock (~100s); it finishes in
+seconds and is what the trusted gate runs locally (`.ttorch/validate.sh`). `make test` is
+the full suite and is what CI runs on every change. The fast lane is a turnaround
+optimization, never a replacement: the full suite (incl. the e2e tests) still runs in CI
+before anything lands, so the gate is not weakened.
 
 Contributions keep a professional, neutral tone — no themed personas or role-play
 vocabulary. See [`AGENTS.md`](AGENTS.md) for the full contributor conventions, and
@@ -457,8 +466,11 @@ vocabulary. See [`AGENTS.md`](AGENTS.md) for the full contributor conventions, a
 
 ## Releases & CI
 
-- **CI** (`.github/workflows/ci.yml`) runs `go vet`, the `gofmt` check, and `go test` on
-  macOS and Linux for every push and pull request.
+- **CI** (`.github/workflows/ci.yml`) runs `go vet`, the `gofmt` check, and the **full**
+  `make test` (incl. the slow `internal/orchestrator` e2e tests) on macOS and Linux for
+  every push and pull request. It installs tmux first so those integration tests actually
+  execute rather than self-skip — CI is the one place the full suite runs, so it is the
+  authoritative gate and should be a required check on the default branch.
 - **Releases are automated** by [release-please](https://github.com/googleapis/release-please):
   as `feat:` / `fix:` commits land on `main` it maintains a release pull request; merging
   that PR tags the version, then the workflow cross-compiles the binaries, generates

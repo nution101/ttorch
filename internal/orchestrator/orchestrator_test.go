@@ -290,6 +290,7 @@ func TestSnapshotLivenessMatchesTmux(t *testing.T) {
 // TestSpawnPeekTeardown exercises the real runtime against tmux + git. It is
 // skipped where tmux is unavailable (e.g. CI without tmux installed).
 func TestSpawnPeekTeardown(t *testing.T) {
+	skipIfShort(t)
 	if !tmux.Available() {
 		t.Skip("tmux not installed")
 	}
@@ -766,6 +767,7 @@ func TestRestoreRefreshesLeaseAnchor(t *testing.T) {
 }
 
 func TestTeardownRefusesDirtyWorktree(t *testing.T) {
+	skipIfShort(t)
 	if !tmux.Available() {
 		t.Skip("tmux not installed")
 	}
@@ -843,6 +845,7 @@ func newRepoMain(t *testing.T) string {
 }
 
 func TestDeliveryLifecycle(t *testing.T) {
+	skipIfShort(t)
 	if !tmux.Available() {
 		t.Skip("tmux not installed")
 	}
@@ -920,6 +923,7 @@ func TestDeliveryLifecycle(t *testing.T) {
 }
 
 func TestMergeLocal_ApprovalBinding(t *testing.T) {
+	skipIfShort(t)
 	if !tmux.Available() {
 		t.Skip("tmux not installed")
 	}
@@ -983,11 +987,26 @@ func TestMergeLocal_ApprovalBinding(t *testing.T) {
 	_, _ = m.Teardown("b1", true)
 }
 
+// skipIfShort skips a slow orchestrator integration ("e2e") test under `go test -short`
+// — the fast local gate lane (`make test-fast`, run by .ttorch/validate.sh). These tests
+// drive real tmux windows, git worktrees, rebases and validate runs and dominate the
+// package's wall-clock (~100s). Skipping them locally is a speed optimization, NOT a
+// weaker gate: the FULL suite — including every one of these — still runs in CI
+// (.github/workflows/ci.yml) on every push/PR, so nothing lands without the e2e having
+// passed there. Any new test that performs a real Spawn must call this.
+func skipIfShort(t *testing.T) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("slow integration (e2e) test: skipped in the fast local lane (go test -short); the full suite runs in CI")
+	}
+}
+
 // deliveryHarness spins up a Manager against a fresh main-branch repo and a unique
 // tmux session, registering teardown. It mirrors the inline setup the other
 // delivery tests use.
 func deliveryHarness(t *testing.T, tag string) (*Manager, string) {
 	t.Helper()
+	skipIfShort(t)
 	if !tmux.Available() {
 		t.Skip("tmux not installed")
 	}
@@ -2457,6 +2476,7 @@ func TestAutoInit_DoesNotTouchRealTtorchHome(t *testing.T) {
 // the checkout stays clean), commits a change, the lead approves, and merge-local MUST
 // fast-forward — the precise flow the original auto-init broke. Requires tmux + git.
 func TestSpawnAutoInit_DoesNotBlockMergeLocal(t *testing.T) {
+	skipIfShort(t)
 	if !tmux.Available() {
 		t.Skip("tmux not installed")
 	}
@@ -2544,6 +2564,7 @@ func TestStopSession(t *testing.T) {
 // reboot), then asserts restore() rebuilds the manager and worker windows from
 // saved state, and that Reset() clears the saved session.
 func TestRestoreAndReset(t *testing.T) {
+	skipIfShort(t)
 	if !tmux.Available() {
 		t.Skip("tmux not installed")
 	}

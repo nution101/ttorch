@@ -5,13 +5,20 @@ ttorch is a single Go binary that installs and orchestrates a team of Claude Cod
 ## Build & verify
 
 ```sh
-make build    # ./bin/ttorch
-make test     # go test ./...
-make lint     # go vet + gofmt check
-make dist     # cross-compiled artifacts + checksums
+make build      # ./bin/ttorch
+make test       # full suite — go test ./... (incl. the slow orchestrator e2e tests)
+make test-fast  # fast lane — go test -short ./... (skips the slow e2e tests)
+make lint       # go vet + gofmt check
+make dist       # cross-compiled artifacts + checksums
 ```
 
-Always run `make lint && make test` before committing.
+Always run `make lint && make test` (the full suite) before committing. The trusted gate
+(`.ttorch/validate.sh`) runs the **fast lane** locally — `make test-fast` (`go test
+-short`) skips the slow `internal/orchestrator` integration (e2e) tests so local
+turnaround is seconds. That is a speed optimization, not a weaker gate: the full suite
+(incl. the e2e tests) still runs in CI on every push/PR before anything lands. If you add
+a test that performs a real `Spawn`, gate it with `skipIfShort(t)` so the fast lane stays
+fast and CI keeps the coverage.
 
 ## Layout
 
