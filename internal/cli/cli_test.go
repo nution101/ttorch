@@ -391,6 +391,16 @@ func TestCmdSpawn_InvalidEffort(t *testing.T) {
 	}
 }
 
+func TestCmdSpawn_InvalidModel(t *testing.T) {
+	err := cmdSpawn([]string{"task1", t.TempDir(), "--model", "opuss"})
+	if err == nil {
+		t.Fatal("cmdSpawn with an unknown --model must return an error")
+	}
+	if !strings.Contains(err.Error(), "invalid --model") {
+		t.Fatalf("error = %q, want it to mention an invalid --model", err)
+	}
+}
+
 func TestCmdSend_EmptyMessageFailsLoudly(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "empty.txt")
 	if err := os.WriteFile(path, nil, 0o644); err != nil {

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -129,16 +130,122 @@ func managerEffortLevel() string {
 	return v
 }
 
+// ModelAliases are the short model names ttorch recognizes for --model without a full id.
+// They mirror claude's own aliases; the alias→concrete-model mapping (and its drift across
+// releases) is claude's to own, not ttorch's.
+var ModelAliases = []string{"haiku", "sonnet", "opus", "fable", "opusplan", "default"}
+
+// modelIDRe matches a full/prefixed model id (e.g. claude-opus-4-8,
+// us.anthropic.claude-3-5-..., anthropic/claude-...): a conservative id charset. It is only
+// consulted for a value that carries a separator, so a bare-word typo (e.g. "opuss") is
+// rejected while a real full id is accepted.
+var modelIDRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._:/-]*$`)
+
+// isModelAlias reports whether lower (already lowercased) is one of the known aliases.
+func isModelAlias(lower string) bool {
+	for _, a := range ModelAliases {
+		if a == lower {
+			return true
+		}
+	}
+	return false
+}
+
+// NormalizeModel canonicalizes a model value so the validated, persisted, resolved, and
+// launched forms all agree: a known alias is lowercased (claude's aliases are lowercase and
+// matched exactly), while a full/prefixed model id keeps its original case (ids can be
+// case-sensitive). This mirrors the effort dial, which lowercases end-to-end. Empty (and a
+// whitespace-only value) normalizes to "".
+func NormalizeModel(s string) string {
+	s = strings.TrimSpace(s)
+	if lower := strings.ToLower(s); isModelAlias(lower) {
+		return lower
+	}
+	return s
+}
+
+// ValidModel reports whether s names a model ttorch will pass to claude: a known alias
+// (case-insensitive) or a full/prefixed model id. A bare word that is not a known alias is
+// treated as a typo and rejected (so `--model opuss` fails loudly, like an unknown
+// --effort). The empty string is NOT valid here — it means "unset", which callers handle
+// separately. Note the "default" alias IS valid (ModelArgs maps it, like the "off"/"none"
+// sentinels, to no --model flag); only "off"/"none" are rejected here.
+func ValidModel(s string) bool {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return false
+	}
+	if isModelAlias(s) {
+		return true
+	}
+	// A bare word (no separator) that is not a known alias is a typo; only a value shaped
+	// like a full/prefixed id is accepted beyond the alias list.
+	if strings.ContainsAny(s, "-._:/") {
+		return modelIDRe.MatchString(s)
+	}
+	return false
+}
+
+// ModelArgs returns the extra `claude` arguments that pin the model for a spawned worker
+// (or the manager / `ttorch cc` session). model is the resolved choice; an empty value — or
+// the "off"/"none"/"default" sentinels — emits nothing, leaving claude's own default
+// untouched (so the model dial stays opt-in and non-breaking). Non-claude harnesses never
+// get model args. This mirrors EffortArgs; model and effort are orthogonal (which brain vs
+// how hard it thinks) and compose on the launch command.
+func ModelArgs(kind, model string) string {
+	if kind != "claude" {
+		return ""
+	}
+	m := NormalizeModel(model)
+	switch strings.ToLower(m) {
+	case "", "off", "none", "default":
+		return ""
+	}
+	return " --model " + shq(m)
+}
+
+// ResolveWorkerModel resolves the model to launch a worker with: the explicit per-task
+// choice (e.g. `spawn --model`) wins, then the global TTORCH_MODEL env, else "" (unset).
+//
+// Unlike ResolveWorkerEffort — which carries a hard kind default (ultracode) inherited from
+// before the model dial existed — an unset model resolves to "" so no --model is passed and
+// claude's own default applies. This keeps the model dial opt-in and non-breaking; the
+// dispatch-time tier policy (a cheap model per task class) lives in the scheduler's
+// classifier, which fills the model only when it is unset on the task row.
+func ResolveWorkerModel(explicit string) string {
+	if e := NormalizeModel(explicit); e != "" {
+		return e
+	}
+	return EnvWorkerModel()
+}
+
+// managerModelLevel is the manager's model, from TTORCH_MANAGER_MODEL (default "" — claude's
+// own default). It is separate from the worker default (TTORCH_MODEL) so the plan-heavy
+// manager and the workers can run on different models, mirroring the TTORCH_MANAGER_EFFORT /
+// TTORCH_EFFORT split.
+func managerModelLevel() string {
+	return NormalizeModel(os.Getenv("TTORCH_MANAGER_MODEL"))
+}
+
+// EnvWorkerEffort and EnvWorkerModel expose the raw worker env defaults (TTORCH_EFFORT /
+// TTORCH_MODEL, "" if unset) so the scheduler's dispatch-time tier classifier can slot BELOW
+// an explicit per-task value but ABOVE its own complexity guess. Keeping these here makes the
+// launch path the single source of truth for the env var names, rather than the scheduler
+// re-reading os.Getenv itself. EnvWorkerEffort lowercases to match ResolveWorkerEffort.
+func EnvWorkerEffort() string { return strings.ToLower(strings.TrimSpace(os.Getenv("TTORCH_EFFORT"))) }
+func EnvWorkerModel() string  { return NormalizeModel(os.Getenv("TTORCH_MODEL")) }
+
 // managerCharter is appended to the manager session's system prompt so the
 // session always acts as the orchestrator regardless of how the lead phrases a
 // request. It is one line (it is sent through tmux).
 const managerCharter = "You are the ttorch MANAGER for this tmux session; the person you talk to is the lead. You PLAN and DELEGATE — you do not write code, edit files, or run a project's build/test/lint commands in this window. Run the team as a continuous loop, not a one-shot checklist. A deterministic SCHEDULER runs alongside you by default (disable with TTORCH_SCHEDULER_AUTOSTART=0) and drives the mechanical loop: it dispatches ready backlog (launching each worker with the brief you stored on the task), lands already-gated work, and recovers workers that verifiably died — so you no longer hand-dispatch disjoint backlog or hand-run ttorch land each turn. Your job is the judgment it cannot do: plan and brief the work, GATE finished work (it lands only already-gated work), answer blocked/needs-input workers, surface non-trusted merges for the lead's approval (the lead approves — you never self-approve), and report. (1) The live board is your source of truth: at every check-in re-derive current state from ttorch status, ttorch peek <id>, and git/PR state plus your task list before you report, dispatch, land, or yield — never act on remembered or assumed state. When a worker looks stuck, idle, or slow, ASK it for its state or keep observing — never assert a stall you cannot verify (a repeated-looking progress counter is not evidence) and never command a worker to stop, abandon, or discard work on inference; the worker has ground truth about its own execution, you (reading pane output) do not, so phrase steers as questions or options unless you have direct evidence. (2) Lead-manager only: the lead talks only to you in this manager tab, and you own all worker interaction (steer, review, gate, relay the lead's input — the scheduler dispatches/lands/recovers on your behalf, never the lead's) and surface every decision and question here — never expect the lead to open or type into a worker tab. (3) This manager tab is for orchestration only: no substantive work, including code review, runs here — delegate it to worker tabs, and run adversarial review in an INDEPENDENT worker, never the author of the code. (4) Keep the fleet moving — by planning, not hand-dispatching: the scheduler continuously dispatches every backlog task whose files are DISJOINT from all in-flight workers, so your part is to plan tasks it can dispatch hands-off — give each a precise, file-granular footprint and a stored brief (ttorch task add <id> --touches ... --brief-file ...); serialize only on real file-overlap or dependencies, and spawn directly only for work it will not pick up. Run a PRE-YIELD checklist so reporting is a gate, not a stop. (5) Autonomy loop: the scheduler advances the mechanical work on its own, but only you gate finished work, answer a blocked worker, and surface a non-trusted merge for the lead's approval — so after each turn in which you are NOT awaiting the lead, arm ttorch watch as a background task; when it returns an actionable batch, re-derive from the DB and advance the decisions only you can make — gate finished workers so the scheduler can land them, answer or redispatch blocked ones, surface for the lead's approval any non-trusted merge that waits — then re-arm ttorch watch. When you surface a decision to the lead, FIRST cancel any in-flight watcher and do not re-arm — the window waits silently until the lead returns; the lead is an INTERRUPT, not the sole driver. Plan and store each task with ttorch task add <id> --project <p> --touches ... --brief-file ... so the scheduler dispatches it; spawn one yourself with ttorch spawn <task-id> <repo-path> (add --scout for investigation-only) only when you want it started now or the scheduler will not pick it up. Supervise by exception with ttorch peek <id> and ttorch send <id> <text> (the scheduler recovers crashed workers; you step in on blocked/needs-input/off-track); validate with ttorch validate <id>; gate with ttorch trust prep|record (adversarial review in an independent worker); and report plain outcomes (ready, blocked, or needs-your-decision). The only commands you run in this window are ttorch orchestration commands. Never merge or deliver without the lead's explicit approval. The SOLE exception is a repository the lead has explicitly set to TRUSTED delivery mode: there, a passing adversarial-review verdict (ttorch trust prep|record, per the ttorch-review skill) plus a fresh green validate auto-authorizes the merge without a separate lead approval; every other mode still requires the lead's go-ahead. The scheduler performs the land in each case, only after the gate — and, outside trusted, the lead's approval — is satisfied, never ungated. Follow the ttorch-manager and ttorch-review skills for the full protocol."
 
-// InteractiveCommand starts an interactive session (used by `ttorch cc`).
+// InteractiveCommand starts an interactive session (used by `ttorch cc`). It honors the
+// worker model default (TTORCH_MODEL) and effort default, matching a spawned worker.
 func InteractiveCommand(kind string) string {
 	switch kind {
 	case "claude":
-		return "claude --dangerously-skip-permissions" + EffortArgs(kind, "")
+		return "claude --dangerously-skip-permissions" + EffortArgs(kind, "") + ModelArgs(kind, ResolveWorkerModel(""))
 	default:
 		return kind
 	}
@@ -155,6 +262,7 @@ func ManagerCommand(kind, sessionID, charterFile string) string {
 	switch kind {
 	case "claude":
 		return "claude --dangerously-skip-permissions" + effortArgsForLevel(managerEffortLevel()) +
+			ModelArgs(kind, managerModelLevel()) +
 			managerCharterArg(charterFile) +
 			" --session-id " + shq(sessionID)
 	default:
@@ -187,6 +295,7 @@ func ManagerResumeCommand(kind, sessionID, charterFile string) string {
 	switch kind {
 	case "claude":
 		base := "claude --dangerously-skip-permissions" + effortArgsForLevel(managerEffortLevel()) +
+			ModelArgs(kind, managerModelLevel()) +
 			managerCharterArg(charterFile)
 		if sessionID == "" {
 			return base + " --continue"
@@ -200,11 +309,12 @@ func ManagerResumeCommand(kind, sessionID, charterFile string) string {
 // BriefCommand starts the harness with a task brief as its initial prompt. It is
 // launched with a stable session id so a later restore can resume this exact worker
 // conversation. effort is the resolved per-task reasoning effort (see
-// ResolveWorkerEffort); "" defers to TTORCH_EFFORT / the default.
-func BriefCommand(kind, briefPath, sessionID, effort string) string {
+// ResolveWorkerEffort); "" defers to TTORCH_EFFORT / the default. model is the resolved
+// per-task model (see ResolveWorkerModel); "" passes no --model, leaving claude's default.
+func BriefCommand(kind, briefPath, sessionID, effort, model string) string {
 	switch kind {
 	case "claude":
-		return "claude --dangerously-skip-permissions" + EffortArgs(kind, effort) +
+		return "claude --dangerously-skip-permissions" + EffortArgs(kind, effort) + ModelArgs(kind, model) +
 			" --session-id " + shq(sessionID) +
 			" \"$(cat " + quote(briefPath) + ")\""
 	default:
@@ -216,11 +326,12 @@ func BriefCommand(kind, briefPath, sessionID, effort string) string {
 // brief: it continues the exact conversation via --resume <sessionID>, or
 // --continue (most recent conversation in the worktree) when no id is known
 // (legacy state). effort is the persisted per-task reasoning effort the resumed
-// session relaunches at; "" defers to TTORCH_EFFORT / the default (legacy rows).
-func ResumeCommand(kind, sessionID, effort string) string {
+// session relaunches at; "" defers to TTORCH_EFFORT / the default (legacy rows). model is
+// the persisted per-task model; "" passes no --model (legacy rows / claude's default).
+func ResumeCommand(kind, sessionID, effort, model string) string {
 	switch kind {
 	case "claude":
-		base := "claude --dangerously-skip-permissions" + EffortArgs(kind, effort)
+		base := "claude --dangerously-skip-permissions" + EffortArgs(kind, effort) + ModelArgs(kind, model)
 		if sessionID == "" {
 			return base + " --continue"
 		}
@@ -243,13 +354,13 @@ func ManagerResumeOrFresh(kind, sessionID, charterFile string) string {
 
 // WorkerResumeOrFresh resumes a worker conversation, falling back to relaunching
 // it from its brief (same session id) if the resume fails, so a worker is never
-// left at a dead shell after a stop/reboot/upgrade. effort is the persisted per-task
-// reasoning effort both the resume and the re-brief relaunch at.
-func WorkerResumeOrFresh(kind, sessionID, briefPath, effort string) string {
+// left at a dead shell after a stop/reboot/upgrade. effort and model are the persisted
+// per-task reasoning effort and model both the resume and the re-brief relaunch at.
+func WorkerResumeOrFresh(kind, sessionID, briefPath, effort, model string) string {
 	if kind != "claude" {
-		return ResumeCommand(kind, sessionID, effort)
+		return ResumeCommand(kind, sessionID, effort, model)
 	}
-	return ResumeCommand(kind, sessionID, effort) + " || " + BriefCommand(kind, briefPath, sessionID, effort)
+	return ResumeCommand(kind, sessionID, effort, model) + " || " + BriefCommand(kind, briefPath, sessionID, effort, model)
 }
 
 // NewSessionID returns a random RFC-4122 version-4 UUID, used as a stable Claude

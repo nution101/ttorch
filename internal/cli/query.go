@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/nution101/ttorch/internal/db"
+	"github.com/nution101/ttorch/internal/harness"
 	"github.com/nution101/ttorch/internal/projectinit"
 	"github.com/nution101/ttorch/internal/worktree"
 )
@@ -691,7 +692,7 @@ func parseSetStatusArgs(kind string, args []string) (int64, string, error) {
 
 // --- ttorch task add ---------------------------------------------------------
 
-const taskAddUsage = `usage: ttorch task add <id> --project <id> [--epic <id>] [--phase <id>] [--title "…"] [--touches "a,b"] [--brief-file <path> | --brief "…"]`
+const taskAddUsage = `usage: ttorch task add <id> --project <id> [--epic <id>] [--phase <id>] [--title "…"] [--touches "a,b"] [--brief-file <path> | --brief "…"] [--effort <level>] [--model <m>]`
 
 func cmdTask(args []string) error {
 	if len(args) < 1 || args[0] != "add" {
@@ -715,11 +716,22 @@ func cmdTaskAdd(args []string) error {
 	touches := fs.String("touches", "", "comma-separated files/prefixes the task will touch")
 	briefFile := fs.String("brief-file", "", "path to a file whose contents become the worker's initial prompt (the full brief) when this task is dispatched, instead of the generic stub")
 	brief := fs.String("brief", "", "inline brief text used as the worker's initial prompt when this task is dispatched, instead of the generic stub")
+	effort := fs.String("effort", "", "reasoning effort to dispatch at: low|medium|high|xhigh|max|ultracode|off (default: the scheduler's tier classifier)")
+	model := fs.String("model", "", "model to dispatch on: haiku|sonnet|opus|fable|opusplan or a full id (default: the scheduler's tier classifier)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
 	if *project == 0 {
 		return errors.New("task add: --project <id> is required")
+	}
+	// Reject an unknown --effort/--model before any side effect, so a typo fails loudly. A
+	// value set here is persisted on the backlog row and ALWAYS wins over the scheduler's
+	// dispatch-time tier classifier (explicit-wins); leaving them unset defers to it.
+	if *effort != "" && !harness.ValidEffort(*effort) {
+		return fmt.Errorf("task add: invalid --effort %q (want one of: %s)", *effort, strings.Join(harness.EffortLevels, "|"))
+	}
+	if *model != "" && !harness.ValidModel(*model) {
+		return fmt.Errorf("task add: invalid --model %q (want an alias %s, or a full model id)", *model, strings.Join(harness.ModelAliases, "|"))
 	}
 	// Resolve the brief before any side effect so a bad --brief/--brief-file fails the add
 	// loudly. Storing it now (below, after the row is created) means the deterministic scheduler
@@ -801,6 +813,7 @@ func cmdTaskAdd(args []string) error {
 		ID: id, ProjectID: *project, EpicID: epicID, PhaseID: phaseID,
 		CreatedBy: db.ActorManager, Title: strings.TrimSpace(*title),
 		Kind: db.KindShip, Status: db.StatusPending, Footprint: parseTouches(*touches),
+		Effort: strings.ToLower(strings.TrimSpace(*effort)), Model: harness.NormalizeModel(*model),
 	}, db.ActorManager)
 	if err != nil {
 		return err

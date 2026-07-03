@@ -589,7 +589,7 @@ func (m *Manager) restore() []string {
 			notes = append(notes, fmt.Sprintf("skipped %s (%s)", t.ID, err.Error()))
 			continue
 		}
-		_ = tmux.SendLine(m.Session, t.Window, harness.WorkerResumeOrFresh(h, t.SessionID, m.P.BriefPath(t.ID), t.Effort))
+		_ = tmux.SendLine(m.Session, t.Window, harness.WorkerResumeOrFresh(h, t.SessionID, m.P.BriefPath(t.ID), t.Effort, t.Model))
 		_ = termtab.Open(m.Session, t.Window)
 		// Refresh the supervisor's sign-of-life anchor for the worker just rebuilt in place. A
 		// resume re-drives the window but, on its own, appends no event — so a window_gone

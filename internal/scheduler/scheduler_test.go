@@ -24,12 +24,14 @@ type spawnCall struct {
 	scout        bool
 	footprint    []string
 	forceOverlap bool
+	effort       string
+	model        string
 }
 
 // fakeFleet is a tmux-free stand-in for *orchestrator.Manager: Snapshot returns a once-per-
 // tick view built from the configured live set — modelling tmux-liveness as "the task has a
 // non-empty Window" (the real Manager.Snapshot reads liveness from tmux ListWindows; a
-// window-less task is never live) — and SpawnWithFootprint records the call (and optionally
+// window-less task is never live) — and SpawnAutonomous records the call (and optionally
 // forces an error / forwards to a shared sink for concurrency tests) instead of standing up a
 // worktree + tmux window.
 type fakeFleet struct {
@@ -37,7 +39,7 @@ type fakeFleet struct {
 	live          []db.Task
 	calls         []spawnCall
 	spawnErr      map[string]error // per-task forced dispatch failure
-	spawnAttempts map[string]int   // per-task count of SpawnWithFootprint calls, including failures
+	spawnAttempts map[string]int   // per-task count of SpawnAutonomous calls, including failures
 	landed        []string         // ids handed to LandSet, in call order
 	landErr       map[string]error // per-task forced land failure
 	record        func(id string)  // shared sink for the cross-instance race tests
@@ -92,7 +94,7 @@ func (f *fakeFleet) snapshotReads() int {
 	return f.snapshotCalls
 }
 
-func (f *fakeFleet) SpawnWithFootprint(taskID, projectPath string, scout bool, rawCmd string, footprint []string, forceOverlap bool) (db.Task, error) {
+func (f *fakeFleet) SpawnAutonomous(taskID, projectPath string, scout bool, rawCmd string, footprint []string, forceOverlap bool, effort, model string) (db.Task, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.spawnAttempts == nil {
@@ -102,11 +104,11 @@ func (f *fakeFleet) SpawnWithFootprint(taskID, projectPath string, scout bool, r
 	if err := f.spawnErr[taskID]; err != nil {
 		return db.Task{}, err
 	}
-	f.calls = append(f.calls, spawnCall{id: taskID, repo: projectPath, scout: scout, footprint: footprint, forceOverlap: forceOverlap})
+	f.calls = append(f.calls, spawnCall{id: taskID, repo: projectPath, scout: scout, footprint: footprint, forceOverlap: forceOverlap, effort: effort, model: model})
 	if f.record != nil {
 		f.record(taskID)
 	}
-	return db.Task{ID: taskID, Project: projectPath, Footprint: footprint, Status: db.StatusActive}, nil
+	return db.Task{ID: taskID, Project: projectPath, Footprint: footprint, Status: db.StatusActive, Effort: effort, Model: model}, nil
 }
 
 func (f *fakeFleet) dispatched() []string {
@@ -119,7 +121,7 @@ func (f *fakeFleet) dispatched() []string {
 	return ids
 }
 
-// attempts returns how many times SpawnWithFootprint was called for a task, INCLUDING failed
+// attempts returns how many times SpawnAutonomous was called for a task, INCLUDING failed
 // spawns (which never reach f.calls), so a test can assert a parked/backed-off task is not
 // re-attempted every tick.
 func (f *fakeFleet) attempts(id string) int {
@@ -415,6 +417,57 @@ func TestRunOnceDispatchesDisjointReady(t *testing.T) {
 	for _, c := range f.calls {
 		if (c.id == "c") != c.scout {
 			t.Errorf("scout flag for %s = %v, want %v", c.id, c.scout, c.id == "c")
+		}
+	}
+}
+
+// TestRunOnceForwardsTier proves the dispatch path resolves and forwards the (model, effort)
+// tier to SpawnAutonomous: the classifier fills unset dials from complexity signals, and an
+// explicit per-task value wins. It guards BOTH the effort-drop bug fix (the autonomous path
+// used to pass "" and lose the effort) and the new model selection.
+func TestRunOnceForwardsTier(t *testing.T) {
+	t.Setenv("TTORCH_MODEL", "")  // pin: no env default so the classifier is deterministic
+	t.Setenv("TTORCH_EFFORT", "") // (env precedence is covered by the tier unit tests)
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	proj, err := s.UpsertProject(ctx, repo, "")
+	if err != nil {
+		t.Fatalf("UpsertProject: %v", err)
+	}
+	mk := func(id, kind string, fp []string, model, effort string) {
+		if _, err := s.CreateTask(ctx, db.Task{
+			ID: id, ProjectID: proj.ID, Status: db.StatusPending, Kind: kind,
+			Footprint: fp, HasBrief: true, Model: model, Effort: effort,
+		}, db.ActorManager); err != nil {
+			t.Fatalf("CreateTask %s: %v", id, err)
+		}
+	}
+	mk("scout1", db.KindScout, []string{"internal/a"}, "", "")            // classifier → haiku/medium
+	mk("ship1", db.KindShip, []string{"internal/b"}, "", "")              // classifier → sonnet/high
+	mk("risk1", db.KindShip, []string{"internal/crypto/keys.go"}, "", "") // classifier → opus/ultracode
+	mk("explicit1", db.KindShip, []string{"internal/c"}, "opus", "low")   // explicit row wins
+
+	f := &fakeFleet{}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}}
+	if _, err := sc.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	want := map[string]struct{ model, effort string }{
+		"scout1":    {tierScoutModel, tierScoutEffort},
+		"ship1":     {tierShipModel, tierShipEffort},
+		"risk1":     {tierRiskModel, tierRiskEffort},
+		"explicit1": {"opus", "low"},
+	}
+	for id, w := range want {
+		c, ok := f.callFor(id)
+		if !ok {
+			t.Errorf("%s was not dispatched", id)
+			continue
+		}
+		if c.model != w.model || c.effort != w.effort {
+			t.Errorf("%s dispatched with (model=%q,effort=%q), want (%q,%q)", id, c.model, c.effort, w.model, w.effort)
 		}
 	}
 }

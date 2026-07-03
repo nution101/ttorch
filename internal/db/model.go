@@ -150,6 +150,14 @@ type Task struct {
 	// stop/update restores the same effort (see harness.ResolveWorkerEffort).
 	Effort string
 
+	// Model is the model the worker was dispatched on — a claude alias
+	// (haiku|sonnet|opus|fable|opusplan) or a full model id. "" means unset: the launch
+	// path passes no --model and claude uses its own default. It is orthogonal to Effort
+	// (model = which brain, effort = how hard it thinks). Persisted so a resume restores
+	// the same model, and read by the scheduler so an explicit per-task model always wins
+	// over the dispatch-time tier classifier (see harness.ResolveWorkerModel).
+	Model string
+
 	// HasBrief records whether a real (non-stub) brief — the worker's full initial
 	// prompt — has been stored for this task (paths.BriefPath), set by the brief-writing
 	// path (WriteBrief, driven by `ttorch task add --brief` / `spawn --brief`). The
@@ -252,6 +260,7 @@ type TaskFields struct {
 	PhaseID   *int64
 	Footprint *[]string
 	Effort    *string
+	Model     *string
 }
 
 // Delivery carries the provenance RecordDelivery writes (gate/approval/sha) plus

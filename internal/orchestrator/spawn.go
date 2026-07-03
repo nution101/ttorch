@@ -21,27 +21,36 @@ import (
 // it runs rawCmd (used for testing and escape hatches). It declares no footprint,
 // so it is exempt from overlap enforcement — the back-compat entry point.
 func (m *Manager) Spawn(taskID, projectPath string, scout bool, rawCmd string) (db.Task, error) {
-	return m.SpawnWithEffort(taskID, projectPath, scout, rawCmd, nil, false, "")
+	return m.spawnWorker(taskID, projectPath, scout, rawCmd, nil, false, "", "", false)
 }
 
 // SpawnWithFootprint is Spawn plus deterministic overlap prevention (see
-// SpawnWithEffort for the footprint semantics). It dispatches at the default/unset
-// effort. Its signature is kept stable so the scheduler daemon's interface and call
-// site need no change; the explicit-effort path is SpawnWithEffort.
-//
-// It is the AUTONOMOUS (scheduler daemon) entry point, so it dispatches with
-// autonomous=true: a daemon dispatch must never write the manager-send brief stub (no
-// `ttorch send` is coming for it), and a briefless task should already have been skipped
-// by the scheduler — see spawnWithEffort / briefForLaunch.
+// SpawnWithEffort for the footprint semantics). It dispatches at the default/unset effort
+// and model. It is a thin back-compat wrapper over SpawnAutonomous (autonomous=true) kept
+// stable for the overlap-gate tests; the scheduler daemon forwards the per-task effort and
+// model via SpawnAutonomous.
 func (m *Manager) SpawnWithFootprint(taskID, projectPath string, scout bool, rawCmd string, footprint []string, forceOverlap bool) (db.Task, error) {
-	return m.spawnWithEffort(taskID, projectPath, scout, rawCmd, footprint, forceOverlap, "", true)
+	return m.SpawnAutonomous(taskID, projectPath, scout, rawCmd, footprint, forceOverlap, "", "")
 }
 
-// SpawnWithEffort is SpawnWithFootprint plus an explicit per-task reasoning effort
-// (`ttorch spawn --effort`). effort is the requested level, or "" to use the default;
-// it is resolved through harness.ResolveWorkerEffort (explicit > TTORCH_EFFORT > kind
-// default, where a scout defaults to high) and the resolved level is BOTH used for the
-// launch command and persisted on the task row so a later resume restores it.
+// SpawnAutonomous is the AUTONOMOUS (scheduler daemon) entry point: SpawnWithFootprint plus
+// the explicit per-task reasoning effort AND model the scheduler forwards from the claimed
+// task row. Each is resolved through harness.ResolveWorkerEffort / ResolveWorkerModel
+// (explicit row value > env > default) and persisted on the row so a resume restores it.
+//
+// It dispatches with autonomous=true: a daemon dispatch must never write the manager-send
+// brief stub (no `ttorch send` is coming for it), and a briefless task should already have
+// been skipped by the scheduler — see spawnWorker / briefForLaunch.
+func (m *Manager) SpawnAutonomous(taskID, projectPath string, scout bool, rawCmd string, footprint []string, forceOverlap bool, effort, model string) (db.Task, error) {
+	return m.spawnWorker(taskID, projectPath, scout, rawCmd, footprint, forceOverlap, effort, model, true)
+}
+
+// SpawnWithEffort is SpawnWithFootprint plus an explicit per-task reasoning effort AND
+// model (`ttorch spawn --effort/--model`). effort/model are the requested values, or "" to
+// use the defaults; each is resolved through harness.ResolveWorkerEffort / ResolveWorkerModel
+// (explicit > env > default; a scout's effort defaults to high, and an unset model passes no
+// --model) and the resolved values are BOTH used for the launch command and persisted on the
+// task row so a later resume restores them.
 //
 // footprint is the repo-relative paths/prefixes the task will touch. When it is
 // non-empty and forceOverlap is false, the spawn is REFUSED if the footprint overlaps
@@ -60,17 +69,18 @@ func (m *Manager) SpawnWithFootprint(taskID, projectPath string, scout bool, raw
 // autonomous=false: a brief-less interactive spawn launches the worker on the
 // manager-send stub and waits for the manager's `ttorch send`. The autonomous daemon
 // path is SpawnWithFootprint (autonomous=true).
-func (m *Manager) SpawnWithEffort(taskID, projectPath string, scout bool, rawCmd string, footprint []string, forceOverlap bool, effort string) (db.Task, error) {
-	return m.spawnWithEffort(taskID, projectPath, scout, rawCmd, footprint, forceOverlap, effort, false)
+func (m *Manager) SpawnWithEffort(taskID, projectPath string, scout bool, rawCmd string, footprint []string, forceOverlap bool, effort, model string) (db.Task, error) {
+	return m.spawnWorker(taskID, projectPath, scout, rawCmd, footprint, forceOverlap, effort, model, false)
 }
 
-// spawnWithEffort is the shared spawn implementation behind both entry points. autonomous
+// spawnWorker is the shared spawn implementation behind every entry point. autonomous
 // distinguishes a scheduler-daemon dispatch (true) from an interactive manager/`ttorch
 // spawn` (false); it controls whether a missing brief is allowed to fall back to the
 // manager-send stub (interactive only) or is refused (autonomous — the daemon must never
-// strand a worker on a stub no `ttorch send` will satisfy). All other behavior is
-// identical across the two callers.
-func (m *Manager) spawnWithEffort(taskID, projectPath string, scout bool, rawCmd string, footprint []string, forceOverlap bool, effort string, autonomous bool) (db.Task, error) {
+// strand a worker on a stub no `ttorch send` will satisfy). effort and model are the
+// requested per-task levels ("" = default), resolved and persisted once below. All other
+// behavior is identical across callers.
+func (m *Manager) spawnWorker(taskID, projectPath string, scout bool, rawCmd string, footprint []string, forceOverlap bool, effort, model string, autonomous bool) (db.Task, error) {
 	var zero db.Task
 	if err := m.requireTmux(); err != nil {
 		return zero, err
@@ -96,6 +106,10 @@ func (m *Manager) spawnWithEffort(taskID, projectPath string, scout bool, rawCmd
 	// (scout ⇒ high, ship ⇒ ultracode). The resolved level drives the launch command AND
 	// is persisted on the task row below, so a resume restores the same effort.
 	resolvedEffort := harness.ResolveWorkerEffort(effort, scout)
+	// Resolve the model the same way (explicit --model > TTORCH_MODEL > unset). Unset ("")
+	// passes no --model, so claude keeps its own default; the resolved value drives the
+	// launch command AND is persisted on the task row below, so a resume restores it.
+	resolvedModel := harness.ResolveWorkerModel(model)
 
 	// Deterministic overlap gate: refuse a dispatch that would put this worker onto
 	// files a live worker already holds. Done before acquiring any resource so a
@@ -176,7 +190,7 @@ func (m *Manager) spawnWithEffort(taskID, projectPath string, scout bool, rawCmd
 		// Prepend TTORCH_TASK_ID/TTORCH_DB so the worker's reporting commands resolve
 		// their task + DB from the launch env (the .ttorch/task file is the durable
 		// fallback that also survives a resume). §3.1.
-		cmd = harness.WorkerLaunchPrefix(taskID, dbPath) + harness.BriefCommand(h, brief, sid, resolvedEffort)
+		cmd = harness.WorkerLaunchPrefix(taskID, dbPath) + harness.BriefCommand(h, brief, sid, resolvedEffort, resolvedModel)
 	}
 	if err := tmux.SendLine(m.Session, window, cmd); err != nil {
 		m.abortSpawn(window, repo, wt)
@@ -223,7 +237,7 @@ func (m *Manager) spawnWithEffort(taskID, projectPath string, scout bool, rawCmd
 		ID: taskID, ProjectID: proj.ID, Window: window, Worktree: wt,
 		Harness: h, Kind: kind, Created: time.Now(), SessionID: sid,
 		Footprint: footprint, Status: db.StatusActive, Owner: "worker:" + taskID,
-		Effort: resolvedEffort,
+		Effort: resolvedEffort, Model: resolvedModel,
 	}, db.ActorManager)
 	if err != nil {
 		// The worker is live by now (waitForLaunch confirmed it), so a failed save would
