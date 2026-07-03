@@ -1,5 +1,6 @@
 /bin/
 /dist/
+/dev/
 *.test
 *.out
 coverage.*

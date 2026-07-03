@@ -677,6 +677,11 @@ const (
 	// load-bearing judgment over a diff that may merge unread, so it runs high (not the worker
 	// default), matching the manager's own reviewer subagents.
 	reviewerEffort = "high"
+	// reviewerModel is the model the daemon launches each reviewer on. "" leaves claude's own
+	// default (the most capable model the user configured): the adversarial review is the trust
+	// gate that may authorize an unread merge in trusted mode, so it deliberately does NOT
+	// cheap out on the model the way the worker tier classifier does. Pin it to force a model.
+	reviewerModel = ""
 )
 
 // gateProgressFile is the daemon gate's per-task, crash-safe progress record, kept beside the
@@ -1051,7 +1056,7 @@ func (m *Manager) spawnReviewer(taskID, dim, inputsDir, head, repo, wt string) e
 	if err := m.newWindow(window, wt, "review · "+dim+" · "+taskID); err != nil {
 		return err
 	}
-	cmd := harness.BriefCommand(h, briefPath, sid, reviewerEffort)
+	cmd := harness.BriefCommand(h, briefPath, sid, reviewerEffort, reviewerModel)
 	if err := tmux.SendLine(m.Session, window, cmd); err != nil {
 		m.killPaneProcesses(window)
 		_ = tmux.KillWindow(m.Session, window)

@@ -393,12 +393,13 @@ func cmdSpawn(args []string) error {
 	// Task id and repo are the first two positionals; flags follow (the stdlib
 	// flag parser stops at the first positional, so parse the remainder).
 	if len(args) < 2 {
-		return errors.New(`usage: ttorch spawn <task-id> <repo-path> [--scout] [--init] [--touches "a,b"] [--brief-file <path> | --brief "..."] [--effort <level>] [--force-overlap] [--cmd "..."]`)
+		return errors.New(`usage: ttorch spawn <task-id> <repo-path> [--scout] [--init] [--touches "a,b"] [--brief-file <path> | --brief "..."] [--effort <level>] [--model <m>] [--force-overlap] [--cmd "..."]`)
 	}
 	id, repo := args[0], args[1]
 	fs := flag.NewFlagSet("spawn", flag.ContinueOnError)
 	scout := fs.Bool("scout", false, "investigation task: report only, no code changes")
 	effort := fs.String("effort", "", "reasoning effort: low|medium|high|xhigh|max|ultracode|off (default: $TTORCH_EFFORT, else ultracode for ship / high for scout)")
+	model := fs.String("model", "", "model: haiku|sonnet|opus|fable|opusplan or a full model id (default: $TTORCH_MODEL, else claude's own default)")
 	doInit := fs.Bool("init", false, "force first-use setup (AGENTS.md block + CLAUDE.md symlink) even when the repo tracks AGENTS.md, which auto-init declines; plain spawn auto-inits only when tracked-file-safe (TTORCH_NO_AUTOINIT=1 to skip)")
 	touches := fs.String("touches", "", `comma-separated file paths/prefixes this task will touch; refuses to dispatch onto files a live worker already holds`)
 	briefFile := fs.String("brief-file", "", "path to a file whose contents become the worker's initial prompt (the full brief), instead of the generic stub")
@@ -412,6 +413,11 @@ func cmdSpawn(args []string) error {
 	// typo fails loudly rather than silently launching the worker at the ultracode default.
 	if *effort != "" && !harness.ValidEffort(*effort) {
 		return fmt.Errorf("spawn: invalid --effort %q (want one of: %s)", *effort, strings.Join(harness.EffortLevels, "|"))
+	}
+	// Reject an unknown --model before any side effect too, so a typo fails loudly rather
+	// than launching the worker with a --model claude will reject.
+	if *model != "" && !harness.ValidModel(*model) {
+		return fmt.Errorf("spawn: invalid --model %q (want an alias %s, or a full model id)", *model, strings.Join(harness.ModelAliases, "|"))
 	}
 	// Resolve the brief before any side effect so a bad --brief/--brief-file fails the
 	// spawn loudly rather than silently launching the worker on the generic stub.
@@ -442,11 +448,15 @@ func cmdSpawn(args []string) error {
 		}
 	}
 	footprint := parseTouches(*touches)
-	t, err := m.SpawnWithEffort(id, repo, *scout, *raw, footprint, *forceOverlap, *effort)
+	t, err := m.SpawnWithEffort(id, repo, *scout, *raw, footprint, *forceOverlap, *effort, *model)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("spawned %s (%s, effort %s) in window %s\n  worktree: %s\n", t.ID, t.Kind, t.Effort, t.Window, t.Worktree)
+	modelLabel := t.Model
+	if modelLabel == "" {
+		modelLabel = "default"
+	}
+	fmt.Printf("spawned %s (%s, model %s, effort %s) in window %s\n  worktree: %s\n", t.ID, t.Kind, modelLabel, t.Effort, t.Window, t.Worktree)
 	if len(t.Footprint) > 0 {
 		note := ""
 		if *forceOverlap {
@@ -2100,6 +2110,9 @@ Team:
     --effort <level>        reasoning effort: low|medium|high|xhigh|max|ultracode|off
                             (default: $TTORCH_EFFORT, else ultracode for ship / high
                             for scout); persisted so a resume restores it
+    --model <m>             model: haiku|sonnet|opus|fable|opusplan or a full id
+                            (default: $TTORCH_MODEL, else claude's own default);
+                            persisted so a resume restores it
     --force-overlap         dispatch anyway when --touches overlaps a live worker
     --cmd "..."             run a raw command instead of the default harness
   status                  list active workers (live tmux state + DB status/stage/owner)

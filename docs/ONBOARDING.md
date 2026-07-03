@@ -283,6 +283,8 @@ fallback) opens a separate window per worker. Toggle with `TTORCH_WORKER_TABS` a
 | `TTORCH_MAX_WORKTREES` | `16` | worktree pool size per repository (the dispatch capacity) |
 | `TTORCH_EFFORT` | `ultracode` | worker + `ttorch cc` reasoning effort (`ultracode` = xhigh + workflow orchestration; or a fixed `--effort` level; or `off`) |
 | `TTORCH_MANAGER_EFFORT` | `high` | manager reasoning effort (deliberately not ultracode, so it delegates) |
+| `TTORCH_MODEL` | claude's default | worker + `ttorch cc` model — an alias (`haiku`/`sonnet`/`opus`/`fable`/`opusplan`) or a full model id; unset ⇒ no `--model`. Orthogonal to effort; the scheduler auto-tiers a backlog task's model+effort when both are unset |
+| `TTORCH_MANAGER_MODEL` | claude's default | manager model (separate from the worker default) |
 | `TTORCH_VALIDATE_TIMEOUT` | `10m` | per-check timeout for `ttorch validate` |
 | `TTORCH_NO_AUTOINIT` | unset | set to any value to disable zero-config auto-init on first use (§7) |
 | `TTORCH_WORKER_TABS` | enabled | macOS-only: native-terminal worker views + the manager-in-iTerm2 launch; set `0`/`off`/`false`/`no` to disable (workers still run as tmux windows) |

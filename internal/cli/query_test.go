@@ -532,11 +532,36 @@ func TestCmdTaskAddValidations(t *testing.T) {
 		"duplicate id":       {"exists", "--project", itoa(projID)},
 		"unknown epic":       {"y", "--project", itoa(projID), "--epic", "9999"},
 		"cross-project epic": {"z", "--project", itoa(projID), "--epic", itoa(otherEpicID)},
+		"invalid effort":     {"ie", "--project", itoa(projID), "--effort", "turbo"},
+		"invalid model":      {"im", "--project", itoa(projID), "--model", "opuss"},
 	}
 	for name, args := range cases {
 		if err := cmdTaskAdd(args); err == nil {
 			t.Fatalf("%s: cmdTaskAdd(%v) must return an error", name, args)
 		}
+	}
+}
+
+// TestCmdTaskAddPersistsEffortModel proves `task add --effort/--model` land on the pending
+// row — the backlog-tiering entry point the classifier's explicit-wins contract depends on —
+// and that a mixed-case alias is normalized like the effort dial.
+func TestCmdTaskAddPersistsEffortModel(t *testing.T) {
+	var projID int64
+	dbPath := withSeedDB(t, func(ctx context.Context, s *db.Store) {
+		p, _ := s.UpsertProject(ctx, "/r", "r")
+		projID = p.ID
+	})
+	if _, err := captureStdout(t, func() error {
+		return cmdTaskAdd([]string{"tiered", "--project", itoa(projID), "--effort", "ultracode", "--model", "Opus"})
+	}); err != nil {
+		t.Fatalf("task add --effort --model: %v", err)
+	}
+	task := mustTask(t, reopen(t, dbPath), "tiered")
+	if task.Effort != "ultracode" {
+		t.Fatalf("persisted effort = %q, want ultracode", task.Effort)
+	}
+	if task.Model != "opus" {
+		t.Fatalf("persisted model = %q, want opus (mixed-case alias normalized)", task.Model)
 	}
 }
 

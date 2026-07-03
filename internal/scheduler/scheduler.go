@@ -154,9 +154,11 @@ type Fleet interface {
 	// when the board (or tmux) cannot be read; the scheduler treats that as "cannot prove the
 	// fleet" and ABORTS the tick (fail closed), never proceeding against an empty view.
 	Snapshot() (*orchestrator.LiveSnapshot, error)
-	// SpawnWithFootprint dispatches a worker for an already-claimed task via the manager's
-	// spawn path (worktree + tmux window + harness launch).
-	SpawnWithFootprint(taskID, projectPath string, scout bool, rawCmd string, footprint []string, forceOverlap bool) (db.Task, error)
+	// SpawnAutonomous dispatches a worker for an already-claimed task via the manager's
+	// spawn path (worktree + tmux window + harness launch), forwarding the per-task
+	// reasoning effort and model resolved for this dispatch ("" = default). It replaces the
+	// older SpawnWithFootprint call, which dropped the persisted effort by passing "".
+	SpawnAutonomous(taskID, projectPath string, scout bool, rawCmd string, footprint []string, forceOverlap bool, effort, model string) (db.Task, error)
 	// LandSet lands the given already-gated tasks through the manager's concurrent land
 	// pipeline (rebase onto the current default, re-validate, carry the verdict+approval over
 	// a clean rebase, per-repo-locked fast-forward, teardown), returning one result per task
@@ -853,7 +855,14 @@ func (sc *Scheduler) RunOnce(ctx context.Context) (int, error) {
 		// forceOverlap=false, preserving that gate's fail-closed footprint check as defense in
 		// depth. In serialize mode overlaps is always false here (the skip above already left
 		// overlapping tasks pending), so this is forceOverlap=false exactly as before.
-		if _, err := sc.Fleet.SpawnWithFootprint(claimed.ID, repo, scout, "", claimed.Footprint, overlaps); err != nil {
+		// Resolve the dispatch tier: an explicit per-task model/effort on the row always
+		// wins; the classifier fills whichever is unset from the task's complexity signals
+		// (kind, footprint, title). This both fixes the long-standing gap where the
+		// autonomous path dropped the persisted effort (it passed "") and adds
+		// cheap-by-default model selection. The resolved values are persisted by the spawn,
+		// so a resume restores them and a later re-dispatch reuses them (explicit-wins).
+		model, effort := resolveDispatchTier(claimed)
+		if _, err := sc.Fleet.SpawnAutonomous(claimed.ID, repo, scout, "", claimed.Footprint, overlaps, effort, model); err != nil {
 			// Dispatch failed after the claim. Classify and handle it WITHOUT re-dispatching on the
 			// next tick: a PERMANENT failure (a condition a retry cannot change) is parked to
 			// 'blocked' and surfaced for the manager; a TRANSIENT failure is reverted to pending and

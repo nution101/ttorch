@@ -333,6 +333,21 @@ Per-task effort resolves as **explicit `--effort` > `TTORCH_EFFORT` > kind defau
 `high`, ship `ultracode`), is persisted on the task row, and is restored verbatim on resume
 — so changing the environment later doesn't change an already-spawned worker.
 
+**Model** is the orthogonal second dial — *which* model (`haiku`/`sonnet`/`opus`/`fable`/
+`opusplan` or a full id) versus *how hard* it thinks. It mirrors effort end-to-end: a per-task
+`model` column, `harness.ModelArgs`/`ResolveWorkerModel`, `TTORCH_MODEL` / `TTORCH_MANAGER_MODEL`,
+`spawn --model` / `task add --model`, persisted and restored on resume. Unset passes no
+`--model` (claude's own default), so the dial is opt-in. When the scheduler auto-dispatches a
+backlog task whose model/effort are unset (and no env override applies), a small classifier
+(`internal/scheduler/tier.go`) picks a tier from complexity signals — scout ⇒ `haiku`/`medium`,
+a security/concurrency/migration/finance footprint or title ⇒ `opus`/`ultracode`, every other
+ship ⇒ `sonnet`/`high`. Precedence is **explicit per-task > `TTORCH_*` env > classifier > kind
+default**; the pairs it emits are valid `(model, effort)` combinations (claude silently
+downgrades an unsupported effort, and fast mode is opus-only). The autonomous dispatch also now
+forwards the persisted effort, closing a gap where it fell back to the kind default. The
+adversarial-review gate keeps its reviewers on claude's default model (not cheapened), since a
+trusted-mode verdict can authorize a merge unread.
+
 Sessions resume by stable `--session-id` (`--resume`), with `--continue` and a fresh
 re-launch from the brief as fallbacks, so neither lead nor worker is ever stranded at a dead
 shell. See the README's "Resuming after a reboot or upgrade" for the user-facing behavior.

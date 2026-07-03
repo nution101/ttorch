@@ -182,12 +182,19 @@ only you can (rule 5); the scheduler dispatches, recovers, and lands in parallel
    the scheduler will not pick up (no declared footprint or no stored brief); if that task
    overlaps a live worker, add `--force-overlap` (the scheduler does this for you).
    Investigation-only tasks use
-   `--scout` (report only, never change code). **Match reasoning effort to complexity** when
-   you spawn directly with `--effort <level>` (`low|medium|high|xhigh|max|ultracode|off`):
+   `--scout` (report only, never change code). **Match reasoning effort AND model to
+   complexity.** Two orthogonal dials — effort is *how hard* a session thinks, model is
+   *which* one. Set effort with `--effort <level>` (`low|medium|high|xhigh|max|ultracode|off`):
    reserve `ultracode` for tasks that earn it — trust-gate/delivery, concurrency, security, or
    multi-file changes; use `high` or `medium` for docs, dead-code removal, and mechanical or
-   single-file edits; scouts default to `high`. The level persists on the task and is restored
-   on a stop/restart. Never edit the lead's real checkout yourself.
+   single-file edits; scouts default to `high`. Set model with `--model <m>`
+   (`haiku|sonnet|opus|fable|opusplan` or a full id): cheap models (`haiku`/`sonnet`) for
+   mechanical or investigative work, `opus` for the genuinely hard problems. Both persist on
+   the task (settable at backlog time via `ttorch task add --effort/--model`) and are restored
+   on a stop/restart. When you leave them unset, the scheduler auto-tiers a backlog task from
+   its complexity signals (scout ⇒ haiku/medium, security·concurrency·migration·finance ⇒
+   opus/ultracode, otherwise sonnet/high); an explicit value always wins. Never edit the
+   lead's real checkout yourself.
 4. **Supervise by exception.** The scheduler recovers workers that verifiably died (a crashed
    window or an expired lease) and re-dispatches them within a bounded retry ceiling — you do
    not watch for crashes. You step in only on a **judgment** signal it cannot resolve: a worker
@@ -240,7 +247,7 @@ act, then re-check.
 | --- | --- |
 | `ttorch tasks [--project p] [--epic e] [--status s[,s…]] [--tree] [--timeline <id>]` | the DB-backed task list incl. `pending` backlog — your primary source of truth |
 | `ttorch status` | live worker state (tmux) joined with each task's DB status / stage / owner |
-| `ttorch spawn <id> <repo> [--scout] [--effort <level>]` | start a worker on a task in an isolated workspace; `--effort low\|medium\|high\|xhigh\|max\|ultracode\|off` matches reasoning effort to complexity (persisted, restored on resume; scouts default to `high`) |
+| `ttorch spawn <id> <repo> [--scout] [--effort <level>] [--model <m>]` | start a worker on a task in an isolated workspace; `--effort low\|medium\|high\|xhigh\|max\|ultracode\|off` (how hard it thinks) and `--model haiku\|sonnet\|opus\|fable\|opusplan\|<id>` (which model) match capability to complexity (both persisted, restored on resume; scouts default to `high`; unset ⇒ the scheduler auto-tiers) |
 | `ttorch peek <id> [lines]` | read recent output from a worker |
 | `ttorch send <id> "<text>"` | type a message into a worker (steer / unblock) |
 | `ttorch watch [--since n]` | arm the event-driven watcher as a background task; it blocks until an actionable DB event, prints the batch, then exits to wake you (self-heals past an orphan holding the singleton) |

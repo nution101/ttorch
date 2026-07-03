@@ -386,6 +386,45 @@ TTORCH_EFFORT=max ttorch              # workers at highest raw reasoning, no nes
 TTORCH_MANAGER_EFFORT=ultracode ttorch # opt the manager back into ultracode
 ```
 
+## Session model
+
+Model is the **second dial**, orthogonal to effort: *which* model runs (Haiku → Sonnet →
+Opus, or a full model id), independent of *how hard* it thinks. ttorch passes no `--model` by
+default, so every session uses your Claude default — set the dials to spend less on cheap work
+and reserve the expensive model for the hard tasks.
+
+| Env | Applies to | Default | Effect |
+| --- | --- | --- | --- |
+| `TTORCH_MANAGER_MODEL` | the manager | claude's default | an alias (`haiku`/`sonnet`/`opus`/`fable`/`opusplan`) or a full model id |
+| `TTORCH_MODEL` | workers + `ttorch cc` | claude's default | as above; unset ⇒ no `--model` (claude's own default) |
+
+Per-task model (`ttorch spawn --model <m>` / `ttorch task add --model <m>`) resolves as
+explicit `--model` > `TTORCH_MODEL` > unset, is persisted on the task, and is restored
+verbatim on resume — exactly like effort. Model and effort compose: `--model opus --effort
+ultracode` is the top of the grid, `--model haiku --effort medium` the bottom.
+
+**Automatic tiering.** When the scheduler auto-dispatches a backlog task that carries no
+explicit model/effort *and* no `TTORCH_MODEL`/`TTORCH_EFFORT` override, it picks a tier from
+the task's complexity signals (kind, footprint, title):
+
+| Task class | Model | Effort |
+| --- | --- | --- |
+| scout / investigation | `haiku` | `medium` |
+| normal ship | `sonnet` | `high` |
+| security · concurrency · migrations · finance (matched by footprint/title) | `opus` | `ultracode` |
+
+Precedence is **explicit per-task > `TTORCH_*` env > classifier tier > kind default**, so an
+explicit `--model`/`--effort` or a global env always wins. A **manual** `ttorch spawn` without
+flags is unchanged (it uses the raw defaults — ship `ultracode`, model unset); the classifier
+applies to the high-volume autonomous dispatch path. The adversarial-review trust gate keeps
+reviewers on your most capable default (it is deliberately *not* cheapened), since in trusted
+mode it can authorize a merge unread.
+
+```sh
+TTORCH_MODEL=sonnet ttorch                 # fleet on Sonnet; escalate the hard ones with --model opus
+ttorch task add fix-auth --project 1 --touches internal/auth --model opus --effort ultracode
+```
+
 ## Worker visibility
 
 Every worker runs as a window in a shared tmux session (default name `ttorch`).
