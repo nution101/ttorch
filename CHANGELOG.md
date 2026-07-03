@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.0](https://github.com/nution101/ttorch/compare/v0.14.0...v0.15.0) (2026-07-03)
+
+
+### Features
+
+* **model:** per-task model dial with dispatch-time complexity tiering ([#36](https://github.com/nution101/ttorch/issues/36)) ([e29c5e6](https://github.com/nution101/ttorch/commit/e29c5e65349b3dc4b94dbbd39574c2f9e674bc0d))
+
 ## [0.14.0](https://github.com/nution101/ttorch/compare/v0.13.0...v0.14.0) (2026-06-30)
 
 
