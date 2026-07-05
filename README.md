@@ -392,14 +392,16 @@ TTORCH_MANAGER_EFFORT=ultracode ttorch # opt the manager into ultracode
 ## Session model
 
 Model is the **second dial**, orthogonal to effort: *which* model runs (Haiku → Sonnet →
-Opus → Fable, or a full model id), independent of *how hard* it thinks. The manager defaults
-to `sonnet` (plan-only, continuous session); worker/`cc` model is unset by default (claude's
-own default) but the complexity classifier (below) fills a cheap-by-default model per task.
-Set the dials to spend less on cheap work and reserve the expensive model for the hard tasks.
+Opus → Fable, or a full model id), independent of *how hard* it thinks. **Quality floor: code
+is never written on a cheap model.** A task that writes code runs at **opus/high at minimum**
+(equivalently fable/medium) — sonnet/haiku are never a default for code. Only **research** (a
+read-only scout) may use sonnet, and the **manager** (planning) defaults to `opus`. The
+savings come from confining sonnet to research, dropping ultracode, and escalating only on
+failure — never from writing code with a weaker model.
 
 | Env | Applies to | Default | Effect |
 | --- | --- | --- | --- |
-| `TTORCH_MANAGER_MODEL` | the manager | `sonnet` | an alias (`haiku`/`sonnet`/`opus`/`fable`/`opusplan`), a full model id, or `default`/`off` for claude's own default |
+| `TTORCH_MANAGER_MODEL` | the manager | `opus` | an alias (`haiku`/`sonnet`/`opus`/`fable`/`opusplan`), a full model id, or `default`/`off` for claude's own default |
 | `TTORCH_MODEL` | workers + `ttorch cc` | claude's default | as above; unset ⇒ no `--model` (claude's own default) |
 
 Per-task model (`ttorch spawn --model <m>` / `ttorch task add --model <m>`) resolves as
@@ -413,20 +415,21 @@ the task's complexity signals (kind, footprint, title):
 
 | Task class | Model | Effort |
 | --- | --- | --- |
-| scout / investigation | `haiku` | `medium` |
-| normal ship | `sonnet` | `high` |
+| scout / research (read-only) | `sonnet` | `medium` |
+| ship (writes code) | `opus` | `high` |
 | security · concurrency · migrations · finance (matched by footprint/title) | `opus` | `xhigh` |
 
-Precedence is **explicit per-task > `TTORCH_*` env > classifier tier > kind default**, so an
-explicit `--model`/`--effort` or a global env always wins. Both the autonomous dispatch path
-**and** a manual `ttorch spawn` route through this classifier, so hand-started work gets the
-same cheap-by-default tiering instead of falling through to claude's default model.
+Code is never assigned a model below `opus`; `sonnet` is confined to research and `haiku` is
+not used at all. Precedence is **explicit per-task > `TTORCH_*` env > classifier tier > kind
+default**, so an explicit `--model`/`--effort` or a global env always wins. Both the autonomous
+dispatch path **and** a manual `ttorch spawn` route through this classifier.
 
 **Escalation on failure.** A classifier-tiered task that fails and is retried bumps its model
 one rung up the ladder each attempt — `sonnet → opus → fable` (`fable` is the top rung, ~2×
-opus, reserved for work that could not be completed cheaper). This starts every task cheap and
-spends the priciest models only where a cheaper tier actually failed. A **pinned** `--model`
-never escalates (explicit wins). The adversarial-review trust gate keeps reviewers on your most
+opus, reserved for work that could not be completed cheaper). So a ship task starts at `opus`
+and only reaches `fable` on repeated failure, and a re-run scout that fills in or corrects its
+research climbs from `sonnet` to `opus`/`fable`. A **pinned** `--model` never escalates
+(explicit wins). The adversarial-review trust gate keeps reviewers on your most
 capable default (it is deliberately *not* cheapened), since in trusted mode it can authorize a
 merge unread.
 

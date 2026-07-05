@@ -443,8 +443,8 @@ func TestRunOnceForwardsTier(t *testing.T) {
 			t.Fatalf("CreateTask %s: %v", id, err)
 		}
 	}
-	mk("scout1", db.KindScout, []string{"internal/a"}, "", "")            // classifier → haiku/medium
-	mk("ship1", db.KindShip, []string{"internal/b"}, "", "")              // classifier → sonnet/high
+	mk("scout1", db.KindScout, []string{"internal/a"}, "", "")            // classifier → sonnet/medium
+	mk("ship1", db.KindShip, []string{"internal/b"}, "", "")              // classifier → opus/high
 	mk("risk1", db.KindShip, []string{"internal/crypto/keys.go"}, "", "") // classifier → opus/xhigh
 	mk("explicit1", db.KindShip, []string{"internal/c"}, "opus", "low")   // explicit row wins
 

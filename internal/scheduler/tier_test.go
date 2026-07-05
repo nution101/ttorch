@@ -102,12 +102,12 @@ func TestClassifyTierEscalatesOnRetry(t *testing.T) {
 		wantModel  string
 		wantEffort string
 	}{
-		{"ship retry0", db.Task{Kind: db.KindShip}, "sonnet", tierShipEffort},
-		{"ship retry1 → opus", db.Task{Kind: db.KindShip, RetryCount: 1}, "opus", tierShipEffort},
-		{"ship retry2 → fable", db.Task{Kind: db.KindShip, RetryCount: 2}, "fable", tierShipEffort},
+		{"ship retry0 → opus (code floor)", db.Task{Kind: db.KindShip}, "opus", tierShipEffort},
+		{"ship retry1 → fable", db.Task{Kind: db.KindShip, RetryCount: 1}, "fable", tierShipEffort},
+		{"ship retry2 → fable (clamped)", db.Task{Kind: db.KindShip, RetryCount: 2}, "fable", tierShipEffort},
 		{"ship retry5 → fable (clamped)", db.Task{Kind: db.KindShip, RetryCount: 5}, "fable", tierShipEffort},
 		{"risk retry1 → fable", db.Task{Kind: db.KindShip, Title: "fix payment bug", RetryCount: 1}, "fable", tierRiskEffort},
-		{"scout retry1 → sonnet", db.Task{Kind: db.KindScout, RetryCount: 1}, "sonnet", tierScoutEffort},
+		{"scout retry1 → opus (correct research)", db.Task{Kind: db.KindScout, RetryCount: 1}, "opus", tierScoutEffort},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -127,15 +127,16 @@ func TestResolveDispatchTierAutoTieredEscalates(t *testing.T) {
 	t.Setenv("TTORCH_MODEL", "")
 	t.Setenv("TTORCH_EFFORT", "")
 
-	// Auto-tiered ship, retry 1: the persisted sonnet/high is ignored; it re-derives + escalates.
+	// Auto-tiered ship, retry 1: the persisted opus/high is ignored; it re-derives + escalates
+	// one rung (opus code floor → fable).
 	if m, e, auto := resolveDispatchTier(db.Task{
-		Kind: db.KindShip, Model: "sonnet", Effort: "high", AutoTiered: true, RetryCount: 1,
-	}); m != "opus" || e != tierShipEffort || !auto {
-		t.Fatalf("auto-tiered retry1 = (%q,%q,auto=%v), want (opus,%s,true)", m, e, auto, tierShipEffort)
+		Kind: db.KindShip, Model: "opus", Effort: "high", AutoTiered: true, RetryCount: 1,
+	}); m != "fable" || e != tierShipEffort || !auto {
+		t.Fatalf("auto-tiered retry1 = (%q,%q,auto=%v), want (fable,%s,true)", m, e, auto, tierShipEffort)
 	}
-	// Auto-tiered ship, retry 2: escalates to the top rung.
+	// Auto-tiered ship, retry 2: stays at the top rung (clamped).
 	if m, _, _ := resolveDispatchTier(db.Task{
-		Kind: db.KindShip, Model: "opus", Effort: "high", AutoTiered: true, RetryCount: 2,
+		Kind: db.KindShip, Model: "fable", Effort: "high", AutoTiered: true, RetryCount: 2,
 	}); m != "fable" {
 		t.Fatalf("auto-tiered retry2 model = %q, want fable", m)
 	}

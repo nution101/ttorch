@@ -113,12 +113,12 @@ func TestLaunchCommandsCarryModel(t *testing.T) {
 func TestManagerCommandCarriesModel(t *testing.T) {
 	t.Setenv("TTORCH_MANAGER_EFFORT", "")
 	t.Setenv("TTORCH_MODEL", "")
-	t.Setenv("TTORCH_MANAGER_MODEL", "opus")
-	if got := ManagerCommand("claude", "sid", ""); !strings.Contains(got, " --model 'opus'") {
+	t.Setenv("TTORCH_MANAGER_MODEL", "fable") // a non-default value, to prove the env is carried
+	if got := ManagerCommand("claude", "sid", ""); !strings.Contains(got, " --model 'fable'") {
 		t.Errorf("manager should carry TTORCH_MANAGER_MODEL, got %q", got)
 	}
 	// The manager model must survive a resume too (reboot/upgrade), not just a fresh launch.
-	if got := ManagerResumeCommand("claude", "sid", ""); !strings.Contains(got, " --model 'opus'") {
+	if got := ManagerResumeCommand("claude", "sid", ""); !strings.Contains(got, " --model 'fable'") {
 		t.Errorf("manager resume should carry TTORCH_MANAGER_MODEL, got %q", got)
 	}
 	// The worker default (TTORCH_MODEL) must NOT leak into the manager command — the two
@@ -127,10 +127,10 @@ func TestManagerCommandCarriesModel(t *testing.T) {
 	// worker's TTORCH_MODEL.
 	t.Setenv("TTORCH_MANAGER_MODEL", "")
 	t.Setenv("TTORCH_MODEL", "haiku")
-	if got := ManagerCommand("claude", "sid", ""); !strings.Contains(got, " --model 'sonnet'") || strings.Contains(got, "haiku") {
-		t.Errorf("manager should default to sonnet and not inherit TTORCH_MODEL, got %q", got)
+	if got := ManagerCommand("claude", "sid", ""); !strings.Contains(got, " --model 'opus'") || strings.Contains(got, "haiku") {
+		t.Errorf("manager should default to opus and not inherit TTORCH_MODEL, got %q", got)
 	}
-	if got := ManagerResumeCommand("claude", "sid", ""); !strings.Contains(got, " --model 'sonnet'") || strings.Contains(got, "haiku") {
-		t.Errorf("manager resume should default to sonnet and not inherit TTORCH_MODEL, got %q", got)
+	if got := ManagerResumeCommand("claude", "sid", ""); !strings.Contains(got, " --model 'opus'") || strings.Contains(got, "haiku") {
+		t.Errorf("manager resume should default to opus and not inherit TTORCH_MODEL, got %q", got)
 	}
 }

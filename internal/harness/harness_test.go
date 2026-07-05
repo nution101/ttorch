@@ -141,7 +141,7 @@ func TestLaunchCommandsCarryEffort(t *testing.T) {
 
 func TestManagerCommand(t *testing.T) {
 	t.Setenv("TTORCH_MANAGER_EFFORT", "") // default: high (NOT ultracode)
-	t.Setenv("TTORCH_MANAGER_MODEL", "")  // default: sonnet (plan-only, continuous session)
+	t.Setenv("TTORCH_MANAGER_MODEL", "")  // default: opus (planning must not be under-powered)
 	// With a charter file the charter is referenced (short command), not inlined.
 	cmd := ManagerCommand("claude", "mgr-sid", "/tmp/charter.md")
 	if !strings.Contains(cmd, " --effort high") {
@@ -150,8 +150,8 @@ func TestManagerCommand(t *testing.T) {
 	if strings.Contains(cmd, "ultracode") {
 		t.Errorf("manager must not default to ultracode, got %q", cmd)
 	}
-	if !strings.Contains(cmd, " --model 'sonnet'") {
-		t.Errorf("manager should default to --model sonnet, got %q", cmd)
+	if !strings.Contains(cmd, " --model 'opus'") {
+		t.Errorf("manager should default to --model opus, got %q", cmd)
 	}
 	if !strings.Contains(cmd, " --append-system-prompt-file '/tmp/charter.md'") {
 		t.Errorf("manager should reference the charter file, got %q", cmd)
