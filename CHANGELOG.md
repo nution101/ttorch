@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.16.0](https://github.com/nution101/ttorch/compare/v0.15.0...v0.16.0) (2026-07-05)
+
+
+### Features
+
+* **model:** cheaper default tiers — drop ultracode default, tier manual spawns, sonnet manager ([c935a03](https://github.com/nution101/ttorch/commit/c935a0389875b5334b1413906df5216848b215a8))
+* **model:** cheaper default tiers + retry escalation; bundle ponytail skill ([464892e](https://github.com/nution101/ttorch/commit/464892e8299a21e0b4f98c08b31c644eb5822c01))
+* **model:** escalate the tier on retry, with fable as the top rung ([a00ac63](https://github.com/nution101/ttorch/commit/a00ac63c278522e20b82e779899b88afa685cef1))
+* **skills:** bundle the ponytail agent skill, minimal-code worker default ([32ed80f](https://github.com/nution101/ttorch/commit/32ed80fc75ec009c66fa5dd36b3eb81c749d3e3f))
+
 ## [0.15.0](https://github.com/nution101/ttorch/compare/v0.14.0...v0.15.0) (2026-07-03)
 
 
