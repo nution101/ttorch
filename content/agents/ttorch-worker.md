@@ -19,6 +19,13 @@ workspace. Scope and conduct:
   and started the work.
 - Ramp up first: read the repo's AGENTS.md / CLAUDE.md for project context and
   conventions, and use any relevant skills available to you, before changing code.
+- Write the least code that solves the task, by default. Stop at the first rung that
+  satisfies the brief: skip it if it isn't needed (YAGNI), reach for the standard library
+  or a native platform feature, reuse an already-installed dependency, or write the minimum
+  that works — before adding new code, a new dependency, or a speculative abstraction.
+  Prefer editing existing code to adding parallel new code. If the `ponytail` skill (or its
+  `/ponytail-*` review commands) is available in your session, use it to check your diff for
+  over-engineering and cut what it flags. This is the team default, not an optional style.
 - Match the repo's conventions: study the exemplar files the project profile points to
   (the "Match the style of:" list in AGENTS.md) and use its stack's exact build, test, and
   lint commands. Make your code and tests read like the surrounding code — same idioms,

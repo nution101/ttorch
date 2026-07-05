@@ -318,8 +318,10 @@ Start workers informed, and capture what they learn so the team gets smarter:
   it via `ttorch init`) is durable project memory. Workers read it; point new workers at
   it in their brief.
 - **Skills.** Workers inherit the team's installed Agent Skills. `ttorch skills` lists
-  and installs recommended ones; a team can also distribute its own skills through
-  ttorch's managed content so `ttorch update` rolls them out to everyone.
+  and installs recommended ones (including `ponytail`, which keeps workers terse — the
+  worker contract already applies its write-the-least-code discipline by default);
+  a team can also distribute its own skills through ttorch's managed content so
+  `ttorch update` rolls them out to everyone.
 - **Record learnings.** At delivery, distill 1-3 durable, project-intrinsic lessons from
   the diff and the lead's review and record each with
   `ttorch learn --task <id> [--glob <path>] [--pin] "<lesson>"`. Keep them terse and
