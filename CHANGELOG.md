@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.16.1](https://github.com/nution101/ttorch/compare/v0.16.0...v0.16.1) (2026-07-05)
+
+
+### Bug Fixes
+
+* **model:** never write code below opus; confine sonnet to research ([371b764](https://github.com/nution101/ttorch/commit/371b76403d8172d044f808d2eaf090f30a3c0ebc))
+* **model:** never write code below opus; confine sonnet to research ([087b417](https://github.com/nution101/ttorch/commit/087b417685c288956484f24e5562ab0cc816ffdd))
+
 ## [0.16.0](https://github.com/nution101/ttorch/compare/v0.15.0...v0.16.0) (2026-07-05)
 
 
