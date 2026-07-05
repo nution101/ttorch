@@ -445,7 +445,7 @@ func TestRunOnceForwardsTier(t *testing.T) {
 	}
 	mk("scout1", db.KindScout, []string{"internal/a"}, "", "")            // classifier → haiku/medium
 	mk("ship1", db.KindShip, []string{"internal/b"}, "", "")              // classifier → sonnet/high
-	mk("risk1", db.KindShip, []string{"internal/crypto/keys.go"}, "", "") // classifier → opus/ultracode
+	mk("risk1", db.KindShip, []string{"internal/crypto/keys.go"}, "", "") // classifier → opus/xhigh
 	mk("explicit1", db.KindShip, []string{"internal/c"}, "opus", "low")   // explicit row wins
 
 	f := &fakeFleet{}

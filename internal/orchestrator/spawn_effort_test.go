@@ -32,7 +32,7 @@ func TestSpawnWithEffort_PersistsExplicit(t *testing.T) {
 }
 
 // TestSpawnEffortDefaults proves the kind defaults when no --effort and no TTORCH_EFFORT:
-// a scout defaults to high, a ship to ultracode.
+// both a scout and a ship default to high (ultracode is no longer a default — it is opt-in).
 func TestSpawnEffortDefaults(t *testing.T) {
 	m, repo := deliveryHarness(t, "effort-defaults")
 	t.Setenv("TTORCH_EFFORT", "") // pin the env so only the kind default applies
@@ -50,8 +50,8 @@ func TestSpawnEffortDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("spawn ship: %v", err)
 	}
-	if ship.Effort != "ultracode" {
-		t.Fatalf("ship effort = %q, want ultracode", ship.Effort)
+	if ship.Effort != "high" {
+		t.Fatalf("ship effort = %q, want high", ship.Effort)
 	}
 	_, _ = m.Teardown("p1", true)
 }

@@ -324,25 +324,27 @@ effort**:
 
 - The **manager** runs at `TTORCH_MANAGER_EFFORT` (default `high`), deliberately *not*
   ultracode — ultracode would push it to do deep work itself instead of delegating.
-- **Workers** and `ttorch cc` run at `TTORCH_EFFORT` (default `ultracode`).
+- **Workers** and `ttorch cc` run at `TTORCH_EFFORT` (default `high`).
 
 `ultracode` is **not** an `--effort` level — it's a Claude Code session feature (xhigh
-reasoning *plus* dynamic workflow orchestration) enabled via `--settings`. The discrete
-`--effort` levels are `low|medium|high|xhigh|max`; `off`/`none`/`default` add no flag.
-Per-task effort resolves as **explicit `--effort` > `TTORCH_EFFORT` > kind default** (scout
-`high`, ship `ultracode`), is persisted on the task row, and is restored verbatim on resume
+reasoning *plus* dynamic workflow orchestration) enabled via `--settings`. It is **opt-in per
+task**, not a default: it is redundant with ttorch's own orchestration and rarely earns its
+cost. The discrete `--effort` levels are `low|medium|high|xhigh|max`; `off`/`none`/`default`
+add no flag. Per-task effort resolves as **explicit `--effort` > `TTORCH_EFFORT` > classifier
+tier > kind default** (`high`), is persisted on the task row, and is restored verbatim on resume
 — so changing the environment later doesn't change an already-spawned worker.
 
 **Model** is the orthogonal second dial — *which* model (`haiku`/`sonnet`/`opus`/`fable`/
 `opusplan` or a full id) versus *how hard* it thinks. It mirrors effort end-to-end: a per-task
 `model` column, `harness.ModelArgs`/`ResolveWorkerModel`, `TTORCH_MODEL` / `TTORCH_MANAGER_MODEL`,
 `spawn --model` / `task add --model`, persisted and restored on resume. Unset passes no
-`--model` (claude's own default), so the dial is opt-in. When the scheduler auto-dispatches a
-backlog task whose model/effort are unset (and no env override applies), a small classifier
-(`internal/scheduler/tier.go`) picks a tier from complexity signals — scout ⇒ `haiku`/`medium`,
-a security/concurrency/migration/finance footprint or title ⇒ `opus`/`ultracode`, every other
-ship ⇒ `sonnet`/`high`. Precedence is **explicit per-task > `TTORCH_*` env > classifier > kind
-default**; the pairs it emits are valid `(model, effort)` combinations (claude silently
+`--model` (claude's own default), except the manager defaults to `sonnet` (plan-only,
+continuous session — near-opus judgment at a fraction of the standing cost). When the scheduler
+auto-dispatches a backlog task — **or** a manual `ttorch spawn` runs — whose model/effort are
+unset (and no env override applies), a small classifier (`internal/scheduler/tier.go`) picks a
+tier from complexity signals — scout ⇒ `haiku`/`medium`, a security/concurrency/migration/
+finance footprint or title ⇒ `opus`/`xhigh`, every other ship ⇒ `sonnet`/`high`. Precedence is
+**explicit per-task > `TTORCH_*` env > classifier > kind default**; the pairs it emits are valid `(model, effort)` combinations (claude silently
 downgrades an unsupported effort, and fast mode is opus-only). The autonomous dispatch also now
 forwards the persisted effort, closing a gap where it fell back to the kind default. The
 adversarial-review gate keeps its reviewers on claude's default model (not cheapened), since a

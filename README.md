@@ -199,7 +199,7 @@ reference; this table covers the surface a lead and manager use day to day.
 | --- | --- |
 | `ttorch install` / `update [--content-only]` / `uninstall [--purge]` | Manage the installed binary + content |
 | `ttorch doctor [--yes]` | Detect and install missing dependencies |
-| `ttorch skills [install]` | List/install recommended agent skills (e.g. `axi`) |
+| `ttorch skills [install]` | List/force-install recommended agent skills (e.g. `axi`, `ponytail`); ttorch also installs any missing ones automatically before a team launches |
 | `ttorch init [--mode pr\|local\|validated\|trusted]` | Set up a repo's AGENTS.md + CLAUDE.md + delivery mode + profile |
 | `ttorch profile [dir]` | Derive the repo's stack/commands/conventions into AGENTS.md |
 | `ttorch version` / `help` | Version / full usage |
@@ -366,36 +366,40 @@ ttorch spawn <id> <repo> --init                   # force first-use setup, then 
 
 The **manager** is a lean orchestrator: it launches at `--effort high` and carries a charter
 that makes it *plan and delegate* (via `ttorch spawn`) rather than write code itself. The
-deep work happens in **workers**, which run in **ultracode** by default (`xhigh` reasoning +
-dynamic workflow orchestration). `ttorch cc` also defaults to ultracode.
+deep work happens in **workers**, which default to `--effort high`. `ttorch cc` also defaults
+to `high`. `ultracode` (`xhigh` reasoning **plus** a session spinning up its own internal
+sub-agent fleet) is **opt-in per task**, not a default — it is redundant with ttorch's own
+orchestration and rarely earns its cost; reach for it with `--effort ultracode` on a single
+task that genuinely needs it.
 
 | Env | Applies to | Default | Effect |
 | --- | --- | --- | --- |
 | `TTORCH_MANAGER_EFFORT` | the manager | `high` | `low`…`max`, or `ultracode`/`off` |
-| `TTORCH_EFFORT` | workers + `ttorch cc` | `ultracode` | `ultracode`, a fixed `--effort` level (`max`…`low`), or `off` |
+| `TTORCH_EFFORT` | workers + `ttorch cc` | `high` | `ultracode`, a fixed `--effort` level (`max`…`low`), or `off` |
 
 `ultracode` is not an `--effort` level — it is `xhigh` plus workflow orchestration (set via
 `--settings`); the discrete levels go through `--effort`. The manager is deliberately *not*
 ultracode by default, because that pushes a session to do deep work (and spawn its own
 internal sub-agents) instead of delegating. Per-task effort (`ttorch spawn --effort <level>`)
-resolves as explicit `--effort` > `TTORCH_EFFORT` > the kind default (ship `ultracode`,
-scout `high`), is persisted on the task, and is restored verbatim on resume.
+resolves as explicit `--effort` > `TTORCH_EFFORT` > the classifier tier (below) > the kind
+default (`high`), is persisted on the task, and is restored verbatim on resume.
 
 ```sh
-TTORCH_EFFORT=max ttorch              # workers at highest raw reasoning, no nested orchestration
-TTORCH_MANAGER_EFFORT=ultracode ttorch # opt the manager back into ultracode
+TTORCH_EFFORT=max ttorch               # workers at highest raw reasoning, no nested orchestration
+TTORCH_MANAGER_EFFORT=ultracode ttorch # opt the manager into ultracode
 ```
 
 ## Session model
 
 Model is the **second dial**, orthogonal to effort: *which* model runs (Haiku → Sonnet →
-Opus, or a full model id), independent of *how hard* it thinks. ttorch passes no `--model` by
-default, so every session uses your Claude default — set the dials to spend less on cheap work
-and reserve the expensive model for the hard tasks.
+Opus → Fable, or a full model id), independent of *how hard* it thinks. The manager defaults
+to `sonnet` (plan-only, continuous session); worker/`cc` model is unset by default (claude's
+own default) but the complexity classifier (below) fills a cheap-by-default model per task.
+Set the dials to spend less on cheap work and reserve the expensive model for the hard tasks.
 
 | Env | Applies to | Default | Effect |
 | --- | --- | --- | --- |
-| `TTORCH_MANAGER_MODEL` | the manager | claude's default | an alias (`haiku`/`sonnet`/`opus`/`fable`/`opusplan`) or a full model id |
+| `TTORCH_MANAGER_MODEL` | the manager | `sonnet` | an alias (`haiku`/`sonnet`/`opus`/`fable`/`opusplan`), a full model id, or `default`/`off` for claude's own default |
 | `TTORCH_MODEL` | workers + `ttorch cc` | claude's default | as above; unset ⇒ no `--model` (claude's own default) |
 
 Per-task model (`ttorch spawn --model <m>` / `ttorch task add --model <m>`) resolves as
@@ -411,12 +415,13 @@ the task's complexity signals (kind, footprint, title):
 | --- | --- | --- |
 | scout / investigation | `haiku` | `medium` |
 | normal ship | `sonnet` | `high` |
-| security · concurrency · migrations · finance (matched by footprint/title) | `opus` | `ultracode` |
+| security · concurrency · migrations · finance (matched by footprint/title) | `opus` | `xhigh` |
 
 Precedence is **explicit per-task > `TTORCH_*` env > classifier tier > kind default**, so an
-explicit `--model`/`--effort` or a global env always wins. A **manual** `ttorch spawn` without
-flags is unchanged (it uses the raw defaults — ship `ultracode`, model unset); the classifier
-applies to the high-volume autonomous dispatch path. The adversarial-review trust gate keeps
+explicit `--model`/`--effort` or a global env always wins. Both the autonomous dispatch path
+**and** a manual `ttorch spawn` route through this classifier, so hand-started work gets the
+same cheap-by-default tiering instead of falling through to claude's default model. The
+adversarial-review trust gate keeps
 reviewers on your most capable default (it is deliberately *not* cheapened), since in trusted
 mode it can authorize a merge unread.
 

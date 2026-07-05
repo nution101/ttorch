@@ -122,13 +122,15 @@ func TestManagerCommandCarriesModel(t *testing.T) {
 		t.Errorf("manager resume should carry TTORCH_MANAGER_MODEL, got %q", got)
 	}
 	// The worker default (TTORCH_MODEL) must NOT leak into the manager command — the two
-	// dials are independent, mirroring TTORCH_MANAGER_EFFORT / TTORCH_EFFORT.
+	// dials are independent, mirroring TTORCH_MANAGER_EFFORT / TTORCH_EFFORT. With
+	// TTORCH_MANAGER_MODEL unset the manager falls back to its OWN default (sonnet), never the
+	// worker's TTORCH_MODEL.
 	t.Setenv("TTORCH_MANAGER_MODEL", "")
 	t.Setenv("TTORCH_MODEL", "haiku")
-	if got := ManagerCommand("claude", "sid", ""); strings.Contains(got, "--model") {
-		t.Errorf("manager must not inherit TTORCH_MODEL, got %q", got)
+	if got := ManagerCommand("claude", "sid", ""); !strings.Contains(got, " --model 'sonnet'") || strings.Contains(got, "haiku") {
+		t.Errorf("manager should default to sonnet and not inherit TTORCH_MODEL, got %q", got)
 	}
-	if got := ManagerResumeCommand("claude", "sid", ""); strings.Contains(got, "--model") {
-		t.Errorf("manager resume must not inherit TTORCH_MODEL, got %q", got)
+	if got := ManagerResumeCommand("claude", "sid", ""); !strings.Contains(got, " --model 'sonnet'") || strings.Contains(got, "haiku") {
+		t.Errorf("manager resume should default to sonnet and not inherit TTORCH_MODEL, got %q", got)
 	}
 }

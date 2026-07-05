@@ -10,9 +10,15 @@ import (
 // Dispatch-time model/effort tiers. Model and effort are orthogonal dials (which brain vs
 // how hard it thinks); a tier pairs a cheap-enough model with a matching effort. The pairs
 // are deliberately VALID combinations — claude silently downgrades an effort a model does
-// not support, and fast mode is opus-only — so, for example, we never emit (haiku,
-// ultracode). Explicit per-task values always win over these defaults (see
-// resolveDispatchTier).
+// not support, and fast mode is opus-only — so, for example, we never emit (haiku, max).
+// Explicit per-task values always win over these defaults (see resolveDispatchTier).
+//
+// The top tier keeps the strongest model (opus) for risk-bearing work but caps effort at
+// xhigh rather than ultracode: ultracode is xhigh reasoning PLUS a session spinning up its
+// own internal sub-agent fleet, which is redundant with ttorch (ttorch already IS the
+// orchestration fleet) and shows diminishing returns on a single scoped task. A
+// mis-classified small-but-hard task is caught by escalation-on-failure, not by paying for
+// ultracode on every risk-path dispatch.
 const (
 	tierScoutModel  = "haiku"
 	tierScoutEffort = "medium"
@@ -21,7 +27,7 @@ const (
 	tierShipEffort = "high"
 
 	tierRiskModel  = "opus"
-	tierRiskEffort = "ultracode"
+	tierRiskEffort = "xhigh"
 )
 
 // riskKeywords mark a task whose blast radius earns the top tier even when its footprint is
@@ -92,6 +98,12 @@ func matchesRisk(s string) bool {
 // whichever dial is still unset. Resolving both here fixes the historical gap where the
 // autonomous dispatch dropped the persisted effort (it passed "") and adds cheap-by-default
 // model selection without overriding a user's explicit env.
+// ResolveDispatchTier is the exported entry point to the dispatch-time tier policy, so the
+// interactive spawn path (`ttorch spawn`) resolves model/effort through the SAME classifier
+// the autonomous daemon uses — one cost policy, not two. It applies the full precedence
+// (explicit row value > env default > classifier tier).
+func ResolveDispatchTier(t db.Task) (model, effort string) { return resolveDispatchTier(t) }
+
 func resolveDispatchTier(t db.Task) (model, effort string) {
 	model, effort = t.Model, t.Effort
 	if model == "" {

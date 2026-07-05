@@ -218,9 +218,11 @@ detected" is a hard block.
 Workers get more effective when they start informed:
 
 - **Skills.** A worker is a normal Claude Code session, so it inherits every Agent Skill in
-  `~/.claude/skills` — ttorch adds its own on top. `ttorch skills` lists recommended skills
-  and `ttorch skills install` adds them (e.g. the `axi` guidelines for agent-ergonomic CLIs;
-  needs `npx`/Node). A team can also ship its own skills through ttorch's managed content so
+  `~/.claude/skills` — ttorch adds its own on top. ttorch installs its recommended skills
+  automatically before a team launches (e.g. the `axi` guidelines for agent-ergonomic CLIs
+  and `ponytail`, which keeps workers terse; needs `npx`/Node). `ttorch skills` lists them and
+  `ttorch skills install` forces the install now; `TTORCH_SKIP_SKILL_INSTALL=1` disables the
+  automatic step. A team can also ship its own skills through ttorch's managed content so
   `ttorch update` distributes them to everyone.
 - **Memory.** A repo's committed `AGENTS.md` (with `CLAUDE.md` symlinked to it by
   `ttorch init`) is durable project memory — conventions, gotchas, where things live. Workers
@@ -281,10 +283,10 @@ fallback) opens a separate window per worker. Toggle with `TTORCH_WORKER_TABS` a
 | `TTORCH_TMUX_SESSION` | `ttorch` | tmux session name |
 | `TTORCH_SCHEDULER_AUTOSTART` | enabled | the scheduler auto-starts with the manager (dispatch + land + supervise); set `0`/`off`/`false`/`no` to disable and drive dispatch/land/recovery by hand |
 | `TTORCH_MAX_WORKTREES` | `16` | worktree pool size per repository (the dispatch capacity) |
-| `TTORCH_EFFORT` | `ultracode` | worker + `ttorch cc` reasoning effort (`ultracode` = xhigh + workflow orchestration; or a fixed `--effort` level; or `off`) |
+| `TTORCH_EFFORT` | `high` | worker + `ttorch cc` reasoning effort (`ultracode` = xhigh + workflow orchestration, opt-in; or a fixed `--effort` level; or `off`) |
 | `TTORCH_MANAGER_EFFORT` | `high` | manager reasoning effort (deliberately not ultracode, so it delegates) |
-| `TTORCH_MODEL` | claude's default | worker + `ttorch cc` model — an alias (`haiku`/`sonnet`/`opus`/`fable`/`opusplan`) or a full model id; unset ⇒ no `--model`. Orthogonal to effort; the scheduler auto-tiers a backlog task's model+effort when both are unset |
-| `TTORCH_MANAGER_MODEL` | claude's default | manager model (separate from the worker default) |
+| `TTORCH_MODEL` | claude's default | worker + `ttorch cc` model — an alias (`haiku`/`sonnet`/`opus`/`fable`/`opusplan`) or a full model id; unset ⇒ no `--model`. Orthogonal to effort; the classifier auto-tiers a task's model+effort (autonomous dispatch and manual `ttorch spawn`) when both are unset |
+| `TTORCH_MANAGER_MODEL` | `sonnet` | manager model (separate from the worker default; `default`/`off` for claude's own) |
 | `TTORCH_VALIDATE_TIMEOUT` | `10m` | per-check timeout for `ttorch validate` |
 | `TTORCH_NO_AUTOINIT` | unset | set to any value to disable zero-config auto-init on first use (§7) |
 | `TTORCH_WORKER_TABS` | enabled | macOS-only: native-terminal worker views + the manager-in-iTerm2 launch; set `0`/`off`/`false`/`no` to disable (workers still run as tmux windows) |
