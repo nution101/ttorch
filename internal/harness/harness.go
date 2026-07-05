@@ -220,18 +220,17 @@ func ResolveWorkerModel(explicit string) string {
 	return EnvWorkerModel()
 }
 
-// managerModelLevel is the manager's model, from TTORCH_MANAGER_MODEL (default "sonnet").
+// managerModelLevel is the manager's model, from TTORCH_MANAGER_MODEL (default "opus").
 // It is separate from the worker default (TTORCH_MODEL) so the plan-heavy manager and the
 // workers can run on different models, mirroring the TTORCH_MANAGER_EFFORT / TTORCH_EFFORT
-// split. The manager only plans and delegates (it writes no code) and runs continuously, so
-// it defaults to sonnet — near-opus judgment at a fraction of the per-token cost of the
-// standing session. Override with TTORCH_MANAGER_MODEL (e.g. "opus" for the hardest planning,
-// or "default"/"off" to fall back to claude's own default).
+// split. Planning (and following up to fill in or correct research) must not be under-powered,
+// so it defaults to opus — never a cheap model. Override with TTORCH_MANAGER_MODEL (e.g.
+// "fable" for the hardest planning, or "default"/"off" to fall back to claude's own default).
 func managerModelLevel() string {
 	if m := NormalizeModel(os.Getenv("TTORCH_MANAGER_MODEL")); m != "" {
 		return m
 	}
-	return "sonnet"
+	return "opus"
 }
 
 // EnvWorkerEffort and EnvWorkerModel expose the raw worker env defaults (TTORCH_EFFORT /

@@ -8,22 +8,25 @@ import (
 )
 
 // Dispatch-time model/effort tiers. Model and effort are orthogonal dials (which brain vs
-// how hard it thinks); a tier pairs a cheap-enough model with a matching effort. The pairs
-// are deliberately VALID combinations — claude silently downgrades an effort a model does
-// not support, and fast mode is opus-only — so, for example, we never emit (haiku, max).
-// Explicit per-task values always win over these defaults (see resolveDispatchTier).
+// how hard it thinks); a tier pairs a model with a matching effort. The pairs are deliberately
+// VALID combinations — claude silently downgrades an effort a model does not support, and fast
+// mode is opus-only. Explicit per-task values always win over these defaults (see
+// resolveDispatchTier).
 //
-// The top tier keeps the strongest model (opus) for risk-bearing work but caps effort at
-// xhigh rather than ultracode: ultracode is xhigh reasoning PLUS a session spinning up its
-// own internal sub-agent fleet, which is redundant with ttorch (ttorch already IS the
-// orchestration fleet) and shows diminishing returns on a single scoped task. A
-// mis-classified small-but-hard task is caught by escalation-on-failure, not by paying for
-// ultracode on every risk-path dispatch.
+// QUALITY FLOOR — code is NEVER written on a cheap model. A ship task (it writes code) starts
+// at opus/high AT MINIMUM; the equivalent floor is fable/medium. Sonnet/haiku are never a
+// default for code. Research (a scout, read-only investigation) MAY run on sonnet — the one
+// place a cheaper model is allowed — and any follow-up that fills in or corrects that research
+// climbs to opus/fable via escalation. The top (risk) tier keeps opus but caps effort at xhigh
+// rather than ultracode: ultracode is xhigh reasoning PLUS a session spinning up its own
+// internal sub-agent fleet, redundant with ttorch (ttorch already IS the orchestration fleet)
+// and diminishing on a single scoped task. This saves money on research and on effort — never
+// by writing code with a weaker model.
 const (
-	tierScoutModel  = "haiku"
+	tierScoutModel  = "sonnet"
 	tierScoutEffort = "medium"
 
-	tierShipModel  = "sonnet"
+	tierShipModel  = "opus"
 	tierShipEffort = "high"
 
 	tierRiskModel  = "opus"
@@ -37,8 +40,10 @@ const (
 
 // modelLadder is the capability/cost order the escalation walks: each retry of an auto-tiered
 // task bumps the model one rung up from its base tier, so the priciest models are spent only on
-// work that could not be completed cheaper. Fable ($10/$50 in/out, ~2x opus) is the last rung.
-var modelLadder = []string{tierScoutModel, tierShipModel, tierRiskModel, tierTopModel} // haiku, sonnet, opus, fable
+// work that could not be completed cheaper. Haiku is deliberately absent — the floor for any
+// assigned tier is sonnet (research) and the floor for code is opus. Fable ($10/$50 in/out,
+// ~2x opus) is the last rung.
+var modelLadder = []string{tierScoutModel, tierShipModel, tierTopModel} // sonnet, opus, fable
 
 // escalateModel bumps base up the ladder by `steps` rungs, clamped to the top (fable). A model
 // not on the ladder (a full id or an unknown alias) is returned unchanged — escalation only

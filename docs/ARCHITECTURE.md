@@ -338,18 +338,21 @@ tier > kind default** (`high`), is persisted on the task row, and is restored ve
 `opusplan` or a full id) versus *how hard* it thinks. It mirrors effort end-to-end: a per-task
 `model` column, `harness.ModelArgs`/`ResolveWorkerModel`, `TTORCH_MODEL` / `TTORCH_MANAGER_MODEL`,
 `spawn --model` / `task add --model`, persisted and restored on resume. Unset passes no
-`--model` (claude's own default), except the manager defaults to `sonnet` (plan-only,
-continuous session — near-opus judgment at a fraction of the standing cost). When the scheduler
-auto-dispatches a backlog task — **or** a manual `ttorch spawn` runs — whose model/effort are
-unset (and no env override applies), a small classifier (`internal/scheduler/tier.go`) picks a
-tier from complexity signals — scout ⇒ `haiku`/`medium`, a security/concurrency/migration/
-finance footprint or title ⇒ `opus`/`xhigh`, every other ship ⇒ `sonnet`/`high`. Precedence is
+`--model` (claude's own default), except the manager defaults to `opus` — planning (and
+follow-up that fills in or corrects research) must not be under-powered. **Quality floor: code
+is never written on a cheap model.** When the scheduler auto-dispatches a backlog task — **or**
+a manual `ttorch spawn` runs — whose model/effort are unset (and no env override applies), a
+small classifier (`internal/scheduler/tier.go`) picks a tier from complexity signals — a
+read-only scout (research) ⇒ `sonnet`/`medium`, a security/concurrency/migration/finance
+footprint or title ⇒ `opus`/`xhigh`, every other ship (it writes code) ⇒ `opus`/`high`. Code
+is never assigned below `opus`; `sonnet` is confined to research and `haiku` is unused. Precedence is
 **explicit per-task > `TTORCH_*` env > classifier > kind default**; the pairs it emits are valid `(model, effort)` combinations (claude silently
 downgrades an unsupported effort, and fast mode is opus-only). A classifier-tiered dispatch is
 flagged (`tasks.auto_tiered`); on a retry such a task re-derives its tier and **escalates the
-model one rung up the ladder** (`haiku→sonnet→opus→fable`, clamped at fable) per `retry_count`,
-so every task starts cheap and only repeated failure reaches the priciest model — a user/env
-pin (`auto_tiered=0`) never escalates. The autonomous dispatch also now
+model one rung up the ladder** (`sonnet→opus→fable`, clamped at fable) per `retry_count`, so a
+ship task starts at `opus` and only repeated failure reaches `fable`, while a re-run scout that
+corrects its research climbs from `sonnet` to `opus`/`fable` — a user/env pin
+(`auto_tiered=0`) never escalates. The autonomous dispatch also now
 forwards the persisted effort, closing a gap where it fell back to the kind default. The
 adversarial-review gate keeps its reviewers on claude's default model (not cheapened), since a
 trusted-mode verdict can authorize a merge unread.
