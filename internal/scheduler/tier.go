@@ -10,9 +10,15 @@ import (
 // Dispatch-time model/effort tiers. Model and effort are orthogonal dials (which brain vs
 // how hard it thinks); a tier pairs a cheap-enough model with a matching effort. The pairs
 // are deliberately VALID combinations — claude silently downgrades an effort a model does
-// not support, and fast mode is opus-only — so, for example, we never emit (haiku,
-// ultracode). Explicit per-task values always win over these defaults (see
-// resolveDispatchTier).
+// not support, and fast mode is opus-only — so, for example, we never emit (haiku, max).
+// Explicit per-task values always win over these defaults (see resolveDispatchTier).
+//
+// The top tier keeps the strongest model (opus) for risk-bearing work but caps effort at
+// xhigh rather than ultracode: ultracode is xhigh reasoning PLUS a session spinning up its
+// own internal sub-agent fleet, which is redundant with ttorch (ttorch already IS the
+// orchestration fleet) and shows diminishing returns on a single scoped task. A
+// mis-classified small-but-hard task is caught by escalation-on-failure, not by paying for
+// ultracode on every risk-path dispatch.
 const (
 	tierScoutModel  = "haiku"
 	tierScoutEffort = "medium"
@@ -21,8 +27,42 @@ const (
 	tierShipEffort = "high"
 
 	tierRiskModel  = "opus"
-	tierRiskEffort = "ultracode"
+	tierRiskEffort = "xhigh"
+
+	// tierTopModel is the top of the escalation ladder, above opus. It is the most capable
+	// (and priciest) model, reserved for auto-tiered work that has repeatedly FAILED at a
+	// cheaper tier — never a default. See escalateModel / classifyTier.
+	tierTopModel = "fable"
 )
+
+// modelLadder is the capability/cost order the escalation walks: each retry of an auto-tiered
+// task bumps the model one rung up from its base tier, so the priciest models are spent only on
+// work that could not be completed cheaper. Fable ($10/$50 in/out, ~2x opus) is the last rung.
+var modelLadder = []string{tierScoutModel, tierShipModel, tierRiskModel, tierTopModel} // haiku, sonnet, opus, fable
+
+// escalateModel bumps base up the ladder by `steps` rungs, clamped to the top (fable). A model
+// not on the ladder (a full id or an unknown alias) is returned unchanged — escalation only
+// applies to the classifier's own tiers, never to a value it did not choose.
+func escalateModel(base string, steps int) string {
+	i := indexOfModel(base)
+	if i < 0 {
+		return base
+	}
+	i += steps
+	if i >= len(modelLadder) {
+		i = len(modelLadder) - 1
+	}
+	return modelLadder[i]
+}
+
+func indexOfModel(m string) int {
+	for i, v := range modelLadder {
+		if v == m {
+			return i
+		}
+	}
+	return -1
+}
 
 // riskKeywords mark a task whose blast radius earns the top tier even when its footprint is
 // small: security/auth/crypto, concurrency, schema/data migrations, and money/finance paths.
@@ -51,13 +91,22 @@ var riskKeywords = []string{
 // bias UP and escalation-on-failure (a task re-dispatched after a failed validate/review at a
 // higher tier) is the intended safety net for a mis-classified small-but-hard task.
 func classifyTier(t db.Task) (model, effort string) {
-	if t.Kind == db.KindScout {
-		return tierScoutModel, tierScoutEffort
+	switch {
+	case t.Kind == db.KindScout:
+		model, effort = tierScoutModel, tierScoutEffort
+	case isRiskyTask(t):
+		model, effort = tierRiskModel, tierRiskEffort
+	default:
+		model, effort = tierShipModel, tierShipEffort
 	}
-	if isRiskyTask(t) {
-		return tierRiskModel, tierRiskEffort
+	// Escalation-on-failure: each retry bumps the model one rung up the ladder
+	// (haiku→sonnet→opus→fable), reserving the priciest models for work that has actually
+	// failed at a cheaper tier. Effort stays at the tier's level. Only auto-tiered tasks
+	// reach classifyTier on a retry (see resolveDispatchTier) — a user/env pin never escalates.
+	if t.RetryCount > 0 {
+		model = escalateModel(model, t.RetryCount)
 	}
-	return tierShipModel, tierShipEffort
+	return model, effort
 }
 
 // isRiskyTask reports whether a task touches a risk-bearing path (by footprint or title),
@@ -92,13 +141,38 @@ func matchesRisk(s string) bool {
 // whichever dial is still unset. Resolving both here fixes the historical gap where the
 // autonomous dispatch dropped the persisted effort (it passed "") and adds cheap-by-default
 // model selection without overriding a user's explicit env.
-func resolveDispatchTier(t db.Task) (model, effort string) {
+// ResolveDispatchTier is the exported entry point to the dispatch-time tier policy, so the
+// interactive spawn path (`ttorch spawn`) resolves model/effort through the SAME classifier
+// the autonomous daemon uses — one cost policy, not two. It applies the full precedence
+// (explicit row value > env default > classifier tier) and returns whether the result was
+// classifier-derived (autoTiered), which the caller persists so a later retry may escalate.
+func ResolveDispatchTier(t db.Task) (model, effort string, autoTiered bool) {
+	return resolveDispatchTier(t)
+}
+
+func resolveDispatchTier(t db.Task) (model, effort string, autoTiered bool) {
+	envM, envE := harness.EnvWorkerModel(), harness.EnvWorkerEffort()
+
+	// An auto-tiered task (its model+effort were classifier-assigned, no user/env pin) re-derives
+	// the tier on EVERY dispatch, so a retry escalates the model — deliberately ignoring the
+	// values persisted from the prior dispatch. A global env still overrides the classifier.
+	if t.AutoTiered {
+		model, effort = classifyTier(t)
+		if envM != "" {
+			model = envM
+		}
+		if envE != "" {
+			effort = envE
+		}
+		return model, effort, true
+	}
+
 	model, effort = t.Model, t.Effort
 	if model == "" {
-		model = harness.EnvWorkerModel()
+		model = envM
 	}
 	if effort == "" {
-		effort = harness.EnvWorkerEffort()
+		effort = envE
 	}
 	if model == "" || effort == "" {
 		cm, ce := classifyTier(t)
@@ -109,5 +183,8 @@ func resolveDispatchTier(t db.Task) (model, effort string) {
 			effort = ce
 		}
 	}
-	return model, effort
+	// The dispatch is auto-tiered only when BOTH dials were classifier-derived (no row pin and
+	// no env on either), so a retry may escalate freely while any user/env pin stays pinned.
+	autoTiered = t.Model == "" && t.Effort == "" && envM == "" && envE == ""
+	return model, effort, autoTiered
 }

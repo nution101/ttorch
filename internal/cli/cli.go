@@ -60,6 +60,7 @@ func Main(args []string) int {
 			return run(err)
 		}
 		defer m.Close()
+		skills.EnsureInstalled(os.Stderr)
 		return run(m.StartManager())
 	}
 	cmd, rest := args[0], args[1:]
@@ -90,6 +91,7 @@ func Main(args []string) int {
 			return run(err)
 		}
 		defer m.Close()
+		skills.EnsureInstalled(os.Stderr)
 		return run(m.StartManager())
 	case "resume":
 		return run(cmdResume())
@@ -447,11 +449,39 @@ func cmdSpawn(args []string) error {
 			return fmt.Errorf("spawn: writing brief for %q: %w", id, err)
 		}
 	}
+	// Install any missing recommended agent skills before the worker's tmux session comes
+	// up, so it inherits them from its first turn. Best-effort: never blocks the spawn.
+	skills.EnsureInstalled(os.Stderr)
 	footprint := parseTouches(*touches)
-	t, err := m.SpawnWithEffort(id, repo, *scout, *raw, footprint, *forceOverlap, *effort, *model)
+	// Resolve model + effort through the SAME dispatch-time tier policy the autonomous
+	// scheduler uses, so an interactive `ttorch spawn` gets cheap-by-default tiering (a scout
+	// on haiku, a normal ship on sonnet, a risk-path ship on opus) instead of falling through
+	// to claude's default model at ultracode. Precedence is preserved: an explicit --model/
+	// --effort (or a value persisted on the task row) wins over the env default, which wins
+	// over the classifier. The task row (if it exists) supplies the title/footprint the
+	// classifier reads; the flags override those signals for this dispatch.
+	tierTask, _, _ := m.Store.GetTask(context.Background(), id)
+	tierTask.Kind = db.KindShip
+	if *scout {
+		tierTask.Kind = db.KindScout
+	}
+	if len(footprint) > 0 {
+		tierTask.Footprint = footprint
+	}
+	if *effort != "" {
+		tierTask.Effort = *effort
+	}
+	if *model != "" {
+		tierTask.Model = *model
+	}
+	tierModel, tierEffort, autoTiered := scheduler.ResolveDispatchTier(tierTask)
+	t, err := m.SpawnWithEffort(id, repo, *scout, *raw, footprint, *forceOverlap, tierEffort, tierModel)
 	if err != nil {
 		return err
 	}
+	// Record whether the tier was classifier-derived so a later retry may escalate the model
+	// (auto) or must respect a user/env pin — mirroring the scheduler's autonomous dispatch.
+	_ = m.Store.SetTaskAutoTiered(context.Background(), id, autoTiered)
 	modelLabel := t.Model
 	if modelLabel == "" {
 		modelLabel = "default"
@@ -1484,6 +1514,10 @@ func cmdScheduler(args []string) error {
 		defer singleton.Release(lock)
 	}
 
+	// The daemon spawns workers autonomously; install any missing recommended agent skills
+	// once here, before the dispatch loop brings up worker tmux sessions. Best-effort.
+	skills.EnsureInstalled(os.Stderr)
+
 	sch := scheduler.New(m, *interval, os.Stdout)
 	sch.Dispatch = *dispatch
 	sch.Land = *land
@@ -2241,7 +2275,7 @@ Setup:
   update [--content-only] self-update the binary, then re-apply content
   uninstall [--purge]     remove managed files (keeps files you edited)
   doctor [--yes]          check/install tmux, git, gh, claude (+ optional codegraph)
-  skills [install]        list / install recommended agent skills (e.g. axi)
+  skills [install]        list / install recommended agent skills (e.g. axi, ponytail)
   init [--mode m]         set up a repo's AGENTS.md + CLAUDE.md + delivery mode
                           (+ codegraph nav when TTORCH_CODEGRAPH=1; opt-in, default off)
   profile [dir]           derive the repo's stack/commands/conventions into AGENTS.md

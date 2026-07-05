@@ -861,7 +861,7 @@ func (sc *Scheduler) RunOnce(ctx context.Context) (int, error) {
 		// autonomous path dropped the persisted effort (it passed "") and adds
 		// cheap-by-default model selection. The resolved values are persisted by the spawn,
 		// so a resume restores them and a later re-dispatch reuses them (explicit-wins).
-		model, effort := resolveDispatchTier(claimed)
+		model, effort, autoTiered := resolveDispatchTier(claimed)
 		if _, err := sc.Fleet.SpawnAutonomous(claimed.ID, repo, scout, "", claimed.Footprint, overlaps, effort, model); err != nil {
 			// Dispatch failed after the claim. Classify and handle it WITHOUT re-dispatching on the
 			// next tick: a PERMANENT failure (a condition a retry cannot change) is parked to
@@ -872,6 +872,10 @@ func (sc *Scheduler) RunOnce(ctx context.Context) (int, error) {
 			sc.handleDispatchFailure(ctx, claimed, owner, err, now)
 			continue
 		}
+
+		// Record whether this dispatch's tier was classifier-derived, so a later retry knows it
+		// may re-tier and escalate the model (auto) or must respect a user/env pin. Best-effort.
+		_ = sc.Store.SetTaskAutoTiered(ctx, claimed.ID, autoTiered)
 
 		// Won and dispatched: it now holds a worktree slot and its footprint is in play for
 		// the rest of this tick. A task that previously failed and now dispatched has recovered —

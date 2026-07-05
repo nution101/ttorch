@@ -42,7 +42,7 @@ func Available(kind string) bool {
 // EffortArgs returns the extra `claude` arguments that set the reasoning effort for a
 // spawned worker (or the `ttorch cc` session). level is the explicit per-task choice
 // (e.g. from `spawn --effort`); when it is empty the level falls back to TTORCH_EFFORT
-// and finally the "ultracode" default (effortLevel). A level (or TTORCH_EFFORT) of off
+// and finally the "high" default (effortLevel). A level (or TTORCH_EFFORT) of off
 // leaves Claude's own default untouched. Non-claude harnesses never get effort args.
 func EffortArgs(kind, level string) string {
 	if kind != "claude" {
@@ -75,10 +75,14 @@ func ValidEffort(s string) bool {
 
 // ResolveWorkerEffort resolves the reasoning-effort level to launch a worker with. The
 // order is: the explicit per-task choice (e.g. `spawn --effort`), then the global
-// TTORCH_EFFORT env, then the kind default — "high" for a scout (investigation only, it
-// does not need ultracode) and "ultracode" for a ship worker. The result is a concrete
-// level the spawn path persists on the task row so a later resume restores the same
-// effort. It is always non-empty.
+// TTORCH_EFFORT env, then the kind default — "high" for both a scout and a ship worker.
+// "high" (not ultracode) is the ship default because ultracode (xhigh + a session running
+// its own sub-agent fleet) is redundant with ttorch's own orchestration and rarely earns
+// its cost; opt into it per task with `--effort ultracode` when a single task genuinely
+// needs it. The autonomous dispatch path additionally refines this via the scheduler's
+// complexity classifier (cheap model + matching effort). The result is a concrete level the
+// spawn path persists on the task row so a later resume restores the same effort. It is
+// always non-empty.
 func ResolveWorkerEffort(explicit string, scout bool) string {
 	if e := strings.ToLower(strings.TrimSpace(explicit)); e != "" {
 		return e
@@ -86,10 +90,7 @@ func ResolveWorkerEffort(explicit string, scout bool) string {
 	if v := strings.ToLower(strings.TrimSpace(os.Getenv("TTORCH_EFFORT"))); v != "" {
 		return v
 	}
-	if scout {
-		return "high"
-	}
-	return "ultracode"
+	return "high"
 }
 
 // effortArgsForLevel maps an effort level to claude flags. "ultracode" is not an
@@ -112,7 +113,7 @@ func effortArgsForLevel(level string) string {
 func effortLevel() string {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv("TTORCH_EFFORT")))
 	if v == "" {
-		return "ultracode"
+		return "high"
 	}
 	return v
 }
@@ -219,12 +220,18 @@ func ResolveWorkerModel(explicit string) string {
 	return EnvWorkerModel()
 }
 
-// managerModelLevel is the manager's model, from TTORCH_MANAGER_MODEL (default "" — claude's
-// own default). It is separate from the worker default (TTORCH_MODEL) so the plan-heavy
-// manager and the workers can run on different models, mirroring the TTORCH_MANAGER_EFFORT /
-// TTORCH_EFFORT split.
+// managerModelLevel is the manager's model, from TTORCH_MANAGER_MODEL (default "sonnet").
+// It is separate from the worker default (TTORCH_MODEL) so the plan-heavy manager and the
+// workers can run on different models, mirroring the TTORCH_MANAGER_EFFORT / TTORCH_EFFORT
+// split. The manager only plans and delegates (it writes no code) and runs continuously, so
+// it defaults to sonnet — near-opus judgment at a fraction of the per-token cost of the
+// standing session. Override with TTORCH_MANAGER_MODEL (e.g. "opus" for the hardest planning,
+// or "default"/"off" to fall back to claude's own default).
 func managerModelLevel() string {
-	return NormalizeModel(os.Getenv("TTORCH_MANAGER_MODEL"))
+	if m := NormalizeModel(os.Getenv("TTORCH_MANAGER_MODEL")); m != "" {
+		return m
+	}
+	return "sonnet"
 }
 
 // EnvWorkerEffort and EnvWorkerModel expose the raw worker env defaults (TTORCH_EFFORT /

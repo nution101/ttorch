@@ -37,7 +37,7 @@ func TestEffortArgs(t *testing.T) {
 		env  string
 		want string
 	}{
-		{"", ` --settings '{"ultracode":true}'`}, // default
+		{"", " --effort high"}, // default
 		{"ultracode", ` --settings '{"ultracode":true}'`},
 		{"MAX", " --effort max"}, // case-insensitive
 		{"xhigh", " --effort xhigh"},
@@ -103,26 +103,27 @@ func TestResolveWorkerEffort(t *testing.T) {
 	if got := ResolveWorkerEffort("", true); got != "max" {
 		t.Errorf("env should win over scout default: got %q, want max", got)
 	}
-	// No explicit, no env: kind default — high for scout, ultracode for ship.
+	// No explicit, no env: kind default — "high" for both scout and ship (ultracode is no
+	// longer a default; it's opt-in per task).
 	t.Setenv("TTORCH_EFFORT", "")
 	if got := ResolveWorkerEffort("", true); got != "high" {
 		t.Errorf("scout default: got %q, want high", got)
 	}
-	if got := ResolveWorkerEffort("", false); got != "ultracode" {
-		t.Errorf("ship default: got %q, want ultracode", got)
+	if got := ResolveWorkerEffort("", false); got != "high" {
+		t.Errorf("ship default: got %q, want high", got)
 	}
 }
 
 func TestLaunchCommandsCarryEffort(t *testing.T) {
-	t.Setenv("TTORCH_EFFORT", "") // default: ultracode
+	t.Setenv("TTORCH_EFFORT", "") // default: high
 	t.Setenv("TTORCH_MODEL", "")  // pin: no --model so the exact-match assertions below hold
-	want := `claude --dangerously-skip-permissions --settings '{"ultracode":true}'`
+	want := `claude --dangerously-skip-permissions --effort high`
 	if got := InteractiveCommand("claude"); got != want {
 		t.Errorf("interactive: got %q, want %q", got, want)
 	}
 	brief := BriefCommand("claude", "/tmp/b.md", "sid-123", "", "")
-	if !strings.Contains(brief, `--settings '{"ultracode":true}'`) {
-		t.Errorf("brief command missing ultracode setting: %q", brief)
+	if !strings.Contains(brief, " --effort high") {
+		t.Errorf("brief command missing default effort: %q", brief)
 	}
 	if !strings.HasSuffix(brief, `"$(cat '/tmp/b.md')"`) {
 		t.Errorf("brief command should end with the brief prompt: %q", brief)
@@ -140,6 +141,7 @@ func TestLaunchCommandsCarryEffort(t *testing.T) {
 
 func TestManagerCommand(t *testing.T) {
 	t.Setenv("TTORCH_MANAGER_EFFORT", "") // default: high (NOT ultracode)
+	t.Setenv("TTORCH_MANAGER_MODEL", "")  // default: sonnet (plan-only, continuous session)
 	// With a charter file the charter is referenced (short command), not inlined.
 	cmd := ManagerCommand("claude", "mgr-sid", "/tmp/charter.md")
 	if !strings.Contains(cmd, " --effort high") {
@@ -147,6 +149,9 @@ func TestManagerCommand(t *testing.T) {
 	}
 	if strings.Contains(cmd, "ultracode") {
 		t.Errorf("manager must not default to ultracode, got %q", cmd)
+	}
+	if !strings.Contains(cmd, " --model 'sonnet'") {
+		t.Errorf("manager should default to --model sonnet, got %q", cmd)
 	}
 	if !strings.Contains(cmd, " --append-system-prompt-file '/tmp/charter.md'") {
 		t.Errorf("manager should reference the charter file, got %q", cmd)

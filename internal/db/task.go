@@ -17,7 +17,7 @@ const taskSelect = `SELECT
 	t.reviewed_sha, t.footprint, t.last_pane_hash, t.idle_sweeps,
 	t.created_at, t.updated_at, t.last_progress_at,
 	t.lease_owner, t.lease_expires_at, t.retry_count, t.max_retries, t.attempt,
-	t.effort, t.model, t.has_brief,
+	t.effort, t.model, t.has_brief, t.auto_tiered,
 	p.repo_path
 	FROM tasks t JOIN projects p ON p.id = t.project_id`
 
@@ -28,6 +28,7 @@ func scanTask(sc rowScanner) (Task, error) {
 		parentID         sql.NullString
 		gate             int64
 		hasBrief         int64
+		autoTiered       int64
 		footprint        string
 		createdAt, updAt string
 		lastProgress     sql.NullString
@@ -39,12 +40,13 @@ func scanTask(sc rowScanner) (Task, error) {
 		&t.ReviewedSHA, &footprint, &t.LastPaneHash, &t.IdleSweeps,
 		&createdAt, &updAt, &lastProgress,
 		&t.LeaseOwner, &leaseExpires, &t.RetryCount, &t.MaxRetries, &t.Attempt,
-		&t.Effort, &t.Model, &hasBrief,
+		&t.Effort, &t.Model, &hasBrief, &autoTiered,
 		&t.Project); err != nil {
 		return Task{}, err
 	}
 	t.GatePassed = gate != 0
 	t.HasBrief = hasBrief != 0
+	t.AutoTiered = autoTiered != 0
 	if epicID.Valid {
 		v := epicID.Int64
 		t.EpicID = &v
@@ -138,19 +140,23 @@ func (s *Store) insertTaskTx(ctx context.Context, tx *sql.Tx, t Task) error {
 	if t.HasBrief {
 		hasBrief = 1
 	}
+	autoTiered := 0
+	if t.AutoTiered {
+		autoTiered = 1
+	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO tasks (
 			id, project_id, epic_id, phase_id, parent_task_id, created_by,
 			title, kind, status, stage, owner,
 			window, worktree, harness, session_id, pr, gate_passed, approved_by, reviewed_sha, footprint,
 			last_pane_hash, idle_sweeps, created_at, updated_at, last_progress_at,
-			lease_owner, lease_expires_at, retry_count, max_retries, attempt, effort, model, has_brief)
-		VALUES (?, ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?,  ?, ?, ?)`,
+			lease_owner, lease_expires_at, retry_count, max_retries, attempt, effort, model, has_brief, auto_tiered)
+		VALUES (?, ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?,  ?, ?, ?, ?)`,
 		t.ID, t.ProjectID, nullInt(t.EpicID), nullInt(t.PhaseID), nullStr(t.ParentTaskID), t.CreatedBy,
 		t.Title, t.Kind, t.Status, t.Stage, t.Owner,
 		t.Window, t.Worktree, t.Harness, t.SessionID, t.PR, gate, t.ApprovedBy, t.ReviewedSHA, fp,
 		t.LastPaneHash, t.IdleSweeps, formatTime(t.Created), formatTime(t.UpdatedAt), nullTime(t.LastProgressAt),
-		t.LeaseOwner, nullTime(t.LeaseExpiresAt), t.RetryCount, t.MaxRetries, t.Attempt, t.Effort, t.Model, hasBrief)
+		t.LeaseOwner, nullTime(t.LeaseExpiresAt), t.RetryCount, t.MaxRetries, t.Attempt, t.Effort, t.Model, hasBrief, autoTiered)
 	return err
 }
 
@@ -638,5 +644,21 @@ func (s *Store) SetBriefStored(ctx context.Context, id string) error {
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE tasks SET has_brief = 1, updated_at = ? WHERE id = ?`,
 		formatTime(s.now()), id)
+	return err
+}
+
+// SetTaskAutoTiered records whether a task's model+effort were assigned by the dispatch-time
+// complexity classifier (true) rather than pinned by the user/env (false). The dispatch path
+// calls it right after a spawn so a later retry knows whether it may re-tier and escalate the
+// model up the ladder (auto) or must respect the pinned values ("explicit wins"). It is a
+// no-op when the row does not exist yet (like SetBriefStored) and emits no event (§2.2).
+func (s *Store) SetTaskAutoTiered(ctx context.Context, id string, auto bool) error {
+	v := 0
+	if auto {
+		v = 1
+	}
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE tasks SET auto_tiered = ?, updated_at = ? WHERE id = ?`,
+		v, formatTime(s.now()), id)
 	return err
 }
