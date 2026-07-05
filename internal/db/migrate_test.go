@@ -38,8 +38,8 @@ func TestFreshDBBootstrapsToV0(t *testing.T) {
 	if err := s.Migrate(ctx); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if v, err = s.schemaVersion(ctx); err != nil || v != 7 {
-		t.Errorf("after Migrate: version=%d err=%v, want 7/nil", v, err)
+	if v, err = s.schemaVersion(ctx); err != nil || v != 8 {
+		t.Errorf("after Migrate: version=%d err=%v, want 8/nil", v, err)
 	}
 }
 
@@ -50,8 +50,8 @@ func TestMigrateUpDownUp(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t) // Open() already migrated up
 
-	if v, err := s.schemaVersion(ctx); err != nil || v != 7 {
-		t.Fatalf("after Open: version=%d err=%v, want 7", v, err)
+	if v, err := s.schemaVersion(ctx); err != nil || v != 8 {
+		t.Fatalf("after Open: version=%d err=%v, want 8", v, err)
 	}
 	var fk int
 	if err := s.db.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&fk); err != nil || fk != 1 {
@@ -78,8 +78,8 @@ func TestMigrateUpDownUp(t *testing.T) {
 	if err := s.Migrate(ctx); err != nil {
 		t.Fatalf("re-Migrate: %v", err)
 	}
-	if v, err := s.schemaVersion(ctx); err != nil || v != 7 {
-		t.Fatalf("after re-up: version=%d err=%v, want 7", v, err)
+	if v, err := s.schemaVersion(ctx); err != nil || v != 8 {
+		t.Fatalf("after re-up: version=%d err=%v, want 8", v, err)
 	}
 	if !tableExists(t, s, "tasks") {
 		t.Error("tasks missing after re-up")
@@ -100,7 +100,7 @@ func TestMigrateIdempotent(t *testing.T) {
 	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations`).Scan(&rows); err != nil {
 		t.Fatal(err)
 	}
-	if rows != 7 {
-		t.Errorf("schema_migrations rows = %d, want 7 (no duplicate ledger row)", rows)
+	if rows != 8 {
+		t.Errorf("schema_migrations rows = %d, want 8 (no duplicate ledger row)", rows)
 	}
 }

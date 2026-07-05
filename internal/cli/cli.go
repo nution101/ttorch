@@ -474,11 +474,14 @@ func cmdSpawn(args []string) error {
 	if *model != "" {
 		tierTask.Model = *model
 	}
-	tierModel, tierEffort := scheduler.ResolveDispatchTier(tierTask)
+	tierModel, tierEffort, autoTiered := scheduler.ResolveDispatchTier(tierTask)
 	t, err := m.SpawnWithEffort(id, repo, *scout, *raw, footprint, *forceOverlap, tierEffort, tierModel)
 	if err != nil {
 		return err
 	}
+	// Record whether the tier was classifier-derived so a later retry may escalate the model
+	// (auto) or must respect a user/env pin — mirroring the scheduler's autonomous dispatch.
+	_ = m.Store.SetTaskAutoTiered(context.Background(), id, autoTiered)
 	modelLabel := t.Model
 	if modelLabel == "" {
 		modelLabel = "default"

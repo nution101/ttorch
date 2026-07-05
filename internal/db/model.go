@@ -158,6 +158,14 @@ type Task struct {
 	// over the dispatch-time tier classifier (see harness.ResolveWorkerModel).
 	Model string
 
+	// AutoTiered records whether Model+Effort were assigned by the dispatch-time complexity
+	// classifier (true) rather than pinned by the user/env (false). When true, the dispatch
+	// path re-derives the tier on each retry and escalates the model up the ladder
+	// (sonnet → opus → fable) as RetryCount climbs — the escalation-on-failure safety net;
+	// when false the pinned values are respected unchanged ("explicit wins"). See
+	// scheduler.ResolveDispatchTier.
+	AutoTiered bool
+
 	// HasBrief records whether a real (non-stub) brief — the worker's full initial
 	// prompt — has been stored for this task (paths.BriefPath), set by the brief-writing
 	// path (WriteBrief, driven by `ttorch task add --brief` / `spawn --brief`). The

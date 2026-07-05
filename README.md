@@ -420,10 +420,15 @@ the task's complexity signals (kind, footprint, title):
 Precedence is **explicit per-task > `TTORCH_*` env > classifier tier > kind default**, so an
 explicit `--model`/`--effort` or a global env always wins. Both the autonomous dispatch path
 **and** a manual `ttorch spawn` route through this classifier, so hand-started work gets the
-same cheap-by-default tiering instead of falling through to claude's default model. The
-adversarial-review trust gate keeps
-reviewers on your most capable default (it is deliberately *not* cheapened), since in trusted
-mode it can authorize a merge unread.
+same cheap-by-default tiering instead of falling through to claude's default model.
+
+**Escalation on failure.** A classifier-tiered task that fails and is retried bumps its model
+one rung up the ladder each attempt — `sonnet → opus → fable` (`fable` is the top rung, ~2×
+opus, reserved for work that could not be completed cheaper). This starts every task cheap and
+spends the priciest models only where a cheaper tier actually failed. A **pinned** `--model`
+never escalates (explicit wins). The adversarial-review trust gate keeps reviewers on your most
+capable default (it is deliberately *not* cheapened), since in trusted mode it can authorize a
+merge unread.
 
 ```sh
 TTORCH_MODEL=sonnet ttorch                 # fleet on Sonnet; escalate the hard ones with --model opus

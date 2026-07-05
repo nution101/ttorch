@@ -345,7 +345,11 @@ unset (and no env override applies), a small classifier (`internal/scheduler/tie
 tier from complexity signals — scout ⇒ `haiku`/`medium`, a security/concurrency/migration/
 finance footprint or title ⇒ `opus`/`xhigh`, every other ship ⇒ `sonnet`/`high`. Precedence is
 **explicit per-task > `TTORCH_*` env > classifier > kind default**; the pairs it emits are valid `(model, effort)` combinations (claude silently
-downgrades an unsupported effort, and fast mode is opus-only). The autonomous dispatch also now
+downgrades an unsupported effort, and fast mode is opus-only). A classifier-tiered dispatch is
+flagged (`tasks.auto_tiered`); on a retry such a task re-derives its tier and **escalates the
+model one rung up the ladder** (`haiku→sonnet→opus→fable`, clamped at fable) per `retry_count`,
+so every task starts cheap and only repeated failure reaches the priciest model — a user/env
+pin (`auto_tiered=0`) never escalates. The autonomous dispatch also now
 forwards the persisted effort, closing a gap where it fell back to the kind default. The
 adversarial-review gate keeps its reviewers on claude's default model (not cheapened), since a
 trusted-mode verdict can authorize a merge unread.
