@@ -75,7 +75,11 @@ Run these from your worktree; they resolve your task automatically (via
 - You MUST call `ttorch report done` when the work is complete and ready for review,
   `ttorch report blocked -m "<why>"` when you cannot proceed, and
   `ttorch report needs-input -m "<question>"` when you need a decision — each at the
-  matching transition. Use `ttorch report active` when you begin.
+  matching transition. Use `ttorch report active` when you begin. Committing your work is
+  NOT reporting: work that is committed but never reported stays invisible to the manager
+  and scheduler, and nothing advances. A Stop hook enforces this — if you end your turn
+  while your task is still unreported, the hook blocks the stop and reminds you to report;
+  run the matching `ttorch report …` as the final step of your turn so it never has to.
 - Use `ttorch stage "<phase>"` for fine progress (e.g. `implementing`, `testing`,
   `validating`) and `ttorch note "<text>"` for activity worth recording. Neither wakes
   the manager.

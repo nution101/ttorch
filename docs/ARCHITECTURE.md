@@ -91,7 +91,12 @@ A task moves through the store like this:
    brief. The task is now `active` and holds a lease.
 3. **Work.** The worker syncs (fetch + rebase onto the default branch), implements the
    brief, runs the repo's build/test/lint, and reports `done`. Each report extends its
-   lease (a heartbeat).
+   lease (a heartbeat). Reporting is enforced, not just asked: every worker session carries a
+   worker-only Stop hook (`ttorch stop-hook`, installed in its worktree-local settings) that
+   fires when the worker goes idle and **blocks the stop while the task is still `active`**,
+   reminding it to run `ttorch report done|blocked|needs-input`. Without it, a worker that
+   commits and idles without reporting leaves finished work invisible to the land/gate
+   machinery — the "committed but stuck at active" dead zone. Opt out with `TTORCH_NO_STOP_REPORT`.
 4. **Gate.** Finished work is reviewed: the manager (or you) runs `ttorch validate` and the
    adversarial-review gate (`trust prep` → reviewers → `trust record`), which writes a
    durable, commit-pinned **verdict**. Gating is a judgment step; it never merges.

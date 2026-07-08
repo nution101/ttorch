@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/nution101/ttorch/internal/paths"
 )
 
 // DetectOwn returns the harness running the current process, or "" if unknown.
@@ -395,22 +397,46 @@ func shq(s string) string {
 // repo's git user. For Claude Code it writes <worktree>/.claude/settings.local.json
 // and keeps it out of git's view. Other harnesses are no-ops for now.
 //
-// Workers report their turn boundaries and status through the DB (`ttorch report`),
-// so no Stop hook is installed; this file carries only the co-author setting.
+// It also installs a worker-only Stop hook (`ttorch stop-hook`). Reporting is otherwise
+// only an instruction the worker may skip — a worker that commits its work and ends its
+// turn WITHOUT running `ttorch report done` leaves finished work stuck at `active`, invisible
+// to the scheduler (lands only reported/gated work) and the manager (gates only reported-done
+// work). The Stop hook fires when the worker goes idle and blocks the stop until it reports a
+// terminal/blocking status. It is scoped to the worktree-local settings — never global — so it
+// governs workers only, never the manager, `ttorch cc`, or the user's own sessions.
 func WriteWorkerSettings(kind, worktree string) error {
 	if kind != "claude" {
 		return nil
+	}
+	type hookCommand struct {
+		Type    string `json:"type"`
+		Command string `json:"command"`
+	}
+	type hookGroup struct {
+		Hooks []hookCommand `json:"hooks"`
+	}
+	type hooksBlock struct {
+		Stop []hookGroup `json:"Stop"`
 	}
 	type settings struct {
 		// IncludeCoAuthoredBy=false stops the agent from adding an AI co-author
 		// trailer to commits — work is authored as the repo's git user, not the agent.
 		IncludeCoAuthoredBy bool `json:"includeCoAuthoredBy"`
+		// Hooks installs the worker Stop hook that enforces `ttorch report` (see above).
+		Hooks hooksBlock `json:"hooks"`
 	}
+	// The absolute ttorch binary so the hook resolves regardless of the hook process's PATH.
+	stopHookCmd := shq(paths.Default().Binary()) + " stop-hook"
 	dir := filepath.Join(worktree, ".claude")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	b, err := json.MarshalIndent(settings{IncludeCoAuthoredBy: false}, "", "  ")
+	b, err := json.MarshalIndent(settings{
+		IncludeCoAuthoredBy: false,
+		Hooks: hooksBlock{Stop: []hookGroup{{
+			Hooks: []hookCommand{{Type: "command", Command: stopHookCmd}},
+		}}},
+	}, "", "  ")
 	if err != nil {
 		return err
 	}
