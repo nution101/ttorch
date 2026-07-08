@@ -6,6 +6,7 @@ package cli
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -105,6 +106,8 @@ func Main(args []string) int {
 		return run(cmdSpawn(rest))
 	case "report":
 		return run(cmdReport(rest))
+	case "stop-hook":
+		return run(cmdStopHook(os.Stdin, os.Stdout))
 	case "stage":
 		return run(cmdStage(rest))
 	case "note":
@@ -592,6 +595,72 @@ func cmdReport(args []string) error {
 		tail = " (the manager has been notified)"
 	}
 	fmt.Printf("%s → %s%s\n", taskID, status, tail)
+	return nil
+}
+
+// cmdStopHook is the Claude Code Stop-hook handler installed on every worker session
+// (see harness.WriteWorkerSettings). Claude fires it when the worker finishes a turn and is
+// about to go idle. If the worker's task is still `active` — it has not reported a
+// terminal/blocking status — the hook BLOCKS the stop and reminds the worker to run
+// `ttorch report done|blocked|needs-input`. This closes the gap where a worker committed its
+// work and idled WITHOUT reporting, leaving finished work invisible to the scheduler (which
+// lands only reported/gated work) and the manager (which gates only reported-done work).
+//
+// It is FAIL-OPEN: any ambiguity — unreadable payload, not a worker context, DB error, or a
+// task that already left `active` — allows the stop (no output), so the hook can never wedge
+// a session. `stop_hook_active` (Claude sets it when this stop already follows a prior block)
+// short-circuits to avoid a block loop. Opt out entirely with TTORCH_NO_STOP_REPORT.
+func cmdStopHook(in io.Reader, out io.Writer) error {
+	if os.Getenv("TTORCH_NO_STOP_REPORT") != "" {
+		return nil
+	}
+	// The only field we need is stop_hook_active: re-blocking a stop that already follows a
+	// prior block would loop, so we stand down in that case.
+	var payload struct {
+		StopHookActive bool `json:"stop_hook_active"`
+	}
+	if data, err := io.ReadAll(io.LimitReader(in, 1<<20)); err == nil {
+		_ = json.Unmarshal(data, &payload) // best-effort; a malformed payload leaves it false
+	}
+	if payload.StopHookActive {
+		return nil
+	}
+	// Resolve THIS worker's own task from its unforgeable identity ($TTORCH_TASK_ID / the
+	// worktree's .ttorch/task), exactly as `ttorch report` does. Not a worker context → allow.
+	taskID, dbPath, _, err := resolveWorkerAuth("")
+	if err != nil {
+		return nil
+	}
+	store, err := db.Open(dbPath)
+	if err != nil {
+		return nil
+	}
+	defer store.Close()
+	task, ok, err := store.GetTask(context.Background(), taskID)
+	if err != nil || !ok {
+		return nil
+	}
+	// A task that has reported done/blocked/needs-input (or otherwise left `active`) is already
+	// visible to the advance machinery — there is nothing to enforce.
+	if task.Status != db.StatusActive {
+		return nil
+	}
+	reason := "ttorch: you are about to go idle without reporting this task's status, so the manager " +
+		"and scheduler cannot advance your work (they act only on reported/gated work). Run exactly " +
+		"one of these now, from your worktree, then stop:\n" +
+		"  - `ttorch report done -m \"<summary>\"` — the work is complete and committed\n" +
+		"  - `ttorch report blocked -m \"<why>\"` — you cannot proceed\n" +
+		"  - `ttorch report needs-input -m \"<question>\"` — you need a decision\n" +
+		"If the task is not actually finished, keep working instead."
+	resp := struct {
+		Decision string `json:"decision"`
+		Reason   string `json:"reason"`
+	}{Decision: "block", Reason: reason}
+	b, err := json.Marshal(resp)
+	if err != nil {
+		return nil
+	}
+	fmt.Fprintln(out, string(b))
 	return nil
 }
 
