@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.16.2](https://github.com/nution101/ttorch/compare/v0.16.1...v0.16.2) (2026-07-08)
+
+
+### Bug Fixes
+
+* **worker:** enforce ttorch report via a worker Stop hook ([682beb8](https://github.com/nution101/ttorch/commit/682beb8f852baefccbdc343aedead405739d6731))
+* **worker:** enforce ttorch report via a worker Stop hook ([9e090ee](https://github.com/nution101/ttorch/commit/9e090eea5a570417605e31155a0aae8326fadda3))
+
 ## [0.16.1](https://github.com/nution101/ttorch/compare/v0.16.0...v0.16.1) (2026-07-05)
 
 
