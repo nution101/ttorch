@@ -1952,7 +1952,7 @@ func TestMergeLocal_GateRefusesLegacyBareToken(t *testing.T) {
 }
 
 // TestMergeLocal_TrustedAutoRequiresDefaultBranchScript mirrors the reproduced bypass:
-// with NO .ttorch/validate.sh on the default branch, gateValidate would fall back to
+// with NO .ttorch/validate.sh on the default branch, the gate would fall back to
 // ecosystem detection on the worker's checkout — which the worker controls. Here the
 // worker deletes go.mod and adds a package.json whose test is a no-op, alongside a broken
 // payload. The trusted auto path must refuse (no auto-mint, merge refused) rather than
