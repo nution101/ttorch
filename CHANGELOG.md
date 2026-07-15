@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.17.0](https://github.com/nution101/ttorch/compare/v0.16.2...v0.17.0) (2026-07-15)
+
+
+### Features
+
+* autonomous trusted-gating + tree-hash validate cache ([437a0d5](https://github.com/nution101/ttorch/commit/437a0d564dacd5ff17f75c66958dcb7b9acc9f24))
+* **gate:** content-address the validate cache by git tree hash ([ba1b124](https://github.com/nution101/ttorch/commit/ba1b1242ad46039dcaad44482ceba7761b7121ac))
+* **scheduler:** auto-gate trusted done-work in the autostarted daemon ([bf44830](https://github.com/nution101/ttorch/commit/bf448305ec4ec9d0ab282496442ee9d9272a1686))
+
 ## [0.16.2](https://github.com/nution101/ttorch/compare/v0.16.1...v0.16.2) (2026-07-08)
 
 
