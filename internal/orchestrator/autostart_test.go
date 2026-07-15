@@ -76,6 +76,38 @@ func TestAutoStartScheduler(t *testing.T) {
 	}
 }
 
+// TestSchedulerDaemonArgsEnableGate pins the auto-started daemon's argument list: it must run the
+// full mechanical loop — dispatch, GATE, land, supervise — under the singleton lock, so trusted
+// done-work is gated hands-off and never waits for a manager turn. --gate is the load-bearing
+// assertion (its omission is what left gating manager-paced); the exact list also guards against a
+// pass silently dropping out of auto-start. It reads the package var directly, so it needs no
+// forked process.
+func TestSchedulerDaemonArgsEnableGate(t *testing.T) {
+	want := []string{"scheduler", "--singleton", "--dispatch", "--gate", "--land", "--supervise"}
+	if len(schedulerDaemonArgs) != len(want) {
+		t.Fatalf("schedulerDaemonArgs = %v, want %v", schedulerDaemonArgs, want)
+	}
+	for i, a := range want {
+		if schedulerDaemonArgs[i] != a {
+			t.Fatalf("schedulerDaemonArgs[%d] = %q, want %q (full: %v)", i, schedulerDaemonArgs[i], a, schedulerDaemonArgs)
+		}
+	}
+	// --gate ordered between --dispatch and --land, mirroring the loop's dispatch→gate→land order.
+	di, gi, li := indexOf(schedulerDaemonArgs, "--dispatch"), indexOf(schedulerDaemonArgs, "--gate"), indexOf(schedulerDaemonArgs, "--land")
+	if !(di >= 0 && gi > di && li > gi) {
+		t.Fatalf("expected --dispatch < --gate < --land, got positions dispatch=%d gate=%d land=%d in %v", di, gi, li, schedulerDaemonArgs)
+	}
+}
+
+func indexOf(s []string, v string) int {
+	for i, x := range s {
+		if x == v {
+			return i
+		}
+	}
+	return -1
+}
+
 // TestLaunchSchedulerDaemonNoBinaryIsQuietNoop: the real launcher is a quiet no-op when no
 // installed binary exists (running from source / under test), so it never forks a stray process
 // in those contexts — the binary-existence guard, not just the seam, protects test runs.

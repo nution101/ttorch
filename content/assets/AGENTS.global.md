@@ -21,10 +21,13 @@ one-shot checklist:
 - Keep the **manager tab for orchestration only** — delegate all substantive work,
   including review, to workers, and run adversarial review in an independent worker, never
   the author.
-- **A scheduler drives dispatch, land, and recovery** by default (disable with
+- **A scheduler drives dispatch, gate, land, and recovery** by default (disable with
   `TTORCH_SCHEDULER_AUTOSTART=0`): it continuously dispatches every briefed, footprinted backlog
   task **in parallel — even when their files overlap** — launching each with the brief you
-  stored, lands already-gated work, and recovers workers that verifiably died.
+  stored, gates trusted done-work (runs the adversarial review in an independent worker and records
+  a passing verdict, fail-closed — only an all-pass is recorded; a blocking finding surfaces a
+  `gate_blocked` event to adjudicate instead), lands already-gated work, and recovers workers that
+  verifiably died.
 - **Parallelize by default; serialize only on a true dependency** (B needs A's code to exist,
   or a genuinely intractable semantic conflict), never on coarse same-file or same-directory
   overlap. Each worker is isolated in its own worktree, so overlap is not a hazard — the only
@@ -34,12 +37,13 @@ one-shot checklist:
   footprint and a stored brief (`ttorch task add … --touches … --brief-file …`) so the scheduler
   can dispatch it hands-off; confine each overlapping task's bulk to its own new file with minimal
   shared-file wiring so the land-rebase stays trivial; and land overlapping tasks in dependency order.
-- **Stay reachable for the decisions the scheduler cannot make** — gating finished work,
-  answering blocked/needs-input workers, surfacing non-trusted merges for the lead's approval
-  (the lead approves; you never self-approve). Arm `ttorch watch` after each turn in which you
-  are not awaiting the lead; when it returns, gate green workers (so the scheduler can land
-  them), unblock/redispatch stuck ones, and surface for the lead's approval any merge that
-  waits — then re-arm. **When awaiting a lead decision, first cancel any in-flight watcher and
+- **Stay reachable for the decisions the scheduler cannot make** — gating non-trusted work,
+  adjudicating the gates it escalates (a `gate_blocked` event where a reviewer raised a blocking
+  finding), answering blocked/needs-input workers, surfacing non-trusted merges for the lead's
+  approval (the lead approves; you never self-approve). Arm `ttorch watch` after each turn in which
+  you are not awaiting the lead; when it returns, gate non-trusted workers and adjudicate any
+  escalated gate (so the scheduler can land what it gated), unblock/redispatch stuck ones, and
+  surface for the lead's approval any merge that waits — then re-arm. **When awaiting a lead decision, first cancel any in-flight watcher and
   do not re-arm; the window waits silently** until the lead returns (the lead is the
   interrupt, not the sole driver).
 

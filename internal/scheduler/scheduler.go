@@ -8,25 +8,31 @@
 // sitting idle while the manager is mid-turn or stalled — parallelism becomes deterministic
 // code, not a rule the manager must remember.
 //
-// Phase 1 DISPATCHES ready backlog; phase 2a additionally LANDS work that has already passed
-// the trust gate; phase 3 additionally SUPERVISES the fleet — it reclaims workers that have
-// VERIFIABLY died (a tmux window the watcher confirmed gone, or an expired lease — never
-// pane-output inference) and re-dispatches them within a bounded retry ceiling, poison-pilling
-// a task that exceeds the ceiling to the terminal 'failed' status with an actionable event for
-// the lead rather than restarting it forever. With the land pass enabled, each tick also finds
-// done tasks that already carry a passing durable verdict and lands them through the manager's
-// EXISTING land pipeline (the same code `ttorch land` runs), so a green, gated task merges
-// without the LLM manager doing it by hand — the core throughput/anti-stall win. The three
-// passes are independent: a tick runs whichever are enabled, dispatch defaults on
-// (`ttorch scheduler`) while land (`--land`) and supervise (`--supervise`) are opt-in.
-// Autonomous GATING (spawning the reviewers, recording the verdict) remains the LLM manager's
-// job — the LAND pass deliberately lands only work that ALREADY carries a passing verdict, so
-// recording it stays a deliberate, human-or-LLM gate. The LAND pass NEVER lands ungated work;
+// Phase 1 DISPATCHES ready backlog; the GATE pass additionally gates done-work in a TRUSTED
+// repo; phase 2a additionally LANDS work that has already passed the trust gate; phase 3
+// additionally SUPERVISES the fleet — it reclaims workers that have VERIFIABLY died (a tmux
+// window the watcher confirmed gone, or an expired lease — never pane-output inference) and
+// re-dispatches them within a bounded retry ceiling, poison-pilling a task that exceeds the
+// ceiling to the terminal 'failed' status with an actionable event for the lead rather than
+// restarting it forever. With the land pass enabled, each tick also finds done tasks that
+// already carry a passing durable verdict and lands them through the manager's EXISTING land
+// pipeline (the same code `ttorch land` runs), so a green, gated task merges without the LLM
+// manager doing it by hand — the core throughput/anti-stall win. The four passes are
+// independent: a tick runs whichever are enabled, dispatch defaults on (`ttorch scheduler`)
+// while gate (`--gate`), land (`--land`), and supervise (`--supervise`) are opt-in.
+// With the gate pass enabled, autonomous GATING of TRUSTED done-work (dispatching the
+// adversarial reviewers in independent workers, recording an all-pass verdict, fail-closed) is
+// performed by the daemon — taking the mechanical gate off the LLM manager so trusted done-work
+// no longer waits for a manager turn; a blocking finding, prep refusal, or stalled reviewer
+// records nothing and surfaces an actionable gate_blocked event for the manager to adjudicate.
+// Non-trusted repos are SKIPPED by the gate pass (a daemon-recorded verdict there would not
+// advance delivery — a human still approves), so the LLM manager still gates those. The LAND
+// pass deliberately lands only work that ALREADY carries a passing verdict. The LAND pass NEVER lands ungated work;
 // the SUPERVISE pass reclaims only a worker that has shown no sign of life (no re-dispatch and no
 // heartbeat) since its window was flagged gone, or whose lease genuinely lapsed, and never
 // restarts a task past its retry ceiling. The daemon now AUTO-STARTS by default from the manager
 // session (Manager.StartManager, config-gated by TTORCH_SCHEDULER_AUTOSTART, singleton via
-// `scheduler --singleton`), with dispatch+land+supervise enabled, so a normal `ttorch` session
+// `scheduler --singleton`), with dispatch+gate+land+supervise enabled, so a normal `ttorch` session
 // drives the board autonomously; the manual `ttorch scheduler` subcommand stays available for
 // running it by hand or with a different pass mix.
 //
@@ -42,8 +48,9 @@
 // scheduler has just claimed (active, window not yet up) won't see that claim in its own
 // liveness-gated overlap gate; the worst case is a window-name collision that fails one of
 // the two spawns (never a silent double-dispatch). The manager↔scheduler co-running model is
-// now the DEFAULT: the auto-started daemon drives dispatch/land/recovery while the LLM manager
-// plans, gates, and answers decisions, coexisting purely through the DB's atomic claims. A
+// now the DEFAULT: the auto-started daemon drives dispatch/gate/land/recovery while the LLM manager
+// plans, gates non-trusted work, adjudicates escalated gates, and answers decisions, coexisting
+// purely through the DB's atomic claims. A
 // manager-driven `ttorch spawn` and the daemon's dispatch can still collide on the exact same
 // id only in the brief claimed-but-window-not-yet-up window above (a loud spawn failure, never a
 // silent double-dispatch); in normal operation the manager leaves routine dispatch to the daemon
@@ -202,7 +209,8 @@ type Scheduler struct {
 	Interval time.Duration
 	Log      io.Writer
 
-	// Dispatch, Land, and Supervise select which passes each tick runs, independently.
+	// Dispatch, Land, and Supervise — plus Gate (documented below) — select which passes each
+	// tick runs, independently.
 	// Dispatch (the phase-1 behavior) claims and dispatches ready pending backlog; Land claims
 	// and lands done tasks that already carry a passing verdict; Supervise (phase 3) reclaims
 	// workers that have verifiably died — a confirmed-gone tmux window or an expired lease —
