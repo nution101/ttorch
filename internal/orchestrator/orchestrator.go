@@ -467,8 +467,9 @@ func (m *Manager) StartManager() error {
 		return err
 	}
 	// Auto-start the deterministic scheduler daemon (config-gated, default-on, singleton) so a
-	// normal `ttorch` session drives the board autonomously — dispatch + land + supervise — while
-	// the LLM manager plans, gates, and answers decisions. Run for every start path (re-attach,
+	// normal `ttorch` session drives the board autonomously — dispatch + gate + land + supervise —
+	// while the LLM manager plans, gates non-trusted work, adjudicates escalated gates, and answers
+	// decisions. Run for every start path (re-attach,
 	// restore, fresh) so a missing daemon is (re)started; the singleton makes a redundant launch a
 	// no-op. Best-effort and non-blocking: it never fails or delays the attach below.
 	m.autoStartScheduler()

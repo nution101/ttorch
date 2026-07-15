@@ -1504,7 +1504,7 @@ func cmdWatchdog(args []string) error {
 	}
 }
 
-// cmdScheduler runs the deterministic dispatch+land+supervise daemon (roadmap item A). Each
+// cmdScheduler runs the deterministic dispatch+gate+land+supervise daemon (roadmap item A). Each
 // tick it runs whichever passes are enabled, in this order:
 //
 //   - SUPERVISE (phase 3, opt-in via --supervise): reclaim workers that have VERIFIABLY died —
@@ -1518,15 +1518,23 @@ func cmdWatchdog(args []string) error {
 //     every live and just-claimed worker, within free worktree capacity), and dispatch them
 //     through the SAME spawn path the manager uses — so disjoint ready work (including a
 //     supervisor-reclaimed task) never sits idle.
+//   - GATE (opt-in via --gate): find done tasks in a TRUSTED repo that do NOT already carry a
+//     passing verdict, run the trust prep, dispatch the adversarial reviewers in independent
+//     workers, and on an all-pass RECORD the verdict via the SAME commit-pinned trust-record
+//     path the manager uses — so trusted done-work is gated without the manager doing it by
+//     hand. It FAILS CLOSED: a blocking finding, a prep refusal, or a stalled reviewer records
+//     nothing and surfaces an actionable gate_blocked event for the manager to adjudicate.
+//     Non-trusted repos and already-passing tasks are skipped. Runs before LAND so a verdict
+//     recorded this tick can land in the same tick.
 //   - LAND (phase 2a, opt-in via --land): find done tasks that ALREADY carry a passing durable
 //     verdict and land them through the SAME pipeline `ttorch land` runs (rebase, re-validate,
 //     carry verdict+approval, per-repo fast-forward, teardown) — so green, gated work merges
 //     without the manager doing it by hand. It NEVER lands ungated work: a passing verdict is
 //     required to attempt a task and the land path's own commit-pinned gate is the authority.
 //
-// The three passes are independent (--dispatch defaults on; --land and --supervise opt-in), so
-// it can run as a dispatch-only daemon, a land-only daemon, a supervisor, or any combination.
-// The manager AUTO-STARTS this daemon by default with all three passes on (config-gated by
+// The four passes are independent (--dispatch defaults on; --gate, --land, and --supervise
+// opt-in), so it can run as a dispatch-only daemon, a land-only daemon, a supervisor, or any
+// combination. The manager AUTO-STARTS this daemon by default with all four passes on (config-gated by
 // TTORCH_SCHEDULER_AUTOSTART; see Manager.StartManager), so a normal `ttorch` session is already
 // driving the board — this subcommand stays for running it by hand or with a different pass mix.
 // --singleton takes a per-~/.ttorch lock and exits quietly if another daemon already holds it

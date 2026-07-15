@@ -573,6 +573,16 @@ func ResolveRef(repo, ref string) (string, error) {
 	return git("-C", repo, "rev-parse", ref)
 }
 
+// TreeHash returns the git TREE object id of the commit sha resolves to
+// (`git rev-parse <sha>^{tree}`). Unlike a commit sha — which git rewrites on every rebase
+// even for a byte-identical tree (new committer metadata / fork-point replay) — the tree id
+// is a cryptographic content identity of the checked-out files, so two commits with identical
+// trees share one tree hash. The trust gate's validate cache keys on it (via ResolveRef's
+// sibling in the orchestrator), so re-validations of an identical tree collapse into one run.
+func TreeHash(repo, sha string) (string, error) {
+	return git("-C", repo, "rev-parse", sha+"^{tree}")
+}
+
 // SetRef points refName at commit (`git update-ref`), creating or moving it. refName
 // must be a fully-qualified ref (e.g. refs/ttorch/discarded/<id>-<sha>). Teardown's
 // --force path uses it to stash a discarded task branch under refs/ttorch/discarded/

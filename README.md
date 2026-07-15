@@ -173,7 +173,7 @@ reference; this table covers the surface a lead and manager use day to day.
 | `ttorch watch` | Block until an actionable DB event, print the batch + watermark, exit. Flags: `--since`, `--timeout`, `--coalesce`, `--reset`. The manager arms this each non-blocking turn |
 | `ttorch await-lead [--clear]` | Mark the manager as awaiting the lead (the watcher stays silent until cleared) |
 | `ttorch watchdog` | External manager-liveness net (run from launchd/cron). Flags: `--stall`, `--interval`, `--quiet` |
-| `ttorch scheduler` | The deterministic dispatch+land+supervise daemon. Flags: `--dispatch` (on), `--land`, `--supervise`, `--interval`, `--once`, `--singleton` |
+| `ttorch scheduler` | The deterministic dispatch+gate+land+supervise daemon. Flags: `--dispatch` (on), `--gate`, `--land`, `--supervise`, `--interval`, `--once`, `--singleton` |
 
 **Delivery**
 
@@ -207,8 +207,8 @@ reference; this table covers the surface a lead and manager use day to day.
 ## The scheduler daemon
 
 `ttorch scheduler` is a deterministic Go loop (no LLM) that drains the task board on a
-ticker (default every 5s). Each tick runs up to three independent, error-isolated passes
-in fixed order — **supervise → dispatch → land**:
+ticker (default every 5s). Each tick runs up to four independent, error-isolated passes
+in fixed order — **supervise → dispatch → gate → land**:
 
 - **Dispatch** — claim and launch every `pending` task that has a **declared footprint**, a
   **stored brief**, and free worktree capacity — **in parallel, even when footprints overlap**
@@ -217,6 +217,12 @@ in fixed order — **supervise → dispatch → land**:
   double-dispatch. The `TTORCH_SERIALIZE_OVERLAP` off-switch restores the pre-parallel
   skip-on-overlap behavior. No-capacity, footprint-less, or brief-less tasks are **skipped**
   (left for the manager), never failed.
+- **Gate** — gate `done` tasks in a **trusted** repo that don't yet carry a passing verdict:
+  dispatch the adversarial reviewers and, **fail-closed**, record **only** an all-pass verdict
+  (auto-minting the approval the land pass consumes). A blocking finding, prep refusal, or
+  stalled reviewer records nothing and surfaces an actionable `gate_blocked` event for the
+  manager; non-trusted repos and already-passing tasks are skipped. This takes hands-off gating
+  off the manager so trusted done-work no longer waits for a manager turn.
 - **Land** — land `done` tasks that **already carry a passing verdict**, through the same
   pipeline as `ttorch land`. It never lands ungated work.
 - **Supervise** — reclaim only **verifiably-dead** workers (a confirmed-gone window or an
@@ -224,8 +230,8 @@ in fixed order — **supervise → dispatch → land**:
   them within a **bounded retry ceiling** (default 3), poison-pilling a task that exceeds it
   to terminal `failed` with an actionable event.
 
-**It auto-starts with the manager by default**, running all three passes
-(`scheduler --singleton --dispatch --land --supervise`), logging to `~/.ttorch/scheduler.log`
+**It auto-starts with the manager by default**, running all four passes
+(`scheduler --singleton --dispatch --gate --land --supervise`), logging to `~/.ttorch/scheduler.log`
 — never the manager pane. Turn it off with a falsey **`TTORCH_SCHEDULER_AUTOSTART`**
 (`0`/`false`/`no`/`off`). A `--singleton` `flock` ensures at most one daemon runs per
 `~/.ttorch`.

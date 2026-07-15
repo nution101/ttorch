@@ -17,10 +17,19 @@ import (
 // launchSchedulerDaemon.
 var schedulerDaemonLauncher = launchSchedulerDaemon
 
+// schedulerDaemonArgs is the argument list the auto-started daemon is launched with: the full
+// mechanical loop under the singleton lock — dispatch, GATE (trusted done-work), land, and
+// supervise — so a normal `ttorch` session drives the board with no manager turn, INCLUDING
+// gating trusted work hands-off (the mechanical prep→dispatch→aggregate→record choreography the
+// LLM manager used to run each turn). It is a package var so a test can assert the daemon
+// launches with gating enabled without forking a real process. --gate sits between --dispatch
+// and --land to mirror the loop's dispatch→gate→land sequence; flag order is otherwise immaterial.
+var schedulerDaemonArgs = []string{"scheduler", "--singleton", "--dispatch", "--gate", "--land", "--supervise"}
+
 // autoStartScheduler starts the deterministic scheduler daemon in the background so a normal
-// `ttorch` session drives the board autonomously — dispatching ready backlog, landing
-// already-gated work, and recovering crashed workers — while the LLM manager plans, gates, and
-// answers decisions. It is:
+// `ttorch` session drives the board autonomously — dispatching ready backlog, gating done-work
+// in trusted repos, landing already-gated work, and recovering crashed workers — while the LLM
+// manager plans, gates non-trusted work, adjudicates blocked gates, and answers decisions. It is:
 //
 //   - CONFIG-GATED and default-ON: it runs unless TTORCH_SCHEDULER_AUTOSTART is set falsey, so a
 //     user can always fall back to manual dispatch/land (the manual `ttorch scheduler` subcommand
@@ -32,8 +41,9 @@ var schedulerDaemonLauncher = launchSchedulerDaemon
 //     is an accelerator, not a prerequisite, and the lead can always run `ttorch scheduler`.
 //
 // It coexists with the manager session purely through the DB (atomic claims): the daemon drives
-// dispatch/land/supervise, the manager session gates and answers decisions. Its log goes to a
-// file under ~/.ttorch, never the manager pane (no TTY injection).
+// dispatch/gate/land/supervise, the manager session adjudicates blocked or non-trusted gates and
+// answers decisions. Its log goes to a file under ~/.ttorch, never the manager pane (no TTY
+// injection).
 func (m *Manager) autoStartScheduler() {
 	if !schedulerAutoStartEnabled() {
 		return
@@ -58,7 +68,8 @@ func schedulerAutoStartEnabled() bool {
 	}
 }
 
-// launchSchedulerDaemon forks `ttorch scheduler --singleton --dispatch --land --supervise` as a
+// launchSchedulerDaemon forks `ttorch scheduler` with schedulerDaemonArgs
+// (`--singleton --dispatch --gate --land --supervise`) as a
 // detached background process (its own session via Setsid, so it outlives the launching `ttorch`,
 // which exits as soon as the lead's terminal attaches), with stdout/stderr redirected to the
 // scheduler log. It launches the INSTALLED, user-owned binary (paths.Binary), not the running
@@ -77,7 +88,7 @@ func launchSchedulerDaemon(p paths.Paths) error {
 		return err
 	}
 	defer logf.Close()
-	cmd := exec.Command(exe, "scheduler", "--singleton", "--dispatch", "--land", "--supervise")
+	cmd := exec.Command(exe, schedulerDaemonArgs...)
 	cmd.Stdout = logf
 	cmd.Stderr = logf
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // detach into its own session

@@ -50,11 +50,12 @@ ttorch coordinates four roles through a single SQLite store (the source of truth
 - **You (the lead).** A human. You talk *only* to the manager, in one tab. You approve
   delivery (except in trusted mode, §7).
 - **The manager.** A Claude Code session running the `ttorch-manager` skill. It plans tasks,
-  briefs them, gates finished work, answers blocked workers, and surfaces decisions to you.
-  It delegates all coding and review — it never writes code itself.
+  briefs them, gates non-trusted work and adjudicates gates the scheduler escalates, answers
+  blocked workers, and surfaces decisions to you. It delegates all coding and review — it never
+  writes code itself.
 - **The scheduler daemon.** A plain Go loop (no LLM), auto-started with the manager. It
-  dispatches ready backlog **in parallel — overlapping work included** — lands already-gated
-  work, and recovers crashed workers.
+  dispatches ready backlog **in parallel — overlapping work included** — gates trusted done-work,
+  lands already-gated work, and recovers crashed workers.
 - **Workers.** Claude Code sessions, one per task, each in its own isolated git worktree.
 
 The key idea: the daemon does only what it can *prove* safe (a declared file footprint and
@@ -90,7 +91,7 @@ the saved session for a clean start (worktrees and branches are always kept).
 ## 5. The daily loop
 
 The default experience is **autonomous**: you plan and approve, the scheduler dispatches,
-lands, and recovers, and the manager bridges the two with judgment.
+gates trusted work, lands, and recovers, and the manager bridges the two with judgment.
 
 1. **Plan.** Tell the manager what you want; it breaks the work into tasks, giving each a
    precise **file footprint** and a stored **brief** (§6).
@@ -108,10 +109,11 @@ lands, and recovers, and the manager bridges the two with judgment.
    navigates between worker windows. With iTerm2 installed (recommended; `ttorch doctor` can
    install it), bare `ttorch` opens the manager in a new iTerm2 window so the manager and all
    worker tabs share one window.
-4. **Gate.** When a worker reports done, the manager runs the repo's checks
-   (`ttorch validate <id>`, §8) and the adversarial-review gate (§7), recording a durable
-   **verdict**. `ttorch review-diff <id>` shows the changes. Gating produces a verdict; it
-   never merges.
+4. **Gate.** When a worker reports done, it is gated — the repo's checks (`ttorch validate <id>`,
+   §8) and the adversarial-review gate (§7) run, recording a durable **verdict**. In **trusted**
+   repos the scheduler does this automatically; in other modes the manager runs it, and either
+   way the manager adjudicates any gate the scheduler escalates. `ttorch review-diff <id>` shows
+   the changes. Gating produces a verdict; it never merges.
 5. **Approve & land.** In most modes you run `ttorch approve <id>` and the gated work lands
    (the scheduler lands already-gated work for you, or the manager runs `ttorch land`). In
    **trusted** mode a passing verdict + a fresh green validate lands it with no separate
@@ -281,7 +283,7 @@ fallback) opens a separate window per worker. Toggle with `TTORCH_WORKER_TABS` a
 | `TTORCH_AGENTS_DIR` | `~/.agents` | vendor-neutral skill mirror |
 | `TTORCH_BIN_DIR` | `~/.local/bin` | directory for the PATH symlink |
 | `TTORCH_TMUX_SESSION` | `ttorch` | tmux session name |
-| `TTORCH_SCHEDULER_AUTOSTART` | enabled | the scheduler auto-starts with the manager (dispatch + land + supervise); set `0`/`off`/`false`/`no` to disable and drive dispatch/land/recovery by hand |
+| `TTORCH_SCHEDULER_AUTOSTART` | enabled | the scheduler auto-starts with the manager (dispatch + gate + land + supervise); set `0`/`off`/`false`/`no` to disable and drive dispatch/gate/land/recovery by hand |
 | `TTORCH_MAX_WORKTREES` | `16` | worktree pool size per repository (the dispatch capacity) |
 | `TTORCH_EFFORT` | `high` | worker + `ttorch cc` reasoning effort (`ultracode` = xhigh + workflow orchestration, opt-in; or a fixed `--effort` level; or `off`) |
 | `TTORCH_MANAGER_EFFORT` | `high` | manager reasoning effort (deliberately not ultracode, so it delegates) |

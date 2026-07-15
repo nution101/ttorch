@@ -22,7 +22,7 @@ ttorch runs a team of Claude Code agents under four roles with a strict division
   │  (LLM)  │ ◄─── wakes on actionable events ─────  │ (source of truth) │
   └─────────┘                                        └──────────────────┘
                                                         ▲   ▲        │
-                          dispatch / land / supervise   │   │        │ leases,
+                   dispatch / gate / land / supervise   │   │        │ leases,
                        ┌──────────────────────────────┐ │   │        ▼ events
                        │   scheduler daemon (no LLM)   │─┘   │   ┌──────────┐
                        └──────────────────────────────┘     └───│ workers  │
@@ -41,8 +41,8 @@ ttorch runs a team of Claude Code agents under four roles with a strict division
   including review, to workers. It carries no durable memory of its own; it re-derives
   state from the store every time it wakes.
 - **The scheduler daemon.** A plain Go loop with **no LLM in it**. It mechanically
-  dispatches ready work, lands already-gated work, and recovers crashed workers. It
-  auto-starts with the manager by default (§3).
+  dispatches ready work, gates trusted done-work, lands already-gated work, and recovers
+  crashed workers. It auto-starts with the manager by default (§3).
 - **Workers.** Claude Code sessions, one per task, each in its own isolated git worktree.
   A worker executes exactly one task, reports status to the store, and never touches
   another worker's files.
@@ -111,9 +111,9 @@ A task moves through the store like this:
 ## 3. The scheduler daemon
 
 `ttorch scheduler` is a deterministic Go loop that drains the task board on a ticker
-(default every 5s). Each tick runs up to three independent passes **in fixed order —
-supervise, then dispatch, then land** — each guarded by its own toggle and error-isolated
-so a transient failure in one never stops the others.
+(default every 5s). Each tick runs up to four independent passes **in fixed order —
+supervise, then dispatch, then gate, then land** — each guarded by its own toggle and
+error-isolated so a transient failure in one never stops the others.
 
 - **Dispatch** (`--dispatch`). Re-derive the ready backlog and dispatch every `pending`
   task that declares a non-empty footprint, has a stored brief, and whose repo has a free
@@ -129,6 +129,16 @@ so a transient failure in one never stops the others.
   pool, **not** by the footprint check. A task that **declares no footprint**, **has no stored
   brief**, or has no free capacity is silently skipped and left for the manager; it is never
   failed.
+- **Gate** (`--gate`). Find `done` tasks in a **trusted** repo that do not yet carry a
+  passing verdict, dispatch the adversarial reviewers, and — **fail-closed** — record
+  **only** an all-pass verdict, auto-minting the approval token the land pass consumes. A
+  blocking finding, prep refusal, missing/mismatched report, or stalled reviewer records
+  nothing and instead surfaces an actionable `gate_blocked` event for the manager to
+  adjudicate; non-trusted repos and already-passing tasks are skipped. An atomic `gater:`
+  claim (distinct from the land pass's `lander:`) means exactly one actor gates a task per
+  tick. This takes the mechanical gate off the LLM manager so trusted done-work no longer
+  waits for a manager turn — the merge/land authority (a fresh, commit-pinned passing
+  verdict + single-use approval consumed at the fast-forward) is unchanged.
 - **Land** (`--land`). Find `done` tasks that **already carry a passing verdict** and land
   them through the same pipeline as `ttorch land` (with the verdict requirement on). It
   never lands ungated work: a missing or non-passing verdict is skipped, and the
@@ -146,16 +156,16 @@ so a transient failure in one never stops the others.
   flapping task into a single terminal failure instead of an infinite restart storm.
 
 **Auto-start (default on).** When the manager starts (fresh, re-attach, or restore) it
-forks the installed binary as `ttorch scheduler --singleton --dispatch --land --supervise`
-— **all three passes** — detached, logging to `~/.ttorch/scheduler.log` (never the manager
+forks the installed binary as `ttorch scheduler --singleton --dispatch --gate --land --supervise`
+— **all four passes** — detached, logging to `~/.ttorch/scheduler.log` (never the manager
 pane). Disable it with a falsey **`TTORCH_SCHEDULER_AUTOSTART`** (`0`/`false`/`no`/`off`);
 any other value or unset leaves it on. Auto-start launches the *installed* binary, so it is
 a quiet no-op in a from-source dev tree.
 
 > **Two different defaults.** A bare `ttorch scheduler` you run by hand defaults to
-> **dispatch-only** (`--land` and `--supervise` default off). The manager's *auto-started*
-> daemon runs all three. (The in-binary `ttorch help` text still describes the scheduler as
-> opt-in — that wording predates v0.10's default-on auto-start.)
+> **dispatch-only** (`--gate`, `--land`, and `--supervise` default off). The manager's
+> *auto-started* daemon runs all four. (The in-binary `ttorch help` text still describes the
+> scheduler passes as opt-in — that wording predates the default-on auto-start.)
 
 **Singleton.** `--singleton` takes a `flock`-as-truth advisory lock on
 `~/.ttorch/state/scheduler.pid`. At most one daemon holds it; a crashed holder's lock frees

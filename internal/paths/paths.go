@@ -68,6 +68,16 @@ func (p Paths) StateDB() string { return envOr("TTORCH_DB", filepath.Join(p.Home
 // DataDir holds durable manager records (never touched by updates).
 func (p Paths) DataDir() string { return filepath.Join(p.Home, "data") }
 
+// ValidateCacheDir is the content-addressed cache of GREEN trust-gate validate results,
+// keyed by (git tree hash + gate-definition identity) so every re-validation of an identical
+// tree under an identical gate collapses to a single real run (a rebase mints a new commit
+// sha but not a new tree, so a commit-keyed cache missed on every rebase). Overridable via
+// TTORCH_VALIDATE_CACHE_DIR (set and non-empty ⇒ used verbatim) so it can later point at a
+// shared/networked volume. Entries are content-addressed, so a stale one is never served.
+func (p Paths) ValidateCacheDir() string {
+	return envOr("TTORCH_VALIDATE_CACHE_DIR", filepath.Join(p.Home, "validate-cache"))
+}
+
 // Worktrees is the root for per-task isolated git worktrees.
 func (p Paths) Worktrees() string { return filepath.Join(p.Home, "worktrees") }
 
