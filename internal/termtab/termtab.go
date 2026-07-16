@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -53,11 +54,28 @@ func Enabled() bool { return enabled() }
 // ITermAvailable reports whether iTerm2 is installed. iTerm2 ships no CLI on
 // PATH, so its presence is detected by the app bundle. macOS-only.
 func ITermAvailable() bool {
+	return ITermAppPath() != ""
+}
+
+// ITermAppPath returns the path to the iTerm2 app bundle if installed, or ""
+// when it is absent (or off macOS). Homebrew installs the cask into the system
+// /Applications when it can write there, and falls back to the user's
+// ~/Applications when it cannot — e.g. a standard, non-admin account on a
+// managed Mac. Both locations are checked so detection works in either case.
+func ITermAppPath() string {
 	if runtime.GOOS != "darwin" {
-		return false
+		return ""
 	}
-	_, err := os.Stat("/Applications/iTerm.app")
-	return err == nil
+	candidates := []string{"/Applications/iTerm.app"}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(home, "Applications", "iTerm.app"))
+	}
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
 }
 
 // managerCommand builds the tmux command a fresh iTerm window runs to attach the
@@ -168,7 +186,7 @@ func terminalChoice() string {
 // detectTerminal picks a terminal when the choice is "auto": iTerm if installed,
 // otherwise Terminal.app (always present on macOS).
 func detectTerminal() string {
-	if _, err := os.Stat("/Applications/iTerm.app"); err == nil {
+	if ITermAvailable() {
 		return "iterm"
 	}
 	return "terminal"

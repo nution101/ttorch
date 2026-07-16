@@ -10,6 +10,8 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+
+	"github.com/nution101/ttorch/internal/termtab"
 )
 
 // Tool is an external dependency ttorch relies on.
@@ -77,8 +79,8 @@ func Run(out io.Writer, in io.Reader, autoYes bool) error {
 	// team in a single iTerm2 window with clean per-worker tabs. Never required.
 	wantITerm := false
 	if runtime.GOOS == "darwin" {
-		if itermInstalled() {
-			fmt.Fprintf(out, "  [ok]      %-7s %s\n", "iTerm2", "/Applications/iTerm.app")
+		if p := termtab.ITermAppPath(); p != "" {
+			fmt.Fprintf(out, "  [ok]      %-7s %s\n", "iTerm2", p)
 		} else {
 			fmt.Fprintln(out, "  [absent] iTerm2  — clean per-worker tabs; 'ttorch' will open the team in iTerm2 when present")
 			if _, ok := itermInstallCmd(d.Manager); ok {
@@ -206,16 +208,6 @@ func installSpec(manager, tool string) ([]string, bool) {
 		return []string{"sudo", "apk", "add", tool}, true
 	}
 	return nil, false
-}
-
-// itermInstalled reports whether iTerm2 is present (macOS app bundle). iTerm2
-// has no CLI on PATH, so its presence is the existence of the bundle.
-func itermInstalled() bool {
-	if runtime.GOOS != "darwin" {
-		return false
-	}
-	_, err := os.Stat("/Applications/iTerm.app")
-	return err == nil
 }
 
 // itermInstallCmd returns the command to install iTerm2 via the given manager.
