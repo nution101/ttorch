@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.17.1](https://github.com/nution101/ttorch/compare/v0.17.0...v0.17.1) (2026-07-20)
+
+
+### Bug Fixes
+
+* **termtab:** detect iTerm2 installed in ~/Applications ([b642ba6](https://github.com/nution101/ttorch/commit/b642ba676d5db9012e2ffda6c56be11880323b51))
+* **termtab:** detect iTerm2 installed in ~/Applications ([91847a2](https://github.com/nution101/ttorch/commit/91847a2bc85c6018649a9bbefda348857644f54b))
+
 ## [0.17.0](https://github.com/nution101/ttorch/compare/v0.16.2...v0.17.0) (2026-07-15)
 
 
