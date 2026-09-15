@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/nution101/ttorch/internal/db"
+	"github.com/nution101/ttorch/internal/review"
 	"github.com/nution101/ttorch/internal/validate"
 	"github.com/nution101/ttorch/internal/worktree"
 )
@@ -227,9 +228,11 @@ func (m *Manager) reusablePrepValidate(taskID, sha string) ([]validate.Result, b
 // stagedGreen mirrors gateGreen's pass semantics for a persisted result set, where the
 // originating step list is no longer available: at least one check ran and none failed. An
 // empty or null result set is a no-checks-detected hard BLOCK, never a pass (an empty
-// Failures() must not read as green) — exactly as the merge gate treats it.
+// Failures() must not read as green) — exactly as the merge gate treats it. The rule itself
+// lives in review.StagedGreen, which the verdict fold applies to the validate a review was
+// staged over, so the merge gate and the gate verdict cannot drift on what "green" means.
 func stagedGreen(results []validate.Result) bool {
-	return len(results) > 0 && len(validate.Failures(results)) == 0
+	return review.StagedGreen(results)
 }
 
 // hasDefaultBranchGateScript reports whether the repo's default branch defines the gate

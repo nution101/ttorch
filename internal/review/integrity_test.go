@@ -1,17 +1,22 @@
 package review
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nution101/ttorch/internal/validate"
 )
 
 // stagePrep materializes the non-report inputs `ttorch trust prep` writes into inputsDir —
-// the reviewed head and the episode marker (written last, exactly as prep writes it) — so a
-// test fixture looks like a real, freshly prepped review dir.
-func stagePrep(t *testing.T, inputsDir, sha string) {
+// the reviewed head, the gate's validate of that commit, and the episode marker (written
+// last, exactly as prep writes it) — so a test fixture looks like a real, freshly prepped
+// review dir. results is the staged validate (nil models a repo where no checks were
+// detected).
+func stagePrep(t *testing.T, inputsDir, sha string, results []validate.Result) {
 	t.Helper()
 	if err := os.MkdirAll(inputsDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -19,9 +24,22 @@ func stagePrep(t *testing.T, inputsDir, sha string) {
 	if err := os.WriteFile(filepath.Join(inputsDir, "head.txt"), []byte(sha+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := WritePrepStamp(inputsDir, sha); err != nil {
+	b, err := json.MarshalIndent(results, "", "  ")
+	if err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(inputsDir, "validate.json"), append(b, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := WritePrepStamp(inputsDir, sha, results); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// greenValidate is a staged validate that ran real checks and passed — the premise the
+// reviewers are told to trust.
+func greenValidate() []validate.Result {
+	return []validate.Result{{Name: "build", Passed: true}, {Name: "test", Passed: true}}
 }
 
 // backdate rewinds a file's mtime by d, modeling an input written in an earlier session.
@@ -53,7 +71,7 @@ func TestAggregate_ReportPredatingPrepIsAbsent(t *testing.T) {
 		backdate(t, filepath.Join(dir, d+".json"), 24*24*time.Hour)
 	}
 	// The gate re-preps now; the reviewers have not run yet.
-	stagePrep(t, dir, sha)
+	stagePrep(t, dir, sha, greenValidate())
 
 	v, err := Aggregate(dir, sha, dims)
 	if err != nil {
@@ -76,7 +94,7 @@ func TestAggregate_ReportWrittenAfterPrepCounts(t *testing.T) {
 	const sha = "abc123def456"
 	dir := t.TempDir()
 
-	stagePrep(t, dir, sha)
+	stagePrep(t, dir, sha, greenValidate())
 	for _, d := range dims {
 		writeReport(t, dir, d, sha, nil)
 	}
@@ -106,6 +124,78 @@ func TestAggregate_UnpreppedInputsFailClosed(t *testing.T) {
 	}
 	if v.Overall != Block {
 		t.Fatalf("overall = %q, want %q: reports with no prep marker must fail closed", v.Overall, Block)
+	}
+}
+
+// TestAggregate_FailedStagedValidateBlocks is the validate-premise guard. The reviewers are
+// told to trust the staged validate as proof the repo's checks pass at the reviewed commit
+// and not to re-run the suite, so a review over a RED validate rests on a premise that never
+// held: a clean pass there would read as gated when the commit was never validated. The fold
+// must block and name the failed step.
+func TestAggregate_FailedStagedValidateBlocks(t *testing.T) {
+	const sha = "abc123def456"
+	dir := t.TempDir()
+
+	red := []validate.Result{
+		{Name: "build", Passed: true},
+		{Name: "test", Passed: false, Output: "could not build: the branch is not pushed"},
+	}
+	stagePrep(t, dir, sha, red)
+	for _, d := range dims { // every reviewer came back clean
+		writeReport(t, dir, d, sha, nil)
+	}
+
+	v, err := Aggregate(dir, sha, dims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Overall != Block {
+		t.Fatalf("overall = %q, want %q: a clean review over a failed validate must not pass", v.Overall, Block)
+	}
+	if !findingMentions(v, "test") {
+		t.Errorf("no finding names the failed validate step; findings = %+v", v.Findings)
+	}
+}
+
+// TestAggregate_NoChecksStagedBlocks: a validate that detected no checks is not green (an
+// empty set of failures must never read as a pass), so it cannot underwrite a passing
+// verdict either.
+func TestAggregate_NoChecksStagedBlocks(t *testing.T) {
+	const sha = "abc123def456"
+	dir := t.TempDir()
+
+	stagePrep(t, dir, sha, nil) // no checks detected
+	for _, d := range dims {
+		writeReport(t, dir, d, sha, nil)
+	}
+
+	v, err := Aggregate(dir, sha, dims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Overall != Block {
+		t.Fatalf("overall = %q, want %q: a no-checks validate must not read as green", v.Overall, Block)
+	}
+}
+
+// TestAggregate_PrepForAnotherCommitBlocks: the episode counts only when it was prepared
+// for the commit under review. Inputs staged for an earlier commit say nothing about this
+// one, so neither the reports nor the validate that came with them can underwrite a pass.
+func TestAggregate_PrepForAnotherCommitBlocks(t *testing.T) {
+	const sha = "abc123def456"
+	dir := t.TempDir()
+
+	stagePrep(t, dir, "OTHERSHA00000", greenValidate())
+	for _, d := range dims {
+		writeReport(t, dir, d, sha, nil)
+	}
+
+	v, err := Aggregate(dir, sha, dims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Overall != Block {
+		t.Fatalf("overall = %q, want %q: inputs prepped for another commit must not underwrite a pass", v.Overall, Block)
 	}
 }
 

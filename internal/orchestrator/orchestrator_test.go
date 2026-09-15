@@ -1024,15 +1024,21 @@ func deliveryHarness(t *testing.T, tag string) (*Manager, string) {
 }
 
 // writeReviewReports puts a task's review dir in the state a full, clean review pass leaves
-// behind: the episode marker `ttorch trust prep` stamps for the reviewed commit, then one
-// per-dimension report per required reviewer pinned to sha, in that order. Tests that drive
-// the real TrustPrep use writeReportsForPreppedInputs instead, so prep's own inputs survive.
+// behind: the episode marker `ttorch trust prep` stamps for the reviewed commit (recording a
+// GREEN staged validate), then one per-dimension report per required reviewer pinned to sha,
+// in that order. Tests that drive the real TrustPrep — which stages the actual validate of
+// the commit — use writeReportsForPreppedInputs instead, so prep's own inputs survive.
+//
+// The staged validate is green because that is the premise the reviewers review under; a
+// test that wants the MERGE gate to refuse a red validate still gets that from the gate's
+// own fresh run at merge time, which is independent of what review was staged over.
 func writeReviewReports(t *testing.T, dir, sha string, perDim map[string][]review.Finding) {
 	t.Helper()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := review.WritePrepStamp(dir, sha); err != nil {
+	green := []validate.Result{{Name: "gate", Passed: true}}
+	if _, err := review.WritePrepStamp(dir, sha, green); err != nil {
 		t.Fatal(err)
 	}
 	writeReportsForPreppedInputs(t, dir, sha, perDim)
@@ -3176,15 +3182,15 @@ func worktreeIsDirty(t *testing.T, path string) (bool, error) {
 
 // --- ttorch security-review (the security-everywhere advisory pass) ---
 
-// writeSecurityReport stages the review episode for sha, as prep would, and drops ONLY the
-// security reviewer's report into dir — the manager ran just the security reviewer, not the
-// full three-dimension gate — as the security-everywhere pass expects.
+// writeSecurityReport stages the review episode for sha (a green validate, as prep would)
+// and drops ONLY the security reviewer's report into dir — the manager ran just the security
+// reviewer, not the full three-dimension gate — as the security-everywhere pass expects.
 func writeSecurityReport(t *testing.T, dir, sha string, findings []review.Finding) {
 	t.Helper()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := review.WritePrepStamp(dir, sha); err != nil {
+	if _, err := review.WritePrepStamp(dir, sha, []validate.Result{{Name: "gate", Passed: true}}); err != nil {
 		t.Fatal(err)
 	}
 	b, err := json.Marshal(review.Report{Dimension: review.DimensionSecurity, ReviewedSHA: sha, Findings: findings})
@@ -3316,15 +3322,15 @@ func TestSecurityReview_RefusesStaleSha(t *testing.T) {
 
 // --- ttorch qa-review (the optional test-adequacy advisory pass) ---
 
-// writeQAReport stages the review episode for sha, as prep would, and drops ONLY the QA
-// reviewer's report into dir — the manager ran just the QA reviewer, not the full
-// three-dimension gate — as the qa-review pass expects.
+// writeQAReport stages the review episode for sha (a green validate, as prep would) and
+// drops ONLY the QA reviewer's report into dir — the manager ran just the QA reviewer, not
+// the full three-dimension gate — as the qa-review pass expects.
 func writeQAReport(t *testing.T, dir, sha string, findings []review.Finding) {
 	t.Helper()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := review.WritePrepStamp(dir, sha); err != nil {
+	if _, err := review.WritePrepStamp(dir, sha, []validate.Result{{Name: "gate", Passed: true}}); err != nil {
 		t.Fatal(err)
 	}
 	b, err := json.Marshal(review.Report{Dimension: review.DimensionQA, ReviewedSHA: sha, Findings: findings})

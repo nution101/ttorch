@@ -205,7 +205,8 @@ func diffLineStat(dir, base, rev string) (lines int, binary, ok bool) {
 // inputs invalidates any review written against the materialization before it, and the
 // commit pin cannot catch that on its own — a task that has sat idle has not moved its
 // HEAD, so a report from an earlier session still pins to head.txt verbatim. The stamp is
-// what makes such a report fold as ABSENT (fail closed) instead of current.
+// what makes such a report fold as ABSENT (fail closed) instead of current, and it carries
+// the staged validate's outcome so a verdict can never read as gated over a red suite.
 //
 // The diff base is the up-to-date default tip the merge actually targets (reviewBase:
 // origin/<default> when current, fetched best-effort), NOT the raw local <default> branch.
@@ -321,12 +322,14 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 		return "", err
 	}
 	// LAST, once every input is staged: stamp the episode. Its mtime is the line a report
-	// must postdate to count as this episode's.
-	if err := review.WritePrepStamp(dir, head); err != nil {
+	// must postdate to count as this episode's, and it records the staged validate's outcome
+	// for the verdict fold, so both guards read one Go-owned marker.
+	stamp, err := review.WritePrepStamp(dir, head, results)
+	if err != nil {
 		return "", err
 	}
-	m.audit(fmt.Sprintf("trust-prep task=%s commit=%s size=%s reviewers=%s",
-		taskID, short(head), size, strings.Join(dims, "+")))
+	m.audit(fmt.Sprintf("trust-prep task=%s commit=%s size=%s reviewers=%s validate=%s",
+		taskID, short(head), size, strings.Join(dims, "+"), stamp.Label()))
 	return dir, nil
 }
 
@@ -468,8 +471,15 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 	if t.ApprovedBy == "auto" {
 		autoMinted = "yes"
 	}
-	m.audit(fmt.Sprintf("trust-record task=%s commit=%s verdict=%s mode=%s auto-approved=%s",
-		taskID, short(sha), verdict.Overall, projectinit.ReadMode(t.Project), autoMinted))
+	// The audit line names the episode's validate state, so a reader of the trail can tell a
+	// verdict recorded over a green suite from one degraded by a validate that never ran or
+	// failed — the same thing the verdict's own findings say.
+	staged := "unprepped"
+	if stamp, ok := review.ReadPrepStamp(m.P.ReviewInputsDir(taskID)); ok {
+		staged = stamp.Label()
+	}
+	m.audit(fmt.Sprintf("trust-record task=%s commit=%s verdict=%s mode=%s auto-approved=%s validate=%s",
+		taskID, short(sha), verdict.Overall, projectinit.ReadMode(t.Project), autoMinted, staged))
 	return verdict, nil
 }
 

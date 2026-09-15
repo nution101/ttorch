@@ -9,8 +9,10 @@ import (
 	"time"
 
 	"github.com/nution101/ttorch/internal/approval"
+	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/projectinit"
 	"github.com/nution101/ttorch/internal/review"
+	"github.com/nution101/ttorch/internal/validate"
 )
 
 // preppedTrustedTask stands up a trusted repo whose default-branch gate script is gateBody,
@@ -141,6 +143,75 @@ func backdateFile(t *testing.T, path string, d time.Duration) {
 	}
 }
 
+// TestTrustRecord_RedStagedValidateCannotPass is the validate-premise guard end to end. The
+// reviewers are told to trust the staged validate as proof the repo's checks pass at the
+// reviewed commit and NOT to re-run the suite, so a clean review over a RED validate rests
+// on a premise that never held. `trust record` must not turn it into a clean pass a reader
+// would take for gated: it records a degraded verdict that names the failed step.
+func TestTrustRecord_RedStagedValidateCannotPass(t *testing.T) {
+	m, head, dir := preppedTrustedTask(t, "redstaged", "rs2", "echo cannot run the suite here; exit 1")
+
+	// Precondition: prep really did stage a red validate for the reviewed commit.
+	staged, ok := m.reusablePrepValidate("rs2", head)
+	if !ok {
+		t.Fatal("prep must stage a validate pinned to the reviewed commit")
+	}
+	if len(validate.Failures(staged)) == 0 {
+		t.Fatalf("this test needs a failing staged validate, got %+v", staged)
+	}
+
+	// Every reviewer comes back clean over those inputs.
+	writeReportsForPreppedInputs(t, dir, head, nil)
+
+	v, err := m.TrustRecord("rs2", "", time.Minute)
+	if err != nil {
+		t.Fatalf("recording over a red validate must degrade the verdict, not hard-error: %v", err)
+	}
+	if v.Overall != review.Block {
+		t.Fatalf("verdict = %q, want %q: a clean review over a failed validate must not read as gated", v.Overall, review.Block)
+	}
+	if !verdictMentions(v, "not green") {
+		t.Errorf("the verdict must state the validate state a reader would otherwise mistake for gated; findings = %+v", v.Findings)
+	}
+	if !verdictMentions(v, "gate") {
+		t.Errorf("the verdict must name the failed validate step; findings = %+v", v.Findings)
+	}
+	if approval.Valid(m.P.ApprovalFile("rs2")) {
+		t.Error("a degraded verdict must never auto-mint the approval token")
+	}
+	// The audit trail states the validate state too, so the recorded line cannot be read as
+	// a gated pass either.
+	b, err := os.ReadFile(m.P.AuditLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "verdict=block") || !strings.Contains(string(b), "validate=failed:gate") {
+		t.Errorf("audit log must record the verdict AND the staged validate state: %s", b)
+	}
+}
+
+// TestTrustRecord_GreenPrepStillPasses is the no-regression half: the same path over a green
+// staged validate and reports written after the prep records a passing verdict and auto-mints
+// in trusted mode exactly as before, so the two new guards cost the happy path nothing.
+func TestTrustRecord_GreenPrepStillPasses(t *testing.T) {
+	m, head, dir := preppedTrustedTask(t, "greenprep", "gp1", "exit 0")
+	writeReportsForPreppedInputs(t, dir, head, nil)
+
+	v, err := m.TrustRecord("gp1", "", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Overall != review.Pass {
+		t.Fatalf("verdict = %q, want %q (findings: %+v)", v.Overall, review.Pass, v.Findings)
+	}
+	if !approval.Valid(m.P.ApprovalFile("gp1")) {
+		t.Error("a trusted pass over a green validate must still auto-mint the approval token")
+	}
+	if b, _ := os.ReadFile(m.P.AuditLog()); !strings.Contains(string(b), "validate=green") {
+		t.Errorf("audit log must record the green staged validate: %s", b)
+	}
+}
+
 // TestGateOnce_SupersededReportRedispatches: the daemon gate treats a report from a previous
 // episode as not-ready and re-dispatches that reviewer, rather than folding it into a verdict
 // or surfacing a block the manager has to adjudicate.
@@ -180,5 +251,58 @@ func TestGateOnce_SupersededReportRedispatches(t *testing.T) {
 	}
 	if hasGateBlockedEvent(t, m, "gs1") {
 		t.Error("a superseded report is a re-review, not something for the manager to adjudicate")
+	}
+}
+
+// TestGateOnce_RedStagedValidateSurfacesBlock: when the gate's own validate of the reviewed
+// commit fails, the daemon gate cannot pass the task hands-off — it records nothing, mints
+// nothing, and surfaces an actionable gate_blocked event for the manager.
+func TestGateOnce_RedStagedValidateSurfacesBlock(t *testing.T) {
+	m, repo := deliveryHarness(t, "gate-redvalidate")
+	commitGateScript(t, repo, "exit 1") // the default-branch gate FAILS
+	if _, err := projectinit.Init(repo, "trusted"); err != nil {
+		t.Fatal(err)
+	}
+	task, err := m.Spawn("gr1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = m.Teardown("gr1", true) })
+	head := commitFeature(t, task.Worktree, "feature.txt", "new\n")
+	recordingReviewer(t, false)
+
+	if out, err := m.GateOnce("gr1"); err != nil || out != GateDispatched {
+		t.Fatalf("tick1 = (%q, %v), want dispatched", out, err)
+	}
+	writeReportsForPreppedInputs(t, m.P.ReviewInputsDir("gr1"), head, nil)
+
+	out, err := m.GateOnce("gr1")
+	if err != nil {
+		t.Fatalf("GateOnce: %v", err)
+	}
+	if out != GateBlocked {
+		t.Fatalf("outcome = %q, want %q", out, GateBlocked)
+	}
+	if _, ok := m.TrustShow("gr1"); ok {
+		t.Fatal("a review over a failed validate must not record a verdict")
+	}
+	if approval.Valid(m.P.ApprovalFile("gr1")) {
+		t.Fatal("a review over a failed validate must not mint an approval token")
+	}
+	if !hasGateBlockedEvent(t, m, "gr1") {
+		t.Fatal("the gate must surface an actionable gate_blocked event for the manager")
+	}
+	evs, err := m.Store.EventsSince(context.Background(), 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	named := false
+	for _, e := range evs {
+		if e.EntityID == "gr1" && e.Type == db.EventGateBlocked && strings.Contains(e.Payload, "not green") {
+			named = true
+		}
+	}
+	if !named {
+		t.Errorf("the gate_blocked event must say the staged validate was not green: %+v", evs)
 	}
 }

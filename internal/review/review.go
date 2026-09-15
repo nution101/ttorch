@@ -9,9 +9,10 @@
 // silently passing.
 //
 // A verdict also has to be honest about the INPUTS it covers, not just the reports. Prep
-// stamps the inputs dir (PrepStamp) with when it materialized them and the commit they
-// cover; Aggregate folds that stamp alongside the reports, so a report left behind by an
-// earlier session fails closed instead of minting a clean pass. It is kept distinct from the human approval token (see
+// stamps the inputs dir (PrepStamp) with when it materialized them, the commit they cover,
+// and the outcome of the gate's own validate of that commit; Aggregate folds that stamp
+// alongside the reports, so a report left behind by an earlier session and a review whose
+// green-suite premise never held both fail closed instead of minting a clean pass. It is kept distinct from the human approval token (see
 // internal/approval) so an audit can always tell "a human read this" from "the
 // reviewers passed it"; like that token it is defense in depth and an audit trail,
 // not an unbreakable barrier against a fully compromised manager.
@@ -117,9 +118,10 @@ func DiffID(patch []byte) string {
 // Aggregate folds the per-dimension reports in inputsDir into a single verdict for
 // sha. Every dimension in dimensions must be present, pinned to sha, and written during
 // the CURRENT review episode: a missing, malformed, or superseded report, or any finding
-// at High severity or above, yields a "block" verdict (fail closed). A report present but
-// recorded against a different commit is a hard error (a stale or mis-targeted review),
-// not merely a block.
+// at High severity or above, yields a "block" verdict (fail closed). The episode's staged
+// validate is folded too — a review over a commit whose checks did not pass cannot yield
+// a clean pass (see prepState.validateGap). A report present but recorded against a
+// different commit is a hard error (a stale or mis-targeted review), not merely a block.
 func Aggregate(inputsDir, sha string, dimensions []string) (Verdict, error) {
 	v := Verdict{Overall: Pass, ReviewedSHA: sha}
 	prep := readPrep(inputsDir)
@@ -145,6 +147,13 @@ func Aggregate(inputsDir, sha string, dimensions []string) (Verdict, error) {
 				v.Overall = Block
 			}
 		}
+	}
+	if gap, ok := prep.validateGap(sha); ok {
+		v.Overall = Block
+		v.Findings = append(v.Findings, Finding{
+			Dimension: validateDimension, Severity: SeverityHigh, Reviewer: "ttorch",
+			Summary: gap,
+		})
 	}
 	return v, nil
 }

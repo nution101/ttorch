@@ -34,7 +34,7 @@ func TestAggregate(t *testing.T) {
 
 	t.Run("all clean passes", func(t *testing.T) {
 		dir := t.TempDir()
-		stagePrep(t, dir, sha)
+		stagePrep(t, dir, sha, greenValidate())
 		for _, d := range dims {
 			writeReport(t, dir, d, sha, nil)
 		}
@@ -49,7 +49,7 @@ func TestAggregate(t *testing.T) {
 
 	t.Run("a high finding blocks", func(t *testing.T) {
 		dir := t.TempDir()
-		stagePrep(t, dir, sha)
+		stagePrep(t, dir, sha, greenValidate())
 		writeReport(t, dir, "correctness", sha, nil)
 		writeReport(t, dir, "scope", sha, nil)
 		writeReport(t, dir, "security", sha, []Finding{
@@ -66,7 +66,7 @@ func TestAggregate(t *testing.T) {
 
 	t.Run("low and medium findings do not block", func(t *testing.T) {
 		dir := t.TempDir()
-		stagePrep(t, dir, sha)
+		stagePrep(t, dir, sha, greenValidate())
 		writeReport(t, dir, "correctness", sha, []Finding{{Severity: SeverityLow, Summary: "nit"}})
 		writeReport(t, dir, "scope", sha, []Finding{{Severity: SeverityMedium, Summary: "minor"}})
 		writeReport(t, dir, "security", sha, nil)
@@ -81,7 +81,7 @@ func TestAggregate(t *testing.T) {
 
 	t.Run("a missing dimension blocks", func(t *testing.T) {
 		dir := t.TempDir()
-		stagePrep(t, dir, sha)
+		stagePrep(t, dir, sha, greenValidate())
 		writeReport(t, dir, "correctness", sha, nil)
 		writeReport(t, dir, "security", sha, nil) // scope absent
 		v, err := Aggregate(dir, sha, dims)
@@ -95,7 +95,7 @@ func TestAggregate(t *testing.T) {
 
 	t.Run("a malformed report blocks", func(t *testing.T) {
 		dir := t.TempDir()
-		stagePrep(t, dir, sha)
+		stagePrep(t, dir, sha, greenValidate())
 		writeReport(t, dir, "correctness", sha, nil)
 		writeReport(t, dir, "scope", sha, nil)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -115,7 +115,7 @@ func TestAggregate(t *testing.T) {
 
 	t.Run("an unknown severity blocks", func(t *testing.T) {
 		dir := t.TempDir()
-		stagePrep(t, dir, sha)
+		stagePrep(t, dir, sha, greenValidate())
 		writeReport(t, dir, "correctness", sha, nil)
 		writeReport(t, dir, "scope", sha, nil)
 		writeReport(t, dir, "security", sha, []Finding{{Severity: Severity("weird"), Summary: "?"}})
@@ -130,7 +130,7 @@ func TestAggregate(t *testing.T) {
 
 	t.Run("a report pinned to another commit errors", func(t *testing.T) {
 		dir := t.TempDir()
-		stagePrep(t, dir, sha)
+		stagePrep(t, dir, sha, greenValidate())
 		writeReport(t, dir, "correctness", sha, nil)
 		writeReport(t, dir, "scope", sha, nil)
 		writeReport(t, dir, "security", "OTHERSHA00000", nil)
@@ -151,7 +151,7 @@ func TestAggregateQADimension(t *testing.T) {
 
 	t.Run("a clean qa report passes", func(t *testing.T) {
 		dir := t.TempDir()
-		stagePrep(t, dir, sha)
+		stagePrep(t, dir, sha, greenValidate())
 		writeReport(t, dir, DimensionQA, sha, nil)
 		v, err := Aggregate(dir, sha, qa)
 		if err != nil {
@@ -164,7 +164,7 @@ func TestAggregateQADimension(t *testing.T) {
 
 	t.Run("a high qa finding blocks", func(t *testing.T) {
 		dir := t.TempDir()
-		stagePrep(t, dir, sha)
+		stagePrep(t, dir, sha, greenValidate())
 		writeReport(t, dir, DimensionQA, sha, []Finding{
 			{Severity: SeverityHigh, Reviewer: "qa", Summary: "new transfer path has no failure-case test"},
 		})
@@ -179,7 +179,7 @@ func TestAggregateQADimension(t *testing.T) {
 
 	t.Run("a missing qa report fails closed", func(t *testing.T) {
 		dir := t.TempDir()
-		stagePrep(t, dir, sha)
+		stagePrep(t, dir, sha, greenValidate())
 		v, err := Aggregate(dir, sha, qa)
 		if err != nil {
 			t.Fatal(err)
@@ -191,7 +191,7 @@ func TestAggregateQADimension(t *testing.T) {
 
 	t.Run("a qa report pinned to another commit errors", func(t *testing.T) {
 		dir := t.TempDir()
-		stagePrep(t, dir, sha)
+		stagePrep(t, dir, sha, greenValidate())
 		writeReport(t, dir, DimensionQA, "OTHERSHA00000", nil)
 		if _, err := Aggregate(dir, sha, qa); err == nil {
 			t.Fatal("a qa report recorded against a different commit must error")
