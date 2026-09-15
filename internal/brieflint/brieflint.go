@@ -96,6 +96,8 @@ type Report struct {
 	// resolved against, which rules a project disabled, what was deliberately not checked.
 	// A disabled rule or an unchecked citation is surfaced here rather than passing silently.
 	Notes []string
+	// evaluated is how many rules ran (see Evaluated).
+	evaluated int
 }
 
 // Violations counts the StatusFail findings.
@@ -126,6 +128,11 @@ func (r Report) Outcome() Outcome {
 		return OutcomePass
 	}
 }
+
+// Evaluated is how many rules actually ran: the rule set less whatever the project
+// disabled. A summary must count what ran, so a run with rules turned off cannot claim the
+// whole set passed.
+func (r Report) Evaluated() int { return r.evaluated }
 
 // Options describes what a single run may consult. The zero value is valid: it lints the
 // brief's text alone and reports every ref-dependent check as indeterminate rather than
@@ -228,6 +235,7 @@ func Lint(text string, opt Options) Report {
 		findings, notes := r.run(b, opt)
 		rep.Findings = append(rep.Findings, findings...)
 		rep.Notes = append(rep.Notes, notes...)
+		rep.evaluated++
 	}
 	return rep
 }

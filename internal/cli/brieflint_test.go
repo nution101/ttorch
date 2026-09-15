@@ -94,7 +94,7 @@ func TestCmdBriefLintExitStatuses(t *testing.T) {
 	if got := exitOf(t, err); got != 0 {
 		t.Fatalf("a clean brief must exit 0, got %d (%v)\n%s", got, err, out)
 	}
-	if !strings.Contains(out, "all 5 rules passed") {
+	if !strings.Contains(out, "all 5 enabled rules passed") {
 		t.Fatalf("unexpected output:\n%s", out)
 	}
 
@@ -160,7 +160,7 @@ func TestCmdBriefLintProjectOverrides(t *testing.T) {
 	if got := exitOf(t, err); got != 0 {
 		t.Fatalf("with those rules disabled the brief passes, got exit %d (%v)\n%s", got, err, out)
 	}
-	for _, want := range []string{"rule target-branch: DISABLED", "rule standards: DISABLED", "AGENTS.md"} {
+	for _, want := range []string{"rule target-branch: DISABLED", "rule standards: DISABLED", "AGENTS.md", "all 2 enabled rules passed (3 disabled)"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("an override must be visible in the output, want %q:\n%s", want, out)
 		}

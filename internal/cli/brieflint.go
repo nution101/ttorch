@@ -111,7 +111,9 @@ func printBriefLint(w io.Writer, path string, rep brieflint.Report) {
 		fmt.Fprintf(w, "  · %s\n", n)
 	}
 	if len(rep.Findings) == 0 {
-		fmt.Fprintf(w, "\nall %d rules passed\n", len(brieflint.Rules()))
+		// Count what actually RAN, so a run with rules disabled cannot claim the whole set
+		// passed.
+		fmt.Fprintf(w, "\nall %d enabled rules passed%s\n", rep.Evaluated(), disabledSuffix(rep))
 		return
 	}
 	fmt.Fprintln(w)
@@ -127,6 +129,15 @@ func printBriefLint(w io.Writer, path string, rep brieflint.Report) {
 		}
 	}
 	fmt.Fprintf(w, "\n%s\n", describeLintCounts(rep))
+}
+
+// disabledSuffix names how many rules a project turned off, for the summary line.
+func disabledSuffix(rep brieflint.Report) string {
+	n := len(brieflint.Rules()) - rep.Evaluated()
+	if n <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (%d disabled)", n)
 }
 
 // lintBriefForAdd runs the same rules in front of `ttorch task add`, where the cost of a
