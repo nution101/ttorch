@@ -399,6 +399,31 @@ only an allowlist of bare build/test/lint entrypoints and skips (and reports) an
 > `.ttorch/validate.sh`) on your machine with your credentials. Only run them against
 > repositories and worker output you trust.
 
+### The brief lint
+
+Validation gates a worker's output; the brief lint (`internal/brieflint`) gates its **input**. A
+stored brief is a snapshot — `task add` copies it into the task, so a later edit of the file
+reaches nobody — which means a defective brief is only discovered once a worker has acted on it.
+So the checks run at `ttorch task add` (whenever a brief is supplied) and standalone as
+`ttorch brief-lint <file>`: a declared target branch that resolves on the remote, cited paths that
+exist, a hard count that carries a verify-yourself hedge, a prohibition stated as an invariant plus
+an allowed end state, and a pointer to the project's standards.
+
+Three properties are load-bearing:
+
+- **Three outcomes, three exit statuses.** Passed (0), a rule violated (1), and a check that COULD
+  NOT be evaluated (3) are distinct. An unreachable remote, a ref that does not resolve, or a
+  `file:line` citation with no ref to resolve it against is reported, never passed.
+- **The ref a citation is resolved against is explicit.** A bare path is resolved at the base
+  (`--ref`, defaulting to the brief's declared target); a `file:line` citation is resolved at
+  `--citations-ref`, the commit it was read at, because a gate finding legitimately cites a line
+  that exists at the reviewed commit and is past end-of-file on the base.
+- **Per-project configuration, visible overrides.** `- brief-standards:` and
+  `- brief-lint-disable:` lines in the repo's `AGENTS.md` (read anywhere in the file, like
+  `- auto-mint-max-age:`) set the expected standards pointer and turn individual rules off. Every
+  disable, and every citation exempted because the brief asks for the file to be created, is
+  echoed in the report rather than applied silently.
+
 ## 10. On-disk layout
 
 ```

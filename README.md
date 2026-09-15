@@ -152,7 +152,8 @@ reference; this table covers the surface a lead and manager use day to day.
 | Command | Description |
 | --- | --- |
 | `ttorch tasks` | List tasks. Flags: `--project`, `--epic`, `--status s[,s…]`, `--tree` (projects→epics→phases→tasks), `--timeline <id>` |
-| `ttorch task add <id> --project <id>` | Create a pending backlog task (does not spawn). Flags: `--epic`, `--phase`, `--title`, `--touches`, `--brief`/`--brief-file` |
+| `ttorch task add <id> --project <id>` | Create a pending backlog task (does not spawn). A supplied brief is lint-checked first. Flags: `--epic`, `--phase`, `--title`, `--touches`, `--brief`/`--brief-file`, `--citations-ref`, `--no-brief-lint` |
+| `ttorch brief-lint <file>` | Check a brief before it is stored on a task. Flags: `--repo`, `--remote`, `--ref`, `--citations-ref` |
 | `ttorch project add <repo>` / `project ls` | Register / list repos (caches delivery mode for display) |
 | `ttorch epic add` / `epic ls` / `epic set-status` | Manage epics under a project |
 | `ttorch phase add` / `phase ls` / `phase set-status` | Manage phases under an epic |
@@ -203,6 +204,50 @@ reference; this table covers the surface a lead and manager use day to day.
 | `ttorch init [--mode pr\|local\|validated\|trusted]` | Set up a repo's AGENTS.md + CLAUDE.md + delivery mode + profile |
 | `ttorch profile [dir]` | Derive the repo's stack/commands/conventions into AGENTS.md |
 | `ttorch version` / `help` | Version / full usage |
+
+## The brief lint
+
+A stored brief is a **snapshot**: `ttorch task add --brief-file` copies the file's contents into
+the task, so editing the file afterwards reaches nobody, and a defective brief is discovered only
+once a worker has already acted on it. `ttorch brief-lint <file>` runs the checks before that
+happens, and `task add` runs the same checks automatically whenever a brief is supplied (an add
+with no brief is unchanged). Five rules:
+
+| Rule | What it requires |
+| --- | --- |
+| `target-branch` | The brief names its target as `origin/<branch>`, and that branch exists on the remote |
+| `file-paths` | Every file path the brief cites exists at the ref the citation is about |
+| `hard-counts` | A brief stating "there are 21 occurrences" also tells the worker to verify it and report their own number |
+| `prohibition` | A prohibition states the invariant it protects and the allowed end state, rather than banning `push`/`merge`/PR outright |
+| `standards` | The brief points at the standards the project expects |
+
+Two details matter in practice:
+
+- **Which ref a citation is resolved against.** A cited path *without* a line number is about the
+  work's base, so it is resolved at `--ref` (the declared target by default). A `file:line`
+  citation is about the commit it was read at — typically a gate finding quoting a worker's HEAD,
+  where the file is longer than on the base — so it is resolved at `--citations-ref`. With no
+  citations ref supplied, such a citation is reported as unevaluable rather than resolved against
+  the base, which would false-positive on a citation that was perfectly valid at the reviewed
+  commit. Both refs are named in the output.
+- **A check that cannot run never passes.** Exit `0` means every enabled rule was evaluated and
+  passed, `1` that a rule was violated, `3` that at least one check *could not be evaluated* (an
+  unreachable remote, a ref that does not resolve), and `2` a usage error. One run reports every
+  violation, with the rule named and the offending text quoted.
+
+Per-project configuration lives in the repo's `AGENTS.md`, beside the delivery-mode line:
+
+```markdown
+- brief-standards: docs/standards/, CONTRIBUTING.md
+- brief-lint-disable: hard-counts
+```
+
+`brief-standards` is the pointer a brief must cite to satisfy the `standards` rule — the rule is
+configurable precisely so no repository is held to another's layout. A project that declares none
+falls back to accepting any explicit standards reference; a project that declares the key with an
+empty value is a broken declaration, reported as unevaluable rather than a pass.
+`brief-lint-disable` turns individual rules off, and every override is echoed in the output rather
+than applied silently.
 
 ## The scheduler daemon
 
