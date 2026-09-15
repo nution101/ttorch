@@ -482,9 +482,24 @@ func ShowFile(repo, ref, repoPath string) (string, bool) {
 
 // ChangedFiles returns the repo-relative paths changed between base and the COMMITTED
 // rev (`git diff --name-only base rev`) — committed objects, never the working tree.
-// Used to detect when a worker's committed diff touches the trust gate's definition.
+// Used to detect drift between a landed default branch and a rebased worker head.
 func ChangedFiles(path, base, rev string) ([]string, error) {
-	out, err := git("-C", path, "diff", "--name-only", base, rev)
+	return changedFiles(path, base, rev)
+}
+
+// ChangedFilesNoRenames is ChangedFiles with git's rename detection turned OFF, so a
+// renamed file reports BOTH its old and its new path. A caller that has to decide whether a
+// diff touches a specific path needs both: with rename detection on, `diff --name-only`
+// collapses a rename to its DESTINATION alone, so moving a file out of a watched set would
+// read as never having touched it. Listing both sides is strictly more conservative, which
+// is what the trust-gate guard wants.
+func ChangedFilesNoRenames(path, base, rev string) ([]string, error) {
+	return changedFiles(path, base, rev, "--no-renames")
+}
+
+func changedFiles(path, base, rev string, extra ...string) ([]string, error) {
+	args := append([]string{"-C", path, "diff", "--name-only"}, extra...)
+	out, err := git(append(args, base, rev)...)
 	if err != nil {
 		return nil, err
 	}

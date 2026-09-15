@@ -821,3 +821,60 @@ func TestPoolFreeSlots(t *testing.T) {
 		}
 	}
 }
+
+// TestChangedFilesNoRenames_ReportsBothSidesOfARename pins the difference that matters to a
+// caller deciding whether a diff touched a specific path: with git's rename detection on, a
+// rename collapses to its destination alone, so a file moved out of a watched set reads as
+// untouched. --no-renames reports both sides.
+func TestChangedFilesNoRenames_ReportsBothSidesOfARename(t *testing.T) {
+	repo := makeRepo(t)
+	run := func(args ...string) {
+		t.Helper()
+		c := exec.Command("git", append([]string{"-C", repo}, args...)...)
+		c.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com")
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	base := strings.TrimSpace(gitOut(t, repo, "rev-parse", "HEAD"))
+	run("mv", "f.txt", "moved.txt")
+	run("commit", "-q", "-m", "rename")
+	head := strings.TrimSpace(gitOut(t, repo, "rev-parse", "HEAD"))
+
+	withRenames, err := ChangedFiles(repo, base, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(withRenames) != 1 || withRenames[0] != "moved.txt" {
+		t.Fatalf("ChangedFiles over a rename = %v, want just the destination", withRenames)
+	}
+
+	both, err := ChangedFilesNoRenames(repo, base, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"f.txt": false, "moved.txt": false}
+	for _, n := range both {
+		if _, ok := want[n]; !ok {
+			t.Fatalf("unexpected path %q in %v", n, both)
+		}
+		want[n] = true
+	}
+	for n, seen := range want {
+		if !seen {
+			t.Errorf("ChangedFilesNoRenames over a rename = %v, missing %s", both, n)
+		}
+	}
+}
+
+func gitOut(t *testing.T, repo string, args ...string) string {
+	t.Helper()
+	c := exec.Command("git", append([]string{"-C", repo}, args...)...)
+	out, err := c.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, out)
+	}
+	return string(out)
+}
