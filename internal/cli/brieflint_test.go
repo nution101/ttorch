@@ -1,0 +1,178 @@
+package cli
+
+import (
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// lintRepo builds a neutral fixture repository: one commit on a base branch pushed to a
+// local bare "remote", so the brief lint's remote and ref checks run offline.
+func lintRepo(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	run := func(dir string, args ...string) {
+		t.Helper()
+		full := append([]string{
+			"-c", "user.name=lint fixture", "-c", "user.email=fixture@example.invalid",
+			"-c", "commit.gpgsign=false",
+		}, args...)
+		cmd := exec.Command("git", full...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	remote := t.TempDir()
+	run(remote, "init", "--bare", "-b", "main", "-q")
+	repo := t.TempDir()
+	run(repo, "init", "-b", "main", "-q")
+	run(repo, "remote", "add", "origin", remote)
+	if err := os.MkdirAll(filepath.Join(repo, "pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "pkg", "thing.go"), []byte("package pkg\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(repo, "add", "-A")
+	run(repo, "commit", "-q", "-m", "base")
+	run(repo, "push", "-q", "origin", "main")
+	run(repo, "fetch", "-q", "origin")
+	return repo
+}
+
+// cleanBrief satisfies every rule against a lintRepo fixture.
+const cleanBrief = `# Task
+
+Base is origin/main in this repository.
+
+Follow this repo's demonstrated conventions and match the shape of pkg/thing.go.
+
+No changes to any product branch and no PR until I have reviewed the work. Commit on your
+own branch, leave the worktree clean, and report the sha.
+`
+
+// defectiveBrief violates the target-branch and prohibition rules and points at no
+// standards.
+const defectiveBrief = "# Task\n\nJust do it. Do NOT push.\n"
+
+func writeBrief(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "brief.md")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// exitOf reports the process exit status run() would produce for err.
+func exitOf(t *testing.T, err error) int {
+	t.Helper()
+	if err == nil {
+		return 0
+	}
+	var ec exitCoder
+	if errors.As(err, &ec) {
+		return ec.ExitCode()
+	}
+	return 1
+}
+
+// The three outcomes must be distinguishable by exit status alone: a check that could not
+// run must never share a status with a pass.
+func TestCmdBriefLintExitStatuses(t *testing.T) {
+	repo := lintRepo(t)
+
+	out, err := captureStdout(t, func() error {
+		return cmdBriefLint([]string{writeBrief(t, cleanBrief), "--repo", repo})
+	})
+	if got := exitOf(t, err); got != 0 {
+		t.Fatalf("a clean brief must exit 0, got %d (%v)\n%s", got, err, out)
+	}
+	if !strings.Contains(out, "all 5 rules passed") {
+		t.Fatalf("unexpected output:\n%s", out)
+	}
+
+	out, err = captureStdout(t, func() error {
+		return cmdBriefLint([]string{writeBrief(t, defectiveBrief), "--repo", repo})
+	})
+	if got := exitOf(t, err); got != exitLintViolation {
+		t.Fatalf("a violated rule must exit %d, got %d (%v)\n%s", exitLintViolation, got, err, out)
+	}
+	// Every violation in one run, each with its rule named and its text quoted.
+	for _, want := range []string{"target-branch", "prohibition", "standards", `offending text: "Do NOT push"`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output must mention %q:\n%s", want, out)
+		}
+	}
+
+	// A file:line citation with no citations ref cannot be resolved — reported, not passed.
+	brief := strings.Replace(cleanBrief, "pkg/thing.go", "pkg/thing.go:400", 1)
+	out, err = captureStdout(t, func() error {
+		return cmdBriefLint([]string{writeBrief(t, brief), "--repo", repo})
+	})
+	if got := exitOf(t, err); got != exitLintIndeterminate {
+		t.Fatalf("an unevaluable check must exit %d, got %d (%v)\n%s", exitLintIndeterminate, got, err, out)
+	}
+	if !strings.Contains(out, "CANNOT-EVALUATE") {
+		t.Fatalf("output must mark the check unevaluable:\n%s", out)
+	}
+}
+
+func TestCmdBriefLintUsageErrors(t *testing.T) {
+	for name, args := range map[string][]string{
+		"no argument":  {},
+		"flag first":   {"--repo", "."},
+		"missing file": {filepath.Join(t.TempDir(), "nope.md")},
+		"unknown flag": {writeBrief(t, cleanBrief), "--nope"},
+	} {
+		err := cmdBriefLint(args)
+		if err == nil {
+			t.Fatalf("%s: want an error", name)
+		}
+		if got := exitOf(t, err); got != exitLintUsage {
+			t.Fatalf("%s: want exit %d, got %d (%v)", name, exitLintUsage, got, err)
+		}
+	}
+	// An empty brief is a usage error, not a passing lint.
+	if err := cmdBriefLint([]string{writeBrief(t, "   \n")}); exitOf(t, err) != exitLintUsage {
+		t.Fatalf("an empty brief must be a usage error, got %v", err)
+	}
+}
+
+// A project turning a rule off must see the override in the output, and an unknown rule id
+// must not read as a pass.
+func TestCmdBriefLintProjectOverrides(t *testing.T) {
+	repo := lintRepo(t)
+	agents := filepath.Join(repo, "AGENTS.md")
+
+	if err := os.WriteFile(agents, []byte("# Fixture\n\n- brief-lint-disable: target-branch, standards, prohibition\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := captureStdout(t, func() error {
+		return cmdBriefLint([]string{writeBrief(t, defectiveBrief), "--repo", repo})
+	})
+	if got := exitOf(t, err); got != 0 {
+		t.Fatalf("with those rules disabled the brief passes, got exit %d (%v)\n%s", got, err, out)
+	}
+	for _, want := range []string{"rule target-branch: DISABLED", "rule standards: DISABLED", "AGENTS.md"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("an override must be visible in the output, want %q:\n%s", want, out)
+		}
+	}
+
+	if err := os.WriteFile(agents, []byte("# Fixture\n\n- brief-lint-disable: target-brunch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err = captureStdout(t, func() error {
+		return cmdBriefLint([]string{writeBrief(t, cleanBrief), "--repo", repo})
+	})
+	if got := exitOf(t, err); got != exitLintIndeterminate {
+		t.Fatalf("an unknown disabled rule must not read as a pass, got exit %d (%v)\n%s", got, err, out)
+	}
+}

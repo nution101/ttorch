@@ -146,6 +146,8 @@ func Main(args []string) int {
 		return run(cmdScheduler(rest))
 	case "validate":
 		return run(cmdValidate(rest))
+	case "brief-lint":
+		return run(cmdBriefLint(rest))
 	case "ci-parity":
 		return run(cmdCIParity(rest))
 	case "review-diff":
@@ -184,9 +186,19 @@ func Main(args []string) int {
 	}
 }
 
+// exitCoder lets a command choose its own process exit status. `ttorch brief-lint` needs
+// it: "passed", "violated a rule" and "could not be evaluated" are three distinct
+// outcomes, and collapsing the last two would let an unevaluated check read as a failure
+// (or worse, a pass).
+type exitCoder interface{ ExitCode() int }
+
 func run(err error) int {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
+		var ec exitCoder
+		if errors.As(err, &ec) {
+			return ec.ExitCode()
+		}
 		return 1
 	}
 	return 0
@@ -2298,7 +2310,20 @@ Backlog & planning (read the DB; includes pending backlog tasks):
   phase ls [--epic id]                    list phases
   phase set-status <id> <status>          planned|in_progress|blocked|done|cancelled
   task add <id> --project <id> [--epic id] [--phase id] [--title "…"] [--touches "a,b"]
-                          create a pending backlog task (does not spawn)
+                          create a pending backlog task (does not spawn); a supplied
+                          brief is lint-checked first (--no-brief-lint to skip)
+
+Briefs:
+  brief-lint <file>       check a brief before it is stored on a task: target branch
+    [--repo <dir>]          declared and present on the remote, cited paths present,
+    [--remote <name>]       hard counts hedged, prohibitions bounded with an allowed end
+    [--ref <rev>]           state, standards pointed at. Exit 0 passed, 1 a rule was
+    [--citations-ref <rev>] violated, 3 a check COULD NOT be evaluated (never a pass).
+                          --ref is the base a cited path must exist at; --citations-ref
+                          is the commit a file:line citation was read at (a worker HEAD
+                          or reviewed sha), which is not the base. Per-project config
+                          lives in AGENTS.md, as "- brief-standards: <pointer>" and
+                          "- brief-lint-disable: <rule,...>" lines.
 
 Supervision:
   watch                   block until an actionable DB event, print the coalesced
