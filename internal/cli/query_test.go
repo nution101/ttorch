@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -416,6 +417,10 @@ func TestCmdTaskAddPendingBacklog(t *testing.T) {
 // the worker WITH the full brief as its initial prompt instead of the stub. A task added with
 // no brief stores none (and dispatches on the stub, unchanged); both flags at once is a loud
 // error that creates no task.
+//
+// The adds here pass --no-brief-lint: this test is about the storage path, and its fixture
+// briefs are one-line stubs that the brief lint would (correctly) reject. The lint itself is
+// covered in brieflint_test.go and internal/brieflint.
 func TestCmdTaskAddStoresBrief(t *testing.T) {
 	var projID int64
 	dbPath := withSeedDB(t, func(ctx context.Context, s *db.Store) {
@@ -424,7 +429,7 @@ func TestCmdTaskAddStoresBrief(t *testing.T) {
 	})
 	const inline = "# Real brief\n\nImplement part C.\n"
 	if _, err := captureStdout(t, func() error {
-		return cmdTaskAdd([]string{"brief-inline", "--project", itoa(projID), "--brief", inline})
+		return cmdTaskAdd([]string{"brief-inline", "--project", itoa(projID), "--brief", inline, "--no-brief-lint"})
 	}); err != nil {
 		t.Fatalf("task add --brief: %v", err)
 	}
@@ -439,7 +444,7 @@ func TestCmdTaskAddStoresBrief(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := captureStdout(t, func() error {
-		return cmdTaskAdd([]string{"brief-file", "--project", itoa(projID), "--brief-file", file})
+		return cmdTaskAdd([]string{"brief-file", "--project", itoa(projID), "--brief-file", file, "--no-brief-lint"})
 	}); err != nil {
 		t.Fatalf("task add --brief-file: %v", err)
 	}
@@ -473,7 +478,7 @@ func TestCmdTaskAddStoresBrief(t *testing.T) {
 
 	// Both flags at once is ambiguous: a loud error, and nothing is written (resolveBrief
 	// refuses before the task row or brief file is created).
-	if err := cmdTaskAdd([]string{"brief-both", "--project", itoa(projID), "--brief", inline, "--brief-file", file}); err == nil {
+	if err := cmdTaskAdd([]string{"brief-both", "--project", itoa(projID), "--brief", inline, "--brief-file", file, "--no-brief-lint"}); err == nil {
 		t.Fatal("task add with both --brief and --brief-file must error")
 	}
 	if _, err := os.Stat(paths.Default().BriefPath("brief-both")); !os.IsNotExist(err) {
@@ -512,6 +517,58 @@ func mustReadFile(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(b)
+}
+
+// A defective brief stops `task add` before any side effect: no task row, no stored brief.
+// The brief is a snapshot, so this is the last moment a fix reaches the worker.
+func TestCmdTaskAddLintsTheBrief(t *testing.T) {
+	repo := lintRepo(t)
+	var projID int64
+	dbPath := withSeedDB(t, func(ctx context.Context, s *db.Store) {
+		p, _ := s.UpsertProject(ctx, repo, "fixture")
+		projID = p.ID
+	})
+
+	out, err := captureStdout(t, func() error {
+		return cmdTaskAdd([]string{"lint-bad", "--project", itoa(projID), "--brief", defectiveBrief})
+	})
+	if got := exitOf(t, err); got != exitLintViolation {
+		t.Fatalf("a defective brief must fail the add with exit %d, got %d (%v)\n%s", exitLintViolation, got, err, out)
+	}
+	if _, statErr := os.Stat(paths.Default().BriefPath("lint-bad")); !os.IsNotExist(statErr) {
+		t.Fatalf("a refused add must store no brief; stat err = %v", statErr)
+	}
+	store := reopen(t, dbPath)
+	if _, exists, qErr := store.GetTask(context.Background(), "lint-bad"); qErr != nil {
+		t.Fatal(qErr)
+	} else if exists {
+		t.Fatal("a refused add must create no task row")
+	}
+
+	// A clean brief is added and stored.
+	if _, err := captureStdout(t, func() error {
+		return cmdTaskAdd([]string{"lint-good", "--project", itoa(projID), "--brief", cleanBrief})
+	}); err != nil {
+		t.Fatalf("a clean brief must be added: %v", err)
+	}
+	if got := mustReadFile(t, paths.Default().BriefPath("lint-good")); got != cleanBrief {
+		t.Fatalf("stored brief = %q, want the brief as written", got)
+	}
+
+	// The escape hatch stores the brief as written.
+	if _, err := captureStdout(t, func() error {
+		return cmdTaskAdd([]string{"lint-skipped", "--project", itoa(projID), "--brief", defectiveBrief, "--no-brief-lint"})
+	}); err != nil {
+		t.Fatalf("--no-brief-lint must add the task as written: %v", err)
+	}
+	if got := mustReadFile(t, paths.Default().BriefPath("lint-skipped")); got != defectiveBrief {
+		t.Fatalf("stored brief = %q, want the brief as written", got)
+	}
+
+	// --no-brief-lint with nothing to lint is a loud error rather than a silent no-op.
+	if err := cmdTaskAdd([]string{"lint-nobrief", "--project", itoa(projID), "--no-brief-lint"}); !errors.Is(err, errNoBriefLintWithoutBrief) {
+		t.Fatalf("want errNoBriefLintWithoutBrief, got %v", err)
+	}
 }
 
 func TestCmdTaskAddValidations(t *testing.T) {

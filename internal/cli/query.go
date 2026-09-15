@@ -692,7 +692,7 @@ func parseSetStatusArgs(kind string, args []string) (int64, string, error) {
 
 // --- ttorch task add ---------------------------------------------------------
 
-const taskAddUsage = `usage: ttorch task add <id> --project <id> [--epic <id>] [--phase <id>] [--title "…"] [--touches "a,b"] [--brief-file <path> | --brief "…"] [--effort <level>] [--model <m>]`
+const taskAddUsage = `usage: ttorch task add <id> --project <id> [--epic <id>] [--phase <id>] [--title "…"] [--touches "a,b"] [--brief-file <path> | --brief "…"] [--effort <level>] [--model <m>] [--citations-ref <rev>] [--no-brief-lint]`
 
 func cmdTask(args []string) error {
 	if len(args) < 1 || args[0] != "add" {
@@ -718,6 +718,8 @@ func cmdTaskAdd(args []string) error {
 	brief := fs.String("brief", "", "inline brief text used as the worker's initial prompt when this task is dispatched, instead of the generic stub")
 	effort := fs.String("effort", "", "reasoning effort to dispatch at: low|medium|high|xhigh|max|ultracode|off (default: the scheduler's tier classifier)")
 	model := fs.String("model", "", "model to dispatch on: haiku|sonnet|opus|fable|opusplan or a full id (default: the scheduler's tier classifier)")
+	citationsRef := fs.String("citations-ref", "", "ref the brief's file:line citations were read at (a worker HEAD or reviewed sha) — passed to the brief lint, which cannot resolve such a citation against the base")
+	noLint := fs.Bool("no-brief-lint", false, "store the brief without linting it (see 'ttorch brief-lint'); prefer disabling a specific rule in the project's AGENTS.md")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -743,16 +745,31 @@ func cmdTaskAdd(args []string) error {
 	if err != nil {
 		return err
 	}
+	if *noLint && briefContent == "" {
+		return errNoBriefLintWithoutBrief
+	}
 	m, err := mgr()
 	if err != nil {
 		return err
 	}
 	defer m.Close()
 	ctx := context.Background()
-	if _, ok, err := m.Store.GetProject(ctx, *project); err != nil {
+	proj, ok, err := m.Store.GetProject(ctx, *project)
+	if err != nil {
 		return err
 	} else if !ok {
 		return fmt.Errorf("task add: no such project %d (see 'ttorch project ls')", *project)
+	}
+	// Lint the brief before any side effect. The brief is a SNAPSHOT — it is copied into
+	// the task here, so editing the file afterwards reaches nobody and a defect is only
+	// discovered once a worker has acted on it. This is the last moment a fix is free. It
+	// runs against the project's own repository (its remote, its refs, its AGENTS.md
+	// configuration), and only when a brief was supplied: an add with no brief behaves
+	// exactly as before.
+	if !*noLint {
+		if err := lintBriefForAdd(briefContent, proj.RepoPath, *citationsRef); err != nil {
+			return err
+		}
 	}
 	// Resolve and cross-validate the hierarchy refs so the row is coherent: an
 	// --epic must live under --project, and a --phase must live under that epic
