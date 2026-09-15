@@ -34,6 +34,12 @@ var requiredReviewers = []string{review.DimensionCorrectness, review.DimensionSc
 // record). It lives beside the other review inputs in ReviewInputsDir.
 const reviewersFileName = "reviewers.json"
 
+// supersededDirName holds the reports of previous review episodes, one timestamped subdir
+// per prep. It keeps the audit trail of what earlier reviewers said (including findings
+// that were later adjudicated away) without leaving those reports where the current
+// episode's belong.
+const supersededDirName = "superseded"
+
 // scaledReviewers is the persisted reviewer-set decision: the change-size class and the
 // dimensions the trust gate requires for it. The manager reads it to spawn exactly those
 // reviewer subagents.
@@ -194,6 +200,13 @@ func diffLineStat(dir, base, rev string) (lines int, binary, ok bool) {
 // only committed objects, so the reviewers see exactly the commit that will fast-forward —
 // a worker cannot present a benign working tree while a different commit merges.
 //
+// Each prep opens a new review EPISODE: it archives the previous episode's per-dimension
+// reports into superseded/ and stamps the dir (review.PrepStamp). Re-materializing the
+// inputs invalidates any review written against the materialization before it, and the
+// commit pin cannot catch that on its own — a task that has sat idle has not moved its
+// HEAD, so a report from an earlier session still pins to head.txt verbatim. The stamp is
+// what makes such a report fold as ABSENT (fail closed) instead of current.
+//
 // The diff base is the up-to-date default tip the merge actually targets (reviewBase:
 // origin/<default> when current, fetched best-effort), NOT the raw local <default> branch.
 // A local default that is behind origin (e.g. a release merged on origin but never pulled
@@ -248,6 +261,11 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
+	// Open the new episode by moving the previous one's reports out of the way, so a report
+	// written for superseded inputs is simply not there to be folded. Best-effort: the
+	// episode stamp written below rejects a surviving report anyway, so failing to archive
+	// one degrades to a re-review, never to counting it.
+	m.archivePriorReports(dir)
 	// The reviewers' diff is the COMMITTED three-dot diff `git diff <base>...<head>` (the
 	// merge-base diff against the branch's true base), so it contains ONLY the branch's own
 	// changes — never any lead the default gained since the branch was cut. The stale-base
@@ -302,9 +320,44 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 	if err := os.WriteFile(filepath.Join(dir, "head.txt"), []byte(head+"\n"), 0o644); err != nil {
 		return "", err
 	}
+	// LAST, once every input is staged: stamp the episode. Its mtime is the line a report
+	// must postdate to count as this episode's.
+	if err := review.WritePrepStamp(dir, head); err != nil {
+		return "", err
+	}
 	m.audit(fmt.Sprintf("trust-prep task=%s commit=%s size=%s reviewers=%s",
 		taskID, short(head), size, strings.Join(dims, "+")))
 	return dir, nil
+}
+
+// archivePriorReports moves any per-dimension reports left in dir into a timestamped
+// superseded/ subdir, so the episode a prep opens starts with no report in place while the
+// earlier review is still readable. Reviews have been worth going back to — an adjudicated
+// finding, a reviewer that named a gap — so they are archived rather than deleted.
+// Best-effort by design: correctness rests on the episode stamp (a report that predates it
+// folds as absent), and this only keeps a superseded review from sitting where the current
+// one belongs.
+func (m *Manager) archivePriorReports(dir string) {
+	// Every dimension that writes a "<dimension>.json" report into this dir: the gate's own
+	// set plus the advisory QA audit, which reads the same prep-staged inputs.
+	dims := append(append([]string(nil), requiredReviewers...), review.DimensionQA)
+	var archive string
+	for _, dim := range dims {
+		report := filepath.Join(dir, dim+".json")
+		if _, err := os.Stat(report); err != nil {
+			continue
+		}
+		if archive == "" {
+			archive = filepath.Join(dir, supersededDirName, time.Now().UTC().Format("20060102T150405Z"))
+			if err := os.MkdirAll(archive, 0o755); err != nil {
+				fmt.Fprintf(os.Stderr, "ttorch: could not archive the previous review reports in %s: %v\n", dir, err)
+				return
+			}
+		}
+		if err := os.Rename(report, filepath.Join(archive, dim+".json")); err != nil {
+			fmt.Fprintf(os.Stderr, "ttorch: could not archive the previous %s review report in %s: %v\n", dim, dir, err)
+		}
+	}
 }
 
 // TrustRecord aggregates the reviewers' per-dimension reports for taskID into a
@@ -766,13 +819,13 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 	prog := m.readGateProgress(dir)
 
 	// Episode boundary: a first-ever gate, or the worker advanced past a prior episode's head
-	// (a re-gate). Reset the episode for the new head — clear any stale per-dimension reports
-	// and tear down the prior head's reviewer windows so a present report can only ever be one
-	// for THIS head — then run prep. A prep refusal (dirty worktree / stale base) is the
+	// (a re-gate). Reset the episode for the new head — tear down the prior head's reviewer
+	// windows, then run prep, which archives the previous episode's reports and stamps the new
+	// one so a present report can only ever be this episode's. A prep refusal (dirty worktree
+	// / stale base) is the
 	// worker's to fix (commit / rebase), not the daemon's: surface it once and mark the head
 	// terminal so the pass does not re-prep every tick.
 	if prog.Head != head {
-		m.clearStaleReviewerReports(dir, head)
 		m.teardownReviewers(taskID, prog.Dims)
 		if _, err := m.TrustPrep(taskID); err != nil {
 			m.surfaceGateBlocked(taskID, head, "gate prep refused: "+err.Error())
@@ -919,40 +972,15 @@ func (m *Manager) reviewerWindowAlive(taskID, dim string) bool {
 	return tmux.WindowExists(m.Session, reviewerWindow(taskID, dim))
 }
 
-// reviewReportPinned reports whether dimension dim's report exists in dir and is a parseable
-// review.Report pinned to head — i.e. a completed review for THIS commit. A missing,
-// unparseable, or stale-pinned report reads as not-ready (the gate re-dispatches), so a report
-// left over from a prior head can never be mistaken for this head's. This is the same pin
-// review.Aggregate enforces; checking it here lets the gate treat a stale report as "absent"
-// and re-dispatch rather than hit Aggregate's hard stale-sha error.
+// reviewReportPinned reports whether dimension dim's report in dir is the report the verdict
+// fold will accept: a parseable review.Report pinned to head AND written during the current
+// review episode (after the prep that staged the inputs it reviewed). A missing, unparseable,
+// stale-pinned, or superseded report reads as not-ready, so the gate re-dispatches that
+// reviewer rather than folding a review of inputs that no longer exist. It delegates to
+// review.ReportCurrent so the daemon's readiness check and review.Aggregate can never
+// disagree about what counts as a completed review.
 func (m *Manager) reviewReportPinned(dir, dim, head string) bool {
-	b, err := os.ReadFile(filepath.Join(dir, dim+".json"))
-	if err != nil {
-		return false
-	}
-	var r review.Report
-	if err := json.Unmarshal(b, &r); err != nil {
-		return false
-	}
-	return r.ReviewedSHA == head
-}
-
-// clearStaleReviewerReports removes per-dimension report files that are NOT pinned to head, at
-// the start of an episode, so a report left over from a PRIOR head is never present for the new
-// one — while a report already (validly) written for head is PRESERVED. Pinning the removal to
-// head matters because the episode reset also fires on the rare best-effort gate-progress write
-// loss for the CURRENT head: there, blindly deleting would discard a surviving same-head
-// reviewer's work and force a needless re-dispatch; head-aware removal keeps it. (Correctness
-// never depended on the delete — reviewReportPinned already treats a stale-pinned report as
-// absent — so this is purely hygiene + avoiding wasted re-review.) The gate's three dimensions'
-// files are considered; the advisory security/qa verdict files live under different names and
-// are untouched.
-func (m *Manager) clearStaleReviewerReports(dir, head string) {
-	for _, dim := range requiredReviewers {
-		if !m.reviewReportPinned(dir, dim, head) {
-			_ = os.Remove(filepath.Join(dir, dim+".json"))
-		}
-	}
+	return review.ReportCurrent(dir, dim, head)
 }
 
 // teardownReviewers reaps and kills any reviewer windows for the given dimensions. Best-effort:

@@ -6,7 +6,12 @@
 // task's review inputs dir; Aggregate folds the required dimensions into a single
 // Verdict. The verdict body is written by this Go-owned code (Write), not free-typed
 // by an LLM, so a missing or malformed report fails closed to "block" rather than
-// silently passing. It is kept distinct from the human approval token (see
+// silently passing.
+//
+// A verdict also has to be honest about the INPUTS it covers, not just the reports. Prep
+// stamps the inputs dir (PrepStamp) with when it materialized them and the commit they
+// cover; Aggregate folds that stamp alongside the reports, so a report left behind by an
+// earlier session fails closed instead of minting a clean pass. It is kept distinct from the human approval token (see
 // internal/approval) so an audit can always tell "a human read this" from "the
 // reviewers passed it"; like that token it is defense in depth and an audit trail,
 // not an unbreakable barrier against a fully compromised manager.
@@ -110,33 +115,26 @@ func DiffID(patch []byte) string {
 }
 
 // Aggregate folds the per-dimension reports in inputsDir into a single verdict for
-// sha. Every dimension in dimensions must be present and pinned to sha: a missing or
-// malformed report, or any finding at High severity or above, yields a "block"
-// verdict (fail closed). A report present but recorded against a different commit is
-// a hard error (a stale or mis-targeted review), not merely a block.
+// sha. Every dimension in dimensions must be present, pinned to sha, and written during
+// the CURRENT review episode: a missing, malformed, or superseded report, or any finding
+// at High severity or above, yields a "block" verdict (fail closed). A report present but
+// recorded against a different commit is a hard error (a stale or mis-targeted review),
+// not merely a block.
 func Aggregate(inputsDir, sha string, dimensions []string) (Verdict, error) {
 	v := Verdict{Overall: Pass, ReviewedSHA: sha}
+	prep := readPrep(inputsDir)
 	for _, dim := range dimensions {
-		b, err := os.ReadFile(filepath.Join(inputsDir, dim+".json"))
+		r, reason, err := currentReport(inputsDir, dim, sha, prep)
 		if err != nil {
+			return Verdict{}, err
+		}
+		if reason != "" {
 			v.Overall = Block
 			v.Findings = append(v.Findings, Finding{
 				Dimension: dim, Severity: SeverityHigh, Reviewer: "ttorch",
-				Summary: "no review recorded for dimension " + dim,
+				Summary: reason,
 			})
 			continue
-		}
-		var r Report
-		if err := json.Unmarshal(b, &r); err != nil {
-			v.Overall = Block
-			v.Findings = append(v.Findings, Finding{
-				Dimension: dim, Severity: SeverityHigh, Reviewer: "ttorch",
-				Summary: "malformed review report for dimension " + dim + ": " + err.Error(),
-			})
-			continue
-		}
-		if r.ReviewedSHA != sha {
-			return Verdict{}, fmt.Errorf("review for %q was recorded against %s, not the current %s", dim, short(r.ReviewedSHA), short(sha))
 		}
 		for _, f := range r.Findings {
 			if f.Dimension == "" {
