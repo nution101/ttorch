@@ -39,11 +39,6 @@ func (m *Manager) Validate(taskID string) ([]validate.Result, error) {
 	return results, nil
 }
 
-// gateConfigFiles define the trust gate itself: the validation script and the repo's
-// delivery-mode/gate config. A trusted AUTO-merge must never change them — altering the
-// gate requires an explicit human approval.
-var gateConfigFiles = []string{".ttorch/validate.sh", "AGENTS.md"}
-
 // gateDefinition is the resolved trust-gate validation DEFINITION for a repo: the
 // .ttorch/validate.sh text as it exists on the DEFAULT BRANCH (hasScript true), or, when the
 // default branch defines none, the ecosystem-detection fallback (hasScript false). Only the
@@ -242,23 +237,4 @@ func stagedGreen(results []validate.Result) bool {
 func hasDefaultBranchGateScript(repo string) bool {
 	_, ok := worktree.ShowFile(repo, worktree.DefaultBranch(repo), ".ttorch/validate.sh")
 	return ok
-}
-
-// diffTouchesGateConfig reports whether the COMMITTED diff base..rev modifies any
-// gate-definition file (and which one), so a trusted auto-merge of such a change can be
-// refused in favor of an explicit human approval. It reads committed objects, not the
-// working tree, so the check cannot be evaded by reverting the bytes in the worktree.
-func diffTouchesGateConfig(repo, base, rev string) (bool, string, error) {
-	names, err := worktree.ChangedFiles(repo, base, rev)
-	if err != nil {
-		return false, "", err
-	}
-	for _, n := range names {
-		for _, g := range gateConfigFiles {
-			if n == g {
-				return true, n, nil
-			}
-		}
-	}
-	return false, "", nil
 }
