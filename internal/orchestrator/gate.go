@@ -832,9 +832,8 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 	// (a re-gate). Reset the episode for the new head — tear down the prior head's reviewer
 	// windows, then run prep, which archives the previous episode's reports and stamps the new
 	// one so a present report can only ever be this episode's. A prep refusal (dirty worktree
-	// / stale base) is the
-	// worker's to fix (commit / rebase), not the daemon's: surface it once and mark the head
-	// terminal so the pass does not re-prep every tick.
+	// / stale base) is the worker's to fix (commit / rebase), not the daemon's: surface it
+	// once and mark the head terminal so the pass does not re-prep every tick.
 	if prog.Head != head {
 		m.teardownReviewers(taskID, prog.Dims)
 		if _, err := m.TrustPrep(taskID); err != nil {

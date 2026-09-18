@@ -12,10 +12,12 @@
 // stamps the inputs dir (PrepStamp) with when it materialized them, the commit they cover,
 // and the outcome of the gate's own validate of that commit; Aggregate folds that stamp
 // alongside the reports, so a report left behind by an earlier session and a review whose
-// green-suite premise never held both fail closed instead of minting a clean pass. It is kept distinct from the human approval token (see
-// internal/approval) so an audit can always tell "a human read this" from "the
-// reviewers passed it"; like that token it is defense in depth and an audit trail,
-// not an unbreakable barrier against a fully compromised manager.
+// green-suite premise never held both fail closed instead of minting a clean pass.
+//
+// A verdict is kept distinct from the human approval token (see internal/approval) so an
+// audit can always tell "a human read this" from "the reviewers passed it"; like that token
+// it is defense in depth and an audit trail, not an unbreakable barrier against a fully
+// compromised manager.
 package review
 
 import (

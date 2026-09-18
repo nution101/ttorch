@@ -29,10 +29,10 @@ const validateDimension = "validate"
 // the reports reviewed these inputs, and that the green-suite premise the reviewers are
 // told to trust actually held.
 //
-// PreparedAt is for the audit trail. The freshness comparison uses the marker FILE's mtime
-// instead (see readPrep), so both sides of it come from one filesystem clock at one
-// granularity and a coarse-mtime filesystem cannot report a report written after the prep
-// as older than it.
+// PreparedAt is for the audit trail, in UTC to match the archive directory names stamped
+// from the same moment. The freshness comparison uses the marker FILE's mtime instead (see
+// readPrep), so both sides of it come from one filesystem clock at one granularity and a
+// coarse-mtime filesystem cannot report a report written after the prep as older than it.
 type PrepStamp struct {
 	PreparedAt time.Time `json:"preparedAt"`
 	Head       string    `json:"head"`
@@ -61,7 +61,7 @@ func StagedGreen(results []validate.Result) bool {
 // complete.
 func WritePrepStamp(inputsDir, head string, results []validate.Result) (PrepStamp, error) {
 	stamp := PrepStamp{
-		PreparedAt:    time.Now(),
+		PreparedAt:    time.Now().UTC(),
 		Head:          head,
 		ValidateGreen: StagedGreen(results),
 	}
