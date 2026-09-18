@@ -18,75 +18,103 @@ import (
 // work on the tool still auto-merges (a guard that refuses everything gets switched off) and
 // wide enough to cover every input to the pass/fail decision:
 //
-//   - .ttorch/validate.sh — the script the gate EXECUTES as its green authority.
-//   - AGENTS.md — the delivery-mode block the gate READS to decide the trusted path applies.
-//   - content/agents/ttorch-reviewer-* — the adversarial reviewers the gate DISPATCHES. Their
+//   - .ttorch/validate.sh - the script the gate EXECUTES as its green authority.
+//   - Makefile - what that script actually runs. validate.sh is read from the DEFAULT branch
+//     so a worker cannot weaken it, but it runs `make lint` and `make test-fast` inside a
+//     checkout of the WORKER'S sha, so the worker's Makefile supplies the commands. A branch
+//     defining `test-fast: @true` has a green gate.
+//   - AGENTS.md - the delivery-mode block the gate READS to decide the trusted path applies.
+//   - content/agents/ttorch-reviewer-* - the adversarial reviewers the gate DISPATCHES. Their
 //     prompts are the review; the gate has no other notion of what gets checked.
-//   - content/skills/ttorch-review/ — the review protocol the gate RUNS.
-//   - the Go source that decides: verdict aggregation and reviewer scaling (internal/review),
-//     the approval token (internal/approval), what "green" means (internal/validate), the
-//     durable verdict row (internal/db/verdict.go), the delivery-mode reader
-//     (internal/projectinit/projectinit.go), and the gate's own orchestrator files — the
-//     auto-mint path, the merge-time re-checks, the freshness and pin checks, the
-//     content-addressed validate cache (a cache hit IS a green), and this guard.
+//   - content/skills/ttorch-review/ - the review protocol the gate RUNS.
+//   - the Go PACKAGES that decide (see below): internal/orchestrator (the auto-mint, the
+//     merge-time re-checks, the freshness and pin checks, the validate cache where a hit IS a
+//     green, and this guard), internal/review (verdict aggregation, reviewer scaling),
+//     internal/approval (the token), internal/validate (what "green" means), internal/db (the
+//     verdict row, read AND written), internal/projectinit (the delivery-mode reader) and
+//     internal/worktree (the git primitives the guard feeds itself from).
+//
+// FOR GO SOURCE THE UNIT IS THE PACKAGE, NEVER THE FILE. This is the correction that matters,
+// and it was found the hard way: an earlier version of this list named six files inside the
+// eleven-source-file package orchestrator. Go package-level vars are writable from ANY file in
+// the same package, and the gate's decisions hang off five of them - runGateOnCommitted
+// (validate.go), requiredReviewers and reviewerDispatcher (gate.go), nowFunc and landRebase /
+// landIntegrate (merge.go). A worker adding internal/orchestrator/anything.go with an init()
+// that rebinds runGateOnCommitted to return green, or editing spawn.go, which the old guard
+// explicitly permitted, changes what the gate decides without touching one guarded file. The
+// guard said not touched, the validate passed, the approval auto-minted, and every gate after
+// that was green. A partly guarded Go package is not a boundary at all, so the guard's
+// granularity has to equal the language's encapsulation boundary.
+// TestGateSeamsAreRebindableFromAnyFileInPackage performs that rebind and
+// TestGuardedGoPackagesAreWholePackages enforces the rule, so this cannot regress to file
+// granularity. Non-Go entries stay file-granular: a markdown file cannot rewrite another
+// markdown file's state.
 //
 // DELIBERATELY OUTSIDE the line, with the reasoning, because each was considered:
 //
 //   - The rest of content/agents/ and content/skills/. The other agents and skills are a
 //     library the gate never consults; content/agents/ttorch-worker.md is the worker's
 //     contract, not the reviewer's. content/assets/AGENTS.global.md states the no-merge-
-//     without-approval policy in prose, but the gate does not read it — the Go gate enforces
+//     without-approval policy in prose, but the gate does not read it - the Go gate enforces
 //     the same rule regardless, so rewriting the prose cannot authorize a merge.
-//   - internal/worktree. The gate leans on it (ShowFile, ChangedFilesNoRenames, TreeHash,
-//     IsAncestor), and a primitive that stopped reporting changed files would blind this
-//     guard. It is still excluded: it is a mechanical wrapper over git commands carrying no
-//     gate policy, and it is used by spawn, land, teardown and status, so guarding it would
-//     make a large share of ordinary work ineligible. The mitigation is that gateguard_test.go
-//     drives this guard end to end over a real git repo, so a change that broke the primitive
-//     turns the gate's own validate RED, and a trusted auto-merge requires a fresh green.
 //   - internal/scheduler. It chooses WHICH tasks to gate and land, but every authorization it
-//     relies on is re-checked here and in MergeLocal (token provenance, a fresh passing
-//     verdict, a fresh validate), so it cannot manufacture a pass the gate would refuse.
-//   - internal/orchestrator/landqueue.go. Concurrency and fast-forward serialization only; the
-//     land's gate decisions live in merge.go.
+//     relies on is re-checked in TrustRecord and MergeLocal (token provenance, a fresh passing
+//     verdict, a fresh validate), so it cannot manufacture a pass the gate would refuse. It is
+//     a separate package, so it cannot rebind the gate's seams either.
+//   - .github/workflows/. CI is the default branch's required check, not ttorch's gate; a
+//     trusted auto-merge is a local fast-forward and does not consult it.
+//   - Every other package: internal/cli, internal/tmux, internal/harness, internal/installer,
+//     internal/manifest, internal/watch, internal/termtab, internal/selfupdate, internal/state,
+//     internal/livestate, internal/skills, internal/learnings, internal/ciparity,
+//     internal/profile, internal/singleton, internal/doctor, internal/paths, internal/buildinfo,
+//     cmd/ttorch. None declares state the gate reads, and none can reach into a guarded
+//     package's vars.
+//
+// RULED OUT: moving the gate into its own package so the trust boundary IS a package boundary.
+// That is the more correct fix and it stays the right long-term shape, but it means relocating
+// TrustRecord, MergeLocal, the land pipeline and the validate cache (about 2,300 lines of
+// gate.go plus merge.go) out of package orchestrator, which requires exporting or re-interfacing
+// most of Manager's internals. Rewriting the gate's own plumbing while trying to secure it is
+// the wrong order: the refactor would need exactly the careful human review the guard exists to
+// force, and a mistake in it is a fail-open. Widening the list is cheap, reversible and
+// verifiable today. The narrower alternative - deleting the five mutable seams so file
+// granularity becomes sound again - is recorded as the follow-up that would let this guard
+// shrink back, but those seams exist so the tests can count validate runs and fake rebase
+// conflicts, so removing them is itself a change to the gate's testability.
 //
 // HARDCODED, NOT CONFIGURABLE. The guard exists to constrain the project, so the project must
 // not be able to edit it: a repo that could widen the list could also narrow it, and a
 // per-project setting would be exactly the file a self-approving change would edit first.
-// Deriving the list structurally (say, from every file the gate imports) was ruled out too —
-// it would pull in the standard library and half of internal/db through transitive imports,
-// which is the "refuses everything" failure. The list is therefore explicit, and
-// TestGateDefinitionPathsAnchored keeps it honest: it fails if any entry stops naming real
-// content, so a rename that orphans an entry turns validate red instead of silently opening a
-// hole.
+// Deriving the list structurally (say, from every file the gate imports) was ruled out too -
+// it would pull in the standard library through transitive imports, which is the
+// "refuses everything" failure. The list is therefore explicit, and three tests keep it honest:
+// TestGateDefinitionPathsAnchored (every entry still names real content),
+// TestGuardedGoPackagesAreWholePackages (no partly guarded Go package) and
+// TestGateDecisionSourceStaysGuarded (every gate-deciding declaration still lives inside it).
 var (
-	// gateDefinitionFiles are matched exactly, for gate files that live among non-gate
-	// siblings in the same directory.
+	// gateDefinitionFiles are matched exactly. Non-Go only: a Go file belongs to a package,
+	// and packages are guarded whole.
 	gateDefinitionFiles = []string{
 		".ttorch/validate.sh",
 		"AGENTS.md",
-		"internal/db/verdict.go",
-		"internal/orchestrator/gate.go",
-		"internal/orchestrator/gateguard.go",
-		"internal/orchestrator/gateguard_test.go",
-		"internal/orchestrator/merge.go",
-		"internal/orchestrator/validate.go",
-		"internal/orchestrator/validatecache.go",
-		"internal/projectinit/projectinit.go",
+		"Makefile",
 	}
 
-	// gateDefinitionPrefixes are matched as path prefixes, so a file ADDED to the gate later
-	// (a fifth reviewer, another file in the review skill or the review package) is covered
-	// the moment it exists. Exact filenames would not scale here, and a gap in the guard is
-	// worse than an occasional needless refusal. Each prefix is either a directory that
-	// belongs wholly to the gate or, for content/agents/, the reviewer filename stem — the
-	// directory itself also holds the non-gate agent library.
+	// gateDefinitionPrefixes are matched as path prefixes. For Go this is the package
+	// directory, which is the trust boundary. For content/agents/ it is the reviewer filename
+	// stem, because that directory also holds the non-gate agent library; a file ADDED to the
+	// gate later (a fifth reviewer, another file in the review skill or the review package) is
+	// then covered the moment it exists.
 	gateDefinitionPrefixes = []string{
 		"content/agents/ttorch-reviewer-",
 		"content/skills/ttorch-review/",
 		"internal/approval/",
+		"internal/db/",
+		"internal/orchestrator/",
+		"internal/projectinit/",
 		"internal/review/",
 		"internal/validate/",
+		"internal/worktree/",
 	}
 )
 
@@ -198,6 +226,8 @@ var gateDecisionDeclarations = []string{
 	// What a reviewer is told, and which reviewers run at all.
 	"reviewerBrief",
 	"(*Manager).spawnReviewer",
+	"reviewerDispatcher",
+	"requiredReviewers",
 	"(*Manager).ReviewersFor",
 	"(*Manager).clearStaleReviewerReports",
 	// The auto-mint path, the daemon gate pass, and this guard.
@@ -224,4 +254,16 @@ var gateDecisionDeclarations = []string{
 	"(*Manager).carryVerdictForward",
 	"(*Manager).gateCoversRebased",
 	"(*Manager).remintFromVerdict",
+	"nowFunc",
+	"landRebase",
+	"landIntegrate",
+	// The verdict row, written as well as read.
+	"(*Store).RecordDelivery",
+	"(*Store).GetVerdict",
+	// The delivery-mode reader, and the git primitives the guard feeds itself from.
+	"ReadMode",
+	"ChangedFilesNoRenames",
+	"DefaultBranch",
+	"ShowFile",
+	"TreeHash",
 }

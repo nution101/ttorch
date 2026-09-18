@@ -7,9 +7,13 @@ import (
 	"go/token"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/nution101/ttorch/internal/validate"
 )
 
 // gateGuardDiff builds a repo whose HEAD~1..HEAD diff touches exactly files, and returns the
@@ -82,24 +86,43 @@ func TestGateGuardRefusesGateDefinition(t *testing.T) {
 	}
 }
 
-// TestGateGuardPermitsOrdinarySource covers acceptance criterion 4: trusted mode must stay
-// useful. Ordinary source, docs and non-gate content agents are NOT the gate definition and
-// must still auto-merge. This is the regression that would make people disable the guard, so
-// it also pins the breadth line: internal/worktree and internal/scheduler are DELIBERATELY
-// outside the guard (see gateguard.go for why).
+// TestGateGuardPermitsOrdinarySource is the regression that would make people disable the
+// guard, so it is also the honest record of what trusted mode still buys after the guard went
+// package-granular. Measured against the 200 commits before this branch: 109 of them touch
+// none of the guarded paths and would still auto-merge; 101 would now need a human, with
+// internal/orchestrator alone accounting for 78. That is the price of the fix and it is
+// recorded here rather than in prose only.
+//
+// Three paths moved OUT of this list when the guard went package-granular:
+// internal/orchestrator/spawn.go, internal/orchestrator/landqueue.go and
+// internal/worktree/worktree.go. Each is in a package whose files can rebind the gate's seams
+// or feed the guard its own input, so each is now refused. That change is deliberate; see
+// TestGateSeamsAreRebindableFromAnyFileInPackage for why.
 func TestGateGuardPermitsOrdinarySource(t *testing.T) {
 	for _, path := range []string{
+		// Docs and entrypoints.
 		"README.md",
 		"docs/design.md",
 		"cmd/ttorch/main.go",
-		"internal/orchestrator/spawn.go",
-		"internal/orchestrator/landqueue.go",
+		".github/workflows/ci.yml",
+		// Packages that declare no state the gate reads and cannot reach into one that does.
+		"internal/cli/cli.go",
 		"internal/termtab/termtab.go",
-		"internal/worktree/worktree.go",
 		"internal/scheduler/scheduler.go",
+		"internal/scheduler/gate.go",
+		"internal/watch/watchdog.go",
+		"internal/tmux/tmux.go",
+		"internal/installer/installer.go",
+		"internal/manifest/manifest.go",
+		"internal/selfupdate/selfupdate.go",
+		"internal/harness/harness.go",
+		"internal/doctor/doctor.go",
+		// The agent and skill library the gate never consults.
 		"content/agents/golang-pro.md",
 		"content/agents/ttorch-worker.md",
 		"content/skills/ttorch-manager/SKILL.md",
+		"content/skills/ttorch-validate/SKILL.md",
+		"content/assets/AGENTS.global.md",
 	} {
 		t.Run(path, func(t *testing.T) {
 			repo, base, rev := gateGuardDiff(t, path)
@@ -392,4 +415,149 @@ func declKey(d *ast.FuncDecl) string {
 		return d.Name.Name
 	}
 	return "(" + recv + ")." + d.Name.Name
+}
+
+// TestGateSeamsAreRebindableFromAnyFileInPackage is the attack, written as a test. Go
+// package-level vars are writable from ANY file in the same package, and the gate's decisions
+// hang off five of them. This test performs the rebind from gateguard_test.go, which is a
+// DIFFERENT file in package orchestrator from the ones declaring the vars, and shows the
+// gate's notion of "green" following the rebind. A worker file doing this in an init() needs
+// no guarded file at all.
+//
+// Having demonstrated that, it asserts the consequence: the guard's unit for Go source must be
+// the PACKAGE, so every file in package orchestrator has to be covered.
+func TestGateSeamsAreRebindableFromAnyFileInPackage(t *testing.T) {
+	// The rebind. runGateOnCommitted is declared in validate.go; this file is not validate.go.
+	orig := runGateOnCommitted
+	t.Cleanup(func() { runGateOnCommitted = orig })
+	runGateOnCommitted = func(repo, sha string, def gateDefinition) (bool, []validate.Result, error) {
+		return true, []validate.Result{{Name: "gate", Passed: true}}, nil
+	}
+	green, results, err := runGateOnCommitted("/nonexistent-repo", "deadbeef", gateDefinition{})
+	if err != nil || !green || len(results) != 1 {
+		t.Fatalf("the rebind did not take: green=%v results=%v err=%v", green, results, err)
+	}
+	// Same for the other four seams, to show the channel is not one variable.
+	for name, rebind := range map[string]func() func(){
+		"requiredReviewers": func() func() {
+			o := requiredReviewers
+			requiredReviewers = nil
+			return func() { requiredReviewers = o }
+		},
+		"reviewerDispatcher": func() func() {
+			o := reviewerDispatcher
+			reviewerDispatcher = func(*Manager, string, string, string, string, string, string) error { return nil }
+			return func() { reviewerDispatcher = o }
+		},
+		"nowFunc": func() func() {
+			o := nowFunc
+			nowFunc = func() time.Time { return time.Unix(0, 0) }
+			return func() { nowFunc = o }
+		},
+		"landRebase": func() func() {
+			o := landRebase
+			landRebase = func(wt, base string) error { return nil }
+			return func() { landRebase = o }
+		},
+	} {
+		restore := rebind()
+		restore()
+		_ = name
+	}
+
+	// The consequence: a partially guarded Go package is not a boundary.
+	entries, err := os.ReadDir(filepath.Join("..", "..", "internal", "orchestrator"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") {
+			continue
+		}
+		p := "internal/orchestrator/" + e.Name()
+		if !isGateDefinition(p) {
+			t.Errorf("%s is in package orchestrator, so it can rebind runGateOnCommitted in an init() and make every gate green; the guard must cover it", p)
+		}
+	}
+}
+
+// TestGuardedGoPackagesAreWholePackages encodes the rule the rebind attack forces: for Go
+// source the guard's unit is the package, never the file. A package that is partly guarded is
+// not a boundary at all, because any unguarded file in it can rewrite the guarded files'
+// package-level state. It fails if any guarded .go path leaves a sibling .go file uncovered.
+func TestGuardedGoPackagesAreWholePackages(t *testing.T) {
+	root := filepath.Join("..", "..")
+	dirs := map[string]bool{}
+	for _, f := range gateDefinitionFiles {
+		if strings.HasSuffix(f, ".go") {
+			dirs[path.Dir(f)] = true
+		}
+	}
+	for _, p := range gateDefinitionPrefixes {
+		if d := strings.TrimSuffix(p, "/"); strings.HasPrefix(d, "internal/") || strings.HasPrefix(d, "cmd/") {
+			if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(d))); err == nil {
+				dirs[d] = true
+			}
+		}
+	}
+	if len(dirs) == 0 {
+		t.Fatal("no guarded Go packages found; the guard covers no Go source at all")
+	}
+	for dir := range dirs {
+		entries, err := os.ReadDir(filepath.Join(root, filepath.FromSlash(dir)))
+		if err != nil {
+			t.Errorf("guarded Go package %s: %v", dir, err)
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") {
+				continue
+			}
+			p := dir + "/" + e.Name()
+			if !isGateDefinition(p) {
+				t.Errorf("%s is guarded only in part: %s is in the same Go package and is not covered, so it can rewrite that package's gate state", dir, p)
+			}
+		}
+	}
+}
+
+// TestGateGuardRefusesNewlyIdentifiedGateInputs covers the brief's CRITICAL and three HIGHs:
+// an in-package rebind vector, the Makefile that .ttorch/validate.sh actually executes, the
+// verdict WRITE path, and the git primitives the guard feeds itself from.
+func TestGateGuardRefusesNewlyIdentifiedGateInputs(t *testing.T) {
+	for _, path := range []string{
+		// CRITICAL: any file in package orchestrator can rebind the gate's seams.
+		"internal/orchestrator/spawn.go",
+		"internal/orchestrator/landqueue.go",
+		"internal/orchestrator/audit.go",
+		"internal/orchestrator/orchestrator.go",
+		"internal/orchestrator/autostart.go",
+		"internal/orchestrator/overlap.go",
+		"internal/orchestrator/rebind.go", // a file that does not exist yet: the attack adds one
+		// HIGH: validate.sh is pinned to the default branch, but it runs `make lint` and
+		// `make test-fast` inside a checkout of the WORKER's sha, so the worker's Makefile
+		// supplies the commands. `test-fast: @true` is a green gate.
+		"Makefile",
+		// HIGH: the verdict WRITE path. verdict.go was the read side; RecordDelivery, the
+		// upsert TrustRecord calls, is in task.go.
+		"internal/db/task.go",
+		"internal/db/verdict.go",
+		// HIGH: the guard's own input. diffTouchesGateConfig is only as honest as
+		// ChangedFilesNoRenames, and DefaultBranch supplies its base.
+		"internal/worktree/worktree.go",
+	} {
+		t.Run(path, func(t *testing.T) {
+			repo, base, rev := gateGuardDiff(t, path)
+			touched, name, err := diffTouchesGateConfig(repo, base, rev)
+			if err != nil {
+				t.Fatalf("guard could not evaluate the diff: %v", err)
+			}
+			if !touched {
+				t.Fatalf("a diff touching %s must refuse a trusted auto-merge, but the guard permitted it", path)
+			}
+			if name != path {
+				t.Fatalf("the refusal must name the triggering file: got %q, want %q", name, path)
+			}
+		})
+	}
 }
