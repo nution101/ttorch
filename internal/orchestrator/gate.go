@@ -315,7 +315,7 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(filepath.Join(dir, "validate.json"), append(vb, '\n'), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, review.StagedValidateFile), append(vb, '\n'), 0o644); err != nil {
 		return "", err
 	}
 	if err := os.WriteFile(filepath.Join(dir, "head.txt"), []byte(head+"\n"), 0o644); err != nil {
@@ -485,13 +485,12 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 	}
 	// The audit line names the episode's validate state, so a reader of the trail can tell a
 	// verdict recorded over a green suite from one degraded by a validate that never ran or
-	// failed — the same thing the verdict's own findings say.
-	staged := "unprepped"
-	if stamp, ok := review.ReadPrepStamp(m.P.ReviewInputsDir(taskID)); ok {
-		staged = stamp.Label()
-	}
+	// failed — the same thing the verdict's own findings say. It is resolved FOR sha through
+	// the same cross-checked view the fold used, so the line cannot report another commit's
+	// outcome beside this commit's verdict, nor call a state green that the fold blocked on.
 	m.audit(fmt.Sprintf("trust-record task=%s commit=%s verdict=%s mode=%s auto-approved=%s validate=%s",
-		taskID, short(sha), verdict.Overall, projectinit.ReadMode(t.Project), autoMinted, staged))
+		taskID, short(sha), verdict.Overall, projectinit.ReadMode(t.Project), autoMinted,
+		review.ValidateState(m.P.ReviewInputsDir(taskID), sha)))
 	return verdict, nil
 }
 

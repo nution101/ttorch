@@ -214,7 +214,7 @@ func (m *Manager) reusablePrepValidate(taskID, sha string) ([]validate.Result, b
 	if err != nil || strings.TrimSpace(string(pinned)) != sha {
 		return nil, false
 	}
-	raw, err := os.ReadFile(filepath.Join(dir, "validate.json"))
+	raw, err := os.ReadFile(filepath.Join(dir, review.StagedValidateFile))
 	if err != nil {
 		return nil, false
 	}

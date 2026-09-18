@@ -24,14 +24,21 @@ func stagePrep(t *testing.T, inputsDir, sha string, results []validate.Result) {
 	if err := os.WriteFile(filepath.Join(inputsDir, "head.txt"), []byte(sha+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	writeValidateJSON(t, inputsDir, results)
+	if _, err := WritePrepStamp(inputsDir, sha, results); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// writeValidateJSON writes the staged validate the reviewers read, as prep does. Separate from
+// stagePrep so a test can make it disagree with the marker.
+func writeValidateJSON(t *testing.T, inputsDir string, results []validate.Result) {
+	t.Helper()
 	b, err := json.MarshalIndent(results, "", "  ")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(inputsDir, "validate.json"), append(b, '\n'), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := WritePrepStamp(inputsDir, sha, results); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -208,4 +215,144 @@ func findingMentions(v Verdict, s string) bool {
 		}
 	}
 	return false
+}
+
+// TestAggregate_MarkerContradictingStagedValidateBlocks: the marker is not the only record of
+// the episode's validate. It is Go-written, but it sits in the same directory as everything
+// else a review reads, so a marker claiming green while the staged validate the reviewers
+// actually read says otherwise means one of the two has been altered. Neither can underwrite
+// the review then, so the fold blocks rather than believing the marker.
+func TestAggregate_MarkerContradictingStagedValidateBlocks(t *testing.T) {
+	const sha = "abc123def456"
+	dir := t.TempDir()
+
+	stagePrep(t, dir, sha, greenValidate())
+	for _, d := range dims {
+		writeReport(t, dir, d, sha, nil)
+	}
+	// The staged validate now disagrees with the marker, which still records green.
+	writeValidateJSON(t, dir, []validate.Result{{Name: "gate", Passed: false, Output: "boom"}})
+
+	v, err := Aggregate(dir, sha, dims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Overall != Block {
+		t.Fatalf("overall = %q, want %q: the marker was trusted against the staged validate", v.Overall, Block)
+	}
+	if !findingMentions(v, "disagree") {
+		t.Errorf("the verdict must say the two records disagree; findings = %+v", v.Findings)
+	}
+}
+
+// TestAggregate_MissingStagedValidateBlocks: with the staged validate gone there is nothing to
+// corroborate the marker against, so the fold blocks instead of taking the marker's word.
+func TestAggregate_MissingStagedValidateBlocks(t *testing.T) {
+	const sha = "abc123def456"
+	dir := t.TempDir()
+
+	stagePrep(t, dir, sha, greenValidate())
+	for _, d := range dims {
+		writeReport(t, dir, d, sha, nil)
+	}
+	if err := os.Remove(filepath.Join(dir, "validate.json")); err != nil {
+		t.Fatal(err)
+	}
+
+	v, err := Aggregate(dir, sha, dims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Overall != Block {
+		t.Fatalf("overall = %q, want %q: an uncorroborated marker must not underwrite a pass", v.Overall, Block)
+	}
+}
+
+// TestAggregate_AgreeingRecordsStillPass is the other half of the cross-check: when the two
+// records agree, the guard costs nothing. Both the green case (passes) and the red case
+// (blocks for the validate's own sake, not for a disagreement).
+func TestAggregate_AgreeingRecordsStillPass(t *testing.T) {
+	const sha = "abc123def456"
+
+	t.Run("both green", func(t *testing.T) {
+		dir := t.TempDir()
+		stagePrep(t, dir, sha, greenValidate())
+		for _, d := range dims {
+			writeReport(t, dir, d, sha, nil)
+		}
+		v, err := Aggregate(dir, sha, dims)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v.Overall != Pass {
+			t.Fatalf("overall = %q, want %q: the cross-check tripped on agreeing records (findings: %+v)", v.Overall, Pass, v.Findings)
+		}
+	})
+
+	t.Run("both red", func(t *testing.T) {
+		dir := t.TempDir()
+		red := []validate.Result{{Name: "gate", Passed: false, Output: "boom"}}
+		stagePrep(t, dir, sha, red)
+		for _, d := range dims {
+			writeReport(t, dir, d, sha, nil)
+		}
+		v, err := Aggregate(dir, sha, dims)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v.Overall != Block {
+			t.Fatalf("overall = %q, want %q", v.Overall, Block)
+		}
+		if findingMentions(v, "disagree") {
+			t.Errorf("records that agree must not be reported as a disagreement; findings = %+v", v.Findings)
+		}
+	})
+}
+
+// TestValidateState reports the episode's validate state for one commit, and is what the audit
+// line says. It must never describe a commit the episode does not cover, and must refuse to
+// call a disputed or unreadable state green.
+func TestValidateState(t *testing.T) {
+	const sha = "abc123def456"
+
+	t.Run("green", func(t *testing.T) {
+		dir := t.TempDir()
+		stagePrep(t, dir, sha, greenValidate())
+		if got := ValidateState(dir, sha); got != "green" {
+			t.Fatalf("ValidateState = %q, want green", got)
+		}
+	})
+
+	t.Run("failed names the steps", func(t *testing.T) {
+		dir := t.TempDir()
+		stagePrep(t, dir, sha, []validate.Result{{Name: "build", Passed: true}, {Name: "test", Passed: false}})
+		if got := ValidateState(dir, sha); got != "failed:test" {
+			t.Fatalf("ValidateState = %q, want failed:test", got)
+		}
+	})
+
+	t.Run("no checks", func(t *testing.T) {
+		dir := t.TempDir()
+		stagePrep(t, dir, sha, nil)
+		if got := ValidateState(dir, sha); got != "none" {
+			t.Fatalf("ValidateState = %q, want none", got)
+		}
+	})
+
+	t.Run("an episode for another commit is not this commit's state", func(t *testing.T) {
+		dir := t.TempDir()
+		stagePrep(t, dir, "OTHERSHA00000", greenValidate())
+		if got := ValidateState(dir, sha); got != "unprepped" {
+			t.Fatalf("ValidateState = %q, want unprepped: another commit's outcome was reported as this one's", got)
+		}
+	})
+
+	t.Run("disputed records are not green", func(t *testing.T) {
+		dir := t.TempDir()
+		stagePrep(t, dir, sha, greenValidate())
+		writeValidateJSON(t, dir, []validate.Result{{Name: "gate", Passed: false}})
+		if got := ValidateState(dir, sha); got != "disputed" {
+			t.Fatalf("ValidateState = %q, want disputed", got)
+		}
+	})
 }

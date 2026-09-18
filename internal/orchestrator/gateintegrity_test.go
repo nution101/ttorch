@@ -401,3 +401,55 @@ func containsDim(dims []string, dim string) bool {
 	}
 	return false
 }
+
+// TestTrustRecord_AuditNeverNamesAnotherCommitsValidate: the audit line's validate token must
+// describe the commit the verdict covers. Reading the marker without checking which commit it
+// was prepped for lets the line report an unrelated commit's outcome, so the trail can read
+// "green" beside a verdict that blocked precisely because this commit was never prepped.
+func TestTrustRecord_AuditNeverNamesAnotherCommitsValidate(t *testing.T) {
+	m, _, dir := preppedTrustedTask(t, "auditsha", "as1", "exit 0")
+	task, ok, err := m.Store.GetTask(context.Background(), "as1")
+	if err != nil || !ok {
+		t.Fatal(err)
+	}
+
+	// The worker commits again after the prep, so the staged episode covers the earlier
+	// commit while the reviewers report on the new one.
+	head2 := commitFeature(t, task.Worktree, "more.txt", "more\n")
+	writeReportsForPreppedInputs(t, dir, head2, nil)
+
+	v, err := m.TrustRecord("as1", "", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Overall != review.Block {
+		t.Fatalf("verdict = %q, want %q: the episode does not cover the recorded commit", v.Overall, review.Block)
+	}
+
+	line := auditLineFor(t, m, "trust-record task=as1")
+	if strings.Contains(line, "validate=green") {
+		t.Errorf("the audit line reports another commit's validate outcome beside a blocking verdict: %s", line)
+	}
+	if !strings.Contains(line, "validate=unprepped") {
+		t.Errorf("the audit line must say this commit has no prepped validate; got: %s", line)
+	}
+}
+
+// auditLineFor returns the last audit-log line containing match.
+func auditLineFor(t *testing.T, m *Manager, match string) string {
+	t.Helper()
+	b, err := os.ReadFile(m.P.AuditLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := ""
+	for _, ln := range strings.Split(string(b), "\n") {
+		if strings.Contains(ln, match) {
+			found = ln
+		}
+	}
+	if found == "" {
+		t.Fatalf("no audit line matching %q in:\n%s", match, b)
+	}
+	return found
+}

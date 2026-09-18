@@ -17,6 +17,11 @@ import (
 // it, and the marker is what tells the two apart.
 const PrepStampFile = "prep.json"
 
+// StagedValidateFile is the gate's own validate of the reviewed commit, as prep stages it for
+// the reviewers to read. The fold cross-checks the marker against it, so the name lives here
+// rather than being spelled out separately by every writer and reader of it.
+const StagedValidateFile = "validate.json"
+
 // validateDimension labels the Go-authored finding that reports a gap in the episode's
 // staged validate. It is not a review dimension — no reviewer writes a validate.json
 // report — but carrying the gap as an ordinary blocking finding means every existing
@@ -29,8 +34,8 @@ const validateDimension = "validate"
 // the reports reviewed these inputs, and that the green-suite premise the reviewers are
 // told to trust actually held.
 //
-// PreparedAt is for the audit trail, in UTC to match the archive directory names stamped
-// from the same moment. The freshness comparison uses the marker FILE's mtime instead (see
+// PreparedAt is for the audit trail, in UTC to match the archive directory prep names from
+// the same moment. The freshness comparison uses the marker FILE's mtime instead (see
 // readPrep), so both sides of it come from one filesystem clock at one granularity and a
 // coarse-mtime filesystem cannot report a report written after the prep as older than it.
 type PrepStamp struct {
@@ -75,18 +80,9 @@ func WritePrepStamp(inputsDir, head string, results []validate.Result) (PrepStam
 	return stamp, os.WriteFile(filepath.Join(inputsDir, PrepStampFile), append(b, '\n'), 0o644)
 }
 
-// ReadPrepStamp returns the episode marker in inputsDir, if one is there. Callers use it to
-// report the episode's staged validate state alongside a verdict; the fold itself reads the
-// marker directly (readPrep), because it also needs the file's mtime.
-func ReadPrepStamp(inputsDir string) (PrepStamp, bool) {
-	p := readPrep(inputsDir)
-	return p.stamp, p.ok
-}
-
 // Label renders the episode's staged validate outcome as one audit-line token: "green",
-// "none" when no checks were detected, or "failed:<steps>". It gives the audit trail the
-// same unambiguous statement of the validate state that a degraded verdict's findings
-// carry.
+// "none" when no checks were detected, or "failed:<steps>". Callers reporting a commit's
+// state go through ValidateState, which corroborates the marker first.
 func (s PrepStamp) Label() string {
 	if s.ValidateGreen {
 		return "green"
@@ -97,12 +93,35 @@ func (s PrepStamp) Label() string {
 	return "failed:" + strings.Join(s.ValidateFailed, ",")
 }
 
+// ValidateState returns the one-token summary of the episode's staged validate FOR sha:
+// "green", "none" when no checks ran, "failed:<steps>", "unprepped" when no episode covers
+// sha, "unreadable" when the staged validate is gone, or "disputed" when the two records
+// disagree. It is what an audit line reports, and it is derived from the same cross-checked
+// view the verdict fold uses (validateGap), so a line can never describe a commit the verdict
+// does not cover, nor call a state green that the fold blocked on.
+func ValidateState(inputsDir, sha string) string {
+	p := readPrep(inputsDir)
+	switch {
+	case !p.covers(sha):
+		return "unprepped"
+	case !p.stagedOK:
+		return "unreadable"
+	case StagedGreen(p.staged) != p.stamp.ValidateGreen:
+		return "disputed"
+	default:
+		return p.stamp.Label()
+	}
+}
+
 // prepState is the episode the reports in an inputs dir are folded against: the marker's
-// content, the moment it was written (its mtime), and whether it could be read at all.
+// content, the moment it was written (its mtime), whether it could be read at all, and the
+// staged validate the reviewers themselves read, which the marker is cross-checked against.
 type prepState struct {
 	stamp      PrepStamp
 	preparedAt time.Time
 	ok         bool
+	staged     []validate.Result
+	stagedOK   bool
 }
 
 // readPrep loads the episode marker from inputsDir. A missing or unparseable marker yields
@@ -123,7 +142,17 @@ func readPrep(inputsDir string) prepState {
 	if err := json.Unmarshal(b, &stamp); err != nil {
 		return prepState{}
 	}
-	return prepState{stamp: stamp, preparedAt: st.ModTime(), ok: true}
+	p := prepState{stamp: stamp, preparedAt: st.ModTime(), ok: true}
+	// The second record of the same fact: the staged validate the REVIEWERS read. Read it
+	// here so the fold can corroborate the marker instead of taking its word (see
+	// validateGap). Unreadable or malformed leaves stagedOK false, which fails closed.
+	if vb, err := os.ReadFile(filepath.Join(inputsDir, StagedValidateFile)); err == nil {
+		var results []validate.Result
+		if err := json.Unmarshal(vb, &results); err == nil {
+			p.staged, p.stagedOK = results, true
+		}
+	}
+	return p
 }
 
 // covers reports whether the episode was prepared for sha — the inputs the reports were
@@ -138,9 +167,20 @@ func (p prepState) covers(sha string) bool {
 // NOT to re-run the suite, so a review recorded over a red — or absent — validate rests on
 // a premise that never held, and a clean "pass" there would read as gated when the commit
 // was never validated.
+// It cross-checks the marker against the staged validate.json rather than trusting either
+// alone. Both files sit in the same directory the reviewers and the worker can reach, and the
+// marker is the only one the fold would otherwise read, so a marker that claims green while
+// the file the reviewers actually read says otherwise means one of the two was altered. There
+// is no safe way to pick a winner, so a disagreement blocks.
 func (p prepState) validateGap(sha string) (string, bool) {
 	if !p.covers(sha) {
 		return fmt.Sprintf("no review prep is recorded for %s, so neither the inputs the reviewers read nor the state of the repo's checks at that commit can be established; re-run the review prep and review again", short(sha)), true
+	}
+	if !p.stagedOK {
+		return fmt.Sprintf("the staged validate of %s is missing or unreadable, so the prep marker's record of the checks cannot be corroborated; re-run the review prep", short(sha)), true
+	}
+	if staged := StagedGreen(p.staged); staged != p.stamp.ValidateGreen {
+		return fmt.Sprintf("the prep marker and the staged validate of %s disagree about the checks (marker says %s, %s says %s), so one of them was altered and neither can underwrite this review", short(sha), greenWord(p.stamp.ValidateGreen), StagedValidateFile, greenWord(staged)), true
 	}
 	if p.stamp.ValidateGreen {
 		return "", false
@@ -149,6 +189,14 @@ func (p prepState) validateGap(sha string) (string, bool) {
 		return fmt.Sprintf("the staged validate of %s detected no checks, so nothing shows the repo's checks pass at the reviewed commit; this review does not gate the change", short(sha)), true
 	}
 	return fmt.Sprintf("the staged validate of %s is not green (failed: %s), so the review rests on a premise that does not hold; this review does not gate the change", short(sha), strings.Join(p.stamp.ValidateFailed, ", ")), true
+}
+
+// greenWord renders a greenness bit for a finding summary.
+func greenWord(green bool) string {
+	if green {
+		return "green"
+	}
+	return "not green"
 }
 
 // currentReport reads dim's report from inputsDir and reports whether it is the report

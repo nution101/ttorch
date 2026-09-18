@@ -1037,11 +1037,27 @@ func writeReviewReports(t *testing.T, dir, sha string, perDim map[string][]revie
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	stageGreenPrep(t, dir, sha)
+	writeReportsForPreppedInputs(t, dir, sha, perDim)
+}
+
+// stageGreenPrep materializes what `ttorch trust prep` stages for a commit whose checks
+// passed: the staged validate the reviewers read, and the episode marker recording the same
+// outcome, written last as prep writes it. The verdict fold cross-checks the two, so a
+// fixture has to stage both, exactly as production does.
+func stageGreenPrep(t *testing.T, dir, sha string) {
+	t.Helper()
 	green := []validate.Result{{Name: "gate", Passed: true}}
+	b, err := json.MarshalIndent(green, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, review.StagedValidateFile), append(b, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := review.WritePrepStamp(dir, sha, green); err != nil {
 		t.Fatal(err)
 	}
-	writeReportsForPreppedInputs(t, dir, sha, perDim)
 }
 
 // writeReportsForPreppedInputs drops one per-dimension report per required reviewer into a
@@ -3190,9 +3206,7 @@ func writeSecurityReport(t *testing.T, dir, sha string, findings []review.Findin
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := review.WritePrepStamp(dir, sha, []validate.Result{{Name: "gate", Passed: true}}); err != nil {
-		t.Fatal(err)
-	}
+	stageGreenPrep(t, dir, sha)
 	b, err := json.Marshal(review.Report{Dimension: review.DimensionSecurity, ReviewedSHA: sha, Findings: findings})
 	if err != nil {
 		t.Fatal(err)
@@ -3330,9 +3344,7 @@ func writeQAReport(t *testing.T, dir, sha string, findings []review.Finding) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := review.WritePrepStamp(dir, sha, []validate.Result{{Name: "gate", Passed: true}}); err != nil {
-		t.Fatal(err)
-	}
+	stageGreenPrep(t, dir, sha)
 	b, err := json.Marshal(review.Report{Dimension: review.DimensionQA, ReviewedSHA: sha, Findings: findings})
 	if err != nil {
 		t.Fatal(err)
