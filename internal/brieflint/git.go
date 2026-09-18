@@ -6,14 +6,21 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// gitTimeout bounds every git call the linter makes. A brief lint runs in front of
-// `ttorch task add`, and one of its checks talks to a remote: an unreachable remote must
-// time out into an INDETERMINATE finding rather than hang the add.
+// gitTimeout bounds ONE git call. It is a ceiling per call, not a budget for the run: the
+// run-wide budget is a context deadline every call derives from (see Options.Budget), so a
+// brief naming many refs cannot stall for N times this.
 const gitTimeout = 20 * time.Second
+
+// maxBlobBytes caps the blob a line count will read. Counting the lines of a path means
+// reading its contents, and a brief can cite a path of any size (a vendored bundle, a
+// checked-in binary, a generated fixture), so the read is capped rather than trusted. Over
+// the cap the citation is reported as unevaluable, never as a violation.
+const maxBlobBytes = 4 << 20 // 4 MiB
 
 // gitResult is one git invocation. stdout is kept RAW and separate from stderr: one caller
 // counts the lines of a file's contents, so trimming it or folding a diagnostic into it
@@ -24,11 +31,11 @@ type gitResult struct {
 	// exit is the process exit status; 0 means success. Meaningful only when err is nil.
 	exit int
 	// err is non-nil when git produced no exit status at all — the binary is missing, or
-	// the call timed out. That is unevaluable, never a failed check.
+	// the call ran out of time. That is unevaluable, never a failed check.
 	err error
 }
 
-// token is stdout as a single value (a ref, an object type), whitespace stripped.
+// token is stdout as a single value (a ref, a byte count), whitespace stripped.
 func (r gitResult) token() string { return strings.TrimSpace(r.stdout) }
 
 // msg is the short diagnostic to quote when git failed for a reason the caller cannot
@@ -44,13 +51,20 @@ func (r gitResult) msg() string {
 	return m
 }
 
-// gitFunc runs git in dir. Tests substitute it via Options.git to exercise the unevaluable
-// paths (an unreachable remote, a missing git) without a network.
-type gitFunc func(dir string, args ...string) gitResult
+// gitFunc runs git in dir, under ctx. Tests substitute it via Options.git to exercise the
+// unevaluable paths (an unreachable remote, a missing git, an exhausted budget) without a
+// network.
+type gitFunc func(ctx context.Context, dir string, args ...string) gitResult
 
-// gitRun is the real git.
-func gitRun(dir string, args ...string) gitResult {
-	ctx, cancel := context.WithTimeout(context.Background(), gitTimeout)
+// gitRun is the real git. Its deadline is the SOONER of gitTimeout and whatever ctx already
+// carries, so the run-wide budget always wins over the per-call ceiling.
+func gitRun(ctx context.Context, dir string, args ...string) gitResult {
+	// Fail fast rather than start a process that cannot finish: an already-exhausted budget
+	// is the case that keeps a brief naming many refs from stalling the caller.
+	if err := ctx.Err(); err != nil {
+		return gitResult{err: fmt.Errorf("git %s not attempted: %w", args[0], err)}
+	}
+	ctx, cancel := context.WithTimeout(ctx, gitTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
@@ -60,7 +74,7 @@ func gitRun(dir string, args ...string) gitResult {
 	err := cmd.Run()
 	res := gitResult{stdout: stdout.String(), stderr: stderr.String()}
 	if ctx.Err() != nil {
-		res.err = fmt.Errorf("git %s timed out after %s", args[0], gitTimeout)
+		res.err = fmt.Errorf("git %s ran out of time: %w", args[0], ctx.Err())
 		return res
 	}
 	var ee *exec.ExitError
@@ -79,12 +93,15 @@ func gitRun(dir string, args ...string) gitResult {
 
 // remoteBranchExists reports whether branch is a head on remote. The bool is meaningful
 // only when the error is nil; a non-nil error means the question could not be answered
-// (the remote was unreachable, git is missing), which the caller reports as
-// StatusIndeterminate — never as "the branch does not exist".
-func (o Options) remoteBranchExists(remote, branch string) (bool, error) {
+// (the remote was unreachable, the budget ran out, git is missing), which the caller
+// reports as StatusIndeterminate — never as "the branch does not exist".
+func (o Options) remoteBranchExists(ctx context.Context, remote, branch string) (bool, error) {
 	// --exit-code makes "no such ref" a distinct status (2) instead of a successful empty
-	// listing, so a typo'd branch cannot read the same as a healthy query.
-	res := o.git(o.Repo, "ls-remote", "--exit-code", "--heads", remote, branch)
+	// listing, so a typo'd branch cannot read the same as a healthy query. The "--" keeps
+	// every brief-derived value a positional argument: the extraction regex already
+	// excludes a leading "-", and this makes that the second line of defence rather than
+	// the only one.
+	res := o.git(ctx, o.Repo, "ls-remote", "--exit-code", "--heads", "--", remote, branch)
 	switch {
 	case res.err != nil:
 		return false, res.err
@@ -99,8 +116,8 @@ func (o Options) remoteBranchExists(remote, branch string) (bool, error) {
 
 // revExists reports whether ref resolves to a commit in the repository. As with
 // remoteBranchExists, a non-nil error means unevaluable rather than absent.
-func (o Options) revExists(ref string) (bool, error) {
-	res := o.git(o.Repo, "rev-parse", "--verify", "--quiet", ref+"^{commit}")
+func (o Options) revExists(ctx context.Context, ref string) (bool, error) {
+	res := o.git(ctx, o.Repo, "rev-parse", "--verify", "--quiet", "--end-of-options", ref+"^{commit}")
 	switch {
 	case res.err != nil:
 		return false, res.err
@@ -115,38 +132,71 @@ func (o Options) revExists(ref string) (bool, error) {
 }
 
 // objectType returns the git object type of path at ref ("blob" for a file, "tree" for a
-// directory) and whether it exists at all. Callers must have already established that ref
-// itself resolves, so a miss here is a genuinely absent path and not an unknown revision.
-func (o Options) objectType(ref, path string) (string, bool, error) {
-	res := o.git(o.Repo, "cat-file", "-t", ref+":"+path)
+// directory) and whether it exists there.
+//
+// It asks with ls-tree rather than `cat-file -t` because ls-tree separates the two answers
+// that matter: an absent path is a SUCCESSFUL query with no entry, while a query that could
+// not be performed at all (a shallow clone missing the object, a corrupt object, an
+// exhausted budget) is a non-zero exit. `cat-file -t` collapses both into exit 128, which
+// would report a repository problem as a rule violation — inconsistent with every other
+// query in this file, which treats an unclassifiable failure as unevaluable.
+func (o Options) objectType(ctx context.Context, ref, path string) (string, bool, error) {
+	res := o.git(ctx, o.Repo, "ls-tree", "--full-tree", ref, "--", path)
 	switch {
 	case res.err != nil:
 		return "", false, res.err
-	case res.exit == 0:
-		return res.token(), true, nil
-	default:
+	case res.exit != 0:
+		return "", false, fmt.Errorf("git ls-tree %s -- %s failed (exit %d): %s", ref, path, res.exit, res.msg())
+	}
+	line := res.stdout
+	if i := strings.IndexByte(line, '\n'); i >= 0 {
+		line = line[:i]
+	}
+	// "<mode> <type> <sha>\t<path>": absent means no entry at all, which is the query
+	// succeeding with a negative answer.
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
 		return "", false, nil
 	}
+	return fields[1], true, nil
 }
 
 // lineCount returns the number of lines of path at ref, counted the way an editor and a
 // reviewer count them: a trailing newline closes the last line rather than starting a new
 // one, and a file whose last line is unterminated still counts.
-func (o Options) lineCount(ref, path string) (int, error) {
-	res := o.git(o.Repo, "show", ref+":"+path)
+//
+// The blob's size is checked first so an oversized path is declined instead of read into
+// memory; callers memoize per path so citing twenty lines of one file reads it once.
+func (o Options) lineCount(ctx context.Context, ref, path string) (int, error) {
+	obj := ref + ":" + path
+	size := o.git(ctx, o.Repo, "cat-file", "-s", "--end-of-options", obj)
+	if size.err != nil {
+		return 0, size.err
+	}
+	if size.exit != 0 {
+		return 0, fmt.Errorf("git cat-file -s %s failed (exit %d): %s", obj, size.exit, size.msg())
+	}
+	n, err := strconv.Atoi(size.token())
+	if err != nil {
+		return 0, fmt.Errorf("git cat-file -s %s returned %q, not a byte count", obj, size.token())
+	}
+	if n > maxBlobBytes {
+		return 0, fmt.Errorf("%s is %d bytes at %s, over the %d-byte line-count cap", path, n, ref, maxBlobBytes)
+	}
+	res := o.git(ctx, o.Repo, "cat-file", "blob", "--end-of-options", obj)
 	if res.err != nil {
 		return 0, res.err
 	}
 	if res.exit != 0 {
-		return 0, fmt.Errorf("git show %s:%s failed (exit %d): %s", ref, path, res.exit, res.msg())
+		return 0, fmt.Errorf("git cat-file blob %s failed (exit %d): %s", obj, res.exit, res.msg())
 	}
 	body := res.stdout
 	if body == "" {
 		return 0, nil
 	}
-	n := strings.Count(body, "\n")
+	lines := strings.Count(body, "\n")
 	if !strings.HasSuffix(body, "\n") {
-		n++
+		lines++
 	}
-	return n, nil
+	return lines, nil
 }

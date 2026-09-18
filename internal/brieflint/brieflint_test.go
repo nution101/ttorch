@@ -1,6 +1,7 @@
 package brieflint
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // --- fixtures ---------------------------------------------------------------------------
@@ -453,7 +455,7 @@ func TestRuleStandardsWithEmptyDeclaredValue(t *testing.T) {
 
 // failingGit stands in for a git that cannot answer: an unreachable remote, a missing
 // binary. Every such answer must surface as CANNOT-EVALUATE, never as a pass.
-func failingGit(_ string, args ...string) gitResult {
+func failingGit(_ context.Context, _ string, args ...string) gitResult {
 	return gitResult{err: errors.New("fatal: unable to access remote: network is unreachable"), stderr: args[0]}
 }
 
@@ -588,4 +590,223 @@ func TestRuleFilePathsExemptsPathsTheBriefAsksToCreate(t *testing.T) {
 	if f.Quote != "docs/missing.md" {
 		t.Fatalf("want the unexempted path reported, got %q", f.Quote)
 	}
+}
+
+// --- bounding the work an untrusted brief can cause -------------------------------------
+
+// spyGit wraps the real git, recording every argv and optionally answering some calls
+// itself, so a test can assert how much work a rule actually did.
+type spyGit struct {
+	calls [][]string
+	// answer may return a canned result for a call; false delegates to the real git.
+	answer func(args []string) (gitResult, bool)
+	// sawDeadline records whether the last call's context carried a deadline.
+	sawDeadline bool
+	deadline    time.Time
+}
+
+func (s *spyGit) fn(ctx context.Context, dir string, args ...string) gitResult {
+	s.calls = append(s.calls, args)
+	s.deadline, s.sawDeadline = ctx.Deadline()
+	if s.answer != nil {
+		if res, ok := s.answer(args); ok {
+			return res
+		}
+	}
+	return gitRun(ctx, dir, args...)
+}
+
+// count returns how many recorded calls began with the given argv prefix.
+func (s *spyGit) count(prefix ...string) int {
+	n := 0
+	for _, c := range s.calls {
+		if len(c) < len(prefix) {
+			continue
+		}
+		match := true
+		for i, p := range prefix {
+			if c[i] != p {
+				match = false
+				break
+			}
+		}
+		if match {
+			n++
+		}
+	}
+	return n
+}
+
+// A brief is untrusted input: it is pasted from issues and written by agents. Rule 1 queries
+// the REMOTE once per target it finds, so the number of targets a brief names must not
+// decide how many authenticated requests its reader fires, nor how long the reader waits.
+func TestTargetBranchFanOutIsCapped(t *testing.T) {
+	repo, _ := fixture(t)
+	var b strings.Builder
+	b.WriteString("# Task\n\nBase is origin/main in this repository.\n")
+	for i := 0; i < 40; i++ {
+		fmt.Fprintf(&b, "Also origin/feature-%d is involved.\n", i)
+	}
+	b.WriteString("\nFollow this repo's conventions.\n\nNo changes to a product branch and no PR until I say so. Commit on your own branch and report the sha.\n")
+
+	spy := &spyGit{}
+	r := Lint(b.String(), Options{Repo: repo, Ref: "origin/main", git: spy.fn})
+	if got := spy.count("ls-remote"); got != maxRemoteTargets {
+		t.Fatalf("a 41-target brief fired %d remote queries, want the cap of %d", got, maxRemoteTargets)
+	}
+	// What was not checked must be named, and must not read as a pass.
+	var capped *Finding
+	for i := range r.Findings {
+		if r.Findings[i].Rule == RuleTargetBranch && strings.Contains(r.Findings[i].Detail, "more origin/<branch> target(s)") {
+			capped = &r.Findings[i]
+		}
+	}
+	if capped == nil {
+		t.Fatalf("the unchecked targets must be reported: %+v", r.Findings)
+	}
+	if capped.Status != StatusIndeterminate {
+		t.Fatalf("unchecked targets must be %s, got %s", StatusIndeterminate, capped.Status)
+	}
+	if !strings.Contains(capped.Detail, "origin/feature-") {
+		t.Fatalf("the report must name what went unchecked: %s", capped.Detail)
+	}
+	if r.Outcome() == OutcomePass {
+		t.Fatal("a run that could not verify every target must not read as a pass")
+	}
+}
+
+// Every git call must inherit the run's aggregate deadline, so N items in a brief cannot
+// cost N times the per-call timeout.
+func TestLintGivesEveryGitCallTheRunBudget(t *testing.T) {
+	repo, _ := fixture(t)
+	spy := &spyGit{}
+	start := time.Now()
+	Lint(satisfying, Options{Repo: repo, Ref: "origin/main", Budget: 7 * time.Second, git: spy.fn})
+	if len(spy.calls) == 0 {
+		t.Fatal("no git calls were made")
+	}
+	if !spy.sawDeadline {
+		t.Fatal("git calls must carry the run's deadline")
+	}
+	// The deadline is set when Lint starts, a moment after start, so allow a little slack.
+	// The point is that it comes from the 7s budget and not from the 20s per-call ceiling.
+	if got := spy.deadline.Sub(start); got > 8*time.Second {
+		t.Fatalf("deadline is %s past the start, want it to come from the 7s budget", got)
+	}
+}
+
+// An exhausted budget must decline to start work rather than run past it.
+func TestGitRunDeclinesAnExhaustedBudget(t *testing.T) {
+	repo, _ := fixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	res := gitRun(ctx, repo, "rev-parse", "HEAD")
+	if res.err == nil {
+		t.Fatal("want an error for an exhausted budget")
+	}
+	if !strings.Contains(res.err.Error(), "not attempted") {
+		t.Fatalf("unexpected error: %v", res.err)
+	}
+}
+
+// Running out of budget is unevaluable, never a violation and never a pass.
+func TestExhaustedBudgetIsIndeterminate(t *testing.T) {
+	repo, _ := fixture(t)
+	spy := &spyGit{answer: func(args []string) (gitResult, bool) {
+		if args[0] == "ls-remote" {
+			return gitResult{err: fmt.Errorf("git ls-remote ran out of time: %w", context.DeadlineExceeded)}, true
+		}
+		return gitResult{}, false
+	}}
+	r := Lint(satisfying, Options{Repo: repo, Ref: "origin/main", git: spy.fn})
+	f := requireStatus(t, r, RuleTargetBranch, StatusIndeterminate)
+	if !strings.Contains(f.Detail, "ran out of time") {
+		t.Fatalf("unexpected detail: %s", f.Detail)
+	}
+}
+
+// A brief citing many lines of one file must read that file once, not once per citation.
+func TestLineCountsAreMemoizedPerPath(t *testing.T) {
+	repo, reviewed := fixture(t)
+	brief := strings.Replace(satisfying, "Touch pkg/thing.go and docs/guide.md.",
+		"See pkg/thing.go:2, pkg/thing.go:4 and pkg/thing.go:6.", 1)
+	spy := &spyGit{}
+	r := Lint(brief, Options{Repo: repo, Ref: "origin/main", CitationsRef: reviewed, git: spy.fn})
+	requireClean(t, r, RuleFilePaths)
+	if got := spy.count("cat-file", "blob"); got != 1 {
+		t.Fatalf("three citations of one file read the blob %d times, want 1", got)
+	}
+}
+
+// A blob too large to count is declined, not read into memory, and the citation is
+// unevaluable rather than a violation.
+func TestOversizedBlobIsIndeterminate(t *testing.T) {
+	repo, _ := fixture(t)
+	spy := &spyGit{answer: func(args []string) (gitResult, bool) {
+		if len(args) > 1 && args[0] == "cat-file" && args[1] == "-s" {
+			return gitResult{stdout: fmt.Sprintf("%d\n", maxBlobBytes+1)}, true
+		}
+		return gitResult{}, false
+	}}
+	brief := strings.Replace(satisfying, "Touch pkg/thing.go", "See pkg/thing.go:3", 1)
+	r := Lint(brief, Options{Repo: repo, Ref: "origin/main", CitationsRef: "HEAD", git: spy.fn})
+	f := requireStatus(t, r, RuleFilePaths, StatusIndeterminate)
+	if !strings.Contains(f.Detail, "line-count cap") {
+		t.Fatalf("unexpected detail: %s", f.Detail)
+	}
+	if spy.count("cat-file", "blob") != 0 {
+		t.Fatal("an oversized blob must not be read")
+	}
+}
+
+// A repository that cannot answer whether a path exists (a shallow clone, a corrupt object)
+// is unevaluable — the same classification every other query in git.go uses. Reporting it as
+// a missing file would turn a repository problem into a rule violation.
+func TestUnclassifiableTreeQueryIsIndeterminate(t *testing.T) {
+	repo, _ := fixture(t)
+	spy := &spyGit{answer: func(args []string) (gitResult, bool) {
+		if args[0] == "ls-tree" {
+			return gitResult{exit: 128, stderr: "fatal: not our ref\n"}, true
+		}
+		return gitResult{}, false
+	}}
+	r := Lint(satisfying, Options{Repo: repo, Ref: "origin/main", git: spy.fn})
+	if r.Violations() != 0 {
+		t.Fatalf("a repository problem must not be a violation: %+v", r.Findings)
+	}
+	fs := findingsFor(r, RuleFilePaths)
+	if len(fs) == 0 {
+		t.Fatal("the failed query must be reported")
+	}
+	for _, f := range fs {
+		if f.Status != StatusIndeterminate {
+			t.Fatalf("want %s, got %s (%s)", StatusIndeterminate, f.Status, f.Detail)
+		}
+	}
+}
+
+// Every brief-derived value reaches git as a positional argument, after an end-of-options
+// guard, so a future change to the extraction regexes cannot smuggle in an option.
+func TestBriefDerivedValuesAreGuardedFromOptionParsing(t *testing.T) {
+	repo, reviewed := fixture(t)
+	brief := strings.Replace(satisfying, "Touch pkg/thing.go", "Fix pkg/thing.go:3", 1)
+	spy := &spyGit{}
+	Lint(brief, Options{Repo: repo, Ref: "origin/main", CitationsRef: reviewed, git: spy.fn})
+	if len(spy.calls) == 0 {
+		t.Fatal("no git calls were made")
+	}
+	for _, c := range spy.calls {
+		if !hasGuard(c) {
+			t.Fatalf("git %v passes brief-derived values with no -- or --end-of-options guard", c)
+		}
+	}
+}
+
+func hasGuard(args []string) bool {
+	for _, a := range args {
+		if a == "--" || a == "--end-of-options" {
+			return true
+		}
+	}
+	return false
 }

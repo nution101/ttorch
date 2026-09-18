@@ -19,9 +19,11 @@
 package brieflint
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 )
 
 // RuleID names a rule in output, in a project's disable list, and in tests.
@@ -156,6 +158,14 @@ type Options struct {
 	CitationsRef string
 	// Config is the project's per-rule configuration (see LoadConfig).
 	Config Config
+	// Budget bounds the git work ONE run may do, in aggregate. A brief is untrusted input
+	// — pasted from an issue, or written by an agent — and two rules query git once per
+	// item they find in it, one of them over the network. Without an aggregate bound a
+	// brief naming N refs stalls its caller for N times the per-call timeout, which puts
+	// the caller (every `ttorch task add`) at the mercy of the text it was handed. Zero
+	// means defaultBudget. Whatever the budget does not cover is reported as unevaluable,
+	// naming what went unchecked — never passed over in silence.
+	Budget time.Duration
 	// git runs a git command in Repo. Nil means the real git (see gitRun); tests substitute.
 	git gitFunc
 }
@@ -167,11 +177,16 @@ func (o Options) remote() string {
 	return o.Remote
 }
 
+// defaultBudget is the aggregate git budget for one run when Options.Budget is unset. It
+// is generous for an honest brief (one or two refs and a handful of citations) and short
+// enough that a caller is never held for long by a brief that names hundreds.
+const defaultBudget = 45 * time.Second
+
 // rule is one check. Splitting the registry from the checks keeps the disable/order/report
 // plumbing in one place and each rule a pure function of the brief plus the options.
 type rule struct {
 	id  RuleID
-	run func(*brief, Options) ([]Finding, []string)
+	run func(context.Context, *brief, Options) ([]Finding, []string)
 }
 
 // rules is the rule set, in report order.
@@ -208,6 +223,15 @@ func Lint(text string, opt Options) Report {
 	if opt.git == nil {
 		opt.git = gitRun
 	}
+	budget := opt.Budget
+	if budget <= 0 {
+		budget = defaultBudget
+	}
+	// One deadline for the whole run, shared by every git call (each still capped
+	// individually by gitTimeout). A rule that runs out of it reports what it could not
+	// check.
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
 	b := parse(text)
 	var rep Report
 	if src := opt.Config.Source; src != "" {
@@ -232,7 +256,7 @@ func Lint(text string, opt Options) Report {
 			rep.Notes = append(rep.Notes, fmt.Sprintf("rule %s: DISABLED by project config (%s)", r.id, opt.Config.disableSource()))
 			continue
 		}
-		findings, notes := r.run(b, opt)
+		findings, notes := r.run(ctx, b, opt)
 		rep.Findings = append(rep.Findings, findings...)
 		rep.Notes = append(rep.Notes, notes...)
 		rep.evaluated++

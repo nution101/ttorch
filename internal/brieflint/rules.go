@@ -1,6 +1,7 @@
 package brieflint
 
 import (
+	"context"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -47,7 +48,14 @@ func (b *brief) targets(remote string) []target {
 	return out
 }
 
-func checkTargetBranch(b *brief, opt Options) ([]Finding, []string) {
+// maxRemoteTargets caps how many distinct targets one brief has verified over the network.
+// Rule 1 queries the remote once per distinct <remote>/<branch> token it finds in prose, so
+// without a cap the brief decides how many authenticated requests its reader fires and how
+// long the reader waits. An honest brief names one target, occasionally two; anything past
+// the cap is reported as unchecked rather than either trusted or queried.
+const maxRemoteTargets = 3
+
+func checkTargetBranch(ctx context.Context, b *brief, opt Options) ([]Finding, []string) {
 	remote := opt.remote()
 	targets := b.targets(remote)
 	if len(targets) == 0 {
@@ -72,8 +80,22 @@ func checkTargetBranch(b *brief, opt Options) ([]Finding, []string) {
 	}
 	var findings []Finding
 	var notes []string
+	if len(targets) > maxRemoteTargets {
+		// Over the cap the surplus is neither queried nor trusted: it is named as
+		// unchecked, so the reader can see exactly what was not verified.
+		surplus := targets[maxRemoteTargets:]
+		targets = targets[:maxRemoteTargets]
+		findings = append(findings, Finding{
+			Rule:   RuleTargetBranch,
+			Status: StatusIndeterminate,
+			Detail: fmt.Sprintf("the brief names %d more %s/<branch> target(s) than the %d this rule verifies over the network (%s); name one target, or disable this rule for a brief that legitimately names many",
+				len(surplus), remote, maxRemoteTargets, strings.Join(targetNames(surplus), ", ")),
+			Quote: surplus[0].quote,
+			Line:  surplus[0].line,
+		})
+	}
 	for _, t := range targets {
-		ok, err := opt.remoteBranchExists(remote, t.branch)
+		ok, err := opt.remoteBranchExists(ctx, remote, t.branch)
 		switch {
 		case err != nil:
 			findings = append(findings, Finding{
@@ -96,6 +118,14 @@ func checkTargetBranch(b *brief, opt Options) ([]Finding, []string) {
 		}
 	}
 	return findings, notes
+}
+
+func targetNames(targets []target) []string {
+	out := make([]string, len(targets))
+	for i, t := range targets {
+		out[i] = t.quote
+	}
+	return out
 }
 
 // --- Rule 2: every file path the brief cites must exist ---------------------------------
@@ -220,7 +250,12 @@ func (b *brief) citations(remote string) []citation {
 	return out
 }
 
-func checkFilePaths(b *brief, opt Options) ([]Finding, []string) {
+// maxCitations caps how many distinct cited paths one brief has resolved. Each costs local
+// git work (and a line count reads the blob), so without a cap the brief decides how much
+// work its reader does. Past the cap the surplus is named as unchecked, never passed.
+const maxCitations = 64
+
+func checkFilePaths(ctx context.Context, b *brief, opt Options) ([]Finding, []string) {
 	cites := b.citations(opt.remote())
 	if len(cites) == 0 {
 		return nil, []string{"file-paths: the brief cites no file paths"}
@@ -248,7 +283,7 @@ func checkFilePaths(b *brief, opt Options) ([]Finding, []string) {
 			Detail: fmt.Sprintf("cannot resolve the %d cited path(s): the brief declares no target branch and no explicit ref was given", len(cites)),
 		}}, nil
 	}
-	if ok, err := opt.revExists(ref); err != nil {
+	if ok, err := opt.revExists(ctx, ref); err != nil {
 		return []Finding{{
 			Rule:   RuleFilePaths,
 			Status: StatusIndeterminate,
@@ -263,6 +298,15 @@ func checkFilePaths(b *brief, opt Options) ([]Finding, []string) {
 	}
 	notes := []string{fmt.Sprintf("file-paths: cited paths resolved at %s", ref)}
 	var findings []Finding
+	if len(cites) > maxCitations {
+		surplus := cites[maxCitations:]
+		cites = cites[:maxCitations]
+		findings = append(findings, Finding{
+			Rule: RuleFilePaths, Status: StatusIndeterminate, Quote: surplus[0].quote, Line: surplus[0].src,
+			Detail: fmt.Sprintf("%d cited path(s) past the first %d were not checked (from %s on); a brief citing this many paths is doing too much, so split it or disable this rule",
+				len(surplus), maxCitations, surplus[0].raw),
+		})
+	}
 	var withLine, created []citation
 	for _, c := range cites {
 		if c.create {
@@ -273,7 +317,7 @@ func checkFilePaths(b *brief, opt Options) ([]Finding, []string) {
 			withLine = append(withLine, c)
 			continue
 		}
-		_, ok, err := opt.objectType(ref, c.path)
+		_, ok, err := opt.objectType(ctx, ref, c.path)
 		switch {
 		case err != nil:
 			findings = append(findings, Finding{
@@ -288,7 +332,7 @@ func checkFilePaths(b *brief, opt Options) ([]Finding, []string) {
 		}
 	}
 	if len(withLine) > 0 {
-		findings = append(findings, opt.checkLineCitations(withLine, ref)...)
+		findings = append(findings, opt.checkLineCitations(ctx, withLine, ref)...)
 		if opt.CitationsRef != "" {
 			notes = append(notes, fmt.Sprintf("file-paths: file:line citations resolved at %s", opt.CitationsRef))
 		}
@@ -313,7 +357,7 @@ func rawPaths(cites []citation) []string {
 // commit the citation is about. With no such ref the whole set is unevaluable and is
 // reported as one finding naming it: guessing the base is what false-positived on a
 // citation that was valid at the reviewed commit.
-func (o Options) checkLineCitations(cites []citation, baseRef string) []Finding {
+func (o Options) checkLineCitations(ctx context.Context, cites []citation, baseRef string) []Finding {
 	if o.CitationsRef == "" {
 		return []Finding{{
 			Rule: RuleFilePaths, Status: StatusIndeterminate, Quote: cites[0].raw, Line: cites[0].src,
@@ -321,7 +365,7 @@ func (o Options) checkLineCitations(cites []citation, baseRef string) []Finding 
 				len(cites), strings.Join(rawPaths(cites), ", "), baseRef),
 		}}
 	}
-	if ok, err := o.revExists(o.CitationsRef); err != nil {
+	if ok, err := o.revExists(ctx, o.CitationsRef); err != nil {
 		return []Finding{{
 			Rule: RuleFilePaths, Status: StatusIndeterminate, Quote: cites[0].raw, Line: cites[0].src,
 			Detail: fmt.Sprintf("cannot resolve file:line citations at %s: %v", o.CitationsRef, err),
@@ -333,8 +377,9 @@ func (o Options) checkLineCitations(cites []citation, baseRef string) []Finding 
 		}}
 	}
 	var findings []Finding
+	counted := map[string]int{}
 	for _, c := range cites {
-		typ, ok, err := o.objectType(o.CitationsRef, c.path)
+		typ, ok, err := o.objectType(ctx, o.CitationsRef, c.path)
 		switch {
 		case err != nil:
 			findings = append(findings, Finding{
@@ -353,13 +398,17 @@ func (o Options) checkLineCitations(cites []citation, baseRef string) []Finding 
 			// to bound. Nothing further to check.
 			continue
 		}
-		n, err := o.lineCount(o.CitationsRef, c.path)
-		if err != nil {
-			findings = append(findings, Finding{
-				Rule: RuleFilePaths, Status: StatusIndeterminate, Quote: c.quote, Line: c.src,
-				Detail: fmt.Sprintf("cannot count the lines of %s at %s: %v", c.path, o.CitationsRef, err),
-			})
-			continue
+		n, ok := counted[c.path]
+		if !ok {
+			n, err = o.lineCount(ctx, o.CitationsRef, c.path)
+			if err != nil {
+				findings = append(findings, Finding{
+					Rule: RuleFilePaths, Status: StatusIndeterminate, Quote: c.quote, Line: c.src,
+					Detail: fmt.Sprintf("cannot count the lines of %s at %s: %v", c.path, o.CitationsRef, err),
+				})
+				continue
+			}
+			counted[c.path] = n
 		}
 		if c.line > n {
 			findings = append(findings, Finding{
@@ -415,7 +464,7 @@ func hardCounts(b *brief) []span {
 	return out
 }
 
-func checkHardCounts(b *brief, _ Options) ([]Finding, []string) {
+func checkHardCounts(_ context.Context, b *brief, _ Options) ([]Finding, []string) {
 	counts := hardCounts(b)
 	if len(counts) == 0 {
 		return nil, []string{"hard-counts: the brief states no hard count"}
@@ -454,7 +503,7 @@ func prohibitions(b *brief) []span {
 	return out
 }
 
-func checkProhibition(b *brief, _ Options) ([]Finding, []string) {
+func checkProhibition(_ context.Context, b *brief, _ Options) ([]Finding, []string) {
 	bans := prohibitions(b)
 	if len(bans) == 0 {
 		return nil, []string{"prohibition: the brief states no prohibition on push/merge/commit/PR"}
@@ -510,7 +559,7 @@ var standardsSignal = stemRe(
 	"lint rules", "best practice*", "idiom*",
 )
 
-func checkStandards(b *brief, opt Options) ([]Finding, []string) {
+func checkStandards(_ context.Context, b *brief, opt Options) ([]Finding, []string) {
 	cfg := opt.Config
 	if cfg.StandardsEmpty {
 		return []Finding{{
