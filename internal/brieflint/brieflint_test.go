@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -22,61 +23,111 @@ const (
 	fixtureLongLines  = 50 // lines of pkg/thing.go at the reviewed (local) commit
 )
 
-func git(t *testing.T, dir string, args ...string) string {
-	t.Helper()
+// The fixture repository is built ONCE per package run and copied per test. Each test needs
+// a private repository (some write an AGENTS.md), but rebuilding one with git init / commit /
+// push per test cost more than the whole rule set does to run.
+var (
+	fixtureRoot string // holds the prototype repo and its bare remote for the package run
+	protoOnce   sync.Once
+	protoRepo   string
+	protoHead   string
+	protoErr    error
+)
+
+func TestMain(m *testing.M) {
+	root, err := os.MkdirTemp("", "brieflint-fixture-*")
+	if err != nil {
+		panic(err)
+	}
+	fixtureRoot = root
+	code := m.Run()
+	_ = os.RemoveAll(root)
+	os.Exit(code)
+}
+
+func gitIn(dir string, args ...string) error {
 	full := append([]string{
 		"-c", "user.name=lint fixture", "-c", "user.email=fixture@example.invalid",
 		"-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main",
 	}, args...)
 	cmd := exec.Command("git", full...)
 	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("git %v in %s: %v: %s", args, dir, err, out)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git %v in %s: %v: %s", args, dir, err, out)
 	}
-	return strings.TrimSpace(string(out))
+	return nil
 }
 
-func write(t *testing.T, dir, rel string, lines int) {
-	t.Helper()
+func writeLines(dir, rel string, lines int) error {
 	path := filepath.Join(dir, rel)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatal(err)
+		return err
 	}
 	var b strings.Builder
 	for i := 1; i <= lines; i++ {
 		fmt.Fprintf(&b, "// line %d\n", i)
 	}
-	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	return os.WriteFile(path, []byte(b.String()), 0o644)
 }
 
-// fixture builds the repository and returns its path plus the sha of the reviewed commit
-// (the local HEAD, one commit ahead of origin/main).
+// buildPrototype creates the bare remote and the work repository both under fixtureRoot, so
+// the remote outlives the test that happened to trigger the build.
+func buildPrototype() {
+	remote := filepath.Join(fixtureRoot, "remote")
+	repo := filepath.Join(fixtureRoot, "proto")
+	for _, dir := range []string{remote, repo} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			protoErr = err
+			return
+		}
+	}
+	steps := []func() error{
+		func() error { return gitIn(remote, "init", "--bare", "-b", "main", "-q") },
+		func() error { return gitIn(repo, "init", "-b", "main", "-q") },
+		func() error { return gitIn(repo, "remote", "add", "origin", remote) },
+		func() error { return writeLines(repo, "pkg/thing.go", fixtureShortLines) },
+		func() error { return writeLines(repo, "docs/guide.md", 5) },
+		func() error { return gitIn(repo, "add", "-A") },
+		func() error { return gitIn(repo, "commit", "-q", "-m", "base") },
+		func() error { return gitIn(repo, "push", "-q", "origin", "main") },
+		func() error { return gitIn(repo, "fetch", "-q", "origin") },
+		// The reviewed commit: the file is longer here than on the base, and a new file
+		// exists that the base has never seen.
+		func() error { return writeLines(repo, "pkg/thing.go", fixtureLongLines) },
+		func() error { return writeLines(repo, "pkg/added.go", 30) },
+		func() error { return gitIn(repo, "add", "-A") },
+		func() error { return gitIn(repo, "commit", "-q", "-m", "worker change") },
+	}
+	for _, step := range steps {
+		if protoErr = step(); protoErr != nil {
+			return
+		}
+	}
+	out, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+	if err != nil {
+		protoErr = err
+		return
+	}
+	protoRepo, protoHead = repo, strings.TrimSpace(string(out))
+}
+
+// fixture returns a private copy of the prototype repository and the sha of its reviewed
+// commit (the local HEAD, one commit ahead of origin/main).
 func fixture(t *testing.T) (repo, reviewed string) {
 	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
 	}
-	remote := t.TempDir()
-	git(t, remote, "init", "--bare", "-b", "main", "-q")
-	repo = t.TempDir()
-	git(t, repo, "init", "-b", "main", "-q")
-	git(t, repo, "remote", "add", "origin", remote)
-	write(t, repo, "pkg/thing.go", fixtureShortLines)
-	write(t, repo, "docs/guide.md", 5)
-	git(t, repo, "add", "-A")
-	git(t, repo, "commit", "-q", "-m", "base")
-	git(t, repo, "push", "-q", "origin", "main")
-	git(t, repo, "fetch", "-q", "origin")
-	// The reviewed commit: the file is longer here than on the base, and a new file exists
-	// that the base has never seen.
-	write(t, repo, "pkg/thing.go", fixtureLongLines)
-	write(t, repo, "pkg/added.go", 30)
-	git(t, repo, "add", "-A")
-	git(t, repo, "commit", "-q", "-m", "worker change")
-	return repo, git(t, repo, "rev-parse", "HEAD")
+	protoOnce.Do(buildPrototype)
+	if protoErr != nil {
+		t.Fatalf("building the fixture repository: %v", protoErr)
+	}
+	repo = filepath.Join(t.TempDir(), "repo")
+	out, err := exec.Command("cp", "-R", protoRepo, repo).CombinedOutput()
+	if err != nil {
+		t.Fatalf("copying the fixture repository: %v: %s", err, out)
+	}
+	return repo, protoHead
 }
 
 // findingsFor returns the findings the named rule produced.
