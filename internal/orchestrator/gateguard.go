@@ -175,38 +175,53 @@ func diffTouchesGateConfig(repo, base, rev string) (bool, string, error) {
 }
 
 // gateDecisionDeclarations names the declarations that actually make the gate's decisions, by
-// the source text that declares each one. A path list alone is fragile for Go source: a
-// declaration can be MOVED to a new file and slip out from under the guard, and the gate's
-// reviewer instructions are not confined to content/ — reviewerBrief in gate.go is reviewer
-// prompt text embedded directly in Go, including the rule that high/critical findings block
-// the merge. TestGateDecisionSourceStaysGuarded asserts each of these still lives in a file
-// the list above covers, so relocating one turns the gate's own validate RED rather than
-// quietly opening a hole. It is the structural anchor over the hardcoded list: the list says
-// WHERE the gate is, this says WHAT the gate is and checks the two still agree.
+// DECLARED IDENTITY: a bare name for a package-level func or var, and "(recv).Name" for a
+// method. TestGateDecisionSourceStaysGuarded resolves each one against the parsed AST of every
+// .go file in the repo and asserts it is still declared, and still declared only in files the
+// list above covers.
+//
+// A path list alone is fragile for Go source: a declaration can be MOVED to a new file and
+// slip out from under the guard, and the gate's reviewer instructions are not confined to
+// content/ — reviewerBrief in gate.go is reviewer prompt text embedded directly in Go,
+// including the rule that high/critical findings block the merge. This is the structural
+// anchor over the hardcoded list: the list says WHERE the gate is, this says WHAT the gate is
+// and checks the two still agree, so relocating or renaming one turns the gate's own validate
+// RED rather than quietly opening a hole.
+//
+// The identities are matched against PARSED DECLARATIONS, never against source text. A text
+// scan cannot work here: this file quotes every identity it looks for, so its own bytes would
+// satisfy every search, the "is it still declared anywhere" half would be unreachable, and a
+// rename-and-relocate would evade the check entirely (the moved code no longer carries the old
+// name, and the only remaining match is this list quoting itself). Parsing ignores string
+// literals, so this file matches only the declarations it genuinely makes.
 var gateDecisionDeclarations = []string{
 	// What a reviewer is told, and which reviewers run at all.
-	"func reviewerBrief(",
-	"func (m *Manager) dispatchReviewer(",
-	"func (m *Manager) ReviewersFor(",
-	// The auto-mint path and this guard.
-	"func (m *Manager) TrustRecord(",
-	"func diffTouchesGateConfig(",
-	"func isGateDefinition(",
-	"func couldBeGateDefinition(",
+	"reviewerBrief",
+	"(*Manager).spawnReviewer",
+	"(*Manager).ReviewersFor",
+	"(*Manager).clearStaleReviewerReports",
+	// The auto-mint path, the daemon gate pass, and this guard.
+	"(*Manager).TrustRecord",
+	"(*Manager).GateOnce",
+	"(*Manager).gateOnceAt",
+	"diffTouchesGateConfig",
+	"isGateDefinition",
+	"couldBeGateDefinition",
+	"verbatimPrefix",
 	// What "green" means, and the cache that can stand in for a run.
-	"func gateGreen(",
-	"func stagedGreen(",
-	"func resolveGateDefinition(",
-	"func hasDefaultBranchGateScript(",
-	"func validateCommitted(",
-	"var runGateOnCommitted = func(",
-	"func loadValidateCache(",
-	"func validateCacheKey(",
+	"gateGreen",
+	"stagedGreen",
+	"resolveGateDefinition",
+	"hasDefaultBranchGateScript",
+	"validateCommitted",
+	"runGateOnCommitted",
+	"loadValidateCache",
+	"validateCacheKey",
 	// The merge-time re-checks: freshness, the commit pin, and verdict portability.
-	"func (m *Manager) MergeLocal(",
-	"func (m *Manager) validateForMerge(",
-	"func (m *Manager) reusablePrepValidate(",
-	"func (m *Manager) carryVerdictForward(",
-	"func (m *Manager) gateCoversRebased(",
-	"func (m *Manager) remintFromVerdict(",
+	"(*Manager).MergeLocal",
+	"(*Manager).validateForMerge",
+	"(*Manager).reusablePrepValidate",
+	"(*Manager).carryVerdictForward",
+	"(*Manager).gateCoversRebased",
+	"(*Manager).remintFromVerdict",
 }

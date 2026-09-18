@@ -1,6 +1,10 @@
 package orchestrator
 
 import (
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -249,20 +253,83 @@ func TestGateGuardUnevaluablePathIsUndecidableNotIgnored(t *testing.T) {
 
 // TestGateDecisionSourceStaysGuarded is the structural half of the guard: for Go source, a
 // path list is only as good as the code still being at those paths. It asserts every
-// gate-deciding declaration exists exactly where the guard can see it — which also covers the
-// case that a path-only rule would miss, reviewer PROMPT TEXT living in Go source rather than
-// in content/ (reviewerBrief). Moving one of these into an unguarded file fails this test, so
-// the gate's own validate goes red and no trusted auto-merge can carry the move.
+// gate-deciding declaration still exists and is declared only in files the guard covers -
+// which also covers the case a path-only rule would miss, reviewer PROMPT TEXT living in Go
+// source rather than in content/ (reviewerBrief). Moving or renaming one of these out of a
+// guarded file fails this test, so the gate's own validate goes red and no trusted auto-merge
+// can carry the move.
+//
+// It resolves declarations by PARSING, never by scanning source text. gateguard.go quotes
+// every identity in gateDecisionDeclarations, so a text scan would find them all in
+// gateguard.go, which is itself guarded: the "still declared somewhere" half would be
+// unreachable and a rename-and-relocate would pass. TestGateDecisionCheckIsNotVacuous pins
+// that this is not how it works.
 func TestGateDecisionSourceStaysGuarded(t *testing.T) {
-	root := filepath.Join("..", "..")
-	type hit struct{ file string }
-	found := map[string][]hit{}
+	byDecl, err := declaringFiles(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, decl := range gateDecisionDeclarations {
+		files := byDecl[decl]
+		if len(files) == 0 {
+			t.Errorf("%s decides gate outcomes but no source file declares it; if it was renamed or removed, update gateDecisionDeclarations and make sure its new home is guarded", decl)
+			continue
+		}
+		for _, f := range files {
+			if !isGateDefinition(f) {
+				t.Errorf("%s decides gate outcomes but is declared in %s, which the guard does not cover; add it to gateDefinitionFiles or move the code back", decl, f)
+			}
+		}
+	}
+}
+
+// TestGateDecisionCheckIsNotVacuous proves the check above can actually fail, because a
+// structural anchor that cannot fail is worse than none: it reads as protection while
+// providing none. It asserts that gateguard.go, which QUOTES every identity in the list, is
+// credited only with the declarations it genuinely makes - so a name that moved away or was
+// renamed really does go missing.
+func TestGateDecisionCheckIsNotVacuous(t *testing.T) {
+	byDecl, err := declaringFiles(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const self = "internal/orchestrator/gateguard.go"
+	declaredHere := map[string]bool{
+		"diffTouchesGateConfig": true, "isGateDefinition": true,
+		"couldBeGateDefinition": true, "verbatimPrefix": true,
+	}
+	for _, decl := range gateDecisionDeclarations {
+		if declaredHere[decl] {
+			continue
+		}
+		for _, f := range byDecl[decl] {
+			if f == self {
+				t.Errorf("%s is only QUOTED in %s, not declared there; crediting it would make TestGateDecisionSourceStaysGuarded vacuous", decl, self)
+			}
+		}
+	}
+	// A name this file quotes but nothing declares must resolve to nothing at all.
+	if files := byDecl["reviewerBriefThatNoFileDeclares"]; len(files) != 0 {
+		t.Errorf("a quoted-but-undeclared name resolved to %v, so the check is matching text, not declarations", files)
+	}
+	for _, decl := range declaredHere {
+		_ = decl
+	}
+}
+
+// declaringFiles parses every .go file under root and maps each package-level declaration to
+// the repo-relative files declaring it. Methods are keyed "(recv).Name"; funcs, vars, consts
+// and types by bare name. Parsing rather than text-matching is the point: a declaration name
+// appearing inside a string literal is not a declaration.
+func declaringFiles(root string) (map[string][]string, error) {
+	out := map[string][]string{}
+	fset := token.NewFileSet()
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.IsDir() {
-			if name := d.Name(); name == ".git" || name == "bin" || name == "dist" {
+			if name := d.Name(); name == ".git" || name == "bin" || name == "dist" || name == "testdata" {
 				return fs.SkipDir
 			}
 			return nil
@@ -270,34 +337,59 @@ func TestGateDecisionSourceStaysGuarded(t *testing.T) {
 		if !strings.HasSuffix(p, ".go") {
 			return nil
 		}
-		body, err := os.ReadFile(p)
+		f, err := parser.ParseFile(fset, p, nil, parser.SkipObjectResolution)
 		if err != nil {
-			return err
+			return fmt.Errorf("parsing %s: %w", p, err)
 		}
 		rel, err := filepath.Rel(root, p)
 		if err != nil {
 			return err
 		}
-		for _, decl := range gateDecisionDeclarations {
-			if strings.Contains(string(body), decl) {
-				found[decl] = append(found[decl], hit{file: filepath.ToSlash(rel)})
+		rel = filepath.ToSlash(rel)
+		add := func(name string) {
+			if name != "" && name != "_" {
+				out[name] = append(out[name], rel)
+			}
+		}
+		for _, decl := range f.Decls {
+			switch d := decl.(type) {
+			case *ast.FuncDecl:
+				add(declKey(d))
+			case *ast.GenDecl:
+				for _, spec := range d.Specs {
+					switch s := spec.(type) {
+					case *ast.ValueSpec:
+						for _, n := range s.Names {
+							add(n.Name)
+						}
+					case *ast.TypeSpec:
+						add(s.Name.Name)
+					}
+				}
 			}
 		}
 		return nil
 	})
-	if err != nil {
-		t.Fatal(err)
+	return out, err
+}
+
+// declKey renders a func declaration's identity: "Name" for a plain func, "(*T).Name" or
+// "(T).Name" for a method.
+func declKey(d *ast.FuncDecl) string {
+	if d.Recv == nil || len(d.Recv.List) == 0 {
+		return d.Name.Name
 	}
-	for _, decl := range gateDecisionDeclarations {
-		hits := found[decl]
-		if len(hits) == 0 {
-			t.Errorf("%s decides gate outcomes but no source file declares it; if it was renamed, update gateDecisionDeclarations and make sure its new home is guarded", decl)
-			continue
+	var recv string
+	switch t := d.Recv.List[0].Type.(type) {
+	case *ast.StarExpr:
+		if id, ok := t.X.(*ast.Ident); ok {
+			recv = "*" + id.Name
 		}
-		for _, h := range hits {
-			if !isGateDefinition(h.file) {
-				t.Errorf("%s decides gate outcomes but lives in %s, which the guard does not cover; add it to gateDefinitionFiles or move the code back", decl, h.file)
-			}
-		}
+	case *ast.Ident:
+		recv = t.Name
 	}
+	if recv == "" {
+		return d.Name.Name
+	}
+	return "(" + recv + ")." + d.Name.Name
 }
