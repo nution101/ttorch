@@ -3,6 +3,8 @@ package orchestrator
 import (
 	"fmt"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/nution101/ttorch/internal/worktree"
 )
@@ -50,6 +52,28 @@ import (
 // granularity. Non-Go entries stay file-granular: a markdown file cannot rewrite another
 // markdown file's state.
 //
+// THE GO SET IS DERIVED, NOT CURATED. Per-package triage of "could this one manufacture a
+// pass" is the reasoning that failed twice: round 1 explicitly permitted spawn.go, and round 2
+// cleared internal/harness BY NAME as settled while harness composes the reviewer's command
+// line, model and effort and writes its settings file. So the rule is mechanical instead: every
+// first-party package in the transitive import closure of gateClosureRoots is guarded, and
+// TestGuardCoversEveryFirstPartyGateDependency re-derives that closure with `go list -deps` and
+// fails if a member is uncovered. The closure covers the gate itself and the path that delivers
+// the reviewer definitions it dispatches, because guarding a reviewer's prompt buys nothing if
+// what installs it is open.
+//
+// Concrete attacks that motivated the widening, beyond the seam rebinding above: internal/paths
+// locates the approval token, the review inputs and the validate cache, so redirecting it makes
+// the gate read an attacker's file; internal/harness decides what binary runs as the reviewer
+// and with what settings; internal/tmux and internal/termtab are how that command is actually
+// run, so either can substitute a command that writes a clean findings report; the ROOT package
+// declares `var Content embed.FS`, the payload carrying the reviewer definitions, and
+// internal/installer with internal/manifest write it into ~/.claude/agents; go.mod and go.sum
+// choose what every guarded package compiles against. For internal/ciparity, internal/doctor,
+// internal/livestate, internal/profile, internal/singleton and internal/state I could not
+// construct a concrete attack; they are guarded because they are in the closure and because
+// deciding case by case is what went wrong twice.
+//
 // DELIBERATELY OUTSIDE the line, with the reasoning, because each was considered:
 //
 //   - The rest of content/agents/ and content/skills/. The other agents and skills are a
@@ -60,15 +84,22 @@ import (
 //   - internal/scheduler. It chooses WHICH tasks to gate and land, but every authorization it
 //     relies on is re-checked in TrustRecord and MergeLocal (token provenance, a fresh passing
 //     verdict, a fresh validate), so it cannot manufacture a pass the gate would refuse. It is
-//     a separate package, so it cannot rebind the gate's seams either.
+//     outside the import closure, so it cannot rebind the gate's seams either.
 //   - .github/workflows/. CI is the default branch's required check, not ttorch's gate; a
 //     trusted auto-merge is a local fast-forward and does not consult it.
-//   - Every other package: internal/cli, internal/tmux, internal/harness, internal/installer,
-//     internal/manifest, internal/watch, internal/termtab, internal/selfupdate, internal/state,
-//     internal/livestate, internal/skills, internal/learnings, internal/ciparity,
-//     internal/profile, internal/singleton, internal/doctor, internal/paths, internal/buildinfo,
-//     cmd/ttorch. None declares state the gate reads, and none can reach into a guarded
-//     package's vars.
+//   - The packages outside the closure: internal/cli, internal/scheduler, internal/watch,
+//     internal/selfupdate, internal/skills, internal/learnings, internal/buildinfo, cmd/ttorch.
+//     The gate does not import them, so they cannot reach a guarded package's state.
+//
+// WHAT THIS GUARD CANNOT DO, stated here because the list above would otherwise read as
+// complete. The gate does not read a test RESULT; it EXECUTES worker-controlled code
+// (`make lint`, `make test-fast`) unsandboxed, as the lead's own user, in a checkout of the
+// worker's sha. Code in any package - guarded or not, test file or not - can therefore write
+// the approval token, the verdict row in state.db, ~/.claude/agents/ttorch-reviewer-*.md or
+// ~/.ttorch/bin/ttorch while the gate is running, which defeats every path in this list at
+// once. That is not a path-guarding problem and no entry here fixes it; whether to sandbox the
+// validate run is a separate decision. What the guard does is make a change to the gate's own
+// definition require a human to read it.
 //
 // RULED OUT: moving the gate into its own package so the trust boundary IS a package boundary.
 // That is the more correct fix and it stays the right long-term shape, but it means relocating
@@ -98,6 +129,31 @@ var (
 		".ttorch/validate.sh",
 		"AGENTS.md",
 		"Makefile",
+		// The dependency versions every guarded package compiles against.
+		"go.mod",
+		"go.sum",
+		// The ROOT package, which declares `var Content embed.FS` - the embedded payload
+		// carrying the reviewer definitions the gate dispatches, and a mutable package var
+		// like any other, so any file in that package can rebind it and replace every
+		// reviewer's instructions. Named file by file rather than by a "any .go at the root"
+		// rule: this guard runs against EVERY managed repo, and such a rule would refuse
+		// auto-merge for an ordinary root main.go in any project that keeps one. A root .go
+		// file ADDED here is caught instead by TestRootPackageIsFullyGuarded, which turns this
+		// repo's own validate red, and a trusted auto-merge needs a fresh green. Content only
+		// matters for this repo, so that is where the protection belongs.
+		"content.go",
+		"content_test.go",
+	}
+
+	// gateDefinitionPreemptiveFiles are guarded precisely because they must NEVER appear.
+	// GNU Make reads GNUmakefile in preference to Makefile, and lowercase makefile ahead of it
+	// too, so guarding only Makefile left the hole intact: a worker commits a GNUmakefile whose
+	// lint and test-fast targets are @true and the gate is green having run nothing. They are
+	// kept apart from the list above because TestGateDefinitionPathsAnchored requires those to
+	// EXIST and requires these not to.
+	gateDefinitionPreemptiveFiles = []string{
+		"GNUmakefile",
+		"makefile",
 	}
 
 	// gateDefinitionPrefixes are matched as path prefixes. For Go this is the package
@@ -108,26 +164,83 @@ var (
 	gateDefinitionPrefixes = []string{
 		"content/agents/ttorch-reviewer-",
 		"content/skills/ttorch-review/",
+		// Derived, not curated: every first-party package in the transitive import closure of
+		// gateClosureRoots. TestGuardCoversEveryFirstPartyGateDependency re-derives it.
 		"internal/approval/",
+		"internal/ciparity/",
 		"internal/db/",
+		"internal/doctor/",
+		"internal/harness/",
+		"internal/installer/",
+		"internal/livestate/",
+		"internal/manifest/",
 		"internal/orchestrator/",
+		"internal/paths/",
+		"internal/profile/",
 		"internal/projectinit/",
 		"internal/review/",
+		"internal/singleton/",
+		"internal/state/",
+		"internal/termtab/",
+		"internal/tmux/",
 		"internal/validate/",
 		"internal/worktree/",
 	}
 )
 
 // isGateDefinition reports whether an unquoted repo-relative path names a gate-definition
-// file.
+// file. Comparison FOLDS CASE, because an exact match did not hold: a tree entry spelled
+// Internal/orchestrator/rebind.go defeated the case-sensitive version outright, and
+// `git update-index --cacheinfo` puts such an entry in a tree with no filesystem trick needed.
+// On a case-folding filesystem (macOS, where both the gate's detached checkout and the local
+// fast-forward run) that file lands in internal/orchestrator/ and compiles into the package,
+// so its init() can rebind the gate's seams. Folding is Unicode simple folding, not ASCII
+// lowering, so U+212A KELVIN SIGN and U+017F LATIN SMALL LETTER LONG S fold too.
+//
+// No guarded path differs from another only by case, and none contains a non-ASCII rune
+// (TestGateDefinitionPathsAnchored enforces the ASCII half), so folding cannot collide two
+// guarded entries. It can only widen what matches, which is the safe direction.
 func isGateDefinition(name string) bool {
 	for _, f := range gateDefinitionFiles {
-		if name == f {
+		if strings.EqualFold(name, f) {
+			return true
+		}
+	}
+	for _, f := range gateDefinitionPreemptiveFiles {
+		if strings.EqualFold(name, f) {
 			return true
 		}
 	}
 	for _, p := range gateDefinitionPrefixes {
-		if strings.HasPrefix(name, p) {
+		if foldHasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// foldHasPrefix reports whether s begins with prefix under Unicode simple case folding. A
+// byte-length prefix compare on lowered strings is not enough: some runes fold across byte
+// lengths (U+212A folds to the 1-byte "k"), so the comparison walks runes.
+func foldHasPrefix(s, prefix string) bool {
+	for _, want := range prefix {
+		got, size := utf8.DecodeRuneInString(s)
+		if size == 0 || !foldEqualRune(got, want) {
+			return false
+		}
+		s = s[size:]
+	}
+	return true
+}
+
+// foldEqualRune reports whether a and b are the same rune under Unicode simple folding, by
+// walking the fold orbit unicode.SimpleFold exposes.
+func foldEqualRune(a, b rune) bool {
+	if a == b {
+		return true
+	}
+	for f := unicode.SimpleFold(a); f != a; f = unicode.SimpleFold(f) {
+		if f == b {
 			return true
 		}
 	}
@@ -139,15 +252,20 @@ func isGateDefinition(name string) bool {
 // fail-closed half of the guard: an undecidable name is only permitted when its readable part
 // already PROVES it is not the gate.
 func couldBeGateDefinition(prefix string) bool {
-	for _, f := range gateDefinitionFiles {
-		if strings.HasPrefix(f, prefix) {
+	// No slash yet, so the unread remainder could still make this a Go file in the root
+	// package - or put a slash in and land anywhere. Undecidable.
+	if !strings.Contains(prefix, "/") {
+		return true
+	}
+	for _, f := range append(append([]string{}, gateDefinitionFiles...), gateDefinitionPreemptiveFiles...) {
+		if foldHasPrefix(f, prefix) {
 			return true
 		}
 	}
 	for _, p := range gateDefinitionPrefixes {
 		// Either the prefix already reaches into a guarded directory, or it is still short
 		// enough that the unread remainder could take it there.
-		if strings.HasPrefix(prefix, p) || strings.HasPrefix(p, prefix) {
+		if foldHasPrefix(prefix, p) || foldHasPrefix(p, prefix) {
 			return true
 		}
 	}
@@ -266,4 +384,21 @@ var gateDecisionDeclarations = []string{
 	"DefaultBranch",
 	"ShowFile",
 	"TreeHash",
+}
+
+// gateClosureRoots are the packages whose transitive first-party imports must all be guarded:
+// the gate itself, and the path that delivers the reviewer definitions it dispatches (the root
+// package embeds them; installer and manifest write them into ~/.claude).
+// TestGuardCoversEveryFirstPartyGateDependency re-derives that closure with `go list -deps`.
+var gateClosureRoots = []string{
+	".",
+	"./internal/approval",
+	"./internal/db",
+	"./internal/installer",
+	"./internal/manifest",
+	"./internal/orchestrator",
+	"./internal/projectinit",
+	"./internal/review",
+	"./internal/validate",
+	"./internal/worktree",
 }

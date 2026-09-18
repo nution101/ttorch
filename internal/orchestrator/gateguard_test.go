@@ -7,6 +7,7 @@ import (
 	"go/token"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"strings"
@@ -107,16 +108,12 @@ func TestGateGuardPermitsOrdinarySource(t *testing.T) {
 		".github/workflows/ci.yml",
 		// Packages that declare no state the gate reads and cannot reach into one that does.
 		"internal/cli/cli.go",
-		"internal/termtab/termtab.go",
 		"internal/scheduler/scheduler.go",
 		"internal/scheduler/gate.go",
 		"internal/watch/watchdog.go",
-		"internal/tmux/tmux.go",
-		"internal/installer/installer.go",
-		"internal/manifest/manifest.go",
+		"internal/skills/skills.go",
+		"internal/learnings/learnings.go",
 		"internal/selfupdate/selfupdate.go",
-		"internal/harness/harness.go",
-		"internal/doctor/doctor.go",
 		// The agent and skill library the gate never consults.
 		"content/agents/golang-pro.md",
 		"content/agents/ttorch-worker.md",
@@ -217,9 +214,34 @@ func TestGateGuardRefusesUnresolvableDiff(t *testing.T) {
 // printable ASCII, so git reports it verbatim and never as a quoted token.
 func TestGateDefinitionPathsAnchored(t *testing.T) {
 	root := filepath.Join("..", "..")
+	// Case-SENSITIVE existence. os.Stat is not usable here: this filesystem folds case, so
+	// Stat("makefile") happily finds Makefile and both assertions below would be meaningless.
+	exists := func(rel string) bool {
+		dir, name := path.Split(rel)
+		entries, err := os.ReadDir(filepath.Join(root, filepath.FromSlash(dir)))
+		if err != nil {
+			return false
+		}
+		for _, e := range entries {
+			if e.Name() == name {
+				return true
+			}
+		}
+		return false
+	}
 	for _, f := range gateDefinitionFiles {
-		if _, err := os.Stat(filepath.Join(root, f)); err != nil {
-			t.Errorf("gateDefinitionFiles names %s, which is not in the repo: %v", f, err)
+		if !exists(f) {
+			t.Errorf("gateDefinitionFiles names %s, which is not in the repo under that exact spelling", f)
+		}
+	}
+	// The pre-emptive entries are guarded so they can never be ADDED. If one has appeared, the
+	// guard still covers it, but somebody should look at why it is there.
+	for _, f := range gateDefinitionPreemptiveFiles {
+		if exists(f) {
+			t.Errorf("%s is in the repo; it is guarded as a file that should not exist, so confirm it is legitimate and move it into gateDefinitionFiles", f)
+		}
+		if !isGateDefinition(f) {
+			t.Errorf("%s must be covered by the guard", f)
 		}
 	}
 	for _, p := range gateDefinitionPrefixes {
@@ -231,7 +253,10 @@ func TestGateDefinitionPathsAnchored(t *testing.T) {
 			t.Errorf("gateDefinitionPrefixes names %s, which matches nothing in the repo", p)
 		}
 	}
-	for _, p := range append(append([]string{}, gateDefinitionFiles...), gateDefinitionPrefixes...) {
+	all := append([]string{}, gateDefinitionFiles...)
+	all = append(all, gateDefinitionPreemptiveFiles...)
+	all = append(all, gateDefinitionPrefixes...)
+	for _, p := range all {
 		for _, r := range p {
 			if r < 0x20 || r > 0x7e || r == '\\' || r == '"' {
 				t.Errorf("guarded path %q contains %q, which git would report as a quoted token", p, r)
@@ -513,7 +538,10 @@ func TestGuardedGoPackagesAreWholePackages(t *testing.T) {
 			if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") {
 				continue
 			}
-			p := dir + "/" + e.Name()
+			p := e.Name()
+			if dir != "." {
+				p = dir + "/" + e.Name()
+			}
 			if !isGateDefinition(p) {
 				t.Errorf("%s is guarded only in part: %s is in the same Go package and is not covered, so it can rewrite that package's gate state", dir, p)
 			}
@@ -559,5 +587,235 @@ func TestGateGuardRefusesNewlyIdentifiedGateInputs(t *testing.T) {
 				t.Fatalf("the refusal must name the triggering file: got %q, want %q", name, path)
 			}
 		})
+	}
+}
+
+// gateGuardTreeDiff builds a repo whose diff adds each path as a TREE ENTRY, via
+// `git update-index --cacheinfo`, bypassing the working tree entirely. That is the only way to
+// test a case variant on this machine: macOS is case-insensitive, so `Internal/orchestrator`
+// and `internal/orchestrator` are the same directory on disk but two distinct entries in a git
+// tree, and `git diff --name-only` reports whichever spelling the tree holds.
+func gateGuardTreeDiff(t *testing.T, paths ...string) (repo, base, rev string) {
+	t.Helper()
+	repo = newRepoMain(t)
+	// A real lowercase file in the guarded package, so the tree holds both spellings.
+	realPath := filepath.Join(repo, "internal", "orchestrator")
+	if err := os.MkdirAll(realPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realPath, "real.go"), []byte("package orchestrator\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "-A")
+	gitIn(t, repo, "commit", "-q", "-m", "base")
+	base = gitIn(t, repo, "rev-parse", "HEAD")
+
+	for _, p := range paths {
+		cmd := exec.Command("git", "-C", repo, "hash-object", "-w", "--stdin")
+		cmd.Stdin = strings.NewReader("package orchestrator\n\nfunc init() {}\n")
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("hash-object: %v", err)
+		}
+		blob := strings.TrimSpace(string(out))
+		gitIn(t, repo, "update-index", "--add", "--cacheinfo", "100644,"+blob+","+p)
+	}
+	gitIn(t, repo, "commit", "-q", "-m", "case variant")
+	return repo, base, gitIn(t, repo, "rev-parse", "HEAD")
+}
+
+// TestGateGuardRefusesCaseVariantGatePath is the case bypass, written against the real
+// condition rather than against the matching helper. isGateDefinition compared case
+// SENSITIVELY, so a tree entry spelled Internal/orchestrator/rebind.go walked straight through:
+// the guard returned touched=false, name="", err=nil and the approval auto-minted. On this
+// machine that is not cosmetic. macOS folds case, so the gate's detached checkout and the local
+// fast-forward both put that file in internal/orchestrator/, and `go list` compiles it into the
+// package, where its init() can rebind runGateOnCommitted.
+//
+// TestGuardedGoPackagesAreWholePackages could not see this, because it enumerates the directory
+// under the lowercase prefix and the case-variant sibling looks covered.
+func TestGateGuardRefusesCaseVariantGatePath(t *testing.T) {
+	for _, path := range []string{
+		"Internal/orchestrator/rebind.go",
+		"INTERNAL/ORCHESTRATOR/rebind.go",
+		"Internal/Db/verdict.go",
+		"internal/Review/review.go",
+		"MAKEFILE",
+		"makeFile",
+		"Agents.md",
+		"content/agents/TTORCH-REVIEWER-evil.md",
+		".TTORCH/validate.sh",
+	} {
+		t.Run(path, func(t *testing.T) {
+			repo, base, rev := gateGuardTreeDiff(t, path)
+			// Confirm the tree really carries the spelling under test, so a green result
+			// cannot come from the fixture quietly normalizing it.
+			if names := gitIn(t, repo, "diff", "--name-only", "--no-renames", base, rev); !strings.Contains(names, path) {
+				t.Fatalf("fixture did not produce the tree entry under test: diff reported %q", names)
+			}
+			touched, name, err := diffTouchesGateConfig(repo, base, rev)
+			if err != nil {
+				t.Fatalf("guard could not evaluate the diff: %v", err)
+			}
+			if !touched {
+				t.Fatalf("%s folds to a gate-definition path and must refuse a trusted auto-merge, but the guard permitted it", path)
+			}
+			if name != path {
+				t.Fatalf("the refusal must name the triggering file as the tree spells it: got %q, want %q", name, path)
+			}
+		})
+	}
+}
+
+// TestGateGuardPermitsCaseVariantNonGatePath is the other side of folding: refusing on case
+// must not start refusing every path that merely contains a capital letter.
+func TestGateGuardPermitsCaseVariantNonGatePath(t *testing.T) {
+	for _, path := range []string{
+		"Docs/Design.md",
+		"internal/Scheduler/scheduler.go",
+		"internal/watch/Watchdog.go",
+		"content/agents/Golang-Pro.md",
+		"README.MD",
+	} {
+		t.Run(path, func(t *testing.T) {
+			repo, base, rev := gateGuardTreeDiff(t, path)
+			touched, name, err := diffTouchesGateConfig(repo, base, rev)
+			if err != nil {
+				t.Fatalf("guard could not evaluate the diff: %v", err)
+			}
+			if touched {
+				t.Fatalf("%s is not a gate-definition path under any casing, but the guard refused it as %q", path, name)
+			}
+		})
+	}
+}
+
+// TestGateGuardRefusesMakeEntrypoints covers the second critical. .ttorch/validate.sh runs bare
+// `make lint` and `make test-fast`, and GNU Make reads GNUmakefile in preference to Makefile,
+// with lowercase makefile also ahead of it (checked against the GNU Make 3.81 on this machine;
+// see EVIDENCE.md). Guarding only Makefile left the hole the round-2 commit message claimed to
+// close: a worker commits an unguarded GNUmakefile whose targets are @true and the gate is green
+// with nothing run.
+func TestGateGuardRefusesMakeEntrypoints(t *testing.T) {
+	for _, path := range []string{"Makefile", "GNUmakefile", "makefile"} {
+		t.Run(path, func(t *testing.T) {
+			repo, base, rev := gateGuardTreeDiff(t, path)
+			touched, name, err := diffTouchesGateConfig(repo, base, rev)
+			if err != nil {
+				t.Fatalf("guard could not evaluate the diff: %v", err)
+			}
+			if !touched {
+				t.Fatalf("%s is a make entrypoint the gate's validate would execute; it must refuse the auto-merge", path)
+			}
+			if name != path {
+				t.Fatalf("refusal named %q, want %q", name, path)
+			}
+		})
+	}
+}
+
+// TestGateGuardRefusesBuildAndDeliveryInputs covers the pattern behind the remaining highs: a
+// guarded thing whose behaviour is defined by an unguarded thing.
+//
+//   - go.mod / go.sum choose the dependency versions every guarded package compiles against.
+//   - the ROOT package declares `var Content embed.FS` (content.go), the payload that carries
+//     the guarded reviewer definitions, and it is a mutable package var like any other. Matched
+//     by rule, not by filename, so a file ADDED to that package is covered.
+//   - internal/installer and internal/manifest are what lay those reviewer definitions down
+//     under ~/.claude/agents, which is where the gate dispatches them from.
+//   - internal/harness composes the reviewer's command line, model and effort and writes its
+//     settings. The round-2 comment cleared it BY NAME as settled, which was wrong.
+//   - internal/paths locates the approval token, the verdict's review inputs and the validate
+//     cache. Redirect those and the gate reads an attacker's file.
+//   - internal/tmux and internal/termtab are how the reviewer command actually gets run.
+func TestGateGuardRefusesBuildAndDeliveryInputs(t *testing.T) {
+	for _, path := range []string{
+		"go.mod",
+		"go.sum",
+		"content.go",
+		"content_test.go",
+		"internal/harness/harness.go",
+		"internal/paths/paths.go",
+		"internal/tmux/tmux.go",
+		"internal/termtab/termtab.go",
+		"internal/installer/installer.go",
+		"internal/manifest/manifest.go",
+	} {
+		t.Run(path, func(t *testing.T) {
+			repo, base, rev := gateGuardTreeDiff(t, path)
+			touched, name, err := diffTouchesGateConfig(repo, base, rev)
+			if err != nil {
+				t.Fatalf("guard could not evaluate the diff: %v", err)
+			}
+			if !touched {
+				t.Fatalf("a diff touching %s changes what the gate decides or what it dispatches; it must refuse the auto-merge", path)
+			}
+			if name != path {
+				t.Fatalf("refusal named %q, want %q", name, path)
+			}
+		})
+	}
+}
+
+// TestGuardCoversEveryFirstPartyGateDependency derives the guarded Go set instead of trusting a
+// hand-written list to keep up. Per-package triage of "could this one manufacture a pass" is the
+// reasoning that failed twice: it permitted spawn.go in round 1 and cleared internal/harness by
+// name in round 2. So the rule is mechanical - every first-party package in the transitive
+// import closure of the gate and of the reviewer-delivery path is guarded - and this test
+// re-derives that closure with `go list -deps` and fails if any member is uncovered.
+func TestGuardCoversEveryFirstPartyGateDependency(t *testing.T) {
+	root := filepath.Join("..", "..")
+	args := append([]string{"list", "-deps"}, gateClosureRoots...)
+	cmd := exec.Command("go", args...)
+	cmd.Dir = root
+	out, err := cmd.Output()
+	if err != nil {
+		t.Skipf("go list unavailable: %v", err)
+	}
+	const mod = "github.com/nution101/ttorch"
+	seen := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line != mod && !strings.HasPrefix(line, mod+"/") {
+			continue // third-party or stdlib
+		}
+		seen++
+		rel := strings.TrimPrefix(strings.TrimPrefix(line, mod), "/")
+		probe := "content.go" // the root package is matched by its Go files
+		if rel != "" {
+			probe = rel + "/anything.go"
+		}
+		if !isGateDefinition(probe) {
+			t.Errorf("the gate transitively imports %s, so any file in it can change what the gate decides, but %s is not guarded", line, probe)
+		}
+	}
+	if seen < 15 {
+		t.Fatalf("go list returned only %d first-party packages; the closure looks wrong, refusing to pass vacuously", seen)
+	}
+}
+
+// TestRootPackageIsFullyGuarded covers the root package the way the prefixes cover the others.
+// It cannot be a path rule in the guard, because this guard runs against every managed repo and
+// "any .go at the repo root" would refuse an ordinary main.go in any project that keeps one. So
+// the guard names content.go and content_test.go, and this test fails if the root package grows
+// a file those entries do not cover. A red test here turns this repo's validate red, and a
+// trusted auto-merge requires a fresh green, so a root file added to rebind Content cannot
+// carry itself in.
+func TestRootPackageIsFullyGuarded(t *testing.T) {
+	entries, err := os.ReadDir(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") {
+			continue
+		}
+		found++
+		if !isGateDefinition(e.Name()) {
+			t.Errorf("%s is in the repo root package, which declares Content (the embedded reviewer definitions), so it can rebind it; add it to gateDefinitionFiles", e.Name())
+		}
+	}
+	if found == 0 {
+		t.Fatal("no .go files found in the repo root; this test would pass vacuously")
 	}
 }
