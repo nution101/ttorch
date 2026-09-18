@@ -268,8 +268,8 @@ func TestRuleFilePathsLineCitationBeyondBaseEOF(t *testing.T) {
 	}
 }
 
-// A path that is NEW in the worker's diff does not exist on the base, so it too must be
-// resolved at the citations ref.
+// A path that is NEW in the worker's diff does not exist on the base, so with the citations
+// ref named it resolves there and passes.
 func TestRuleFilePathsCitationOfFileAddedByTheDiff(t *testing.T) {
 	repo, reviewed := fixture(t)
 	brief := strings.Replace(satisfying, "Touch pkg/thing.go", "Fix the finding at pkg/added.go:12", 1)
@@ -287,19 +287,68 @@ func TestRuleFilePathsLineBeyondCitationsRefEOF(t *testing.T) {
 	}
 }
 
-// With no citations ref there is no correct ref to resolve a file:line citation against, so
-// the check is unevaluable — never a pass, and never silently resolved against the base.
-func TestRuleFilePathsLineCitationWithoutCitationsRefIsIndeterminate(t *testing.T) {
+// With no citations ref, a line that is past end-of-file on the base is AMBIGUOUS: it may
+// exist at the commit the citation was read at. That is unevaluable — never a pass, and
+// never a violation, because calling it one is the false positive this rule exists to avoid.
+func TestRuleFilePathsLineBeyondBaseEOFWithoutCitationsRefIsIndeterminate(t *testing.T) {
 	repo, _ := fixture(t)
 	brief := strings.Replace(satisfying, "Touch pkg/thing.go", fmt.Sprintf("Fix the finding at pkg/thing.go:%d", fixtureLongLines-5), 1)
 	r := Lint(brief, Options{Repo: repo, Ref: "origin/main"})
 	f := requireStatus(t, r, RuleFilePaths, StatusIndeterminate)
-	if !strings.Contains(f.Detail, "no citations ref was given") {
-		t.Fatalf("unexpected detail: %s", f.Detail)
+	if !strings.Contains(f.Detail, "pass that commit") {
+		t.Fatalf("the finding must name the remedy: %s", f.Detail)
 	}
 	if r.Outcome() != OutcomeIndeterminate {
 		t.Fatalf("outcome: want %s, got %s", OutcomeIndeterminate, r.Outcome())
 	}
+}
+
+// The ordinary case, and the one the whole rule turns on: a brief pointing at a real line of
+// existing code, with no citations ref given. It must resolve against the base and PASS.
+// Requiring a flag here blocked every brief that cites file:line, which is how briefs
+// normally point at code.
+func TestRuleFilePathsLineCitationResolvesAtTheBaseByDefault(t *testing.T) {
+	repo, _ := fixture(t)
+	cited := fixtureShortLines - 2 // a real line of the file as it exists on the base
+	brief := strings.Replace(satisfying, "Touch pkg/thing.go", fmt.Sprintf("The bug is at pkg/thing.go:%d", cited), 1)
+	r := Lint(brief, Options{Repo: repo, Ref: "origin/main"})
+	requireClean(t, r, RuleFilePaths)
+	if r.Outcome() != OutcomePass {
+		t.Fatalf("outcome: want %s, got %s (%+v)", OutcomePass, r.Outcome(), r.Findings)
+	}
+	// The ref, and the fact that it was defaulted, must both be in the report.
+	if !hasNote(r, "file:line citations resolved at origin/main (defaulted to the base") {
+		t.Fatalf("the report must name the ref and that it was defaulted, got %v", r.Notes)
+	}
+}
+
+// A path that does not exist on the base at all, cited with a line and no citations ref, is
+// equally ambiguous: the diff the citation is about may have added it. Unevaluable, not a
+// violation.
+func TestRuleFilePathsLineCitationOfPathAbsentFromBaseIsIndeterminate(t *testing.T) {
+	repo, _ := fixture(t)
+	brief := strings.Replace(satisfying, "Touch pkg/thing.go", "Fix the finding at pkg/added.go:12", 1)
+	r := Lint(brief, Options{Repo: repo, Ref: "origin/main"})
+	f := requireStatus(t, r, RuleFilePaths, StatusIndeterminate)
+	if !strings.Contains(f.Detail, "does not exist at origin/main") || !strings.Contains(f.Detail, "pass that commit") {
+		t.Fatalf("unexpected detail: %s", f.Detail)
+	}
+}
+
+// Naming the ref makes the answer authoritative: the same miss that is unevaluable by
+// default is a violation once the caller has said which commit the citation is about.
+func TestRuleFilePathsNamedCitationsRefMakesAMissAViolation(t *testing.T) {
+	repo, reviewed := fixture(t)
+	brief := strings.Replace(satisfying, "Touch pkg/thing.go", "Fix the finding at pkg/gone.go:12", 1)
+
+	f := requireStatus(t, Lint(brief, Options{Repo: repo, Ref: "origin/main", CitationsRef: reviewed}), RuleFilePaths, StatusFail)
+	if !strings.Contains(f.Detail, "pkg/gone.go does not exist at "+reviewed) {
+		t.Fatalf("unexpected detail: %s", f.Detail)
+	}
+	if strings.Contains(f.Detail, "pass that commit") {
+		t.Fatalf("a named ref needs no remedy hint: %s", f.Detail)
+	}
+	requireStatus(t, Lint(brief, Options{Repo: repo, Ref: "origin/main"}), RuleFilePaths, StatusIndeterminate)
 }
 
 // --- Rule 3 -----------------------------------------------------------------------------

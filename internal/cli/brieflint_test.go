@@ -36,7 +36,8 @@ func lintRepo(t *testing.T) string {
 	if err := os.MkdirAll(filepath.Join(repo, "pkg"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(repo, "pkg", "thing.go"), []byte("package pkg\n"), 0o644); err != nil {
+	// Several lines, so a brief can cite a real line of it.
+	if err := os.WriteFile(filepath.Join(repo, "pkg", "thing.go"), []byte("package pkg\n\nfunc A() {}\nfunc B() {}\nfunc C() {}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	run(repo, "add", "-A")
@@ -56,6 +57,11 @@ Follow this repo's demonstrated conventions and match the shape of pkg/thing.go.
 No changes to any product branch and no PR until I have reviewed the work. Commit on your
 own branch, leave the worktree clean, and report the sha.
 `
+
+// citingBrief is cleanBrief with the most ordinary citation a brief makes: a real line of
+// existing code, with no citations ref supplied anywhere.
+var citingBrief = strings.Replace(cleanBrief, "match the shape of pkg/thing.go",
+	"fix the helper at pkg/thing.go:4", 1)
 
 // defectiveBrief violates the target-branch and prohibition rules and points at no
 // standards.
@@ -111,7 +117,20 @@ func TestCmdBriefLintExitStatuses(t *testing.T) {
 		}
 	}
 
-	// A file:line citation with no citations ref cannot be resolved — reported, not passed.
+	// The ordinary case: a real line of existing code, no citations ref. This must pass,
+	// because pointing a worker at file:line is how briefs normally point at code.
+	out, err = captureStdout(t, func() error {
+		return cmdBriefLint([]string{writeBrief(t, citingBrief), "--repo", repo})
+	})
+	if got := exitOf(t, err); got != 0 {
+		t.Fatalf("a brief citing a real line must exit 0, got %d (%v)\n%s", got, err, out)
+	}
+	if !strings.Contains(out, "file:line citations resolved at origin/main (defaulted to the base") {
+		t.Fatalf("the report must name the ref and that it was defaulted:\n%s", out)
+	}
+
+	// A line past end-of-file on the base is ambiguous, not a violation: it may exist at the
+	// commit the citation was read at. Reported, never passed.
 	brief := strings.Replace(cleanBrief, "pkg/thing.go", "pkg/thing.go:400", 1)
 	out, err = captureStdout(t, func() error {
 		return cmdBriefLint([]string{writeBrief(t, brief), "--repo", repo})

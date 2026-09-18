@@ -55,7 +55,7 @@ func cmdBriefLint(args []string) error {
 	repo := fs.String("repo", ".", "repository the brief targets; refs and cited paths are resolved here")
 	remote := fs.String("remote", "origin", "remote the declared target branch must exist on")
 	ref := fs.String("ref", "", "ref a cited path must exist at (default: the target branch the brief declares)")
-	citationsRef := fs.String("citations-ref", "", "ref a file:line citation is resolved against — the commit the citation was read at, such as a worker's HEAD or a reviewed sha (default: none, which reports every file:line citation as unevaluable rather than resolving it against the base)")
+	citationsRef := fs.String("citations-ref", "", "ref a file:line citation is resolved against — the commit the citation was read at, such as a worker's HEAD or a reviewed sha (default: the base ref, where an unresolved citation is reported as unevaluable rather than failed, because the line may exist at the commit it was read at)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return lintError{err.Error(), exitLintUsage}
 	}

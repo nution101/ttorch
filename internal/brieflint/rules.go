@@ -133,15 +133,26 @@ func targetNames(targets []target) []string {
 // A brief citing a path that is not on the target sends a worker hunting for a file that
 // was never there.
 //
-// The ref a citation is resolved against is the crux. A citation WITHOUT a line number is
-// about the work's base, so it is resolved at Options.Ref (the declared target by default).
-// A file:line citation is about the commit it was READ at — typically a gate finding
-// quoting a worker's HEAD, where the file is longer because the diff added to it. Resolving
-// such a citation against the base false-positives on a citation that was perfectly valid
-// at the reviewed commit, which is exactly the defect this rule is written to avoid. So a
-// file:line citation is resolved at Options.CitationsRef, and when no such ref was supplied
-// it is reported as INDETERMINATE — never assumed good, and never silently resolved against
-// the base. Both refs are named in the report.
+// The ref a citation resolves against is the crux, because the two kinds of citation are
+// about different commits:
+//
+//   - A citation WITHOUT a line number is about the work's base, and resolves at
+//     Options.Ref (the target branch the brief declares, by default).
+//   - A file:line citation is about the commit it was READ at, which is typically a gate
+//     finding quoting a worker's HEAD, where the file is longer because the diff added to
+//     it. Options.CitationsRef names that commit.
+//
+// When the caller NAMES the citations ref, the answer is authoritative: a missing path or a
+// line past end-of-file is a violation. When the caller does NOT name it, the citation is
+// still checked, against the base, because that is the only commit at hand and because
+// pointing a worker at a line of existing code is the most ordinary thing a brief does and
+// must not require a flag. But there a miss is downgraded to StatusIndeterminate: a line
+// past end-of-file on the base may perfectly well exist at the commit the citation was read
+// at, and calling that a violation is exactly the false positive this rule exists to avoid.
+//
+// So a citation that resolves is a pass either way, a citation that does not is never
+// silently accepted, and the report always names the ref used and whether it was given or
+// defaulted.
 
 // citation is a path the brief cites, with the line it cited if any.
 type citation struct {
@@ -267,9 +278,9 @@ func checkFilePaths(ctx context.Context, b *brief, opt Options) ([]Finding, []st
 			Detail: fmt.Sprintf("cannot resolve the %d cited path(s): no repository was given", len(cites)),
 		}}, nil
 	}
-	// The base ref: an explicit --ref wins, else the target branch the brief itself
-	// declares. Naming it in the report is part of the rule — a citation is only meaningful
-	// against a stated ref.
+	// The base ref: an explicit Ref wins, else the target branch the brief itself declares.
+	// Naming it in the report is part of the rule — a citation is only meaningful against a
+	// stated ref.
 	ref := opt.Ref
 	if ref == "" {
 		if t := b.targets(opt.remote()); len(t) > 0 {
@@ -332,10 +343,9 @@ func checkFilePaths(ctx context.Context, b *brief, opt Options) ([]Finding, []st
 		}
 	}
 	if len(withLine) > 0 {
-		findings = append(findings, opt.checkLineCitations(ctx, withLine, ref)...)
-		if opt.CitationsRef != "" {
-			notes = append(notes, fmt.Sprintf("file-paths: file:line citations resolved at %s", opt.CitationsRef))
-		}
+		lineRef, named := opt.lineCitationRef(ref)
+		findings = append(findings, opt.checkLineCitations(ctx, withLine, lineRef, named)...)
+		notes = append(notes, fmt.Sprintf("file-paths: file:line citations resolved at %s (%s)", lineRef, refSource(named)))
 	}
 	if len(created) > 0 {
 		// Visible, never silent: an exemption the reader can see is one they can question.
@@ -343,6 +353,24 @@ func checkFilePaths(ctx context.Context, b *brief, opt Options) ([]Finding, []st
 			len(created), strings.Join(rawPaths(created), ", ")))
 	}
 	return findings, notes
+}
+
+// lineCitationRef returns the ref a file:line citation resolves against, and whether the
+// caller named it. Defaulting to the base ref is what keeps the ordinary case — a brief
+// pointing at a line of existing code — a plain pass with no flag; the bool is what stops
+// that default from turning an ambiguous miss into a false violation.
+func (o Options) lineCitationRef(baseRef string) (string, bool) {
+	if o.CitationsRef != "" {
+		return o.CitationsRef, true
+	}
+	return baseRef, false
+}
+
+func refSource(named bool) string {
+	if named {
+		return "given"
+	}
+	return "defaulted to the base; an unresolved citation there is unevaluable, not a failure"
 }
 
 func rawPaths(cites []citation) []string {
@@ -353,44 +381,50 @@ func rawPaths(cites []citation) []string {
 	return out
 }
 
-// checkLineCitations resolves the file:line citations against Options.CitationsRef — the
-// commit the citation is about. With no such ref the whole set is unevaluable and is
-// reported as one finding naming it: guessing the base is what false-positived on a
-// citation that was valid at the reviewed commit.
-func (o Options) checkLineCitations(ctx context.Context, cites []citation, baseRef string) []Finding {
-	if o.CitationsRef == "" {
-		return []Finding{{
-			Rule: RuleFilePaths, Status: StatusIndeterminate, Quote: cites[0].raw, Line: cites[0].src,
-			Detail: fmt.Sprintf("%d file:line citation(s) could not be resolved (%s): a line number is about the commit it was read at, not the base %s, and no citations ref was given. Pass the reviewed commit (a worker HEAD or sha) as the citations ref",
-				len(cites), strings.Join(rawPaths(cites), ", "), baseRef),
-		}}
+// checkLineCitations resolves file:line citations at ref. named says whether the caller
+// supplied that ref: if they did, a miss is a violation, because they have told us which
+// commit the citation is about. If it defaulted to the base, a miss is unevaluable and the
+// finding says how to resolve it — the file may legitimately be longer, or newer, at the
+// commit the citation was read at.
+//
+// Line counts are memoized per path, so a brief citing twenty lines of one file reads that
+// file once rather than twenty times.
+func (o Options) checkLineCitations(ctx context.Context, cites []citation, ref string, named bool) []Finding {
+	miss, remedy := StatusFail, ""
+	if !named {
+		miss = StatusIndeterminate
+		remedy = "; it may exist at the commit the citation was read at, so pass that commit (a worker HEAD or a reviewed sha) as the citations ref to resolve this"
 	}
-	if ok, err := o.revExists(ctx, o.CitationsRef); err != nil {
-		return []Finding{{
-			Rule: RuleFilePaths, Status: StatusIndeterminate, Quote: cites[0].raw, Line: cites[0].src,
-			Detail: fmt.Sprintf("cannot resolve file:line citations at %s: %v", o.CitationsRef, err),
-		}}
-	} else if !ok {
-		return []Finding{{
-			Rule: RuleFilePaths, Status: StatusIndeterminate, Quote: cites[0].raw, Line: cites[0].src,
-			Detail: fmt.Sprintf("cannot resolve file:line citations: citations ref %s does not resolve in %s", o.CitationsRef, o.Repo),
-		}}
+	// The base ref was already verified by the caller; only a ref the caller named needs
+	// checking here.
+	if named {
+		if ok, err := o.revExists(ctx, ref); err != nil {
+			return []Finding{{
+				Rule: RuleFilePaths, Status: StatusIndeterminate, Quote: cites[0].raw, Line: cites[0].src,
+				Detail: fmt.Sprintf("cannot resolve file:line citations at %s: %v", ref, err),
+			}}
+		} else if !ok {
+			return []Finding{{
+				Rule: RuleFilePaths, Status: StatusIndeterminate, Quote: cites[0].raw, Line: cites[0].src,
+				Detail: fmt.Sprintf("cannot resolve file:line citations: citations ref %s does not resolve in %s", ref, o.Repo),
+			}}
+		}
 	}
 	var findings []Finding
 	counted := map[string]int{}
 	for _, c := range cites {
-		typ, ok, err := o.objectType(ctx, o.CitationsRef, c.path)
+		typ, ok, err := o.objectType(ctx, ref, c.path)
 		switch {
 		case err != nil:
 			findings = append(findings, Finding{
 				Rule: RuleFilePaths, Status: StatusIndeterminate, Quote: c.quote, Line: c.src,
-				Detail: fmt.Sprintf("cannot check %s at %s: %v", c.path, o.CitationsRef, err),
+				Detail: fmt.Sprintf("cannot check %s at %s: %v", c.path, ref, err),
 			})
 			continue
 		case !ok:
 			findings = append(findings, Finding{
-				Rule: RuleFilePaths, Status: StatusFail, Quote: c.quote, Line: c.src,
-				Detail: fmt.Sprintf("cited path %s does not exist at %s", c.path, o.CitationsRef),
+				Rule: RuleFilePaths, Status: miss, Quote: c.quote, Line: c.src,
+				Detail: fmt.Sprintf("cited path %s does not exist at %s%s", c.path, ref, remedy),
 			})
 			continue
 		case typ != "blob":
@@ -400,11 +434,11 @@ func (o Options) checkLineCitations(ctx context.Context, cites []citation, baseR
 		}
 		n, ok := counted[c.path]
 		if !ok {
-			n, err = o.lineCount(ctx, o.CitationsRef, c.path)
+			n, err = o.lineCount(ctx, ref, c.path)
 			if err != nil {
 				findings = append(findings, Finding{
 					Rule: RuleFilePaths, Status: StatusIndeterminate, Quote: c.quote, Line: c.src,
-					Detail: fmt.Sprintf("cannot count the lines of %s at %s: %v", c.path, o.CitationsRef, err),
+					Detail: fmt.Sprintf("cannot count the lines of %s at %s: %v", c.path, ref, err),
 				})
 				continue
 			}
@@ -412,8 +446,8 @@ func (o Options) checkLineCitations(ctx context.Context, cites []citation, baseR
 		}
 		if c.line > n {
 			findings = append(findings, Finding{
-				Rule: RuleFilePaths, Status: StatusFail, Quote: c.quote, Line: c.src,
-				Detail: fmt.Sprintf("cites line %d but %s has %d line(s) at %s", c.line, c.path, n, o.CitationsRef),
+				Rule: RuleFilePaths, Status: miss, Quote: c.quote, Line: c.src,
+				Detail: fmt.Sprintf("cites line %d but %s has %d line(s) at %s%s", c.line, c.path, n, ref, remedy),
 			})
 		}
 	}

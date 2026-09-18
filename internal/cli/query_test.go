@@ -571,6 +571,55 @@ func TestCmdTaskAddLintsTheBrief(t *testing.T) {
 	}
 }
 
+// The most ordinary citation a brief makes is file:line, and `task add` supplies no
+// citations ref of its own. A brief citing a REAL line of existing code must therefore be
+// added and stored, with no flag: requiring one here blocked essentially every brief that
+// points a worker at code.
+func TestCmdTaskAddAcceptsAnOrdinaryLineCitation(t *testing.T) {
+	repo := lintRepo(t)
+	var projID int64
+	dbPath := withSeedDB(t, func(ctx context.Context, s *db.Store) {
+		p, _ := s.UpsertProject(ctx, repo, "fixture")
+		projID = p.ID
+	})
+	out, err := captureStdout(t, func() error {
+		return cmdTaskAdd([]string{"lint-cite", "--project", itoa(projID), "--brief", citingBrief})
+	})
+	if err != nil {
+		t.Fatalf("a brief citing a real line must be added with no --citations-ref: %v\n%s", err, out)
+	}
+	if got := mustReadFile(t, paths.Default().BriefPath("lint-cite")); got != citingBrief {
+		t.Fatalf("stored brief = %q, want the brief as written", got)
+	}
+	store := reopen(t, dbPath)
+	if _, exists, qErr := store.GetTask(context.Background(), "lint-cite"); qErr != nil {
+		t.Fatal(qErr)
+	} else if !exists {
+		t.Fatal("the task row must exist")
+	}
+
+	// A line that is past end-of-file on the base is ambiguous rather than wrong, so it does
+	// not pass; the add stops with the unevaluable status and names the remedy.
+	beyond := strings.Replace(citingBrief, "pkg/thing.go:4", "pkg/thing.go:4000", 1)
+	out, err = captureStdout(t, func() error {
+		return cmdTaskAdd([]string{"lint-cite-beyond", "--project", itoa(projID), "--brief", beyond})
+	})
+	if got := exitOf(t, err); got != exitLintIndeterminate {
+		t.Fatalf("want exit %d, got %d (%v)\n%s", exitLintIndeterminate, got, err, out)
+	}
+	if !strings.Contains(out, "pass that commit") {
+		t.Fatalf("the report must name the remedy:\n%s", out)
+	}
+
+	// With the citations ref named, the same brief is authoritative and the citation fails.
+	out, err = captureStdout(t, func() error {
+		return cmdTaskAdd([]string{"lint-cite-named", "--project", itoa(projID), "--brief", beyond, "--citations-ref", "HEAD"})
+	})
+	if got := exitOf(t, err); got != exitLintViolation {
+		t.Fatalf("want exit %d, got %d (%v)\n%s", exitLintViolation, got, err, out)
+	}
+}
+
 func TestCmdTaskAddValidations(t *testing.T) {
 	var projID, otherEpicID int64
 	withSeedDB(t, func(ctx context.Context, s *db.Store) {

@@ -2321,9 +2321,11 @@ Briefs:
     [--citations-ref <rev>] violated, 3 a check COULD NOT be evaluated (never a pass).
                           --ref is the base a cited path must exist at; --citations-ref
                           is the commit a file:line citation was read at (a worker HEAD
-                          or reviewed sha), which is not the base. Per-project config
-                          lives in AGENTS.md, as "- brief-standards: <pointer>" and
-                          "- brief-lint-disable: <rule,...>" lines.
+                          or reviewed sha). Without it, line citations resolve against
+                          the base, where an unresolved one is unevaluable rather than
+                          failed. Per-project config lives in AGENTS.md, as the lines
+                          "- brief-standards: <pointer>" and
+                          "- brief-lint-disable: <rule,...>".
 
 Supervision:
   watch                   block until an actionable DB event, print the coalesced
