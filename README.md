@@ -225,15 +225,22 @@ Two details matter in practice:
 
 - **Which ref a citation is resolved against.** A cited path *without* a line number is about the
   work's base, so it is resolved at `--ref` (the declared target by default). A `file:line`
-  citation is about the commit it was read at — typically a gate finding quoting a worker's HEAD,
-  where the file is longer than on the base — so it is resolved at `--citations-ref`. With no
-  citations ref supplied, such a citation is reported as unevaluable rather than resolved against
-  the base, which would false-positive on a citation that was perfectly valid at the reviewed
-  commit. Both refs are named in the output.
+  citation is about the commit it was *read at* — typically a gate finding quoting a worker's HEAD,
+  where the file is longer than on the base — which is what `--citations-ref` names. When you name
+  it, the answer is authoritative and a miss is a violation. When you do not, the citation is still
+  resolved, against the base, so pointing a worker at a line of existing code needs no flag at all;
+  but a miss there is reported as *unevaluable* rather than failed, because the line may perfectly
+  well exist at the commit it was read at. Both refs, and whether the citations ref was given or
+  defaulted, are named in the output.
 - **A check that cannot run never passes.** Exit `0` means every enabled rule was evaluated and
   passed, `1` that a rule was violated, `3` that at least one check *could not be evaluated* (an
-  unreachable remote, a ref that does not resolve), and `2` a usage error. One run reports every
-  violation, with the rule named and the offending text quoted.
+  unreachable remote, a ref that does not resolve, a line citation the base cannot settle), and `2`
+  a usage error. One run reports every violation, with the rule named and the offending text
+  quoted.
+- **A brief is untrusted input**, pasted from issues and written by agents, and two rules query git
+  once per item they find in it. So one run has an aggregate git budget (45s), the remote check
+  verifies at most 3 distinct targets, and at most 64 distinct cited paths are resolved. Whatever a
+  bound excludes is reported as unevaluable and named, never passed over.
 
 Per-project configuration lives in the repo's `AGENTS.md`, beside the delivery-mode line:
 

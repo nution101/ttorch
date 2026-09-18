@@ -414,10 +414,22 @@ Three properties are load-bearing:
 - **Three outcomes, three exit statuses.** Passed (0), a rule violated (1), and a check that COULD
   NOT be evaluated (3) are distinct. An unreachable remote, a ref that does not resolve, or a
   `file:line` citation with no ref to resolve it against is reported, never passed.
-- **The ref a citation is resolved against is explicit.** A bare path is resolved at the base
-  (`--ref`, defaulting to the brief's declared target); a `file:line` citation is resolved at
-  `--citations-ref`, the commit it was read at, because a gate finding legitimately cites a line
-  that exists at the reviewed commit and is past end-of-file on the base.
+- **The ref a citation is resolved against is explicit, and its default is useful.** A bare path
+  is resolved at the base (`--ref`, defaulting to the brief's declared target). A `file:line`
+  citation is about the commit it was read at, which `--citations-ref` names; a gate finding
+  legitimately cites a line that exists at the reviewed commit and is past end-of-file on the
+  base. Naming that ref makes the answer authoritative, so a miss is a violation. Leaving it
+  unset resolves the citation against the base anyway, because citing a line of existing code is
+  the most ordinary thing a brief does and must not need a flag, and downgrades a miss there to
+  CANNOT-EVALUATE: on the base a miss is ambiguous, and calling it a violation is the very false
+  positive the rule exists to avoid.
+- **Brief-driven work is bounded.** A brief is untrusted input, and two rules query git once per
+  item they find in it, one of them over the network. One run therefore shares a single aggregate
+  git deadline (`Options.Budget`, 45s by default, which every call derives from and which always
+  wins over the 20s per-call ceiling), the remote check verifies at most `maxRemoteTargets`
+  distinct branches, at most `maxCitations` distinct paths are resolved, line counts are memoized
+  per path, and a blob over `maxBlobBytes` is declined rather than read. Everything a bound
+  excludes is reported as CANNOT-EVALUATE and named.
 - **Per-project configuration, visible overrides.** `- brief-standards:` and
   `- brief-lint-disable:` lines in the repo's `AGENTS.md` (read anywhere in the file, like
   `- auto-mint-max-age:`) set the expected standards pointer and turn individual rules off. Every
