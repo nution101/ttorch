@@ -266,7 +266,7 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 	// written for superseded inputs is simply not there to be folded. Best-effort: the
 	// episode stamp written below rejects a surviving report anyway, so failing to archive
 	// one degrades to a re-review, never to counting it.
-	m.archivePriorReports(dir)
+	m.archivePriorReports(taskID, dir)
 	// The reviewers' diff is the COMMITTED three-dot diff `git diff <base>...<head>` (the
 	// merge-base diff against the branch's true base), so it contains ONLY the branch's own
 	// changes — never any lead the default gained since the branch was cut. The stale-base
@@ -340,10 +340,22 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 // Best-effort by design: correctness rests on the episode stamp (a report that predates it
 // folds as absent), and this only keeps a superseded review from sitting where the current
 // one belongs.
-func (m *Manager) archivePriorReports(dir string) {
-	// Every dimension that writes a "<dimension>.json" report into this dir: the gate's own
-	// set plus the advisory QA audit, which reads the same prep-staged inputs.
-	dims := append(append([]string(nil), requiredReviewers...), review.DimensionQA)
+//
+// The set it archives is the set the PREVIOUS episode prepared, read from the reviewers.json
+// this prep has not overwritten yet, so a repo that requires a dimension beyond the gate's
+// built-in three (appended to the prepared set after prep) has that dimension's superseded
+// report moved too. A fixed list would leave exactly those reports sitting where the current
+// episode's belong. The gate's own set and the advisory QA audit are unioned in, so a
+// dimension DROPPED from the prepared set, or a missing/malformed record, is still covered.
+func (m *Manager) archivePriorReports(taskID, dir string) {
+	var dims []string
+	seen := map[string]bool{}
+	for _, d := range append(append(m.ReviewersFor(taskID), requiredReviewers...), review.DimensionQA) {
+		if !seen[d] {
+			seen[d] = true
+			dims = append(dims, d)
+		}
+	}
 	var archive string
 	for _, dim := range dims {
 		report := filepath.Join(dir, dim+".json")

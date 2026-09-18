@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -305,4 +306,98 @@ func TestGateOnce_RedStagedValidateSurfacesBlock(t *testing.T) {
 	if !named {
 		t.Errorf("the gate_blocked event must say the staged validate was not green: %+v", evs)
 	}
+}
+
+// addPreparedDimension appends dim to the prepared reviewer set in reviewers.json, the way a
+// team that runs a dimension beyond the built-in three does it: prep writes the size-scaled
+// set, and the extra dimension is added to it afterwards so the fold requires that report too.
+func addPreparedDimension(t *testing.T, dir, dim string) {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(dir, reviewersFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var s scaledReviewers
+	if err := json.Unmarshal(b, &s); err != nil {
+		t.Fatal(err)
+	}
+	s.Dimensions = append(s.Dimensions, dim)
+	out, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, reviewersFileName), append(out, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// writeDimensionReport drops one dimension's report into dir, pinned to sha.
+func writeDimensionReport(t *testing.T, dir, dim, sha string) {
+	t.Helper()
+	b, err := json.Marshal(review.Report{Dimension: dim, ReviewedSHA: sha})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, dim+".json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestTrustPrep_ArchivesEveryPreparedDimension: the set a prep supersedes is the set the
+// PREVIOUS prep prepared, which reviewers.json records and which a repo can extend beyond the
+// gate's built-in three. Keying the archive off a fixed list leaves any added dimension's
+// superseded report sitting where the current episode's belongs.
+func TestTrustPrep_ArchivesEveryPreparedDimension(t *testing.T) {
+	const extra = "convention"
+	m, head, dir := preppedTrustedTask(t, "archivedims", "ad1", "exit 0")
+	addPreparedDimension(t, dir, extra)
+
+	writeReportsForPreppedInputs(t, dir, head, nil)
+	writeDimensionReport(t, dir, extra, head)
+	if got := m.ReviewersFor("ad1"); !containsDim(got, extra) {
+		t.Fatalf("the prepared set must include the added dimension, got %v", got)
+	}
+
+	// The task sits idle and is re-prepped. Every report the previous episode produced is
+	// superseded, the added dimension's included.
+	if _, err := m.TrustPrep("ad1"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, extra+".json")); err == nil {
+		t.Errorf("the %s report survived a re-prep, so a superseded review still sits where the current one belongs", extra)
+	}
+	archived, err := filepath.Glob(filepath.Join(dir, supersededDirName, "*", extra+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archived) == 0 {
+		t.Errorf("the %s report must be archived under superseded/, not dropped from the audit trail", extra)
+	}
+
+	// Characterization, not a guard on this change: it held before it too. The fold's freshness
+	// layer already rejected a superseded report for ANY dimension, added ones included, so the
+	// gap this test closes was the archive layer alone, not a dimension the gate would pass.
+	addPreparedDimension(t, dir, extra)
+	writeReportsForPreppedInputs(t, dir, head, nil)
+	restore := filepath.Join(dir, extra+".json")
+	writeDimensionReport(t, dir, extra, head)
+	backdateFile(t, restore, time.Hour)
+	v, err := m.TrustRecord("ad1", "", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Overall != review.Block {
+		t.Fatalf("verdict = %q, want %q: a report predating the prep satisfied the %s dimension", v.Overall, review.Block, extra)
+	}
+}
+
+// containsDim reports whether dims contains dim.
+func containsDim(dims []string, dim string) bool {
+	for _, d := range dims {
+		if d == dim {
+			return true
+		}
+	}
+	return false
 }
