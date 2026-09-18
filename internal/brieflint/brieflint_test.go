@@ -719,6 +719,13 @@ func TestTargetBranchFanOutIsCapped(t *testing.T) {
 	if !strings.Contains(capped.Detail, "origin/feature-") {
 		t.Fatalf("the report must name what went unchecked: %s", capped.Detail)
 	}
+	// Enough names to recognize what was skipped, not forty of them burying the report.
+	if n := strings.Count(capped.Detail, "origin/feature-"); n > namesInDetail {
+		t.Fatalf("the finding spells out %d names, want at most %d plus a count: %s", n, namesInDetail, capped.Detail)
+	}
+	if !strings.Contains(capped.Detail, "and 33 more") {
+		t.Fatalf("the finding must say how many more went unchecked: %s", capped.Detail)
+	}
 	if r.Outcome() == OutcomePass {
 		t.Fatal("a run that could not verify every target must not read as a pass")
 	}

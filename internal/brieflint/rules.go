@@ -89,7 +89,7 @@ func checkTargetBranch(ctx context.Context, b *brief, opt Options) ([]Finding, [
 			Rule:   RuleTargetBranch,
 			Status: StatusIndeterminate,
 			Detail: fmt.Sprintf("the brief names %d more %s/<branch> target(s) than the %d this rule verifies over the network (%s); name one target, or disable this rule for a brief that legitimately names many",
-				len(surplus), remote, maxRemoteTargets, strings.Join(targetNames(surplus), ", ")),
+				len(surplus), remote, maxRemoteTargets, joinCapped(targetNames(surplus), namesInDetail)),
 			Quote: surplus[0].quote,
 			Line:  surplus[0].line,
 		})
@@ -118,6 +118,19 @@ func checkTargetBranch(ctx context.Context, b *brief, opt Options) ([]Finding, [
 		}
 	}
 	return findings, notes
+}
+
+// namesInDetail caps how many names a finding spells out. The reader needs enough to
+// recognize what went unchecked; a finding that prints forty branch names buries every other
+// finding in the report.
+const namesInDetail = 5
+
+// joinCapped lists at most max names, then says how many more there were.
+func joinCapped(names []string, max int) string {
+	if len(names) <= max {
+		return strings.Join(names, ", ")
+	}
+	return fmt.Sprintf("%s, and %d more", strings.Join(names[:max], ", "), len(names)-max)
 }
 
 func targetNames(targets []target) []string {
