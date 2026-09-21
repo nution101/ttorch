@@ -63,6 +63,33 @@ func TestStdinIsInteractiveDevice(t *testing.T) {
 	}
 }
 
+// TestStdinIsInteractiveDevice_FailsClosedOnStatError: when the null device cannot be stat'd
+// the identity comparison cannot run, and the check must refuse rather than skip it. Skipping
+// would let /dev/null stdin read as interactive, which is the case the guard exists for.
+// Reaching this for real needs control of the process's view of /dev, which already defeats
+// the guard — the point is that a check which cannot evaluate does not pass.
+func TestStdinIsInteractiveDevice_FailsClosedOnStatError(t *testing.T) {
+	prev := devNullPath
+	devNullPath = filepath.Join(t.TempDir(), "no-such-null-device")
+	t.Cleanup(func() { devNullPath = prev })
+
+	if stdinIsInteractiveDevice(openInteractiveDevice(t)) {
+		t.Error("a stat error on the null device must refuse, not fall through to interactive")
+	}
+	// And through checkApproveCaller, with every OTHER reason to refuse removed: no worker
+	// context, and stdin on a character device that would otherwise be allowed. The stat
+	// error is then the only thing left that can produce a refusal.
+	clearWorkerContext(t)
+	swapApproveGuardStdin(t, openInteractiveDevice(t))
+	err := checkApproveCaller()
+	if err == nil {
+		t.Fatal("checkApproveCaller must refuse when the interactive test cannot evaluate")
+	}
+	if !strings.Contains(err.Error(), "interactive terminal") {
+		t.Fatalf("the refusal must come from the interactive test, got: %v", err)
+	}
+}
+
 // TestCheckApproveCaller_RefusesNonInteractive: an approve through a pipe — the shape a
 // wrapper, a script or an agent's shell tool produces — is refused.
 func TestCheckApproveCaller_RefusesNonInteractive(t *testing.T) {

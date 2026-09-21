@@ -26,6 +26,11 @@ import (
 // stdin.
 var approveGuardStdin = func() *os.File { return os.Stdin }
 
+// devNullPath is the null device the interactive test compares stdin against. It is a package
+// seam so a test can point it at a path that does not stat, and prove the check fails closed
+// rather than skipping the comparison.
+var devNullPath = os.DevNull
+
 // stdinIsInteractiveDevice reports whether f is a character device other than the null device.
 //
 // This is a character-device test, not a true isatty: it is the closest the standard library
@@ -40,10 +45,14 @@ func stdinIsInteractiveDevice(f *os.File) bool {
 	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
 		return false
 	}
-	if devnull, err := os.Stat(os.DevNull); err == nil && os.SameFile(fi, devnull) {
+	// Fail closed on a stat error: a check that cannot evaluate must not pass. Skipping the
+	// identity test here would let /dev/null stdin read as interactive, which is the exact
+	// case the guard exists for.
+	devnull, err := os.Stat(devNullPath)
+	if err != nil {
 		return false
 	}
-	return true
+	return !os.SameFile(fi, devnull)
 }
 
 // workerContextSignal names the signal that marks this process as running inside a worker's
