@@ -371,3 +371,196 @@ func TestProcessValidate_MemoDropsCheckOutput(t *testing.T) {
 		t.Fatalf("the memoized green must still authorize on reuse: green=%v reused=%v err=%v", green, reused, err)
 	}
 }
+
+// TestGateOnce_HonoursADispatchedReviewerAfterTheSetShrinks is the red proof for a defect an
+// adversarial review found: the gate aggregated over the dimensions required on THIS tick, not
+// over the ones it had actually dispatched.
+//
+// The required set can shrink mid-episode. requiredDimensions fails closed to all three when
+// reviewBase errors, so a transient git failure on one tick dispatches a security reviewer;
+// when the next tick resolves the base and the diff turns out docs-only, the set drops back to
+// {correctness, scope}. The security reviewer is already running, and if it comes back with a
+// critical finding pinned to this head, review.Aggregate over the shrunken set never reads its
+// report. The gate recorded a pass over a blocking finding it had asked for and received.
+//
+// Its tmux window and its bare mirror leaked in the same window, because teardownReviewers is
+// also called with the current set.
+func TestGateOnce_HonoursADispatchedReviewerAfterTheSetShrinks(t *testing.T) {
+	m, _, wt := trustHarness(t, "sh1", "trusted", "exit 0")
+	// A docs-only diff: the required set is {correctness, scope}, with no security reviewer.
+	if err := os.WriteFile(filepath.Join(wt, "NOTES.md"), []byte("# notes\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, wt, "add", "-A")
+	gitIn(t, wt, "commit", "-q", "-m", "docs")
+	head := gitIn(t, wt, "rev-parse", "HEAD")
+	dir, err := m.TrustPrep("sh1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, _, err := m.Store.GetTask(context.Background(), "sh1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	required, _ := m.requiredDimensions(task, head)
+	if got := strings.Join(required, " "); got != "correctness scope" {
+		t.Fatalf("the harness needs a docs-only diff for this test, got required = %q", got)
+	}
+
+	// The prior tick failed closed to all three and dispatched a security reviewer.
+	m.writeGateProgress(dir, gateProgress{
+		Head:         head,
+		Dims:         []string{review.DimensionCorrectness, review.DimensionScope, review.DimensionSecurity},
+		Attempts:     map[string]int{review.DimensionCorrectness: 1, review.DimensionScope: 1, review.DimensionSecurity: 1},
+		DispatchedAt: time.Now().Add(-time.Minute).UnixNano(),
+	})
+	workspace := m.reviewWorkspaceDir("sh1", review.DimensionSecurity)
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Every reviewer reports. The one that is no longer required found something critical.
+	writeCleanReport(t, dir, review.DimensionCorrectness, head)
+	writeCleanReport(t, dir, review.DimensionScope, head)
+	b, err := json.Marshal(review.Report{
+		Dimension: review.DimensionSecurity, ReviewedSHA: head,
+		Findings: []review.Finding{{
+			Dimension: review.DimensionSecurity, Severity: review.SeverityCritical,
+			Reviewer: "ttorch-reviewer-security", Summary: "unauthenticated path traversal in the new handler",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, review.DimensionSecurity+".json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := m.GateOnce("sh1")
+	if err != nil {
+		t.Fatalf("GateOnce: %v", err)
+	}
+	if out != GateBlocked {
+		t.Fatalf("a critical finding from a reviewer the gate dispatched must block, got outcome %q", out)
+	}
+	if !hasGateBlockedEvent(t, m, "sh1") {
+		t.Fatal("the block must be surfaced for the manager to adjudicate")
+	}
+	if _, err := os.Stat(m.P.ApprovalFile("sh1")); err == nil {
+		t.Fatal("no approval may be minted over a blocking finding")
+	}
+	if v, ok, _ := m.Store.GetVerdict(context.Background(), "sh1"); ok && v.Overall == review.Pass {
+		t.Fatal("a passing verdict was recorded over a critical finding the gate had asked for")
+	}
+	if _, err := os.Stat(workspace); !os.IsNotExist(err) {
+		t.Fatalf("the dropped dimension's workspace leaked: stat err = %v", err)
+	}
+}
+
+// TestGateOnce_DroppedDimensionWithNoReportDoesNotWedge is the wedge direction. Folding an
+// extra dimension must never turn into REQUIRING it: the dispatch loop stops polling a
+// dimension that left the required set, so if the gate then demanded its report the episode
+// would wait forever and time out on a reviewer nothing is going to re-dispatch. An extra is
+// folded only when its report is present and pinned, so a silent one is simply not folded.
+func TestGateOnce_DroppedDimensionWithNoReportDoesNotWedge(t *testing.T) {
+	m, dir, head := shrunkSetHarness(t, "sh2")
+	writeCleanReport(t, dir, review.DimensionCorrectness, head)
+	writeCleanReport(t, dir, review.DimensionScope, head)
+	// The security reviewer was dispatched and never reported.
+
+	out, err := m.GateOnce("sh2")
+	if err != nil {
+		t.Fatalf("GateOnce: %v", err)
+	}
+	if out != GateRecorded {
+		t.Fatalf("a dropped dimension that never reported must not hold up the gate, got %q", out)
+	}
+	if v, ok, _ := m.Store.GetVerdict(context.Background(), "sh2"); !ok || v.Overall != review.Pass {
+		t.Fatalf("the required dimensions were clean, so the verdict must pass: ok=%v %+v", ok, v)
+	}
+}
+
+// TestGateOnce_DroppedDimensionReportingCleanStillPasses is the other must-not-trip case:
+// folding an extra reviewer's CLEAN report adds no findings and must leave the pass alone.
+func TestGateOnce_DroppedDimensionReportingCleanStillPasses(t *testing.T) {
+	m, dir, head := shrunkSetHarness(t, "sh3")
+	writeCleanReport(t, dir, review.DimensionCorrectness, head)
+	writeCleanReport(t, dir, review.DimensionScope, head)
+	writeCleanReport(t, dir, review.DimensionSecurity, head)
+
+	out, err := m.GateOnce("sh3")
+	if err != nil {
+		t.Fatalf("GateOnce: %v", err)
+	}
+	if out != GateRecorded {
+		t.Fatalf("every report clean must record, got %q", out)
+	}
+	if v, ok, _ := m.Store.GetVerdict(context.Background(), "sh3"); !ok || v.Overall != review.Pass {
+		t.Fatalf("a clean extra report must not block: ok=%v %+v", ok, v)
+	}
+	if _, err := os.Stat(m.P.ApprovalFile("sh3")); err != nil {
+		t.Fatalf("a trusted pass over a green tree must auto-mint: %v", err)
+	}
+}
+
+// shrunkSetHarness builds the mid-episode shrink: a docs-only diff (so the required set is
+// {correctness, scope}) whose gate episode already dispatched all three, as requiredDimensions'
+// fail-closed fallback does when it cannot resolve the review base. It returns the manager, the
+// review-inputs dir, and the reviewed head.
+func shrunkSetHarness(t *testing.T, id string) (*Manager, string, string) {
+	t.Helper()
+	m, _, wt := trustHarness(t, id, "trusted", "exit 0")
+	if err := os.WriteFile(filepath.Join(wt, "NOTES.md"), []byte("# notes\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, wt, "add", "-A")
+	gitIn(t, wt, "commit", "-q", "-m", "docs")
+	head := gitIn(t, wt, "rev-parse", "HEAD")
+	dir, err := m.TrustPrep(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.writeGateProgress(dir, gateProgress{
+		Head:         head,
+		Dims:         []string{review.DimensionCorrectness, review.DimensionScope, review.DimensionSecurity},
+		Attempts:     map[string]int{review.DimensionCorrectness: 1, review.DimensionScope: 1, review.DimensionSecurity: 1},
+		DispatchedAt: time.Now().Add(-time.Minute).UnixNano(),
+	})
+	return m, dir, head
+}
+
+// TestFoldDimensions_IgnoresTheAdvisoryAudits is the constraint that decides HOW the extras are
+// found. The standalone security audit and the qa audit write into the same review-inputs dir
+// as the trust gate, and both are advisory by design: neither may ever gate a merge. So the
+// extras must come from what the gate episode actually dispatched, never from "whatever report
+// files exist" — a qa.json sitting in the dir, blocking findings and all, must be invisible to
+// the trust fold.
+func TestFoldDimensions_IgnoresTheAdvisoryAudits(t *testing.T) {
+	m, _, wt := trustHarness(t, "fd1", "trusted", "exit 0")
+	head := commitCodeFiles(t, wt)
+	dir := m.P.ReviewInputsDir("fd1")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(review.Report{
+		Dimension: review.DimensionQA, ReviewedSHA: head,
+		Findings: []review.Finding{{Dimension: review.DimensionQA, Severity: review.SeverityCritical, Summary: "no tests"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, review.DimensionQA+".json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	required := []string{review.DimensionCorrectness, review.DimensionScope, review.DimensionSecurity}
+	got := m.foldDimensions(dir, head, required, nil)
+	if strings.Join(got, " ") != strings.Join(required, " ") {
+		t.Fatalf("an advisory qa.json must not enter the trust fold, got %v", got)
+	}
+	// It is folded only when the gate itself dispatched that dimension.
+	got = m.foldDimensions(dir, head, required, []string{review.DimensionQA})
+	if len(got) != len(required)+1 {
+		t.Fatalf("a dimension the gate dispatched and that reported must be folded, got %v", got)
+	}
+}

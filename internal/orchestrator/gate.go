@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -167,6 +168,65 @@ func quotedNames(names []string) string {
 		out = append(out, review.SafeQuote(n))
 	}
 	return strings.Join(out, ", ")
+}
+
+// dispatchedDimensions returns every dimension this episode has actually dispatched a reviewer
+// for: prog.Dims (the set decided at the episode boundary) plus every key of prog.Attempts (a
+// dimension the dispatch loop launched on a later tick, which prog.Dims does not record).
+// Sorted, so teardown and aggregation are deterministic.
+func dispatchedDimensions(prog gateProgress) []string {
+	seen := make(map[string]bool, len(prog.Dims)+len(prog.Attempts))
+	var out []string
+	for _, d := range prog.Dims {
+		if d != "" && !seen[d] {
+			seen[d] = true
+			out = append(out, d)
+		}
+	}
+	for d := range prog.Attempts {
+		if d != "" && !seen[d] {
+			seen[d] = true
+			out = append(out, d)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// foldDimensions returns the dimensions review.Aggregate must fold for head: every REQUIRED
+// dimension, plus any dimension this episode DISPATCHED that is no longer required but has
+// left a report pinned to head.
+//
+// The required set can shrink mid-episode. requiredDimensions fails closed to all three when
+// it cannot resolve the review base, so a transient git failure on one tick dispatches a
+// security reviewer, and a later tick that resolves the base over a docs-only diff drops back
+// to {correctness, scope}. Folding only the current set would discard that reviewer's report —
+// so a critical finding the gate itself asked for and received would be thrown away and the
+// verdict recorded as a pass.
+//
+// An extra is folded ONLY when its report is present and pinned to head, so a dimension that
+// fell out of the set and never reported cannot wedge the gate: the dispatch loop no longer
+// polls it and Aggregate is never asked to require it. Folding is therefore monotone — it can
+// add findings, never drop a requirement.
+//
+// The extras come from the episode's own dispatch record and never from "whatever report files
+// happen to exist". The advisory audits write qa.json and security.json into this same
+// directory (QAReview, SecurityAudit), and those are advisory by design: neither may ever gate
+// a merge, so neither may be picked up here.
+func (m *Manager) foldDimensions(dir, head string, required, dispatched []string) []string {
+	out := append([]string(nil), required...)
+	have := make(map[string]bool, len(required))
+	for _, d := range required {
+		have[d] = true
+	}
+	for _, d := range dispatched {
+		if have[d] || !m.reviewReportPinned(dir, d, head) {
+			continue
+		}
+		have[d] = true
+		out = append(out, d)
+	}
+	return out
 }
 
 // ReviewDiff returns a worker's changes against the repo's default branch.
@@ -625,7 +685,18 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 	if err := review.ValidateDimensionSet(required); err != nil {
 		return zero, err
 	}
-	verdict, err := review.Aggregate(m.P.ReviewInputsDir(taskID), sha, required)
+	// The set is widened by any dimension the daemon's gate episode for THIS sha dispatched
+	// that is no longer required but reported anyway (foldDimensions). Without that, a manager
+	// running `ttorch trust record` by hand after the daemon blocked on such a reviewer would
+	// record a pass and discard its findings; the two paths must fold the identical set. A
+	// task with no gate episode (the manual flow throughout) has no extras.
+	inputs := m.P.ReviewInputsDir(taskID)
+	var dispatched []string
+	if prog := m.readGateProgress(inputs); prog.Head == sha {
+		dispatched = dispatchedDimensions(prog)
+	}
+	dims := m.foldDimensions(inputs, sha, required, dispatched)
+	verdict, err := review.Aggregate(inputs, sha, dims)
 	if err != nil {
 		return zero, err
 	}
@@ -1073,7 +1144,7 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 	// / stale base) is the worker's to fix (commit / rebase), not the daemon's: surface it
 	// once and mark the head terminal so the pass does not re-prep every tick.
 	if prog.Head != head {
-		m.teardownReviewers(taskID, prog.Dims)
+		m.teardownReviewers(taskID, dispatchedDimensions(prog))
 		if _, err := m.TrustPrep(taskID); err != nil {
 			m.surfaceGateBlocked(taskID, head, "gate prep refused: "+err.Error())
 			m.writeGateProgress(dir, gateProgress{Head: head, Outcome: gateOutcomeBlocked})
@@ -1146,7 +1217,7 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 			m.surfaceGateBlocked(taskID, head, fmt.Sprintf("reviewer %q produced no report after %d attempt(s)", dim, maxReviewerAttempts))
 			prog.Outcome = gateOutcomeBlocked
 			m.writeGateProgress(dir, prog)
-			m.teardownReviewers(taskID, dims)
+			m.teardownReviewers(taskID, unionDimensions(dims, dispatchedDimensions(prog)))
 			return GateBlocked, nil
 		}
 		toDispatch = append(toDispatch, dim)
@@ -1179,16 +1250,20 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 			m.surfaceGateBlocked(taskID, head, fmt.Sprintf("reviewers did not all report within %s", reviewerTimeout))
 			prog.Outcome = gateOutcomeBlocked
 			m.writeGateProgress(dir, prog)
-			m.teardownReviewers(taskID, dims)
+			m.teardownReviewers(taskID, unionDimensions(dims, dispatchedDimensions(prog)))
 			return GateBlocked, nil
 		}
 		return GateWaiting, nil
 	}
 
-	// Every required dimension has a report pinned to head. Aggregate to decide pass vs block.
-	// review.Aggregate is the SAME deterministic fold the manager's `trust record` uses; the
-	// daemon does not fork it.
-	v, err := review.Aggregate(dir, head, dims)
+	// Every required dimension has a report pinned to head. Aggregate to decide pass vs block,
+	// over the required set PLUS any dimension this episode dispatched that is no longer
+	// required but reported anyway (see foldDimensions) — a blocking finding from a reviewer
+	// the gate itself asked for is never discarded because the set shrank under it.
+	// review.Aggregate is the SAME deterministic fold the manager's `trust record` uses, and
+	// TrustRecord derives the same extras, so the daemon does not fork the decision.
+	fold := m.foldDimensions(dir, head, dims, dispatchedDimensions(prog))
+	v, err := review.Aggregate(dir, head, fold)
 	if err != nil {
 		// Only a stale-sha mismatch makes Aggregate error, which reviewReportPinned already
 		// excludes — so this is unexpected. Treat it as not-yet-ready (record nothing); the next
@@ -1202,7 +1277,7 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 		m.surfaceGateBlocked(taskID, head, "adversarial review blocked: "+strings.Join(review.Describe(v), "; "))
 		prog.Outcome = gateOutcomeBlocked
 		m.writeGateProgress(dir, prog)
-		m.teardownReviewers(taskID, dims)
+		m.teardownReviewers(taskID, unionDimensions(fold, dispatchedDimensions(prog)))
 		return GateBlocked, nil
 	}
 
@@ -1219,7 +1294,7 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 	}
 	prog.Outcome = gateOutcomeRecorded
 	m.writeGateProgress(dir, prog)
-	m.teardownReviewers(taskID, dims)
+	m.teardownReviewers(taskID, unionDimensions(fold, dispatchedDimensions(prog)))
 	m.audit(fmt.Sprintf("gate-record task=%s commit=%s verdict=pass actor=daemon", taskID, short(head)))
 	return GateRecorded, nil
 }
