@@ -1857,6 +1857,21 @@ func cmdApprove(args []string) error {
 	return nil
 }
 
+// reviewerRunLine renders the instruction `ttorch trust prep` prints for the manager: which
+// reviewers to run over the prepared inputs. The manager acts on that line, dispatching a
+// reviewer per name and having each write a report at a path built from its name, so the
+// line is a sink for the prepared set just as the Go paths are. The set comes from
+// reviewers.json in a worker-reachable directory, so an unusable name is refused rather than
+// printed: it would otherwise send the manager to a path outside the review dir, and a name
+// carrying newlines would add lines of its own to the terminal the manager is reading.
+func reviewerRunLine(id string, dims []string) (string, error) {
+	if err := review.ValidateDimensionSet(dims); err != nil {
+		return "", fmt.Errorf("%w; fix the prepared reviewer set before running the reviewers", err)
+	}
+	return fmt.Sprintf("  run the %d reviewer(s) for this diff (%s), then: ttorch trust record %s",
+		len(dims), strings.Join(dims, " | "), id), nil
+}
+
 func cmdTrust(args []string) error {
 	if len(args) < 2 {
 		return errors.New("usage: ttorch trust prep|record|show <task-id> [flags]")
@@ -1873,10 +1888,12 @@ func cmdTrust(args []string) error {
 		if err != nil {
 			return err
 		}
-		dims := m.ReviewersFor(id)
+		line, err := reviewerRunLine(id, m.ReviewersFor(id))
+		if err != nil {
+			return err
+		}
 		fmt.Printf("prepared review inputs for %s in %s\n", id, dir)
-		fmt.Printf("  run the %d reviewer(s) for this diff (%s), then: ttorch trust record %s\n",
-			len(dims), strings.Join(dims, " | "), id)
+		fmt.Println(line)
 		return nil
 	case "record":
 		fs := flag.NewFlagSet("trust record", flag.ContinueOnError)

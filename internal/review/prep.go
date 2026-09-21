@@ -153,6 +153,21 @@ func ValidDimensionName(name string) bool {
 	return true
 }
 
+// ValidateDimensionSet checks every name in a prepared reviewer set, returning an error
+// naming the first unusable one. Consumers of the set call it before acting on the set at
+// all: the set is read back from reviewers.json in a worker-writable directory, and its
+// names go on to become file paths, tmux targets, and instructions printed for the manager.
+// The bad name is quoted in the error (%q), so a name carrying newlines or control
+// characters cannot put extra lines on whatever reads the message.
+func ValidateDimensionSet(dims []string) error {
+	for _, d := range dims {
+		if !ValidDimensionName(d) {
+			return fmt.Errorf("unusable review dimension name %q in the prepared reviewer set", d)
+		}
+	}
+	return nil
+}
+
 // InputPath returns the path of the dimension-named file "<dim><suffix>" inside a review
 // inputs dir, refusing any dimension name that could name something other than a plain child
 // of that dir (ValidDimensionName). Every sink that turns a dimension into a path goes

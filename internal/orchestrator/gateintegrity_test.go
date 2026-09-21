@@ -583,20 +583,27 @@ func TestSpawnReviewer_RefusesAnUnusableDimensionName(t *testing.T) {
 	}
 }
 
-// TestNoUnvalidatedDimensionPathJoins is the guard for the sink after the ones fixed here.
-// Every path built from a dimension name must go through review.InputPath, so a new call
-// site cannot reintroduce the traversal by joining the name itself. It scans the non-test
-// sources for a filepath.Join that mentions a dimension variable.
-func TestNoUnvalidatedDimensionPathJoins(t *testing.T) {
-	// The one place a dimension name may legitimately be joined into a path.
-	allowed := map[string]bool{"internal/review/prep.go": true}
-	root := ".."
+// TestNoUnvalidatedDimensionSink is the guard for the sink after the ones fixed here. A
+// dimension name must not reach a filesystem call without going through review.InputPath,
+// which validates it first. The scan walks the WHOLE repository, cmd/ included, and looks for
+// any file-touching call on a line that also mentions a dimension variable, not only
+// filepath.Join: a sink can build a path by concatenation just as easily.
+//
+// What it does not cover, stated so nobody reads it as more than it is: a dimension name
+// reaching the manager as TEXT rather than as a path. internal/cli validates the prepared set
+// before printing it, but no scan enforces that. Closing that class properly means a distinct
+// type for a validated name, so an unvalidated string cannot be passed at all, and that
+// changes ReviewersFor's signature.
+func TestNoUnvalidatedDimensionSink(t *testing.T) {
+	// The one place a dimension name may legitimately be turned into a path.
+	const allowed = "internal/review/prep.go"
+	root := filepath.Join("..", "..")
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 			return err
 		}
-		rel := filepath.ToSlash(strings.TrimPrefix(path, "../"))
-		if allowed["internal/"+rel] {
+		rel := filepath.ToSlash(strings.TrimPrefix(filepath.Clean(path), filepath.Clean(root)+string(filepath.Separator)))
+		if rel == allowed {
 			return nil
 		}
 		b, err := os.ReadFile(path)
@@ -604,13 +611,11 @@ func TestNoUnvalidatedDimensionPathJoins(t *testing.T) {
 			return err
 		}
 		for i, line := range strings.Split(string(b), "\n") {
-			if !strings.Contains(line, "filepath.Join(") {
+			if !fileSink.MatchString(line) || !dimensionToken.MatchString(line) {
 				continue
 			}
-			if dimensionToken.MatchString(line) {
-				t.Errorf("internal/%s:%d joins a dimension name into a path by hand; use review.InputPath so the name is validated:\n\t%s",
-					rel, i+1, strings.TrimSpace(line))
-			}
+			t.Errorf("%s:%d builds a filesystem call from a dimension name; use review.InputPath so the name is validated:\n\t%s",
+				rel, i+1, strings.TrimSpace(line))
 		}
 		return nil
 	})
@@ -618,6 +623,10 @@ func TestNoUnvalidatedDimensionPathJoins(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// fileSink matches a call that touches the filesystem, so a dimension name on the same line
+// is being turned into a path one way or another.
+var fileSink = regexp.MustCompile(`filepath\.Join\(|os\.(WriteFile|ReadFile|Open|OpenFile|Create|Rename|Remove|RemoveAll|Stat|Mkdir|MkdirAll|ReadDir)\(|exec\.Command\(`)
 
 // dimensionToken matches an identifier a dimension name is carried in.
 var dimensionToken = regexp.MustCompile(`\b(dim|dimension)\b`)

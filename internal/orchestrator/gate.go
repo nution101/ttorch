@@ -897,14 +897,12 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 	// One unusable name stops the episode here: the fold would block on it anyway, and the
 	// alternative is handing it to the launcher. This checks the NAMES only; which dimensions
 	// are required, and where the set comes from, are not this pass's business.
-	for _, dim := range dims {
-		if !review.ValidDimensionName(dim) {
-			m.surfaceGateBlocked(taskID, head, fmt.Sprintf("the prepared reviewer set contains an unusable dimension name %q", dim))
-			prog.Outcome = gateOutcomeBlocked
-			m.writeGateProgress(dir, prog)
-			m.teardownReviewers(taskID, dims)
-			return GateBlocked, nil
-		}
+	if err := review.ValidateDimensionSet(dims); err != nil {
+		m.surfaceGateBlocked(taskID, head, err.Error())
+		prog.Outcome = gateOutcomeBlocked
+		m.writeGateProgress(dir, prog)
+		m.teardownReviewers(taskID, dims)
+		return GateBlocked, nil
 	}
 	if prog.Attempts == nil {
 		prog.Attempts = map[string]int{}
@@ -1153,7 +1151,8 @@ func (m *Manager) spawnReviewer(taskID, dim, inputsDir, head, repo, wt string) e
 	// co-author trailer) so the reviewer runs autonomously, exactly like a worker spawn.
 	_ = harness.WriteWorkerSettings(h, wt)
 	harness.TrustWorktree(h, repo, wt)
-	if err := os.WriteFile(briefPath, []byte(reviewerBrief(taskID, dim, inputsDir, head, reportPath)), 0o644); err != nil {
+	brief := reviewerBrief(taskID, dim, inputsDir, head, reportPath)
+	if err := os.WriteFile(briefPath, []byte(brief), 0o644); err != nil {
 		return err
 	}
 	if err := m.newWindow(window, wt, "review · "+dim+" · "+taskID); err != nil {
