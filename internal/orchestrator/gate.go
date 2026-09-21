@@ -100,8 +100,20 @@ func (m *Manager) requiredDimensions(taskID, sha string) (required, dropped []st
 func droppedDimensionFinding(dropped []string) review.Finding {
 	return review.Finding{
 		Dimension: "review", Severity: review.SeverityHigh, Reviewer: "ttorch",
-		Summary: fmt.Sprintf("the prepared reviewer set on disk no longer lists %s, which the prep for this commit prepared; the review inputs were edited after the prep", strings.Join(dropped, ", ")),
+		Summary: fmt.Sprintf("the prepared reviewer set on disk no longer lists %s, which the prep for this commit prepared; the review inputs were edited after the prep", quotedNames(dropped)),
 	}
+}
+
+// quotedNames renders dimension names for a message a person reads. The names come from
+// files in the review inputs dir, so they are quoted even here, where they have usually
+// already passed validation: a summary is composed before anyone knows which path produced
+// it, and an unquoted name in a sentence is how the last three of these started.
+func quotedNames(names []string) string {
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		out = append(out, review.SafeQuote(n))
+	}
+	return strings.Join(out, ", ")
 }
 
 // ReviewDiff returns a worker's changes against the repo's default branch.
@@ -935,31 +947,30 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 		return GateSkipped, nil
 	}
 
-	// Re-derive the required reviewer set from the AUTHORITATIVE record (reviewers.json, what
-	// TrustPrep wrote) every tick rather than trusting the persisted prog.Dims, so the daemon
-	// dispatches, polls, AND aggregates EXACTLY the set TrustRecord will aggregate (which also
-	// reads ReviewersFor). That alignment removes any chance of recording a verdict over a
-	// different set than was reviewed: GateOnce's pass-decision and TrustRecord's record fold the
-	// identical dimensions. reviewers.json is stable within an episode (TrustPrep writes it once
-	// per head) and ReviewersFor fail-safes to the full three-dimension set if it is ever missing
-	// or malformed, so this never under-reviews. prog.Dims remains only the cache the NEXT
-	// episode's reset tears down.
+	// Re-derive the required reviewer set every tick rather than trusting the persisted
+	// prog.Dims, so the daemon dispatches, polls, AND aggregates EXACTLY the set TrustRecord
+	// will aggregate (which resolves it the same way). That alignment removes any chance of
+	// recording a verdict over a different set than was reviewed. The set comes from the prep
+	// stamp, not from reviewers.json: requiredDimensions treats the stamped set as the floor
+	// and lets the file only add to it, and it fails safe to the full built-in set when no
+	// stamp covers this head, so this never under-reviews.
 	dims, dropped := m.requiredDimensions(taskID, head)
-	if len(dropped) > 0 {
-		// The set shrank after prep: the inputs dir was edited during the review, which is
-		// how a blocking report gets hidden. The manager adjudicates that, not the daemon.
-		m.surfaceGateBlocked(taskID, head, droppedDimensionFinding(dropped).Summary)
+	// VALIDATE BEFORE COMPOSING ANYTHING FOR THE MANAGER. Both records these names come from
+	// are files in the review inputs dir, and the gate_blocked payload below is the channel
+	// the manager acts on, so an unusable name must be caught here rather than quoted into a
+	// sentence about something else. The fold would block on it anyway; this is about what
+	// reaches the manager and in what words.
+	if err := review.ValidateDimensionSet(dims); err != nil {
+		m.surfaceGateBlocked(taskID, head, err.Error())
 		prog.Outcome = gateOutcomeBlocked
 		m.writeGateProgress(dir, prog)
 		m.teardownReviewers(taskID, dims)
 		return GateBlocked, nil
 	}
-	// Every name in that set is about to become a file path, a tmux target, and the report
-	// path a reviewer is told to write, and the file half of the set is worker-rewritable.
-	// One unusable name stops the episode here: the fold would block on it anyway, and the
-	// alternative is handing it to the launcher.
-	if err := review.ValidateDimensionSet(dims); err != nil {
-		m.surfaceGateBlocked(taskID, head, err.Error())
+	if len(dropped) > 0 {
+		// The set shrank after prep: the inputs dir was edited during the review, which is
+		// how a blocking report gets hidden. The manager adjudicates that, not the daemon.
+		m.surfaceGateBlocked(taskID, head, droppedDimensionFinding(dropped).Summary)
 		prog.Outcome = gateOutcomeBlocked
 		m.writeGateProgress(dir, prog)
 		m.teardownReviewers(taskID, dims)

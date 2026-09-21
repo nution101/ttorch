@@ -748,3 +748,75 @@ func shrinkPreparedSet(t *testing.T, dir string, dims []string) {
 		t.Fatal(err)
 	}
 }
+
+// forgePreparedDimensions rewrites the prep stamp's dimension list, as anything that can
+// write the inputs dir can. It keeps the rest of the stamp intact so the episode still
+// covers the commit.
+func forgePreparedDimensions(t *testing.T, dir string, dims []string) {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(dir, review.PrepStampFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stamp review.PrepStamp
+	if err := json.Unmarshal(b, &stamp); err != nil {
+		t.Fatal(err)
+	}
+	stamp.Dimensions = dims
+	out, err := json.MarshalIndent(stamp, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, review.PrepStampFile), append(out, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestGateOnce_ValidatesNamesBeforeBuildingThePayload: the gate_blocked payload is the
+// manager's actionable channel, so nothing unvalidated may be composed into it. A name read
+// out of a forged stamp reached that payload before ValidateDimensionSet ran, which put text
+// of the attacker's choosing in front of the manager in the name of a dropped dimension.
+func TestGateOnce_ValidatesNamesBeforeBuildingThePayload(t *testing.T) {
+	const escape = "../../evil"
+	m, _ := trustedTaskWithSubstantialDiff(t, "gate-order", "go1")
+	t.Cleanup(func() { _, _ = m.Teardown("go1", true) })
+	recordingReviewer(t, false)
+
+	if out, err := m.GateOnce("go1"); err != nil || out != GateDispatched {
+		t.Fatalf("tick1 = (%q, %v), want dispatched", out, err)
+	}
+	dir := m.P.ReviewInputsDir("go1")
+	// The stamp gains a name reviewers.json does not have, so it is both unusable AND
+	// "dropped": whichever check runs first decides what the manager is told.
+	forgePreparedDimensions(t, dir, append(m.ReviewersFor("go1"), escape))
+
+	if out, err := m.GateOnce("go1"); err != nil || out != GateBlocked {
+		t.Fatalf("tick2 = (%q, %v), want blocked", out, err)
+	}
+	payload := gateBlockedPayload(t, m, "go1")
+	if !strings.Contains(payload, "unusable") {
+		t.Errorf("the name must be validated before the payload is built; payload = %q", payload)
+	}
+	if strings.Contains(payload, escape) && !strings.Contains(payload, `"`+escape+`"`) {
+		t.Errorf("an unusable name reached the manager's payload unquoted: %q", payload)
+	}
+}
+
+// gateBlockedPayload returns the most recent gate_blocked payload for id.
+func gateBlockedPayload(t *testing.T, m *Manager, id string) string {
+	t.Helper()
+	evs, err := m.Store.EventsSince(context.Background(), 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := ""
+	for _, e := range evs {
+		if e.EntityID == id && e.Type == db.EventGateBlocked {
+			payload = e.Payload
+		}
+	}
+	if payload == "" {
+		t.Fatalf("no gate_blocked event for %s", id)
+	}
+	return payload
+}
