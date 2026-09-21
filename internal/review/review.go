@@ -298,34 +298,54 @@ func Describe(v Verdict) []string {
 		if f.Reviewer != "" {
 			summary = "[" + SafeQuote(f.Reviewer) + "] " + summary
 		}
-		sev := SafeLine(string(f.Severity))
-		if sev == "" {
-			sev = "unknown"
+		// Severity is as reviewer-controlled as the rest of the report, and it lands where
+		// ttorch's own severity token goes, so it is quoted like the others: unquoted, a
+		// finding can put a sentence of its own choosing in the position a reader takes for
+		// ttorch's assessment.
+		sev := SafeQuote(string(f.Severity))
+		if f.Severity == "" {
+			sev = SafeQuote("unknown")
 		}
-		out = append(out, fmt.Sprintf("%-9s %s", sev, summary))
+		out = append(out, fmt.Sprintf("%-11s %s", sev, summary))
 	}
 	return out
 }
 
-// SafeLine renders untrusted text as a single line with no control bytes: newlines, returns,
-// tabs and escape sequences become spaces, so nothing a reviewer writes can start a line, move
-// a cursor, or clear a terminal. Runs of resulting spaces are collapsed so the text stays
-// readable. It is the last-resort boundary for text whose provenance a printer cannot see;
-// where the provenance IS known to be reviewer-authored, SafeQuote says so visibly.
+// SafeLine renders untrusted text as a single printable line. It keeps only the runes
+// unicode.IsPrint accepts (letters, marks, numbers, punctuation, symbols and the ASCII
+// space); a rune that is any kind of space, line break or control character becomes a single
+// space, and anything else non-printing is dropped. Runs of spaces collapse and the result
+// is trimmed.
+//
+// Stated as a property rather than a list, because the list is what goes stale: the output
+// can contain no rune that a renderer treats as a line break, since nothing outside IsPrint
+// survives. A deny-list of the line breaks one can think of does not hold up. U+2028 LINE
+// SEPARATOR and U+2029 PARAGRAPH SEPARATOR are the demonstration: they break lines in most
+// renderers and are neither control characters (unicode.IsControl) nor format characters
+// (unicode.Cf), so a check naming those two categories passed them straight through.
+//
+// It is the last-resort boundary for text whose provenance a printer cannot see. Where the
+// provenance IS known to be reviewer-authored, SafeQuote says so visibly.
 func SafeLine(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
 	space := false
-	for _, r := range s {
-		if r == '\t' || r == '\n' || r == '\r' || unicode.IsControl(r) || r == '\uFEFF' || unicode.Is(unicode.Cf, r) {
+	for _, r := range strings.ToValidUTF8(s, "\uFFFD") {
+		switch {
+		case r == ' ' || unicode.IsSpace(r) || unicode.IsControl(r) || unicode.In(r, unicode.Zl, unicode.Zp):
+			// Every separator, visible or not, becomes one space: a break must not join two
+			// words into one, and must not stay a break.
 			space = true
-			continue
+		case unicode.IsPrint(r):
+			if space && b.Len() > 0 {
+				b.WriteRune(' ')
+			}
+			space = false
+			b.WriteRune(r)
+		default:
+			// Invisible formatting, private use, surrogates, unassigned: nothing a reader
+			// would see, so dropped rather than spaced.
 		}
-		if space && b.Len() > 0 {
-			b.WriteRune(' ')
-		}
-		space = false
-		b.WriteRune(r)
 	}
 	return strings.TrimSpace(b.String())
 }
