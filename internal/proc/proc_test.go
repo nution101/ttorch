@@ -5,7 +5,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -19,11 +21,24 @@ import (
 // made an earlier version of this test report a leak roughly one run in five. The property
 // under test is whether the child outlives the deadline, so the fixture must not be able to
 // half-outlive it.
-const helperEnv = "TTORCH_PROC_TEST_CHILD"
+const (
+	helperEnv = "TTORCH_PROC_TEST_CHILD" // "[setsid ]<sleep-duration> <marker-path>"
+	// helperPIDEnv names a file the child writes its own pid to before it does anything
+	// else. Cleanup needs it: a child that calls setsid is in a session of its own, so the
+	// group kill that reaps the rest of the fixture cannot reach it by any pid the parent
+	// knows.
+	helperPIDEnv = "TTORCH_PROC_TEST_CHILD_PIDFILE"
+)
 
 func TestMain(m *testing.M) {
 	if v := os.Getenv(helperEnv); v != "" {
-		// v is "[setsid ]<sleep-duration> <marker-path>".
+		// Record the pid first, before anything that can change how reachable this process
+		// is, so cleanup can always find it.
+		if f := os.Getenv(helperPIDEnv); f != "" {
+			if err := os.WriteFile(f, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+				os.Exit(5)
+			}
+		}
 		if rest, ok := strings.CutPrefix(v, "setsid "); ok {
 			// Leave the process group, so a kill aimed at the group cannot reach this
 			// process. The pipe it inherited stays open either way.
@@ -57,11 +72,42 @@ func hangingCommand(t *testing.T, ctx context.Context, marker string, wait time.
 		t.Fatal(err)
 	}
 	c := Command(ctx, "sh", "-c", fmt.Sprintf("%q & sleep 120", self))
-	c.Env = append(os.Environ(), fmt.Sprintf("%s=%s%s %s", helperEnv, strings.Join(opts, ""), wait, marker))
+	pidFile := marker + ".childpid"
+	c.Env = append(os.Environ(),
+		fmt.Sprintf("%s=%s%s %s", helperEnv, strings.Join(opts, ""), wait, marker),
+		fmt.Sprintf("%s=%s", helperPIDEnv, pidFile),
+	)
+	t.Cleanup(func() { reapFixture(c, pidFile) })
 	var out bytes.Buffer
 	c.Stdout = &out
 	c.Stderr = &out
 	return &out, c.Run
+}
+
+// reapFixture kills whatever the fixture still has running. Every test here starts a
+// process built to outlive its deadline, so without this a passing run leaves the escaped
+// child at ppid 1 for the length of its sleep, and a run where the group kill regressed
+// leaves the whole sh tree for the full two minutes with nothing bounding it.
+//
+// Both kills are best effort. By the time cleanup runs the group is normally already gone,
+// and ESRCH is the expected answer.
+func reapFixture(c *exec.Cmd, pidFile string) {
+	if c.Process != nil {
+		_ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
+	}
+	// The child records its own pid because a setsid child is in its own session and the
+	// group kill above cannot reach it. Signal the pid alone rather than its group: the
+	// child has no children of its own, and a group kill aimed at a pid this process no
+	// longer owns is a worse thing to get wrong.
+	b, err := os.ReadFile(pidFile)
+	if err != nil {
+		return
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || pid <= 0 {
+		return
+	}
+	_ = syscall.Kill(pid, syscall.SIGKILL)
 }
 
 func TestCommandKillsTheWholeGroupOnDeadline(t *testing.T) {
