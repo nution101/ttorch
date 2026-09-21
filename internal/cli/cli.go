@@ -190,14 +190,19 @@ func Main(args []string) int {
 // it: "passed", "violated a rule" and "could not be evaluated" are three distinct
 // outcomes, and collapsing the last two would let an unevaluated check read as a failure
 // (or worse, a pass).
-type exitCoder interface{ ExitCode() int }
+//
+// The method is unexported so that only this package's own error types can satisfy it. An
+// interface of `ExitCode() int` would also match *exec.ExitError, which carries that method
+// promoted from *os.ProcessState — and cmdUpdate returns one unwrapped from its re-exec, so
+// a failed self-install would quietly start exiting with the child's status instead of 1.
+type exitCoder interface{ exitStatus() int }
 
 func run(err error) int {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		var ec exitCoder
 		if errors.As(err, &ec) {
-			return ec.ExitCode()
+			return ec.exitStatus()
 		}
 		return 1
 	}

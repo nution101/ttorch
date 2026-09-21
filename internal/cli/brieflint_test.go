@@ -84,7 +84,7 @@ func exitOf(t *testing.T, err error) int {
 	}
 	var ec exitCoder
 	if errors.As(err, &ec) {
-		return ec.ExitCode()
+		return ec.exitStatus()
 	}
 	return 1
 }
@@ -193,5 +193,31 @@ func TestCmdBriefLintProjectOverrides(t *testing.T) {
 	})
 	if got := exitOf(t, err); got != exitLintIndeterminate {
 		t.Fatalf("an unknown disabled rule must not read as a pass, got exit %d (%v)\n%s", got, err, out)
+	}
+}
+
+// Only this package's own errors may choose an exit status. *exec.ExitError carries an
+// ExitCode method promoted from *os.ProcessState, so an exitCoder declared as
+// `ExitCode() int` would match it — and cmdUpdate returns one unwrapped from the re-exec
+// that applies a new install, which would have changed `ttorch update`'s exit code on a
+// failed self-install from a flat 1 to the child's own status.
+func TestRunOnlyHonoursThisPackagesExitStatuses(t *testing.T) {
+	err := exec.Command("sh", "-c", "exit 7").Run()
+	if err == nil {
+		t.Fatal("want an ExitError from the fixture command")
+	}
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		t.Fatalf("fixture produced %T, want *exec.ExitError", err)
+	}
+	if got := ee.ExitCode(); got != 7 {
+		t.Fatalf("fixture exit code = %d, want 7", got)
+	}
+	if got := run(err); got != 1 {
+		t.Fatalf("run(*exec.ExitError) = %d, want 1: an unrelated command's exit code leaks through exitCoder", got)
+	}
+	// A brief-lint outcome still chooses its own.
+	if got := run(lintError{"three rules could not be evaluated", exitLintIndeterminate}); got != exitLintIndeterminate {
+		t.Fatalf("run(lintError) = %d, want %d", got, exitLintIndeterminate)
 	}
 }

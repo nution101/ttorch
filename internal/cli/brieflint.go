@@ -37,8 +37,9 @@ type lintError struct {
 
 func (e lintError) Error() string { return e.msg }
 
-// ExitCode implements the exitCoder interface run() consults.
-func (e lintError) ExitCode() int { return e.code }
+// exitStatus implements the exitCoder interface run() consults. It is unexported on
+// purpose: see exitCoder.
+func (e lintError) exitStatus() int { return e.code }
 
 // cmdBriefLint checks a task brief before it is stored on a task, standalone.
 //
