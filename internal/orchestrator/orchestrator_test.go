@@ -1870,10 +1870,13 @@ func TestMergeLocal_AllowGateChangeAuthorizesGateConfigChange(t *testing.T) {
 // TestMatchesGateConfig pins exactly which paths count as the gate's own definition, in both
 // directions. The must-NOT-match cases matter as much as the matches: the guard costs a flag on
 // every merge that trips it, so a near-miss like a non-reviewer agent definition or a docs copy
-// of AGENTS.md must stay out. The final case pins a KNOWN LIMIT rather than a behaviour: the
-// match is byte-exact and does not case-fold, so a differently-cased path naming the same file
-// on a case-insensitive filesystem is not caught. If someone changes that, this test should
-// fail and the docs that state the limit should be updated with it.
+// of AGENTS.md must stay out.
+//
+// The case-fold cases used to pin a KNOWN LIMIT here (the match was byte-exact, so a
+// differently-cased path naming a covered file slipped through). They now pin the behaviour:
+// both sides of every comparison are folded, including the "AGENTS.md" literal, which is the
+// side a half-fix leaves behind. The boundary cases below hold the fold to what it is for —
+// a differently-spelled name for the SAME file — not a licence to match anything adjacent.
 func TestMatchesGateConfig(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -1888,6 +1891,14 @@ func TestMatchesGateConfig(t *testing.T) {
 		{"a reviewer definition", "content/agents/ttorch-reviewer-security.md", true},
 		{"another reviewer definition", "content/agents/ttorch-reviewer-scope.md", true},
 
+		// Case-folding: both sides are folded, so a differently-cased spelling of a covered
+		// file is caught. "AGENTS.md" is the entry a one-sided fold would miss.
+		{"the mode config, lowercased", "agents.md", true},
+		{"the mode config, mixed case", "Agents.Md", true},
+		{"a skill path, mixed case", "Content/Skills/ttorch-review/SKILL.md", true},
+		{"a reviewer definition, mixed case", "Content/Agents/TTorch-Reviewer-Security.md", true},
+		{"the validate script, mixed case", ".TTorch/Validate.SH", true},
+
 		{"a non-reviewer agent definition", "content/agents/golang-pro.md", false},
 		{"the worker agent definition", "content/agents/ttorch-worker.md", false},
 		{"an embedded command", "content/commands/ttorch.md", false},
@@ -1896,7 +1907,9 @@ func TestMatchesGateConfig(t *testing.T) {
 		{"a directory that merely starts the same", "contents/skills/x.md", false},
 		{"ordinary source", "internal/orchestrator/merge.go", false},
 
-		{"KNOWN LIMIT: not case-folded", "Content/Skills/ttorch-review/SKILL.md", false},
+		// Folding must not widen the match past a same-file respelling.
+		{"a mixed-case near-miss", "Contents/Skills/x.md", false},
+		{"a mixed-case docs copy", "Docs/Agents.md", false},
 	} {
 		if got := matchesGateConfig(tc.path); got != tc.want {
 			t.Errorf("%s: matchesGateConfig(%q) = %v, want %v", tc.name, tc.path, got, tc.want)

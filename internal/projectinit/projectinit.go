@@ -17,6 +17,15 @@ const (
 )
 
 // ValidMode reports whether mode is a recognized delivery mode.
+//
+// The comparison is deliberately case-SENSITIVE, and this is the one place in the gate's
+// path where folding would be the unsafe direction. ReadMode falls back to "pr" for anything
+// it does not recognize, so "Trusted" in an AGENTS.md reads as pr: the gate is off, the PR
+// path is taken, and MergeLocal refuses an auto-minted token as ungated. Folding would turn
+// that typo into real trusted mode — a live auto-merge nobody asked for. Init rejects an
+// unrecognized --mode outright, so the canonical spelling is enforced where the file is
+// written. (orchestrator.matchesGateConfig folds both sides for the opposite reason: there,
+// over-matching only costs an extra --allow-gate-change.)
 func ValidMode(mode string) bool {
 	switch mode {
 	case "pr", "local", "validated", "trusted":

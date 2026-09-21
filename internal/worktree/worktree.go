@@ -480,19 +480,51 @@ func ShowFile(repo, ref, repoPath string) (string, bool) {
 	return string(out), true
 }
 
+// gitRaw runs git and returns stdout VERBATIM, with stderr kept separate. It exists
+// alongside git() for MACHINE-READABLE output: git() folds stderr into the result and
+// trims it, so a warning line ("warning: ...") would be glued onto the first record of a
+// listing and a trailing NUL separator would be eaten. A reader that parses git's output
+// by separator must not be handed either.
+func gitRaw(args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, msg)
+		}
+		return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+	}
+	return string(out), nil
+}
+
 // ChangedFiles returns the repo-relative paths changed between base and the COMMITTED
-// rev (`git diff --name-only base rev`) — committed objects, never the working tree.
-// Used to detect when a worker's committed diff touches the trust gate's definition.
+// rev — committed objects, never the working tree. It is the sole input to the trust
+// gate's gate-config guard (orchestrator.diffTouchesGateConfig), so the list must be
+// complete and every path must be spelled the way the guard matches it.
+//
+// It therefore uses `--name-only -z`: NUL-separated and UNQUOTED regardless of
+// core.quotePath. Plain `--name-only` C-quotes any path containing non-ASCII bytes,
+// control characters, quotes or backslashes — "content/skills/caf\303\251.md" — and a
+// quoted path matches neither an exact gate-config name nor a covered prefix, so the guard
+// would silently let it through. Splitting on newlines has the mirror-image failure once a
+// user sets core.quotePath=false: a path containing a literal newline splits into two
+// fragments, neither of which is a real path. internal/review/size.go states this same
+// requirement for the reviewer-set classifier and orchestrator.diffFiles already meets it;
+// this is the gate-config guard's half of it.
 func ChangedFiles(path, base, rev string) ([]string, error) {
-	out, err := git("-C", path, "diff", "--name-only", base, rev)
+	out, err := gitRaw("-C", path, "diff", "--name-only", "-z", base, rev)
 	if err != nil {
 		return nil, err
 	}
-	out = strings.TrimSpace(out)
-	if out == "" {
-		return nil, nil
+	var files []string
+	for _, n := range strings.Split(out, "\x00") {
+		if n != "" {
+			files = append(files, n)
+		}
 	}
-	return strings.Split(out, "\n"), nil
+	return files, nil
 }
 
 // AddDetached creates a temporary linked worktree at dir checked out (detached) to rev,

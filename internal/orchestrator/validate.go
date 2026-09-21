@@ -60,18 +60,30 @@ var gateConfigFiles = []string{".ttorch/validate.sh", "AGENTS.md"}
 var gateConfigPrefixes = []string{"content/skills/", "content/agents/ttorch-reviewer-"}
 
 // matchesGateConfig reports whether a repository path names a gate-definition file. Matching
-// is exact for gateConfigFiles and by prefix for gateConfigPrefixes, and it is byte-exact in
-// both cases: it does NOT case-fold, so on a case-insensitive filesystem a differently-cased
-// path naming the same file is not caught. That gap is pre-existing (it applies to AGENTS.md
-// today) and belongs to the parked guard-hardening work, not here.
+// is exact against gateConfigFiles and by prefix against gateConfigPrefixes.
+//
+// BOTH SIDES of every comparison are case-folded. Folding only the incoming path would leave
+// "AGENTS.md" — the one entry that is not already lowercase — unmatchable, which is the
+// half-folded-comparison bug this repo has shipped repeatedly; folding the literals too means
+// a mixed-case entry added later cannot reintroduce it. Callers must supply a slash-separated,
+// repo-relative path; worktree.ChangedFiles produces exactly that, unquoted.
+//
+// Folding makes the guard deliberately OVER-match on a case-sensitive filesystem, where
+// "Agents.md" is a genuinely different file from "AGENTS.md" and does not configure anything.
+// Over-matching costs an --allow-gate-change on a merge that did not need one; under-matching
+// merges a gate change unflagged. The guard takes the first. It also means the guard and
+// resolveGateDefinition can disagree — the resolver asks git for ".ttorch/validate.sh" by its
+// exact name — but only in that same safe direction: the guard flags a differently-cased
+// script the resolver would not load.
 func matchesGateConfig(name string) bool {
+	folded := strings.ToLower(name)
 	for _, g := range gateConfigFiles {
-		if name == g {
+		if folded == strings.ToLower(g) {
 			return true
 		}
 	}
 	for _, p := range gateConfigPrefixes {
-		if strings.HasPrefix(name, p) {
+		if strings.HasPrefix(folded, strings.ToLower(p)) {
 			return true
 		}
 	}
