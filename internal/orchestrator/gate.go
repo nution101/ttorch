@@ -1066,7 +1066,10 @@ func (m *Manager) teardownReviewers(taskID string, dims []string) {
 // verdict. Best-effort on the event append (the audit line is the durable trail), so a failed
 // append is logged, not fatal.
 func (m *Manager) surfaceGateBlocked(taskID, head, reason string) {
-	payload := fmt.Sprintf("sha=%s %s", short(head), reason)
+	// The reason can carry reviewer-authored text (review.Describe joins finding summaries
+	// into it), and the manager reads this payload as an instruction to act on, so it is one
+	// line with no control bytes. Describe quotes the reviewer's own words inside it.
+	payload := review.SafeLine(fmt.Sprintf("sha=%s %s", short(head), reason))
 	if _, err := m.Store.AppendEvent(context.Background(), db.Event{
 		EntityType: db.EntityTypeTask, EntityID: taskID, Type: db.EventGateBlocked,
 		Actor: db.ActorSystem, Actionable: true, Payload: payload,

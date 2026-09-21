@@ -1788,7 +1788,11 @@ func printResults(w io.Writer, results []validate.Result) int {
 			status = "FAIL"
 			failed++
 		}
-		fmt.Fprintf(w, "  [%s] %s\n", status, r.Name)
+		// The name is rendered on a status line, so it is coerced to one line whatever its
+		// source: a check name from a repo's own gate script, or a reviewer-authored
+		// dimension (already quoted by review.ToResults). A newline here would print a
+		// second line at status-line indentation, which reads as an outcome ttorch produced.
+		fmt.Fprintf(w, "  [%s] %s\n", status, review.SafeLine(r.Name))
 		if !r.Passed && r.Output != "" {
 			fmt.Fprintln(w, indentTail(r.Output, 15))
 		}
@@ -1796,14 +1800,18 @@ func printResults(w io.Writer, results []validate.Result) int {
 	return failed
 }
 
-// indentTail returns the last n lines of s, each indented for readability.
+// indentTail returns the last n lines of s, each indented for readability. Output is kept
+// multi-line on purpose (a failing build or test is unreadable as one line), so each line is
+// stripped of control bytes and indented past the status-line column instead: a line inside
+// command output cannot then imitate a ttorch status line, and no escape sequence in it
+// reaches the terminal.
 func indentTail(s string, n int) string {
 	lines := strings.Split(s, "\n")
 	if len(lines) > n {
 		lines = lines[len(lines)-n:]
 	}
 	for i, l := range lines {
-		lines[i] = "      " + l
+		lines[i] = "      " + review.SafeLine(l)
 	}
 	return strings.Join(lines, "\n")
 }

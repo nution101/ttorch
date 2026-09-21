@@ -28,7 +28,10 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/nution101/ttorch/internal/validate"
 )
@@ -144,9 +147,16 @@ func Aggregate(inputsDir, sha string, dimensions []string) (Verdict, error) {
 			return Verdict{}, err
 		}
 		if reason != "" {
+			// A REJECTED name never travels on as the finding's dimension: that field is
+			// rendered by every reader, and the point of rejecting the name was that it is
+			// not a label. The reason carries it quoted instead.
+			label := dim
+			if !ValidDimensionName(dim) {
+				label = "invalid"
+			}
 			v.Overall = Block
 			v.Findings = append(v.Findings, Finding{
-				Dimension: dim, Severity: SeverityHigh, Reviewer: "ttorch",
+				Dimension: label, Severity: SeverityHigh, Reviewer: "ttorch",
 				Summary: reason,
 			})
 			continue
@@ -227,18 +237,25 @@ func read(path string) (Verdict, bool) {
 // result per blocking finding — so `ttorch trust show` reuses the build/test/lint
 // PASS/FAIL printer and Failures() unchanged. A verdict with nothing blocking yields
 // a single passing result.
+//
+// Every field it renders (dimension, severity, reviewer, summary) is free text a reviewer
+// wrote after reading a diff it does not control, so each is QUOTED (SafeQuote): one finding
+// renders as one line, control bytes cannot reach the terminal, and an embedded newline
+// survives as the two characters \n instead of starting a line that imitates ttorch's own
+// output. A reviewer that writes "[PASS] all reviewers passed" into a summary gets it back
+// as quoted data, which is what it is.
 func ToResults(v Verdict) []validate.Result {
 	var out []validate.Result
 	for _, f := range v.Findings {
 		if !f.Severity.blocking() {
 			continue
 		}
-		summary := f.Summary
+		summary := SafeQuote(f.Summary)
 		if f.Reviewer != "" {
-			summary = "[" + f.Reviewer + "] " + summary
+			summary = "[" + SafeQuote(f.Reviewer) + "] " + summary
 		}
 		out = append(out, validate.Result{
-			Name:   f.Dimension + " (" + string(f.Severity) + ")",
+			Name:   SafeQuote(f.Dimension) + " (" + SafeQuote(string(f.Severity)) + ")",
 			Passed: false,
 			Output: summary,
 		})
@@ -263,6 +280,10 @@ var severityRank = map[Severity]int{
 // pass) to the manager. Unlike ToResults — which renders only the blocking subset for
 // the PASS/FAIL gate printer — Describe lists low/medium advisory findings too, so a
 // non-blocking surface hides nothing. It returns nil for a verdict with no findings.
+//
+// One finding is one line here too, and for the same reason as ToResults: these strings are
+// joined into the gate_blocked event payload the manager reads and acts on, so a newline in
+// a reviewer's summary must not be able to add a line of its own to it.
 func Describe(v Verdict) []string {
 	if len(v.Findings) == 0 {
 		return nil
@@ -273,17 +294,49 @@ func Describe(v Verdict) []string {
 	})
 	out := make([]string, 0, len(sorted))
 	for _, f := range sorted {
-		summary := f.Summary
+		summary := SafeQuote(f.Summary)
 		if f.Reviewer != "" {
-			summary = "[" + f.Reviewer + "] " + summary
+			summary = "[" + SafeQuote(f.Reviewer) + "] " + summary
 		}
-		sev := string(f.Severity)
+		sev := SafeLine(string(f.Severity))
 		if sev == "" {
 			sev = "unknown"
 		}
 		out = append(out, fmt.Sprintf("%-9s %s", sev, summary))
 	}
 	return out
+}
+
+// SafeLine renders untrusted text as a single line with no control bytes: newlines, returns,
+// tabs and escape sequences become spaces, so nothing a reviewer writes can start a line, move
+// a cursor, or clear a terminal. Runs of resulting spaces are collapsed so the text stays
+// readable. It is the last-resort boundary for text whose provenance a printer cannot see;
+// where the provenance IS known to be reviewer-authored, SafeQuote says so visibly.
+func SafeLine(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	space := false
+	for _, r := range s {
+		if r == '\t' || r == '\n' || r == '\r' || unicode.IsControl(r) || r == '\uFEFF' || unicode.Is(unicode.Cf, r) {
+			space = true
+			continue
+		}
+		if space && b.Len() > 0 {
+			b.WriteRune(' ')
+		}
+		space = false
+		b.WriteRune(r)
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// SafeQuote renders untrusted text as a quoted Go string literal: one line, every control
+// byte escaped rather than executed, and visibly delimited so a reader can tell where the
+// quoted text starts and ends. strconv.Quote alone is enough to stop a line break (it escapes
+// \n), and the surrounding quotes are what stop the text from being read as ttorch's own
+// output.
+func SafeQuote(s string) string {
+	return strconv.Quote(strings.ToValidUTF8(s, "\uFFFD"))
 }
 
 func short(sha string) string {

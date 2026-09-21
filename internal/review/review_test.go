@@ -280,8 +280,10 @@ func TestDescribe(t *testing.T) {
 	if !strings.HasPrefix(lines[0], "critical") {
 		t.Fatalf("findings must be ordered most-severe first, got %q first", lines[0])
 	}
-	if !strings.Contains(lines[0], "[sec] leaked key") {
-		t.Fatalf("the reviewer label should prefix the summary, got %q", lines[0])
+	// Reviewer-authored text is rendered quoted, so the manager can see where it starts and
+	// ends and a newline in it cannot add a line of its own.
+	if !strings.Contains(lines[0], `["sec"] "leaked key"`) {
+		t.Fatalf("the reviewer label should prefix the summary, quoted, got %q", lines[0])
 	}
 	if !strings.HasPrefix(lines[2], "low") {
 		t.Fatalf("low severity should sort last, got %q", lines[2])
