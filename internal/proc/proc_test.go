@@ -29,18 +29,24 @@ import (
 // the fixture no longer owned: the child is reaped at the 300ms deadline and the signal went
 // out around 2.3s later, so any process the OS had since given that pid would have taken it.
 const (
-	childEnv = "TTORCH_PROC_TEST_CHILD" // "[setsid ]<wait-duration> <marker-path>"
-	binEnv   = "TTORCH_PROC_TEST_BIN"   // this test binary, for the shell to fork
-	stopEnv  = "TTORCH_PROC_TEST_STOP"  // the stop file every fixture process watches
-	lockEnv  = "TTORCH_PROC_TEST_LOCK"  // the child holds a lock on this for its whole life
+	// childFlag puts this binary into child mode, carrying "[setsid ]<wait-duration>
+	// <marker-path>". It is an argv flag rather than an environment variable on purpose:
+	// an inherited variable of the right name used to make the whole test binary exit 0
+	// through the child path without running a single test, so the suite that guards this
+	// package could be switched off by an export. An argv flag is not inherited and `go
+	// test` never passes it.
+	childFlag = "-proc-test-child"
+	binEnv    = "TTORCH_PROC_TEST_BIN"  // this test binary, for the shell to fork
+	stopEnv   = "TTORCH_PROC_TEST_STOP" // the stop file every fixture process watches
+	lockEnv   = "TTORCH_PROC_TEST_LOCK" // the child holds a lock on this for its whole life
 )
 
 // childPoll is how often a fixture process checks for the stop file.
 const childPoll = 50 * time.Millisecond
 
 func TestMain(m *testing.M) {
-	if v := os.Getenv(childEnv); v != "" {
-		os.Exit(runChild(v))
+	if len(os.Args) > 2 && os.Args[1] == childFlag {
+		os.Exit(runChild(os.Args[2]))
 	}
 	os.Exit(m.Run())
 }
@@ -53,7 +59,9 @@ func TestMain(m *testing.M) {
 // any reason including SIGKILL, so a test can tell "the child is gone" from "the child is
 // still running" without naming a pid that may by then belong to someone else.
 func runChild(v string) int {
-	lock, err := os.OpenFile(os.Getenv(lockEnv), os.O_CREATE|os.O_RDWR, 0o644)
+	// The child creates the lock file. reapFixture refuses to open it any other way, so
+	// its "the child is gone" can never be satisfied by a child that never ran.
+	lock, err := os.OpenFile(os.Getenv(lockEnv), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o644)
 	if err != nil {
 		return 5
 	}
@@ -108,7 +116,7 @@ func hangingCommand(t *testing.T, ctx context.Context, marker string, wait time.
 	// The binary path reaches the shell through the environment, never interpolated into
 	// the script: sh expands $ and backtick inside double quotes, and %q does not escape
 	// either of them.
-	script := `"$` + binEnv + `" &
+	script := `"$` + binEnv + `" ` + childFlag + ` "$` + specEnv + `" &
 i=0
 while [ ! -f "$` + stopEnv + `" ] && [ "$i" -lt 120 ]; do
   sleep 1
@@ -116,7 +124,7 @@ while [ ! -f "$` + stopEnv + `" ] && [ "$i" -lt 120 ]; do
 done`
 	c := Command(ctx, "sh", "-c", script)
 	c.Env = append(os.Environ(),
-		fmt.Sprintf("%s=%s%s %s", childEnv, strings.Join(opts, ""), wait, marker),
+		fmt.Sprintf("%s=%s%s %s", specEnv, strings.Join(opts, ""), wait, marker),
 		binEnv+"="+self,
 		stopEnv+"="+stop,
 		lockEnv+"="+lock,
@@ -127,6 +135,10 @@ done`
 	t.Cleanup(func() { reapFixture(t, stop, lock) })
 	return &out, func() error { return Run(c) }
 }
+
+// specEnv carries the child's spec to the shell, which passes it on as the childFlag
+// argument. Only the flag puts the binary into child mode.
+const specEnv = "TTORCH_PROC_TEST_SPEC"
 
 // reapFixture ends everything the fixture started and proves the child is gone.
 //
@@ -139,9 +151,12 @@ func reapFixture(t *testing.T, stop, lock string) {
 	if err := os.WriteFile(stop, nil, 0o644); err != nil && !os.IsNotExist(err) {
 		t.Errorf("writing the stop file: %v", err)
 	}
-	f, err := os.OpenFile(lock, os.O_CREATE|os.O_RDWR, 0o644)
+	// No O_CREATE: the child creates this file, so a missing one means no child ever ran
+	// and there is nothing here to prove. Creating it ourselves and locking it on the first
+	// try would have reported "the child is gone" with no evidence one existed.
+	f, err := os.OpenFile(lock, os.O_RDWR, 0)
 	if err != nil {
-		t.Errorf("opening the child lock: %v", err)
+		t.Errorf("the fixture child never created its lock (%v), so nothing here shows it ran", err)
 		return
 	}
 	defer f.Close()
