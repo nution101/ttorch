@@ -25,7 +25,7 @@ func stagePrep(t *testing.T, inputsDir, sha string, results []validate.Result) {
 		t.Fatal(err)
 	}
 	writeValidateJSON(t, inputsDir, results)
-	if _, err := WritePrepStamp(inputsDir, sha, results); err != nil {
+	if _, err := WritePrepStamp(inputsDir, sha, results, dims); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -255,7 +255,7 @@ func TestAggregate_MissingStagedValidateBlocks(t *testing.T) {
 	for _, d := range dims {
 		writeReport(t, dir, d, sha, nil)
 	}
-	if err := os.Remove(filepath.Join(dir, "validate.json")); err != nil {
+	if err := os.Remove(filepath.Join(dir, StagedValidateFile)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -373,7 +373,8 @@ func TestAggregate_DimensionNameCannotReachOutsideTheInputsDir(t *testing.T) {
 	for _, d := range dims {
 		writeReport(t, dir, d, sha, nil)
 	}
-	// A clean, correctly pinned report the fold would happily accept, one level up.
+	// A clean, correctly pinned report the fold would happily accept, outside the dir the
+	// reports live in.
 	writeReport(t, parent, "outside", sha, nil)
 
 	v, err := Aggregate(dir, sha, append(append([]string(nil), dims...), outside))

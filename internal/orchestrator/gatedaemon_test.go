@@ -124,7 +124,7 @@ func TestGateOnce_HappyPathRecordsHandsOff(t *testing.T) {
 	}
 
 	// Reviewers complete: drop clean reports pinned to head.
-	writeReviewReports(t, m.P.ReviewInputsDir("g1"), head, nil)
+	writeReportsForPreppedInputs(t, m.P.ReviewInputsDir("g1"), head, nil)
 
 	// Tick 2: all reports present and pinned ⇒ aggregate pass ⇒ record + auto-mint.
 	out, err = m.GateOnce("g1")
@@ -193,7 +193,7 @@ func TestGateOnce_BlockingFindingNeverRecords(t *testing.T) {
 		t.Fatalf("tick1 = (%q, %v), want dispatched", out, err)
 	}
 	// A blocking security finding lands in the reports (the other dimensions are clean).
-	writeReviewReports(t, m.P.ReviewInputsDir("b1"), head, map[string][]review.Finding{
+	writeReportsForPreppedInputs(t, m.P.ReviewInputsDir("b1"), head, map[string][]review.Finding{
 		review.DimensionSecurity: {{
 			Dimension: review.DimensionSecurity, Severity: review.SeverityHigh,
 			Reviewer: "ttorch-reviewer-security", Summary: "hardcoded secret",
@@ -238,7 +238,7 @@ func TestGateOnce_MissingReportNeverRecordsPass(t *testing.T) {
 	}
 	// Write clean reports for all dimensions EXCEPT security, then remove security's so it is
 	// genuinely missing (writeReviewReports always writes the full set).
-	writeReviewReports(t, m.P.ReviewInputsDir("mr1"), head, nil)
+	writeReportsForPreppedInputs(t, m.P.ReviewInputsDir("mr1"), head, nil)
 	if err := os.Remove(filepath.Join(m.P.ReviewInputsDir("mr1"), review.DimensionSecurity+".json")); err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +277,7 @@ func TestGateOnce_StaleShaReportNeverRecordsPass(t *testing.T) {
 		t.Fatalf("tick1 = (%q, %v), want dispatched", out, err)
 	}
 	// All reports present but pinned to a DIFFERENT sha than head.
-	writeReviewReports(t, m.P.ReviewInputsDir("st1"), head+"-stale", nil)
+	writeReportsForPreppedInputs(t, m.P.ReviewInputsDir("st1"), head+"-stale", nil)
 	out, err := m.GateOnce("st1")
 	if err != nil {
 		t.Fatalf("GateOnce: %v", err)

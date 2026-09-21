@@ -49,6 +49,13 @@ type PrepStamp struct {
 	// which step failed rather than just that something did. Empty with ValidateGreen
 	// false means no checks ran at all.
 	ValidateFailed []string `json:"validateFailed,omitempty"`
+	// Dimensions is the reviewer set this prep prepared, recorded here because it decides
+	// what a verdict must cover. reviewers.json holds the same list for the manager to
+	// read, but it is rewritten by whoever can write the inputs dir, so a record that took
+	// its required set from that file could be made to fold a smaller set than was
+	// reviewed. This copy is written by prep and read by the record and the daemon; see
+	// RequiredDimensions for how the two are reconciled.
+	Dimensions []string `json:"dimensions,omitempty"`
 }
 
 // StagedGreen reports whether a PERSISTED validate result set is green: at least one check
@@ -64,11 +71,12 @@ func StagedGreen(results []validate.Result) bool {
 // report the episode's validate state without re-deriving it). Callers write it LAST, after
 // the rest of the inputs, so the marker's mtime is the moment the episode's inputs were
 // complete.
-func WritePrepStamp(inputsDir, head string, results []validate.Result) (PrepStamp, error) {
+func WritePrepStamp(inputsDir, head string, results []validate.Result, dims []string) (PrepStamp, error) {
 	stamp := PrepStamp{
 		PreparedAt:    time.Now().UTC(),
 		Head:          head,
 		ValidateGreen: StagedGreen(results),
+		Dimensions:    append([]string(nil), dims...),
 	}
 	for _, f := range validate.Failures(results) {
 		stamp.ValidateFailed = append(stamp.ValidateFailed, f.Name)
@@ -151,6 +159,52 @@ func ValidDimensionName(name string) bool {
 		}
 	}
 	return true
+}
+
+// RequiredDimensions reconciles the reviewer set a verdict must fold for sha from the two
+// records of it: the set the prep stamped (Go-written, at prep time) and the set now in
+// reviewers.json (rewritable by anything with access to the inputs dir). The stamp is
+// AUTHORITATIVE, because it is the only one written by the code that decided the set, and
+// because the file's whole purpose is to be read and edited by the manager between prep and
+// record.
+//
+// The file may only ADD. A repo that runs a dimension beyond the built-in three appends it
+// to reviewers.json after prep, and that is a real workflow, so the returned set is the
+// union: more review than was prepared is never a problem. Dropping a stamped dimension is
+// the attack, so dropped names are returned separately for the caller to block on rather
+// than silently restored: a set that shrank after prep says the inputs dir was edited during
+// the review, which the caller should surface, not paper over.
+//
+// ok is false when no stamp covers sha. The caller then has no authoritative set and must
+// fall back to its own fail-safe (the full built-in set); the fold blocks in that case
+// anyway, since an episode that does not cover the commit cannot underwrite a verdict.
+func RequiredDimensions(inputsDir, sha string, onDisk []string) (required, dropped []string, ok bool) {
+	p := readPrep(inputsDir)
+	if !p.covers(sha) {
+		return nil, nil, false
+	}
+	stamped := p.stamp.Dimensions
+	seen := map[string]bool{}
+	for _, d := range stamped {
+		seen[d] = true
+		required = append(required, d)
+	}
+	for _, d := range onDisk {
+		if !seen[d] {
+			seen[d] = true
+			required = append(required, d)
+		}
+	}
+	have := map[string]bool{}
+	for _, d := range onDisk {
+		have[d] = true
+	}
+	for _, d := range stamped {
+		if !have[d] {
+			dropped = append(dropped, d)
+		}
+	}
+	return required, dropped, true
 }
 
 // ValidateDimensionSet checks every name in a prepared reviewer set, returning an error
@@ -297,6 +351,12 @@ func currentReport(inputsDir, dim, sha string, prep prepState) (Report, string, 
 	// commit verbatim. Require the report to postdate the episode marker, so a report that
 	// reviewed a previous materialization of the inputs is treated as ABSENT — which the
 	// fold already handles fail-closed — rather than accepted as current.
+	//
+	// This is a staleness check, NOT a tamper check, and the distinction matters to anyone
+	// reading it as a control: mtime is settable by anything that can write the report
+	// (touch, os.Chtimes), so it catches a report left behind, not one backdated on purpose.
+	// Nothing here defends against a writer of the inputs dir, which can forge a report
+	// outright; see the package comment.
 	if !prep.covers(sha) {
 		return Report{}, "no review recorded for dimension " + dim + " in the current review prep", nil
 	}

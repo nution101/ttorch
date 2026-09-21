@@ -52,10 +52,15 @@ type scaledReviewers struct {
 	Dimensions []string    `json:"dimensions"`
 }
 
-// ReviewersFor returns the review dimensions the trust gate requires for taskID, as
-// recorded by TrustPrep in reviewers.json. A missing or malformed record (e.g. inputs
-// prepared by an older ttorch, or an empty set) falls back to the full set — fail-safe, so
-// a verdict is never recorded against fewer reviewers than were actually prepared.
+// ReviewersFor returns the reviewer set recorded in reviewers.json for taskID: the manager's
+// readable, editable copy of what prep prepared, which a repo running an extra dimension
+// appends to after prep. A missing or malformed record (e.g. inputs prepared by an older
+// ttorch, or an empty set) falls back to the full set.
+//
+// It is NOT the authority on what a verdict must cover. The file lives in the review inputs
+// dir, so anything that can write there can rewrite it between the review and the record;
+// the authority is the set prep stamped into prep.json, and requiredDimensions reconciles
+// the two (the stamp is the floor, the file may only add).
 func (m *Manager) ReviewersFor(taskID string) []string {
 	b, err := os.ReadFile(filepath.Join(m.P.ReviewInputsDir(taskID), reviewersFileName))
 	if err != nil {
@@ -66,6 +71,37 @@ func (m *Manager) ReviewersFor(taskID string) []string {
 		return append([]string(nil), requiredReviewers...)
 	}
 	return s.Dimensions
+}
+
+// requiredDimensions resolves the reviewer set a verdict for sha must fold, and reports any
+// dimension the stamp prepared that reviewers.json no longer lists. The stamp is the
+// authority (see review.RequiredDimensions); with no stamp covering sha there is none, so it
+// fails safe to the full built-in set unioned with whatever the file says, never to fewer.
+func (m *Manager) requiredDimensions(taskID, sha string) (required, dropped []string) {
+	onDisk := m.ReviewersFor(taskID)
+	required, dropped, ok := review.RequiredDimensions(m.P.ReviewInputsDir(taskID), sha, onDisk)
+	if ok {
+		return required, dropped
+	}
+	seen := map[string]bool{}
+	for _, d := range append(append([]string(nil), requiredReviewers...), onDisk...) {
+		if !seen[d] {
+			seen[d] = true
+			required = append(required, d)
+		}
+	}
+	return required, nil
+}
+
+// droppedDimensionFinding is the blocking finding for a prepared set that shrank after prep.
+// A dimension vanishing from reviewers.json between the review and the record means the
+// inputs dir was edited mid-review, which is the shape of hiding a blocking report, so it is
+// surfaced rather than quietly corrected by the union.
+func droppedDimensionFinding(dropped []string) review.Finding {
+	return review.Finding{
+		Dimension: "review", Severity: review.SeverityHigh, Reviewer: "ttorch",
+		Summary: fmt.Sprintf("the prepared reviewer set on disk no longer lists %s, which the prep for this commit prepared; the review inputs were edited after the prep", strings.Join(dropped, ", ")),
+	}
 }
 
 // ReviewDiff returns a worker's changes against the repo's default branch.
@@ -327,8 +363,9 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 	}
 	// LAST, once every input is staged: stamp the episode. Its mtime is the line a report
 	// must postdate to count as this episode's, and it records the staged validate's outcome
-	// for the verdict fold, so both guards read one Go-owned marker.
-	stamp, err := review.WritePrepStamp(dir, head, results)
+	// AND the reviewer set this prep prepared, so the fold reads one Go-owned marker rather
+	// than trusting files the review dir's writer can rewrite between prep and record.
+	stamp, err := review.WritePrepStamp(dir, head, results, dims)
 	if err != nil {
 		return "", err
 	}
@@ -426,9 +463,17 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 	if sha != head {
 		return zero, fmt.Errorf("review covers %s but the worker HEAD is now %s; re-run 'ttorch trust prep %s' and review again", short(sha), short(head), taskID)
 	}
-	verdict, err := review.Aggregate(m.P.ReviewInputsDir(taskID), sha, m.ReviewersFor(taskID))
+	required, dropped := m.requiredDimensions(taskID, sha)
+	if err := review.ValidateDimensionSet(required); err != nil {
+		return zero, err
+	}
+	verdict, err := review.Aggregate(m.P.ReviewInputsDir(taskID), sha, required)
 	if err != nil {
 		return zero, err
+	}
+	if len(dropped) > 0 {
+		verdict.Overall = review.Block
+		verdict.Findings = append(verdict.Findings, droppedDimensionFinding(dropped))
 	}
 	// Pin the reviewed diff's content identity onto the verdict (the committed three-dot diff
 	// the reviewers read) so a later clean rebase onto an advanced default can carry the
@@ -871,7 +916,8 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 			m.writeGateProgress(dir, gateProgress{Head: head, Outcome: gateOutcomeBlocked})
 			return GateBlocked, nil
 		}
-		prog = gateProgress{Head: head, Dims: m.ReviewersFor(taskID), Attempts: map[string]int{}}
+		episodeDims, _ := m.requiredDimensions(taskID, head)
+		prog = gateProgress{Head: head, Dims: episodeDims, Attempts: map[string]int{}}
 		m.writeGateProgress(dir, prog)
 	}
 
@@ -891,12 +937,20 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 	// per head) and ReviewersFor fail-safes to the full three-dimension set if it is ever missing
 	// or malformed, so this never under-reviews. prog.Dims remains only the cache the NEXT
 	// episode's reset tears down.
-	dims := m.ReviewersFor(taskID)
+	dims, dropped := m.requiredDimensions(taskID, head)
+	if len(dropped) > 0 {
+		// The set shrank after prep: the inputs dir was edited during the review, which is
+		// how a blocking report gets hidden. The manager adjudicates that, not the daemon.
+		m.surfaceGateBlocked(taskID, head, droppedDimensionFinding(dropped).Summary)
+		prog.Outcome = gateOutcomeBlocked
+		m.writeGateProgress(dir, prog)
+		m.teardownReviewers(taskID, dims)
+		return GateBlocked, nil
+	}
 	// Every name in that set is about to become a file path, a tmux target, and the report
-	// path a reviewer is told to write, and the set is read back from a worker-writable file.
+	// path a reviewer is told to write, and the file half of the set is worker-rewritable.
 	// One unusable name stops the episode here: the fold would block on it anyway, and the
-	// alternative is handing it to the launcher. This checks the NAMES only; which dimensions
-	// are required, and where the set comes from, are not this pass's business.
+	// alternative is handing it to the launcher.
 	if err := review.ValidateDimensionSet(dims); err != nil {
 		m.surfaceGateBlocked(taskID, head, err.Error())
 		prog.Outcome = gateOutcomeBlocked

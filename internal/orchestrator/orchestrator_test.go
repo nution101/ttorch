@@ -1055,7 +1055,7 @@ func stageGreenPrep(t *testing.T, dir, sha string) {
 	if err := os.WriteFile(filepath.Join(dir, review.StagedValidateFile), append(b, '\n'), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := review.WritePrepStamp(dir, sha, green); err != nil {
+	if _, err := review.WritePrepStamp(dir, sha, green, requiredReviewers); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1073,7 +1073,11 @@ func writeReportsForPreppedInputs(t *testing.T, dir, sha string, perDim map[stri
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(dir, dim+".json"), b, 0o644); err != nil {
+		path, err := review.InputPath(dir, dim, review.ReportSuffix)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, b, 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -3211,7 +3215,11 @@ func writeSecurityReport(t *testing.T, dir, sha string, findings []review.Findin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "security.json"), b, 0o644); err != nil {
+	path, err := review.InputPath(dir, review.DimensionSecurity, review.ReportSuffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -3349,7 +3357,11 @@ func writeQAReport(t *testing.T, dir, sha string, findings []review.Finding) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "qa.json"), b, 0o644); err != nil {
+	path, err := review.InputPath(dir, review.DimensionQA, review.ReportSuffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -3678,7 +3690,7 @@ func TestMergeLocal_ReusesPrepValidateForUnchangedHead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	writeReviewReports(t, dir, head, nil) // clean → pass
+	writeReportsForPreppedInputs(t, dir, head, nil) // clean → pass
 	if _, err := m.TrustRecord("mr1", "", time.Minute); err != nil {
 		t.Fatal(err)
 	}

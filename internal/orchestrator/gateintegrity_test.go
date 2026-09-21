@@ -116,10 +116,11 @@ func TestTrustRecord_RePrepSupersedesEarlierReports(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, review.DimensionCorrectness+".json"), restored, 0o644); err != nil {
+	restoredPath := filepath.Join(dir, review.DimensionCorrectness+".json")
+	if err := os.WriteFile(restoredPath, restored, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	backdateFile(t, filepath.Join(dir, review.DimensionCorrectness+".json"), time.Hour)
+	backdateFile(t, restoredPath, time.Hour)
 	v, err = m.TrustRecord("rp1", "", time.Minute)
 	if err != nil {
 		t.Fatal(err)
@@ -339,7 +340,11 @@ func writeDimensionReport(t *testing.T, dir, dim, sha string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, dim+".json"), b, 0o644); err != nil {
+	path, err := review.InputPath(dir, dim, review.ReportSuffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -381,7 +386,7 @@ func TestTrustPrep_ArchivesEveryPreparedDimension(t *testing.T) {
 	// gap this test closes was the archive layer alone, not a dimension the gate would pass.
 	addPreparedDimension(t, dir, extra)
 	writeReportsForPreppedInputs(t, dir, head, nil)
-	restore := filepath.Join(dir, extra+".json")
+	restore := filepath.Join(dir, extra+review.ReportSuffix)
 	writeDimensionReport(t, dir, extra, head)
 	backdateFile(t, restore, time.Hour)
 	v, err := m.TrustRecord("ad1", "", time.Minute)
@@ -630,3 +635,93 @@ var fileSink = regexp.MustCompile(`filepath\.Join\(|os\.(WriteFile|ReadFile|Open
 
 // dimensionToken matches an identifier a dimension name is carried in.
 var dimensionToken = regexp.MustCompile(`\b(dim|dimension)\b`)
+
+// TestTrustRecord_WorkerCannotShrinkThePreparedSet is critical 1. reviewers.json lives in the
+// worker-reachable inputs dir and was re-read live at record time, so a worker that drew a
+// blocking report could drop that dimension from the set between the review and the record.
+// The dimensions a prep prepared are the ones a record must fold, and the record must not
+// take the worker's word for what they were.
+func TestTrustRecord_WorkerCannotShrinkThePreparedSet(t *testing.T) {
+	m, head := trustedTaskWithSubstantialDiff(t, "shrink", "sk1")
+	t.Cleanup(func() { _, _ = m.Teardown("sk1", true) })
+	dir := m.P.ReviewInputsDir("sk1")
+	if _, err := m.TrustPrep("sk1"); err != nil {
+		t.Fatal(err)
+	}
+	prepared := m.ReviewersFor("sk1")
+	if !containsDim(prepared, review.DimensionSecurity) {
+		t.Fatalf("this test needs security in the prepared set, got %v", prepared)
+	}
+
+	// The reviewers run: security finds something that blocks.
+	writeReportsForPreppedInputs(t, dir, head, map[string][]review.Finding{
+		review.DimensionSecurity: {{
+			Dimension: review.DimensionSecurity, Severity: review.SeverityHigh,
+			Reviewer: "ttorch-reviewer-security", Summary: "hardcoded credential in the diff",
+		}},
+	})
+
+	// The worker rewrites the prepared set to drop the dimension that blocked it.
+	shrinkPreparedSet(t, dir, []string{review.DimensionScope})
+
+	v, err := m.TrustRecord("sk1", "", time.Minute)
+	if err != nil {
+		t.Fatalf("TrustRecord: %v", err)
+	}
+	if v.Overall != review.Block {
+		t.Fatalf("verdict = %q, want %q: dropping a dimension from reviewers.json hid its blocking report", v.Overall, review.Block)
+	}
+	if approval.Valid(m.P.ApprovalFile("sk1")) {
+		t.Error("a shrunk prepared set must never auto-mint the approval token")
+	}
+	if !verdictMentions(v, "credential") {
+		t.Errorf("the blocking finding must still be in the verdict; findings = %+v", v.Findings)
+	}
+}
+
+// TestGateOnce_WorkerCannotShrinkThePreparedSet is the same attack against the daemon pass,
+// which re-read the set every tick for the same reason.
+func TestGateOnce_WorkerCannotShrinkThePreparedSet(t *testing.T) {
+	m, head := trustedTaskWithSubstantialDiff(t, "gate-shrink", "gk1")
+	t.Cleanup(func() { _, _ = m.Teardown("gk1", true) })
+	recordingReviewer(t, false)
+
+	if out, err := m.GateOnce("gk1"); err != nil || out != GateDispatched {
+		t.Fatalf("tick1 = (%q, %v), want dispatched", out, err)
+	}
+	dir := m.P.ReviewInputsDir("gk1")
+	writeReportsForPreppedInputs(t, dir, head, map[string][]review.Finding{
+		review.DimensionSecurity: {{
+			Dimension: review.DimensionSecurity, Severity: review.SeverityHigh,
+			Reviewer: "ttorch-reviewer-security", Summary: "hardcoded credential in the diff",
+		}},
+	})
+	shrinkPreparedSet(t, dir, []string{review.DimensionScope})
+
+	out, err := m.GateOnce("gk1")
+	if err != nil {
+		t.Fatalf("GateOnce: %v", err)
+	}
+	if out == GateRecorded {
+		t.Fatal("the daemon recorded a verdict over a shrunk prepared set")
+	}
+	if _, ok := m.TrustShow("gk1"); ok {
+		t.Error("a shrunk prepared set must not yield a recorded verdict")
+	}
+	if approval.Valid(m.P.ApprovalFile("gk1")) {
+		t.Error("a shrunk prepared set must not mint an approval token")
+	}
+}
+
+// shrinkPreparedSet rewrites reviewers.json with dims, as a worker with write access to the
+// inputs dir can at any moment.
+func shrinkPreparedSet(t *testing.T, dir string, dims []string) {
+	t.Helper()
+	b, err := json.MarshalIndent(scaledReviewers{Size: review.SizeSubstantial, Dimensions: dims}, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, reviewersFileName), append(b, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
