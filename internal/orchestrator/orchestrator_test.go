@@ -1867,6 +1867,107 @@ func TestMergeLocal_AllowGateChangeAuthorizesGateConfigChange(t *testing.T) {
 	_, _ = m.Teardown("ga1", true)
 }
 
+// TestMatchesGateConfig pins exactly which paths count as the gate's own definition, in both
+// directions. The must-NOT-match cases matter as much as the matches: the guard costs a flag on
+// every merge that trips it, so a near-miss like a non-reviewer agent definition or a docs copy
+// of AGENTS.md must stay out. The final case pins a KNOWN LIMIT rather than a behaviour: the
+// match is byte-exact and does not case-fold, so a differently-cased path naming the same file
+// on a case-insensitive filesystem is not caught. If someone changes that, this test should
+// fail and the docs that state the limit should be updated with it.
+func TestMatchesGateConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path string
+		want bool
+	}{
+		{"the validate script", ".ttorch/validate.sh", true},
+		{"the delivery-mode config", "AGENTS.md", true},
+		{"the gate procedure skill", "content/skills/ttorch-review/SKILL.md", true},
+		{"the manager skill", "content/skills/ttorch-manager/SKILL.md", true},
+		{"the validate skill", "content/skills/ttorch-validate/SKILL.md", true},
+		{"a reviewer definition", "content/agents/ttorch-reviewer-security.md", true},
+		{"another reviewer definition", "content/agents/ttorch-reviewer-scope.md", true},
+
+		{"a non-reviewer agent definition", "content/agents/golang-pro.md", false},
+		{"the worker agent definition", "content/agents/ttorch-worker.md", false},
+		{"an embedded command", "content/commands/ttorch.md", false},
+		{"a docs copy of the mode config", "docs/AGENTS.md", false},
+		{"a validate script somewhere else", "sub/.ttorch/validate.sh", false},
+		{"a directory that merely starts the same", "contents/skills/x.md", false},
+		{"ordinary source", "internal/orchestrator/merge.go", false},
+
+		{"KNOWN LIMIT: not case-folded", "Content/Skills/ttorch-review/SKILL.md", false},
+	} {
+		if got := matchesGateConfig(tc.path); got != tc.want {
+			t.Errorf("%s: matchesGateConfig(%q) = %v, want %v", tc.name, tc.path, got, tc.want)
+		}
+	}
+}
+
+// TestMergeLocal_GateInstructionChangeNeedsAllowGateChange: the gate's own INSTRUCTIONS are a
+// gate-definition change too. content/skills/ttorch-review/SKILL.md is embedded and installed
+// to ~/.claude/skills, so a landed edit to it changes what the gate does on the next run for
+// every repo on the machine. Before content/skills/ was covered, this merged on a plain
+// approval with nothing in the audit naming it — which made the claim written in that very
+// file false about itself.
+func TestMergeLocal_GateInstructionChangeNeedsAllowGateChange(t *testing.T) {
+	m, repo := deliveryHarness(t, "gateinstr")
+	commitGateScript(t, repo, "exit 0")
+	if _, err := projectinit.Init(repo, "trusted"); err != nil {
+		t.Fatal(err)
+	}
+	task, err := m.Spawn("gi1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := task.Worktree
+	skill := filepath.Join(wt, "content", "skills", "ttorch-review")
+	if err := os.MkdirAll(skill, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "# gate procedure\nreviewers: none\n"
+	if err := os.WriteFile(filepath.Join(skill, "SKILL.md"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, wt, "add", "-A")
+	gitIn(t, wt, "commit", "-q", "-m", "edit the gate's reviewer instructions")
+	head := gitIn(t, wt, "rev-parse", "HEAD")
+	writeReviewReports(t, m.P.ReviewInputsDir("gi1"), head, nil)
+	if _, err := m.TrustRecord("gi1", "", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	// It must not auto-approve, for the same reason a validate.sh change does not.
+	if approval.Valid(m.P.ApprovalFile("gi1")) {
+		t.Fatal("a diff touching the gate's instructions must not auto-approve in trusted mode")
+	}
+	// Nor merge on a plain human approval.
+	if err := m.Approve("gi1", time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	defHead := gitIn(t, repo, "rev-parse", "HEAD")
+	_, err = m.MergeLocal("gi1", false)
+	if err == nil {
+		t.Fatal("a plain human approval must not authorize a change to the gate's own instructions")
+	}
+	if !strings.Contains(err.Error(), "content/skills/ttorch-review/SKILL.md") {
+		t.Fatalf("the refusal must name the instruction file, got: %v", err)
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") != defHead {
+		t.Fatal("the instruction change must not have merged")
+	}
+	// With the explicit flag it merges and the audit names the file.
+	if err := m.Approve("gi1", time.Minute, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.MergeLocal("gi1", false); err != nil {
+		t.Fatalf("an explicitly gate-change-approved instruction change should merge: %v", err)
+	}
+	if b, _ := os.ReadFile(m.P.AuditLog()); !strings.Contains(string(b), "gate-change=content/skills/ttorch-review/SKILL.md") {
+		t.Fatalf("the merge audit line must name the instruction file: %s", b)
+	}
+	_, _ = m.Teardown("gi1", true)
+}
+
 // TestApprovalPayloadScope pins the token wire format the gate reads its authority from: the
 // allow-gate-change scope round-trips, an ordinary token never parses as carrying it, and a
 // legacy provenance-less token still yields by=="" so the gated path fails closed on it.

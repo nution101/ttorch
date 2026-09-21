@@ -40,10 +40,43 @@ func (m *Manager) Validate(taskID string) ([]validate.Result, error) {
 	return results, nil
 }
 
-// gateConfigFiles define the trust gate itself: the validation script and the repo's
-// delivery-mode/gate config. A trusted AUTO-merge must never change them — altering the
-// gate requires an explicit human approval.
+// gateConfigFiles define the trust gate itself by exact path: the validation script (what
+// green means) and the repo's delivery-mode/gate config (whether the gate runs at all).
 var gateConfigFiles = []string{".ttorch/validate.sh", "AGENTS.md"}
+
+// gateConfigPrefixes define the gate's own INSTRUCTIONS by path prefix. These are not
+// documentation about the gate; they are the text the gate executes on. content.go embeds the
+// whole content/ tree and installer.desiredFiles lays it down under ~/.claude: content/skills/
+// becomes ~/.claude/skills (the ttorch-review procedure the manager follows, the ttorch-manager
+// instructions, the ttorch-validate procedure) and content/agents/ttorch-reviewer-*.md becomes
+// ~/.claude/agents (the adversarial reviewers' own definitions, including the security
+// reviewer). A landed change to any of them alters what the gate does on the NEXT run, for
+// every repo on the machine, with no further review — the same delayed diff-channel effect
+// AGENTS.md has, which is why they belong here alongside it.
+//
+// Matched by prefix, not exactly, because the set is a directory of files rather than two
+// named ones. "content/agents/ttorch-reviewer-" is a FILENAME prefix and deliberately does not
+// cover the other agent definitions in that directory, which the gate does not dispatch.
+var gateConfigPrefixes = []string{"content/skills/", "content/agents/ttorch-reviewer-"}
+
+// matchesGateConfig reports whether a repository path names a gate-definition file. Matching
+// is exact for gateConfigFiles and by prefix for gateConfigPrefixes, and it is byte-exact in
+// both cases: it does NOT case-fold, so on a case-insensitive filesystem a differently-cased
+// path naming the same file is not caught. That gap is pre-existing (it applies to AGENTS.md
+// today) and belongs to the parked guard-hardening work, not here.
+func matchesGateConfig(name string) bool {
+	for _, g := range gateConfigFiles {
+		if name == g {
+			return true
+		}
+	}
+	for _, p := range gateConfigPrefixes {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
 
 // gateDefinition is the resolved trust-gate validation DEFINITION for a repo: the
 // .ttorch/validate.sh text as it exists on the DEFAULT BRANCH (hasScript true), or, when the
@@ -248,19 +281,18 @@ func hasDefaultBranchGateScript(repo string) bool {
 }
 
 // diffTouchesGateConfig reports whether the COMMITTED diff base..rev modifies any
-// gate-definition file (and which one), so a trusted auto-merge of such a change can be
-// refused in favor of an explicit human approval. It reads committed objects, not the
-// working tree, so the check cannot be evaded by reverting the bytes in the worktree.
+// gate-definition file (and which one), so a merge of such a change can be refused in favor of
+// an explicit human approval. It reads committed objects, not the working tree, so the check
+// cannot be evaded by reverting the bytes in the worktree. The name returned is the first
+// match in git's order, which is what the refusal and the audit line report.
 func diffTouchesGateConfig(repo, base, rev string) (bool, string, error) {
 	names, err := worktree.ChangedFiles(repo, base, rev)
 	if err != nil {
 		return false, "", err
 	}
 	for _, n := range names {
-		for _, g := range gateConfigFiles {
-			if n == g {
-				return true, n, nil
-			}
+		if matchesGateConfig(n) {
+			return true, n, nil
 		}
 	}
 	return false, "", nil

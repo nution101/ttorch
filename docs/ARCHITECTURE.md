@@ -236,11 +236,18 @@ passing commit-pinned verdict plus a fresh green validate auto-mints the approva
   immutable committed sha using the *default-branch* gate script (a worker can't weaken its
   own gate), and a repo with **no checks detected is a hard block**, never a pass. Without
   the script, the trusted auto-merge is refused and a human `ttorch approve` is required.
-- A trusted auto-merge **cannot change a gate-definition file** (`.ttorch/validate.sh` or
-  `AGENTS.md`); such a diff is refused. On a **gated** merge (trusted mode, or any mode with
-  `--require-verdict`) a human approval does not wave it through either: it needs
-  `ttorch approve <id> --allow-gate-change`, and the merge audit line names the file. An
-  ungated `local`/`validated` merge does not run the check.
+- A trusted auto-merge **cannot change a gate-definition file**; such a diff is refused. The
+  covered set is `.ttorch/validate.sh`, `AGENTS.md`, `content/skills/**` and
+  `content/agents/ttorch-reviewer-*` — the last two because `content.go` embeds them and the
+  installer lays them down under `~/.claude`, so they are the gate's live reviewer and manager
+  instructions, not documentation about the gate. On a **gated** merge (trusted mode, or any
+  mode with `--require-verdict`) a human approval does not wave it through either: it needs
+  `ttorch approve <id> --allow-gate-change`, and the merge audit line names the file.
+- An ungated `local`/`validated` merge **does not run the check at all**. That path lands an
+  `AGENTS.md` change on a plain human approval with no gate-config check and no audit line
+  naming it, and `AGENTS.md` is what `projectinit.ReadMode` reads to decide trusted mode — so
+  an ungated merge can flip a repo into auto-merge, unaudited. This is pre-existing and is not
+  fixed by the gate-change scope.
   The scope lives on the approval token, so an expired token re-minted from the durable
   verdict comes back without it and the merge refuses again (fail closed). This makes a gate
   change an explicit, audited act; it does not make the token unwritable by a process running

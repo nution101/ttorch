@@ -148,16 +148,29 @@ invalidates the verdict — re-prep, re-review, re-record.
   which the worker controls, so the auto path is refused and a human `ttorch approve` is
   required instead. A repo with no detectable checks fails closed (a hard block).
 - **No GATED merge changes the gate's own definition unless the approval says so by name.**
-  If a worker's diff touches `.ttorch/validate.sh` or `AGENTS.md`, an auto-merge is refused
-  outright, and a plain `ttorch approve` is refused too — the lead must run
-  `ttorch approve <id> --allow-gate-change`, and the merge's audit line then names the file
-  that changed. Gated means trusted mode or `--require-verdict`; a `local`/`validated` merge
-  without `--require-verdict` does not run this check at all, and still merges a
-  gate-definition change on a plain approval with nothing in the audit naming it. This is
-  not a barrier even where it does run: anything running as the lead can still write the
-  approval token with that scope in it. What it removes is the silent skip — before, any
-  human approval waved a gate change through, in every mode, with nothing in the audit log
-  naming it.
+  The covered set is `.ttorch/validate.sh`, `AGENTS.md`, everything under `content/skills/`,
+  and `content/agents/ttorch-reviewer-*` — including this file, which is embedded and
+  installed to `~/.claude/skills`, so a landed edit to it changes what the gate does on the
+  next run for every repo on the machine. If a worker's diff touches any of them, an
+  auto-merge is refused outright, and a plain `ttorch approve` is refused too — the lead must
+  run `ttorch approve <id> --allow-gate-change`, and the merge's audit line then names the
+  file that changed.
+- **What that claim does NOT cover**, stated so nobody reads it as wider than it is:
+  - Gated means trusted mode or `--require-verdict`. A `local`/`validated` merge without
+    `--require-verdict` does not run this check at all, so it still merges a gate-definition
+    change on a plain approval with nothing in the audit naming it — including an `AGENTS.md`
+    change, which is what sets the delivery mode, so that path can flip a repo into trusted
+    (auto-merge) unaudited.
+  - `~/.claude/agents/ttorch-reviewer-*.md` and `~/.claude/skills/` as they exist ON DISK. The
+    guard sees a diff; these files live outside any repo and anything running as the lead can
+    overwrite them directly. No diff-channel guard can ever see that.
+  - `internal/orchestrator/*.go` and `internal/review/*.go` — the deciding code. A diff there
+    changes the NEXT binary, not the running one, and covering it is a separate piece of work.
+  - `.github/workflows/*`, `.ttorch/offload/*`, `.ttorch/junk-check.sh`.
+  - The match is byte-exact and does not case-fold, so on a case-insensitive filesystem a
+    differently-cased path naming a covered file is not caught.
+  - None of it is a barrier. Anything running as the lead can write the approval token with
+    the `allow-gate-change` scope already in it. What the guard removes is the silent skip.
 
 ## Findings contract
 
