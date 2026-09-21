@@ -79,25 +79,71 @@ func (m *Manager) ReviewersFor(taskID string) []string {
 }
 
 // requiredDimensions resolves the reviewer set a verdict for sha must fold, and reports any
-// dimension the stamp prepared that reviewers.json no longer lists. Between the two records
-// the stamp decides, and neither is out of a worker's reach: see review.RequiredDimensions
-// for what that buys and what it does not. With no stamp covering sha there is nothing to
-// decide from, so it fails safe to the full built-in set unioned with whatever the file
-// says, never to fewer.
-func (m *Manager) requiredDimensions(taskID, sha string) (required, dropped []string) {
-	onDisk := m.ReviewersFor(taskID)
-	required, dropped, ok := review.RequiredDimensions(m.P.ReviewInputsDir(taskID), sha, onDisk)
-	if ok {
-		return required, dropped
+// dimension the stamp prepared that reviewers.json no longer lists. It composes two defences
+// that catch different things, with the prep stamp as the spine.
+//
+// The STAMP decides. review.RequiredDimensions reads the set prep recorded, lets reviewers.json
+// only ADD to it, and returns separately any stamped dimension the file no longer lists: a set
+// that shrank after prep means the inputs dir was edited during the review, which the caller
+// surfaces rather than papers over. See that function for what the stamp buys (cost and
+// evidence) and what it does not (authenticity; it is not a trust boundary).
+//
+// The DERIVED FLOOR is unioned on top, and it is a distinct property rather than a second
+// opinion on the same one. The stamp catches an edit made after prep. Re-deriving the set from
+// the committed diff catches the case where the stamp itself was written wrong, which matters
+// because prep.json sits 0o644 in the same worker-writable directory as reviewers.json. Neither
+// subsumes the other, so both run and the result is their union: the floor can only raise the
+// requirement.
+//
+// With no stamp covering sha there is nothing to decide from, so it fails safe to the full
+// built-in set unioned with the file and the floor, never to fewer.
+func (m *Manager) requiredDimensions(t db.Task, sha string) (required, dropped []string) {
+	onDisk := m.ReviewersFor(t.ID)
+	derived := m.derivedFloor(t, sha)
+	stamped, dropped, ok := review.RequiredDimensions(m.P.ReviewInputsDir(t.ID), sha, onDisk)
+	if !ok {
+		return unionDimensions(derived, unionDimensions(requiredReviewers, onDisk)), nil
 	}
-	seen := map[string]bool{}
-	for _, d := range append(append([]string(nil), requiredReviewers...), onDisk...) {
-		if !seen[d] {
+	return unionDimensions(derived, stamped), dropped
+}
+
+// derivedFloor re-derives the reviewer set from the committed diff, so the set a verdict must
+// cover does not rest entirely on records kept in a directory the worker can write.
+//
+// It is the same review.Classify over the same authoritative git file list and line stat
+// TrustPrep used. A rewritten `{"dimensions":["correctness"]}` over a two-file code change
+// cannot skip the scope and security reviewers, because the floor names them anyway.
+//
+// Every failure path lands on the full three-dimension set: the base does not resolve, git
+// fails, or review.Classify's own ok flag goes false.
+func (m *Manager) derivedFloor(t db.Task, sha string) []string {
+	base, err := reviewBase(t.Project, false)
+	if err != nil {
+		return append([]string(nil), requiredReviewers...)
+	}
+	files, filesOK := diffFiles(t.Worktree, base, sha)
+	lines, binary, statOK := diffLineStat(t.Worktree, base, sha)
+	_, derived := review.Classify(files, lines, binary, filesOK && statOK)
+	return derived
+}
+
+// unionDimensions merges two dimension sets, preserving order (the first set, in
+// review.Classify's canonical order, then any dimension only the second names) and dropping
+// duplicates and empty entries. The order is deterministic so the dispatch set, the
+// aggregation set, and the audit line always agree.
+func unionDimensions(derived, recorded []string) []string {
+	seen := make(map[string]bool, len(derived)+len(recorded))
+	out := make([]string, 0, len(derived)+len(recorded))
+	for _, set := range [][]string{derived, recorded} {
+		for _, d := range set {
+			if d == "" || seen[d] {
+				continue
+			}
 			seen[d] = true
-			required = append(required, d)
+			out = append(out, d)
 		}
 	}
-	return required, nil
+	return out
 }
 
 // droppedDimensionFinding is the blocking finding for a prepared set that shrank after prep.
@@ -575,7 +621,7 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 	if sha != head {
 		return zero, fmt.Errorf("review covers %s but the worker HEAD is now %s; re-run 'ttorch trust prep %s' and review again", short(sha), short(head), taskID)
 	}
-	required, dropped := m.requiredDimensions(taskID, sha)
+	required, dropped := m.requiredDimensions(t, sha)
 	if err := review.ValidateDimensionSet(required); err != nil {
 		return zero, err
 	}
@@ -665,8 +711,10 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 	// failed — the same thing the verdict's own findings say. It is resolved FOR sha through
 	// the same cross-checked view the fold used, so the line cannot report another commit's
 	// outcome beside this commit's verdict, nor call a state green that the fold blocked on.
-	m.audit(fmt.Sprintf("trust-record task=%s commit=%s verdict=%s mode=%s auto-approved=%s validate=%s",
-		taskID, short(sha), verdict.Overall, projectinit.ReadMode(t.Project), autoMinted,
+	// It names the folded set too: the set is composed from three sources now, so a reader
+	// cannot reconstruct it from any one of them.
+	m.audit(fmt.Sprintf("trust-record task=%s commit=%s verdict=%s reviewers=%s mode=%s auto-approved=%s validate=%s",
+		taskID, short(sha), verdict.Overall, strings.Join(required, "+"), projectinit.ReadMode(t.Project), autoMinted,
 		review.ValidateState(m.P.ReviewInputsDir(taskID), sha)))
 	return verdict, nil
 }
@@ -1029,7 +1077,7 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 			m.writeGateProgress(dir, gateProgress{Head: head, Outcome: gateOutcomeBlocked})
 			return GateBlocked, nil
 		}
-		episodeDims, _ := m.requiredDimensions(taskID, head)
+		episodeDims, _ := m.requiredDimensions(t, head)
 		prog = gateProgress{Head: head, Dims: episodeDims, Attempts: map[string]int{}}
 		m.writeGateProgress(dir, prog)
 	}
@@ -1044,11 +1092,14 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 	// Re-derive the required reviewer set every tick rather than trusting the persisted
 	// prog.Dims, so the daemon dispatches, polls, AND aggregates EXACTLY the set TrustRecord
 	// will aggregate (which resolves it the same way). That alignment removes any chance of
-	// recording a verdict over a different set than was reviewed. The set comes from the prep
-	// stamp, not from reviewers.json: requiredDimensions treats the stamped set as the floor
-	// and lets the file only add to it, and it fails safe to the full built-in set when no
-	// stamp covers this head, so this never under-reviews.
-	dims, dropped := m.requiredDimensions(taskID, head)
+	// recording a verdict over a different set than was reviewed.
+	//
+	// The set is composed by requiredDimensions from the prep stamp, reviewers.json and the
+	// floor re-derived from the committed diff. The stamp decides and the file may only add;
+	// the floor is unioned on top so a stamp written wrong cannot lower what gets dispatched
+	// here, the same way it cannot lower what gets required at record time. It fails safe to
+	// the full built-in set when no stamp covers this head, so this never under-reviews.
+	dims, dropped := m.requiredDimensions(t, head)
 	// VALIDATE BEFORE COMPOSING ANYTHING FOR THE MANAGER. Both records these names come from
 	// are files in the review inputs dir, and the gate_blocked payload below is the channel
 	// the manager acts on, so an unusable name must be caught here rather than quoted into a
