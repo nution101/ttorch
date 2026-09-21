@@ -40,7 +40,7 @@ func TestLifecycleEvents_ManagerActionsNeverActionable(t *testing.T) {
 	if _, err := m.SecurityReview("le1", "", time.Minute); err != nil {
 		t.Fatalf("security review: %v", err)
 	}
-	if err := m.Approve("le1", time.Minute); err != nil { // lead approval (also exercises the 'approved' event)
+	if err := m.Approve("le1", time.Minute, false); err != nil { // lead approval (also exercises the 'approved' event)
 		t.Fatalf("approve: %v", err)
 	}
 	if _, err := m.MergeLocal("le1", false); err != nil {

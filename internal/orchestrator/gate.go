@@ -619,7 +619,7 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 			green, _, _ = validateCommitted(t.Project, sha)
 		}
 		if green {
-			if err := approval.Grant(m.P.ApprovalFile(taskID), ttl, approvalPayload("auto", sha)); err != nil {
+			if err := approval.Grant(m.P.ApprovalFile(taskID), ttl, approvalPayload("auto", sha, false)); err != nil {
 				return zero, err
 			}
 			t.ApprovedBy = "auto"

@@ -1884,6 +1884,7 @@ func cmdApprove(args []string) error {
 	id := args[0]
 	fs := flag.NewFlagSet("approve", flag.ContinueOnError)
 	ttl := fs.Duration("ttl", 10*time.Minute, "how long the approval stays valid")
+	allowGateChange := fs.Bool("allow-gate-change", false, "also authorize a diff that modifies the gate's own definition (.ttorch/validate.sh, AGENTS.md)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -1892,10 +1893,14 @@ func cmdApprove(args []string) error {
 		return err
 	}
 	defer m.Close()
-	if err := m.Approve(id, *ttl); err != nil {
+	if err := m.Approve(id, *ttl, *allowGateChange); err != nil {
 		return err
 	}
-	fmt.Printf("approved %s for %s — now run: ttorch merge-local %s\n", id, *ttl, id)
+	scope := ""
+	if *allowGateChange {
+		scope = " (gate-definition changes authorized)"
+	}
+	fmt.Printf("approved %s for %s%s — now run: ttorch merge-local %s\n", id, *ttl, scope, id)
 	return nil
 }
 
@@ -2417,7 +2422,10 @@ Delivery:
   ci-parity [dir] [--list]    reproduce the repo's actual CI run-steps locally
                               (green here == green in CI); --list shows the plan only
   review-diff <id> [--stat]   show a worker's changes vs the default branch
-  approve <id> [--ttl 10m]    grant a time-boxed approval (run by the lead)
+  approve <id> [--ttl 10m] [--allow-gate-change]
+                              grant a time-boxed approval (run by the lead, from an
+                              interactive terminal); --allow-gate-change also
+                              authorizes a diff that modifies the gate's definition
   trust prep|record|show <id> prep/record/show the adversarial-review verdict
   security-review prep|record|show <id>
                               run the security reviewer in ANY delivery mode (advisory;

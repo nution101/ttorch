@@ -147,9 +147,13 @@ invalidates the verdict — re-prep, re-review, re-record.
   fall back to ecosystem detection (`go.mod`/`package.json`) on the worker's checkout,
   which the worker controls, so the auto path is refused and a human `ttorch approve` is
   required instead. A repo with no detectable checks fails closed (a hard block).
-- A trusted **auto**-merge may not change the gate's own definition. If a worker's diff
-  touches `.ttorch/validate.sh` or `AGENTS.md`, the auto-merge is refused and the change
-  requires an explicit `ttorch approve` — altering the gate is always a human decision.
+- **No merge changes the gate's own definition unless the approval says so by name.** If a
+  worker's diff touches `.ttorch/validate.sh` or `AGENTS.md`, an auto-merge is refused
+  outright, and a plain `ttorch approve` is refused too — the lead must run
+  `ttorch approve <id> --allow-gate-change`, and the merge's audit line then names the file
+  that changed. This is not a barrier: anything running as the lead can still write the
+  approval token with that scope in it. What it removes is the silent skip — before, any
+  human approval waved a gate change through with nothing in the audit log naming it.
 
 ## Findings contract
 

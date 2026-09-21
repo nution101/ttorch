@@ -48,7 +48,7 @@ func TestLand_FastLandCarriesHumanApprovalOnCleanRebase(t *testing.T) {
 	if v, ok := m.TrustShow("fh1"); !ok || v.ReviewedSHA != feat || v.DiffID == "" {
 		t.Fatalf("recorded verdict should pin the reviewed sha and a diff identity: %+v ok=%v", v, ok)
 	}
-	if err := m.Approve("fh1", time.Minute); err != nil { // human token, pinned to feat
+	if err := m.Approve("fh1", time.Minute, false); err != nil { // human token, pinned to feat
 		t.Fatal(err)
 	}
 
@@ -131,7 +131,7 @@ func TestCarryVerdictForward_CarriesHumanApprovalAndVerdict(t *testing.T) {
 	if _, err := m.TrustRecord("cu1", "", time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Approve("cu1", time.Minute); err != nil { // human token pinned to feat
+	if err := m.Approve("cu1", time.Minute, false); err != nil { // human token pinned to feat
 		t.Fatal(err)
 	}
 
@@ -167,7 +167,7 @@ func TestCarryVerdictForward_CarriesHumanApprovalAndVerdict(t *testing.T) {
 	// carryVerdictForward re-pins JUST the verdict; the derived token is re-minted at the gate
 	// check, so the pre-carry human token still pins the ORIGINAL commit at this point.
 	if data, ok := approval.Data(m.P.ApprovalFile("cu1")); ok {
-		if _, sha := splitApprovalPayload(data); sha != feat {
+		if _, sha, _ := splitApprovalPayload(data); sha != feat {
 			t.Fatalf("carryVerdictForward must not move the token itself; want it still pinned to %s, got %s", short(feat), short(sha))
 		}
 	}
@@ -180,7 +180,7 @@ func TestCarryVerdictForward_CarriesHumanApprovalAndVerdict(t *testing.T) {
 	if !ok {
 		t.Fatal("the approval token must be re-minted onto the rebased commit by the gate check")
 	}
-	if by, sha := splitApprovalPayload(data); by != "human" || sha != rebased {
+	if by, sha, _ := splitApprovalPayload(data); by != "human" || sha != rebased {
 		t.Fatalf("the re-minted approval must pin the rebased commit as human (got by=%q sha=%s, want human/%s)", by, short(sha), short(rebased))
 	}
 	_, _ = m.Teardown("cu1", true)
@@ -216,7 +216,7 @@ func TestLand_FastLandRefusesChangedContentHumanApproval(t *testing.T) {
 	if _, err := m.TrustRecord("cc1", "", time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Approve("cc1", time.Minute); err != nil { // human token pinned to feat
+	if err := m.Approve("cc1", time.Minute, false); err != nil { // human token pinned to feat
 		t.Fatal(err)
 	}
 
@@ -248,7 +248,7 @@ func TestLand_FastLandRefusesChangedContentHumanApproval(t *testing.T) {
 	if !ok {
 		t.Fatal("the approval must remain intact after a refusal")
 	}
-	if by, sha := splitApprovalPayload(data); by != "human" || sha != feat {
+	if by, sha, _ := splitApprovalPayload(data); by != "human" || sha != feat {
 		t.Fatalf("the approval must remain pinned to the original commit (got by=%q sha=%s, want human/%s)", by, short(sha), short(feat))
 	}
 	// The verdict was NOT carried either: it still pins the ORIGINAL reviewed commit.

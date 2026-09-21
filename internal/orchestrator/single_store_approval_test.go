@@ -17,7 +17,7 @@ import (
 // gated task waited in a busy land queue, the failure that used to strand it forever.
 func expireToken(t *testing.T, m *Manager, id, by, sha string) {
 	t.Helper()
-	if err := approval.Grant(m.P.ApprovalFile(id), -time.Second, approvalPayload(by, sha)); err != nil {
+	if err := approval.Grant(m.P.ApprovalFile(id), -time.Second, approvalPayload(by, sha, false)); err != nil {
 		t.Fatal(err)
 	}
 	if approval.Valid(m.P.ApprovalFile(id)) {
@@ -170,7 +170,7 @@ func TestLand_ExpiredHumanTokenLandsNoAgeBound(t *testing.T) {
 	if _, err := m.TrustRecord("eh1", "", time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Approve("eh1", time.Minute); err != nil { // human token pinned to head
+	if err := m.Approve("eh1", time.Minute, false); err != nil { // human token pinned to head
 		t.Fatal(err)
 	}
 	expireToken(t, m, "eh1", "human", head)
@@ -269,7 +269,7 @@ func TestMergeLocal_OverAgeAutoMintRefusedWithEvent(t *testing.T) {
 	if _, ok := m.TrustShow("oa1"); !ok {
 		t.Fatal("the over-age refusal must not consume the durable verdict")
 	}
-	if err := m.Approve("oa1", time.Minute); err != nil {
+	if err := m.Approve("oa1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.MergeLocal("oa1", false); err != nil {

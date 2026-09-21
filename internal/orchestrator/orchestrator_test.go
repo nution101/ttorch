@@ -889,7 +889,7 @@ func TestDeliveryLifecycle(t *testing.T) {
 	}
 
 	// Approve, then merge: the default branch fast-forwards to the worker's HEAD.
-	if err := m.Approve("d1", time.Minute); err != nil {
+	if err := m.Approve("d1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.MergeLocal("d1", false); err != nil {
@@ -949,7 +949,7 @@ func TestMergeLocal_ApprovalBinding(t *testing.T) {
 
 	// A recoverable refusal (uncommitted tracked changes) must NOT consume the approval.
 	os.WriteFile(filepath.Join(repo, "f.txt"), []byte("locally changed\n"), 0o644) // f.txt is tracked
-	if err := m.Approve("b1", time.Minute); err != nil {
+	if err := m.Approve("b1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.MergeLocal("b1", false); err == nil {
@@ -975,7 +975,7 @@ func TestMergeLocal_ApprovalBinding(t *testing.T) {
 	}
 
 	// Re-approve the current commit, then merge succeeds.
-	if err := m.Approve("b1", time.Minute); err != nil {
+	if err := m.Approve("b1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.MergeLocal("b1", false); err != nil {
@@ -1371,7 +1371,7 @@ func TestTrustRecord_PrModeUnaffectedByVerdict(t *testing.T) {
 		t.Fatal("pr-mode merge must still require an approval token")
 	}
 	// Identical to today: approve, then merge succeeds.
-	if err := m.Approve("p1", time.Minute); err != nil {
+	if err := m.Approve("p1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.MergeLocal("p1", false); err != nil {
@@ -1495,7 +1495,7 @@ func TestMergeLocal_TrustedHumanApproveOverridesAutoLabel(t *testing.T) {
 	}
 	// ...but the lead then explicitly approves the same commit, which must take over the
 	// token's provenance so the merge is attributed to a human, not the AI gate.
-	if err := m.Approve("ho1", time.Minute); err != nil {
+	if err := m.Approve("ho1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 	if reloaded, _, _ := m.Store.GetTask(context.Background(), "ho1"); reloaded.ApprovedBy != "human" {
@@ -1545,7 +1545,7 @@ func TestMergeLocal_TrustedNoChecksHardBlock(t *testing.T) {
 		t.Fatalf("no-checks repo must not record an auto approver: %+v", reloaded)
 	}
 
-	if err := m.Approve("nc1", time.Minute); err != nil {
+	if err := m.Approve("nc1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 	_, err = m.MergeLocal("nc1", false) // trusted ⇒ gated
@@ -1571,7 +1571,7 @@ func TestMergeLocal_RequireVerdictRefusesMissingVerdict(t *testing.T) {
 		t.Fatal(err)
 	}
 	commitFeature(t, task.Worktree, "feature.txt", "new\n") // clean worktree, but no verdict
-	if err := m.Approve("mv1", time.Minute); err != nil {
+	if err := m.Approve("mv1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 	_, err = m.MergeLocal("mv1", true)
@@ -1603,7 +1603,7 @@ func TestMergeLocal_GateRefusesBlockedVerdict(t *testing.T) {
 	if _, err := m.TrustRecord("bv1", "", time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Approve("bv1", time.Minute); err != nil {
+	if err := m.Approve("bv1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 	_, err = m.MergeLocal("bv1", true)
@@ -1642,7 +1642,7 @@ func TestMergeLocal_GateRefusesStaleVerdictSha(t *testing.T) {
 	}
 	// The lead approves the NEW commit — the approval pin is satisfied, so the verdict
 	// pin is what must reject the unreviewed commit.
-	if err := m.Approve("tc1", time.Minute); err != nil {
+	if err := m.Approve("tc1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 	_, err = m.MergeLocal("tc1", true)
@@ -1672,7 +1672,7 @@ func TestMergeLocal_GateRefusesFailingValidate(t *testing.T) {
 	if _, err := m.TrustRecord("rv1", "", time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Approve("rv1", time.Minute); err != nil {
+	if err := m.Approve("rv1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 	_, err = m.MergeLocal("rv1", true)
@@ -1706,7 +1706,7 @@ func TestMergeLocal_RequireVerdictHumanApprover(t *testing.T) {
 	if approval.Valid(m.P.ApprovalFile("rh1")) {
 		t.Fatal("pr mode must not auto-mint even though the merge will be gated")
 	}
-	if err := m.Approve("rh1", time.Minute); err != nil {
+	if err := m.Approve("rh1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.MergeLocal("rh1", true); err != nil {
@@ -1745,7 +1745,7 @@ func TestMergeLocal_GateUsesDefaultBranchScriptNotWorker(t *testing.T) {
 	if _, err := m.TrustRecord("db1", "", time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Approve("db1", time.Minute); err != nil {
+	if err := m.Approve("db1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 	_, err = m.MergeLocal("db1", true)
@@ -1761,10 +1761,15 @@ func TestMergeLocal_GateUsesDefaultBranchScriptNotWorker(t *testing.T) {
 	_, _ = m.Teardown("db1", true)
 }
 
-// TestMergeLocal_TrustedAutoMergeRefusesGateConfigChange: a worker's diff that touches the
-// gate definition (.ttorch/validate.sh) must NOT auto-merge in trusted mode — changing the
-// gate requires a human. With an explicit human approval the same change is allowed.
-func TestMergeLocal_TrustedAutoMergeRefusesGateConfigChange(t *testing.T) {
+// TestMergeLocal_GateConfigChangeRefusedWithoutAllowGateChange: a worker's diff that touches
+// the gate definition (.ttorch/validate.sh) must NOT merge in trusted mode on an auto-mint
+// (changing the gate is never autonomous) NOR on a plain human approval. Before the
+// allow-gate-change scope existed, a human token skipped diffTouchesGateConfig outright and
+// this merge succeeded with nothing in the audit log naming the file; the second half of this
+// test is the red proof for that. The scope does not make the bypass unreachable — a process
+// running as the lead can still write the token file with the marker in it — it makes an
+// ordinary approval stop authorizing a gate change by accident.
+func TestMergeLocal_GateConfigChangeRefusedWithoutAllowGateChange(t *testing.T) {
 	m, repo := deliveryHarness(t, "gateconfig")
 	commitGateScript(t, repo, "exit 0") // a passing default-branch gate
 	if _, err := projectinit.Init(repo, "trusted"); err != nil {
@@ -1793,17 +1798,100 @@ func TestMergeLocal_TrustedAutoMergeRefusesGateConfigChange(t *testing.T) {
 	if reloaded, _, _ := m.Store.GetTask(context.Background(), "gc1"); reloaded.ApprovedBy != "" {
 		t.Fatalf("a gate-config change must not record an auto approver: %+v", reloaded)
 	}
-	// With an explicit human approval, the gate-config change may merge (a human reviewed it).
-	if err := m.Approve("gc1", time.Minute); err != nil {
+	// A PLAIN human approval does not authorize a gate change either: the check still runs,
+	// the refusal names the offending file, and nothing merges.
+	if err := m.Approve("gc1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.MergeLocal("gc1", false); err != nil {
-		t.Fatalf("a human-approved gate-config change should merge: %v", err)
+	defHead := gitIn(t, repo, "rev-parse", "HEAD")
+	_, err = m.MergeLocal("gc1", false)
+	if err == nil {
+		t.Fatal("a plain human approval must not authorize a gate-definition change")
 	}
-	if b, _ := os.ReadFile(m.P.AuditLog()); !strings.Contains(string(b), "approver=human") {
-		t.Fatalf("the human-approved gate-config merge must audit as approver=human: %s", b)
+	if !strings.Contains(err.Error(), ".ttorch/validate.sh") {
+		t.Fatalf("the refusal must name the offending gate-definition file, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "--allow-gate-change") {
+		t.Fatalf("the refusal must say which explicit approval is needed, got: %v", err)
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") != defHead {
+		t.Fatal("the gate-definition change must not have merged")
 	}
 	_, _ = m.Teardown("gc1", true)
+}
+
+// TestMergeLocal_AllowGateChangeAuthorizesGateConfigChange is the green half: the same diff
+// merges once the lead approves it with --allow-gate-change, and the merge's audit line NAMES
+// the gate-definition file it changed, so a gate change is never reconstructable only by
+// re-reading the diff afterwards.
+func TestMergeLocal_AllowGateChangeAuthorizesGateConfigChange(t *testing.T) {
+	m, repo := deliveryHarness(t, "gateallow")
+	commitGateScript(t, repo, "exit 0")
+	if _, err := projectinit.Init(repo, "trusted"); err != nil {
+		t.Fatal(err)
+	}
+	task, err := m.Spawn("ga1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := task.Worktree
+	if err := os.WriteFile(filepath.Join(wt, ".ttorch", "validate.sh"), []byte("exit 0\n# tweaked by worker\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, wt, "add", "-A")
+	gitIn(t, wt, "commit", "-q", "-m", "edit gate")
+	head := gitIn(t, wt, "rev-parse", "HEAD")
+	writeReviewReports(t, m.P.ReviewInputsDir("ga1"), head, nil)
+	if _, err := m.TrustRecord("ga1", "", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Approve("ga1", time.Minute, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.MergeLocal("ga1", false); err != nil {
+		t.Fatalf("an explicitly gate-change-approved diff should merge: %v", err)
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") != head {
+		t.Fatal("the approved gate-definition change should have fast-forwarded the default branch")
+	}
+	b, _ := os.ReadFile(m.P.AuditLog())
+	if !strings.Contains(string(b), "gate-change=.ttorch/validate.sh") {
+		t.Fatalf("the merge audit line must name the gate-definition file that changed: %s", b)
+	}
+	if !strings.Contains(string(b), "approver=human") {
+		t.Fatalf("the gate-change merge must audit as approver=human: %s", b)
+	}
+	if !strings.Contains(string(b), "scope=allow-gate-change") {
+		t.Fatalf("the approval itself must be audited as scoped to a gate change: %s", b)
+	}
+	_, _ = m.Teardown("ga1", true)
+}
+
+// TestApprovalPayloadScope pins the token wire format the gate reads its authority from: the
+// allow-gate-change scope round-trips, an ordinary token never parses as carrying it, and a
+// legacy provenance-less token still yields by=="" so the gated path fails closed on it.
+func TestApprovalPayloadScope(t *testing.T) {
+	sha := "abc123"
+	for _, tc := range []struct {
+		name          string
+		data          string
+		wantBy        string
+		wantSHA       string
+		wantGateScope bool
+	}{
+		{"human plain", approvalPayload("human", sha, false), "human", sha, false},
+		{"human scoped", approvalPayload("human", sha, true), "human", sha, true},
+		{"auto plain", approvalPayload("auto", sha, false), "auto", sha, false},
+		{"legacy bare sha", sha, "", sha, false},
+		{"empty", "", "", "", false},
+		{"unknown trailing scope", "human " + sha + " something-else", "human", sha, false},
+	} {
+		by, gotSHA, gateScope := splitApprovalPayload(tc.data)
+		if by != tc.wantBy || gotSHA != tc.wantSHA || gateScope != tc.wantGateScope {
+			t.Errorf("%s: splitApprovalPayload(%q) = (%q, %q, %v), want (%q, %q, %v)",
+				tc.name, tc.data, by, gotSHA, gateScope, tc.wantBy, tc.wantSHA, tc.wantGateScope)
+		}
+	}
 }
 
 // TestMergeLocal_RefusesAutoApprovalWhenGateInactive is the ungated-auto guard: an
@@ -2097,7 +2185,7 @@ func TestMergeLocal_TrustedAutoRunsRealDefaultBranchScript(t *testing.T) {
 	}
 	// Even a human-approved gated merge runs the real script and fails — the worker's
 	// package.json no-op never governs.
-	if err := m.Approve("rs1", time.Minute); err != nil {
+	if err := m.Approve("rs1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 	_, err = m.MergeLocal("rs1", false)
@@ -2561,7 +2649,7 @@ func TestSpawnAutoInit_DoesNotBlockMergeLocal(t *testing.T) {
 	}
 	gitIn(t, wt, "add", "-A")
 	gitIn(t, wt, "commit", "-q", "-m", "add feature")
-	if err := m.Approve("aim1", time.Minute); err != nil {
+	if err := m.Approve("aim1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.MergeLocal("aim1", false); err != nil {
@@ -2695,7 +2783,7 @@ func TestLand_CleanLocalMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	head := commitFeature(t, task.Worktree, "feature.txt", "new\n")
-	if err := m.Approve("l1", time.Minute); err != nil {
+	if err := m.Approve("l1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2744,7 +2832,7 @@ func TestLand_RebaseConflictAborts(t *testing.T) {
 	}
 	gitIn(t, repo, "add", "f.txt")
 	gitIn(t, repo, "commit", "-q", "-m", "default edits f.txt")
-	if err := m.Approve("c1", time.Minute); err != nil {
+	if err := m.Approve("c1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2780,7 +2868,7 @@ func TestLand_ValidateRedAborts(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = commitFeature(t, task.Worktree, "feature.txt", "new\n")
-	if err := m.Approve("r1", time.Minute); err != nil {
+	if err := m.Approve("r1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2814,7 +2902,7 @@ func TestLand_PostMergeVerifyMismatchAborts(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = commitFeature(t, task.Worktree, "feature.txt", "new\n")
-	if err := m.Approve("v1", time.Minute); err != nil {
+	if err := m.Approve("v1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2937,7 +3025,7 @@ func TestLand_RebaseMovedRequiresReapproval(t *testing.T) {
 	}
 	wt := task.Worktree
 	feat := commitFeature(t, wt, "feature.txt", "new\n")
-	if err := m.Approve("m1", time.Minute); err != nil { // pinned to the pre-rebase sha
+	if err := m.Approve("m1", time.Minute, false); err != nil { // pinned to the pre-rebase sha
 		t.Fatal(err)
 	}
 	// The default branch advances non-conflictingly (a different file) after approval.
@@ -2969,7 +3057,7 @@ func TestLand_RebaseMovedRequiresReapproval(t *testing.T) {
 	}
 
 	// The lead reviews the rebased diff and approves the rebased commit; the re-run lands.
-	if err := m.Approve("m1", time.Minute); err != nil {
+	if err := m.Approve("m1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 	out, err := m.Land("m1", false)
@@ -3297,7 +3385,7 @@ func TestSecurityReview_BlockingFindingStaysAdvisory(t *testing.T) {
 		t.Fatal("a blocking advisory must not mint an approval")
 	}
 	// The blocking advisory does NOT gate a non-trusted merge: approve + merge still works.
-	if err := m.Approve("sb1", time.Minute); err != nil {
+	if err := m.Approve("sb1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.MergeLocal("sb1", false); err != nil {
@@ -3444,7 +3532,7 @@ func TestQAReview_BlockingFindingStaysAdvisory(t *testing.T) {
 		t.Fatal("a blocking advisory must not mint an approval")
 	}
 	// The blocking advisory does NOT gate a non-trusted merge: approve + merge still works.
-	if err := m.Approve("qb1", time.Minute); err != nil {
+	if err := m.Approve("qb1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.MergeLocal("qb1", false); err != nil {
@@ -3547,7 +3635,7 @@ func TestLand_SurfacesSecurityAdvisory(t *testing.T) {
 		t.Fatal(err)
 	}
 	head := commitFeature(t, task.Worktree, "feature.txt", "new\n")
-	if err := m.Approve("ls1", time.Minute); err != nil {
+	if err := m.Approve("ls1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 

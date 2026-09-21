@@ -186,7 +186,7 @@ reference; this table covers the surface a lead and manager use day to day.
 | `ttorch trust prep\|record\|show <id>` | Prepare / record / show the adversarial-review verdict (the trust gate) |
 | `ttorch security-review prep\|record\|show <id>` | Standalone advisory security audit (every mode; never blocks) |
 | `ttorch qa-review prep\|record\|show <id>` | Optional advisory test-adequacy audit (never blocks) |
-| `ttorch approve <id> [--ttl 10m]` | Grant a time-boxed, single-use approval (the lead's action) |
+| `ttorch approve <id> [--ttl 10m] [--allow-gate-change]` | Grant a time-boxed, single-use approval (the lead's action, from an interactive terminal). `--allow-gate-change` also authorizes a diff that modifies the gate's own definition |
 | `ttorch merge-local <id> [--require-verdict]` | Fast-forward the local default branch (needs approval) |
 | `ttorch land <id>… \| --all [--require-verdict]` | One safe atomic delivery: fetch, rebase, re-validate, integrate per delivery mode, fast-forward. `--all` lands the whole done set concurrently |
 | `ttorch promote <id>` | Turn a scout task into a ship task |
