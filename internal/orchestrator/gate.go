@@ -74,9 +74,11 @@ func (m *Manager) ReviewersFor(taskID string) []string {
 }
 
 // requiredDimensions resolves the reviewer set a verdict for sha must fold, and reports any
-// dimension the stamp prepared that reviewers.json no longer lists. The stamp is the
-// authority (see review.RequiredDimensions); with no stamp covering sha there is none, so it
-// fails safe to the full built-in set unioned with whatever the file says, never to fewer.
+// dimension the stamp prepared that reviewers.json no longer lists. Between the two records
+// the stamp decides, and neither is out of a worker's reach: see review.RequiredDimensions
+// for what that buys and what it does not. With no stamp covering sha there is nothing to
+// decide from, so it fails safe to the full built-in set unioned with whatever the file
+// says, never to fewer.
 func (m *Manager) requiredDimensions(taskID, sha string) (required, dropped []string) {
 	onDisk := m.ReviewersFor(taskID)
 	required, dropped, ok := review.RequiredDimensions(m.P.ReviewInputsDir(taskID), sha, onDisk)

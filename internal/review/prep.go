@@ -50,11 +50,11 @@ type PrepStamp struct {
 	// false means no checks ran at all.
 	ValidateFailed []string `json:"validateFailed,omitempty"`
 	// Dimensions is the reviewer set this prep prepared, recorded here because it decides
-	// what a verdict must cover. reviewers.json holds the same list for the manager to
-	// read, but it is rewritten by whoever can write the inputs dir, so a record that took
-	// its required set from that file could be made to fold a smaller set than was
-	// reviewed. This copy is written by prep and read by the record and the daemon; see
-	// RequiredDimensions for how the two are reconciled.
+	// what a verdict must cover. reviewers.json holds the same list for the manager to read
+	// and edit; this copy is the one the record and the daemon resolve from, so changing the
+	// required set means changing both consistently rather than editing one file. Both live
+	// in the same writable directory, so this is a cost, not a boundary. See
+	// RequiredDimensions.
 	Dimensions []string `json:"dimensions,omitempty"`
 }
 
@@ -170,11 +170,27 @@ func ValidDimensionName(name string) bool {
 }
 
 // RequiredDimensions reconciles the reviewer set a verdict must fold for sha from the two
-// records of it: the set the prep stamped (Go-written, at prep time) and the set now in
-// reviewers.json (rewritable by anything with access to the inputs dir). The stamp is
-// AUTHORITATIVE, because it is the only one written by the code that decided the set, and
-// because the file's whole purpose is to be read and edited by the manager between prep and
+// records of it: the set the prep stamped and the set now in reviewers.json. Between those
+// two, the stamp DECIDES: it is written by the code that chose the set, at the moment it
+// chose it, while the file exists to be read and edited by the manager between prep and
 // record.
+//
+// It is not a trust boundary, and the difference matters. prep.json, reviewers.json and
+// validate.json are all 0o644 in the same review inputs dir, written and read by processes
+// running as the same user, so a worker can write any of them. What the stamp changes is
+// the cost: dropping a dimension used to take one edit to reviewers.json, and now takes
+// consistent edits to reviewers.json and prep.json, plus a fresh mtime on every surviving
+// report (rewriting the stamp moves its own mtime, which fails the freshness check on every
+// report older than it), plus a validate.json that still agrees with the stamp's
+// validateGreen. Three files and their timestamps rather than one file. Someone who does
+// all of it consistently gets a clean verdict, and that has been reproduced, not assumed.
+//
+// A real boundary is not available here: the worker runs as the same uid on the same
+// machine, so anything this code can read or write, it can too, including a signing key or
+// a row in the SQLite store. Making the set unforgeable needs the worker to run somewhere
+// this process does not, which is a change to how ttorch runs workers, not a change to this
+// function. The honest summary is that this raises cost and leaves evidence; it does not
+// make the set authentic.
 //
 // The file may only ADD. A repo that runs a dimension beyond the built-in three appends it
 // to reviewers.json after prep, and that is a real workflow, so the returned set is the
@@ -183,9 +199,9 @@ func ValidDimensionName(name string) bool {
 // than silently restored: a set that shrank after prep says the inputs dir was edited during
 // the review, which the caller should surface, not paper over.
 //
-// ok is false when no stamp covers sha. The caller then has no authoritative set and must
-// fall back to its own fail-safe (the full built-in set); the fold blocks in that case
-// anyway, since an episode that does not cover the commit cannot underwrite a verdict.
+// ok is false when no stamp covers sha. The caller then has no stamped set and must fall
+// back to its own fail-safe (the full built-in set); the fold blocks in that case anyway,
+// since an episode that does not cover the commit cannot underwrite a verdict.
 func RequiredDimensions(inputsDir, sha string, onDisk []string) (required, dropped []string, ok bool) {
 	p := readPrep(inputsDir)
 	if !p.covers(sha) {
