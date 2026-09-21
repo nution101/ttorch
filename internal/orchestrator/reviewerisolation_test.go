@@ -18,10 +18,12 @@ import (
 // straight into the review-inputs dir, a project-scope .claude/agents/ttorch-reviewer-security.md
 // that outranks the installed reviewer definition, and a CLAUDE.md. It returns the reviewed head.
 //
-// The hook is the one that matters. dev/trust-step12/EVIDENCE.md records the harness experiment
-// behind it: a committed .claude/settings.json Stop hook DOES fire for a session launched with
-// --dangerously-skip-permissions whose cwd is the repo, and does NOT fire for the same session
-// run from a directory outside it. This test is the ttorch-side regression guard for that.
+// The hook is the one that matters, and it was checked against the real harness rather than
+// assumed: a committed .claude/settings.json Stop hook DOES fire for a session launched with
+// permissions skipped whose cwd is the repo, and does NOT fire for the same session run from a
+// directory outside it. Go cannot assert that here without launching a model, so this test
+// guards the ttorch-side property the harness result depends on — that no directory the worker
+// controls is on the reviewer session's configuration path.
 func plantHostileHarnessConfig(t *testing.T, wt, inputsDir string) string {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Join(wt, ".claude", "agents"), 0o755); err != nil {

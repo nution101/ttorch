@@ -1385,9 +1385,13 @@ func (m *Manager) Gateable(repo string) bool {
 // This is a PILOT on one dimension rather than the whole set, because it has a real cost: the
 // reviewer loses ripgrep over a working tree and reads surrounding source through
 // `git -C <bare> show` and `git grep <tree-ish>` instead, which the brief spells out. Security
-// is the dimension piloted — it is the one a forged empty report damages most, and the one the
-// hook attack in dev/trust-step12/EVIDENCE.md is demonstrated against. Correctness and scope
-// keep running in the worktree until the pilot's review quality has been measured.
+// is the dimension piloted, for two reasons. A forged empty report damages it most, since its
+// absence lets a vulnerability through rather than a style slip. And it is the one the attack
+// was demonstrated against: a committed .claude/settings.json Stop hook fires for a session
+// launched with permissions skipped whose cwd is the repo, and overwrites the report the
+// reviewer just wrote; run from a scratch directory outside the tree, the same hook does not
+// fire. Correctness and scope keep running in the worktree until the pilot's review quality
+// has been measured.
 //
 // It does not cover the skill-driven path, where the manager dispatches ttorch-reviewer-*
 // subagents from its own cwd. That path's exposure is the DEFAULT BRANCH's CLAUDE.md and
