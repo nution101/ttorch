@@ -116,7 +116,10 @@ gates trusted work, lands, and recovers, and the manager bridges the two with ju
    the changes. Gating produces a verdict; it never merges.
 5. **Approve & land.** In most modes you run `ttorch approve <id>` yourself, in your own
    terminal — it refuses a non-interactive invocation, and one made from inside a worker's
-   context ($TTORCH_TASK_ID, or a `.ttorch/task` at or above the cwd) — and the gated work lands
+   context ($TTORCH_TASK_ID, or a `.ttorch/task` at or above the cwd). Those refusals catch
+   an accidental or injected approval; they are not a boundary. A process running as you can
+   unset the variable, change directory, and hand itself a terminal-like device, or skip the
+   command and write the token file itself. Then the gated work lands
    (the scheduler lands already-gated work for you, or the manager runs `ttorch land`). In
    **trusted** mode a passing verdict + a fresh green validate lands it with no separate
    approval (§7). **Outside trusted mode, nothing merges without your approval.**
