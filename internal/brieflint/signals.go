@@ -76,15 +76,53 @@ var numberSignal = stemRe(
 	"actual", "real", "true", "finding", "findings", "result", "results",
 )
 
-// hedged reports whether the brief hedges its hard counts: somewhere it tells the reader to
-// verify the figure, AND somewhere a reporting verb sits in the same sentence as a word for
-// the number being reported. The hedge is brief-scoped deliberately — one hedge at the top
-// legitimately covers every count below it, and demanding one per count would only push
-// authors to repeat themselves.
-func hedged(b *brief) bool {
-	if !verifySignal.MatchString(b.raw) {
-		return false
+// distrustSignal marks text saying the figure itself is not to be trusted.
+var distrustSignal = stemRe(
+	"may be wrong", "might be wrong", "could be wrong", "may be off", "might be off",
+	"may be stale", "might be stale", "may be out of date", "not authoritative",
+	"do not trust", "don't trust", "dont trust", "indicativ*", "approximat*", "rough*",
+	"estimate*", "unverified", "not exact", "may not be exact", "as a hint", "may be more",
+	"may be fewer", "may be less", "could be more", "could be fewer", "i may have miscounted",
+	"miscount*", "from memory", "off the top of my head",
+)
+
+// recountSignal marks an instruction to establish the number again rather than take it as
+// given. Bare "check" and bare "verify" are deliberately absent: "check the build" is not a
+// hedge, and admitting words that common is what let boilerplate satisfy this rule.
+var recountSignal = stemRe(
+	"recount*", "re-count*", "count them", "count it", "count the", "count yourself",
+	"count again", "count for yourself", "verify the count", "verify the number",
+	"verify the total", "verify the figure", "verify that count", "verify that number",
+	"check the count", "check the number", "check the total", "check the figure",
+	"confirm the count", "confirm the number", "confirm the total", "establish the",
+	"determine the actual", "determine the real", "determine the true", "your own count",
+	"your own number", "your own total", "your own tally", "find the real",
+	"find the actual", "find the true",
+)
+
+// hedgeWindow is how far a hedge may sit from the count it hedges: the sentence carrying the
+// number, and the one immediately after it. A hedge further away than that is not attached
+// to anything, which is how a brief could carry a hard count and satisfy this rule with
+// unrelated prose elsewhere.
+const hedgeWindow = 2
+
+// hedgedAt reports whether the hard count in sents[i] carries a hedge attached to it: within
+// the window, something saying the figure is not to be trusted, or telling the reader to
+// establish it again.
+func hedgedAt(sents []span, i int) bool {
+	for j := i; j < i+hedgeWindow && j < len(sents); j++ {
+		if distrustSignal.MatchString(sents[j].text) || recountSignal.MatchString(sents[j].text) {
+			return true
+		}
 	}
+	return false
+}
+
+// reportsTheNumber reports whether the brief asks anywhere for the figure the reader ends up
+// with. This half stays brief-scoped: one "tell me the number you find" legitimately covers
+// every count below it. It is necessary but not sufficient, since the attached hedge above
+// is what distinguishes a real hedge from prose that happens to mention results.
+func reportsTheNumber(b *brief) bool {
 	for _, s := range sentences(b.raw) {
 		if reportSignal.MatchString(s.text) && numberSignal.MatchString(s.text) {
 			return true
@@ -116,10 +154,14 @@ var endStateSignal = stemRe(
 	"deliverable", "done when",
 )
 
-// createSignal marks a sentence that asks for something to be CREATED. A brief may
-// legitimately cite a path that does not exist yet ("write dev/report.md"), and reporting
-// that as a missing file would fail every brief that asks for a new file. A citation in
-// such a sentence is exempted from the existence check, and the exemption is reported.
+// createSignal marks a verb asking for something to be CREATED. A brief may legitimately
+// cite a path that does not exist yet ("write dev/report.md"), and reporting that as a
+// missing file would fail every brief that asks for a new file.
+//
+// The verb has to govern the citation, not merely share a sentence with it: see
+// governedByCreate. Sentence scope exempted "The regression at internal/nope/ghost.go:9999
+// came from adding the cache", where the create verb is retrospective and the path is
+// fabricated, which is precisely the defect this rule exists to catch.
 var createSignal = stemRe(
 	"write", "writes", "writing", "create*", "add", "adds", "adding", "new file",
 	"introduce*", "generate*", "produce*", "scaffold*", "author", "populate*",
@@ -177,4 +219,24 @@ var markerPrefix = regexp.MustCompile(`^(?:[-*+>#]+\s+)+`)
 func (s span) trim() string {
 	t := strings.Join(strings.Fields(s.text), " ")
 	return markerPrefix.ReplaceAllString(t, "")
+}
+
+// createWindow is how many words may sit between a create verb and the path it governs. A
+// verb further away than this is talking about something else in the sentence.
+const createWindow = 6
+
+// governedByCreate reports whether a create verb governs the citation starting at pathStart
+// in sent: the verb must come BEFORE the path, and within createWindow words of it.
+//
+// Both halves matter. Requiring the verb to precede the path rejects the retrospective
+// "... came from adding the cache", and the word budget rejects "Add the cache layer, then
+// fix the regression at <path>", where the verb governs something else entirely.
+func governedByCreate(sent string, pathStart int) bool {
+	before := sent[:pathStart]
+	locs := createSignal.FindAllStringIndex(before, -1)
+	if len(locs) == 0 {
+		return false
+	}
+	last := locs[len(locs)-1]
+	return len(strings.Fields(before[last[1]:])) <= createWindow
 }

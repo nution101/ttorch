@@ -56,31 +56,100 @@ func TestSpanTrimStripsMarkdown(t *testing.T) {
 	}
 }
 
-// hedged needs BOTH halves: an admission that the figure may be wrong, and an instruction
-// to report the number found. Either alone is not a hedge.
-func TestHedgedNeedsBothSignals(t *testing.T) {
-	both := "The count may be wrong. Report the real total you find."
-	if !hedged(parse(both)) {
-		t.Fatalf("%q: want hedged", both)
+// A hedge counts only where it is attached to the count: in the sentence carrying the
+// number or the one immediately after. Boilerplate elsewhere in the brief is not a hedge.
+func TestHedgedAtRequiresAttachment(t *testing.T) {
+	cases := map[string]struct {
+		brief string
+		want  bool
+	}{
+		"same sentence": {
+			"There are 21 occurrences, give or take, so count them yourself.", true},
+		"next sentence": {
+			"There are 21 occurrences. That figure may be wrong.", true},
+		"two sentences later": {
+			"There are 21 occurrences. Fix them. That figure may be wrong.", false},
+		"the reviewer's boilerplate": {
+			"There are 21 occurrences of the old helper. Fix them. Check the build afterwards and note the results.", false},
+		"bare check nearby is not a hedge": {
+			"There are 21 occurrences. Check the build afterwards.", false},
+		"no hedge at all": {
+			"There are 21 occurrences of the old helper. Fix them.", false},
 	}
-	for _, s := range []string{
-		"The count may be wrong.",
-		"Report your progress when you are done.",
-		"Fix the 21 occurrences.",
-	} {
-		if hedged(parse(s)) {
-			t.Fatalf("%q: must not count as hedged", s)
+	for name, tc := range cases {
+		sents := sentences(tc.brief)
+		counts := hardCounts(sents)
+		if len(counts) != 1 {
+			t.Fatalf("%s: fixture must state exactly one hard count, got %d", name, len(counts))
+		}
+		if got := hedgedAt(sents, counts[0]); got != tc.want {
+			t.Fatalf("%s: hedgedAt = %v, want %v for %q", name, got, tc.want, tc.brief)
 		}
 	}
 }
 
-// The reporting verb and the word for the number must share a sentence: "report" in one
-// sentence and "number" in an unrelated one is not an instruction to report the number.
-func TestHedgedRequiresSameSentence(t *testing.T) {
-	split := "Verify the count. Report your progress.\nThe number of packages is large."
-	if hedged(parse(split)) {
-		t.Fatal("signals in unrelated sentences must not satisfy the hedge")
+// The attached half must say the figure is suspect or ask for it again. Mentioning results
+// is not that, which is the distinction the boilerplate above turned on.
+func TestDistrustAndRecountSignals(t *testing.T) {
+	for _, s := range []string{
+		"that count may be wrong", "my tally is indicative only", "roughly 21",
+		"I counted them approximately", "do not trust it", "count them yourself",
+		"verify the number before you start", "establish the true total",
+		"report your own count",
+	} {
+		if !distrustSignal.MatchString(s) && !recountSignal.MatchString(s) {
+			t.Fatalf("%q: want a hedge signal", s)
+		}
 	}
+	for _, s := range []string{
+		"check the build afterwards", "note the results", "list the findings",
+		"verify the tests pass", "report back when done", "count on me",
+	} {
+		if distrustSignal.MatchString(s) || recountSignal.MatchString(s) {
+			t.Fatalf("%q: must not read as a hedge", s)
+		}
+	}
+}
+
+// reportsTheNumber stays brief-scoped, and still needs the reporting verb and the word for
+// the number in one sentence.
+func TestReportsTheNumber(t *testing.T) {
+	if !reportsTheNumber(parse("Report the real total you find.")) {
+		t.Fatal("want the report instruction recognised")
+	}
+	if reportsTheNumber(parse("Report your progress.\nThe number of packages is large.")) {
+		t.Fatal("signals in unrelated sentences must not count")
+	}
+}
+
+// A create verb exempts only the path it governs, and only when it comes first.
+func TestGovernedByCreate(t *testing.T) {
+	cases := map[string]struct {
+		sent string
+		path string
+		want bool
+	}{
+		"write, adjacent":      {"Write dev/report/EVIDENCE.md with the results", "dev/report/EVIDENCE.md", true},
+		"add, a few words off": {"Add a test to internal/x_test.go", "internal/x_test.go", true},
+		"verb after the path":  {"The regression at internal/nope/ghost.go:9999 came from adding the cache", "internal/nope/ghost.go:9999", false},
+		"verb governs another": {"Add the cache layer, then fix the regression at internal/deep/thing.go:40", "internal/deep/thing.go:40", false},
+		"no verb":              {"Fix the bug in internal/x/y.go", "internal/x/y.go", false},
+	}
+	for name, tc := range cases {
+		at := indexOfPath(t, tc.sent, tc.path)
+		if got := governedByCreate(tc.sent, at); got != tc.want {
+			t.Fatalf("%s: governedByCreate = %v, want %v", name, got, tc.want)
+		}
+	}
+}
+
+func indexOfPath(t *testing.T, sent, path string) int {
+	t.Helper()
+	i := strings.Index(sent, path)
+	if i < 0 {
+		t.Fatalf("fixture %q does not contain %q", sent, path)
+	}
+	return i
 }
 
 func TestLineAt(t *testing.T) {

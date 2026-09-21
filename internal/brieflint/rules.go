@@ -250,24 +250,34 @@ func citationOf(tok string) (citation, bool) {
 // reference to the remote itself ("origin/main") is a ref, not a path, and is excluded.
 func (b *brief) citations(remote string) []citation {
 	var out []citation
-	seen := map[string]bool{}
+	seen := map[string]int{} // raw citation -> index in out
 	text := urlRe.ReplaceAllStringFunc(b.raw, func(s string) string { return strings.Repeat(" ", len(s)) })
 	refPrefix := strings.ToLower(remote) + "/"
 	for _, sent := range sentences(text) {
-		create := createSignal.MatchString(sent.text)
 		for _, m := range candidateRe.FindAllStringIndex(sent.text, -1) {
 			tok := sent.text[m[0]:m[1]]
 			if strings.HasPrefix(strings.ToLower(tok), refPrefix) {
 				continue
 			}
 			c, ok := citationOf(tok)
-			if !ok || seen[c.raw] {
+			if !ok {
 				continue
 			}
-			seen[c.raw] = true
 			c.quote = c.raw
 			c.src = b.lineAt(sent.off + m[0])
-			c.create = create
+			// The exemption is earned by THIS mention, from a create verb governing this
+			// path here, not by the sentence and not by the path.
+			c.create = governedByCreate(sent.text, m[0])
+			if i, ok := seen[c.raw]; ok {
+				// A later mention that earned no exemption puts the path back under the
+				// check. Otherwise one "Add internal/x/y.go" near the top would exempt
+				// every later reference to that path in the brief.
+				if out[i].create && !c.create {
+					out[i] = c
+				}
+				continue
+			}
+			seen[c.raw] = len(out)
 			out = append(out, c)
 		}
 	}
@@ -489,11 +499,10 @@ var (
 // incidental prose; the failure this rule exists for needs a plural claim to bound.
 const minHardCount = 2
 
-// hardCounts returns the sentences that state a hard count, in order.
-func hardCounts(b *brief) []span {
-	var out []span
-	seen := map[int]bool{}
-	for _, s := range sentences(b.raw) {
+// hardCounts returns the indexes, into sents, of the sentences that state a hard count.
+func hardCounts(sents []span) []int {
+	var out []int
+	for i, s := range sents {
 		for _, re := range []*regexp.Regexp{countNounRe, countPhraseRe} {
 			m := re.FindStringSubmatch(s.text)
 			if m == nil {
@@ -502,29 +511,39 @@ func hardCounts(b *brief) []span {
 			if n, err := strconv.Atoi(m[1]); err != nil || n < minHardCount {
 				continue
 			}
-			if !seen[s.off] {
-				seen[s.off] = true
-				out = append(out, s)
-			}
+			out = append(out, i)
+			break
 		}
 	}
 	return out
 }
 
 func checkHardCounts(_ context.Context, b *brief, _ Options) ([]Finding, []string) {
-	counts := hardCounts(b)
+	sents := sentences(b.raw)
+	counts := hardCounts(sents)
 	if len(counts) == 0 {
 		return nil, []string{"hard-counts: the brief states no hard count"}
 	}
-	if hedged(b) {
-		return nil, []string{fmt.Sprintf("hard-counts: %d hard count(s), hedged", len(counts))}
-	}
+	asksForTheNumber := reportsTheNumber(b)
 	var findings []Finding
-	for _, s := range counts {
+	for _, i := range counts {
+		s := sents[i]
+		var detail string
+		switch {
+		case !hedgedAt(sents, i):
+			detail = "states a hard count with no hedge attached to it; in this sentence or the next, say the figure may be wrong or tell the worker to count it themselves"
+		case !asksForTheNumber:
+			detail = "hedges the count but never asks for the worker's own number; tell them to report the figure they actually find"
+		default:
+			continue
+		}
 		findings = append(findings, Finding{
 			Rule: RuleHardCounts, Status: StatusFail, Quote: s.trim(), Line: b.lineAt(s.off),
-			Detail: "states a hard count with no verify-yourself hedge; tell the worker the figure may be wrong, to check it, and to report their own number",
+			Detail: detail,
 		})
+	}
+	if len(findings) == 0 {
+		return nil, []string{fmt.Sprintf("hard-counts: %d hard count(s), each hedged where it is stated", len(counts))}
 	}
 	return findings, nil
 }
@@ -622,7 +641,7 @@ func checkStandards(_ context.Context, b *brief, opt Options) ([]Finding, []stri
 		}
 		return []Finding{{
 			Rule: RuleStandards, Status: StatusFail,
-			Detail: fmt.Sprintf("the brief cites none of the standards pointer(s) this project declares (%s, from %s %s); point the worker at them", strings.Join(cfg.Standards, ", "), cfg.Source, standardsKey),
+			Detail: fmt.Sprintf("the brief cites none of the standards pointer(s) this project declares (%s, from %s %s); point the worker at them", strings.Join(quoteAll(cfg.Standards), ", "), cfg.Source, standardsKey),
 		}}, nil
 	}
 	notes := []string{fmt.Sprintf("standards: no project pointer declared (%s), so any explicit standards reference is accepted", standardsKey)}
