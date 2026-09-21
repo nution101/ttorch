@@ -841,8 +841,10 @@ func TestUnclassifiableTreeQueryIsIndeterminate(t *testing.T) {
 	}
 }
 
-// Every brief-derived value reaches git as a positional argument, after an end-of-options
-// guard, so a future change to the extraction regexes cannot smuggle in an option.
+// Every brief-derived value reaches git as a positional argument, BEHIND an end-of-options
+// guard, so a future change to the extraction regexes cannot smuggle in an option. The
+// position is the point: a guard that sits after the value it is supposed to protect guards
+// nothing, so this asserts the index and not merely the presence.
 func TestBriefDerivedValuesAreGuardedFromOptionParsing(t *testing.T) {
 	repo, reviewed := fixture(t)
 	brief := strings.Replace(satisfying, "Touch pkg/thing.go", "Fix pkg/thing.go:3", 1)
@@ -851,18 +853,49 @@ func TestBriefDerivedValuesAreGuardedFromOptionParsing(t *testing.T) {
 	if len(spy.calls) == 0 {
 		t.Fatal("no git calls were made")
 	}
+	// Everything here came out of the brief or out of the caller's options: the remote, the
+	// branch, the refs, the cited path.
+	fromBrief := []string{"origin", "main", "pkg/thing.go", "docs/guide.md", reviewed}
+	checked := 0
 	for _, c := range spy.calls {
-		if !hasGuard(c) {
-			t.Fatalf("git %v passes brief-derived values with no -- or --end-of-options guard", c)
+		v := firstUserValue(c, fromBrief)
+		if v < 0 {
+			continue // a call carrying no brief-derived value needs no guard
 		}
+		checked++
+		g := guardIndex(c)
+		if g < 0 {
+			t.Fatalf("git %v passes %q with no -- or --end-of-options guard", c, c[v])
+		}
+		if g > v {
+			t.Fatalf("git %v puts its guard at %d, after the brief-derived %q at %d, so it guards nothing", c, g, c[v], v)
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no call carried a brief-derived value, so this asserted nothing")
 	}
 }
 
-func hasGuard(args []string) bool {
-	for _, a := range args {
+// guardIndex is the position of the first end-of-options guard, or -1.
+func guardIndex(args []string) int {
+	for i, a := range args {
 		if a == "--" || a == "--end-of-options" {
-			return true
+			return i
 		}
 	}
-	return false
+	return -1
+}
+
+// firstUserValue is the position of the first argument carrying one of the given values, or
+// -1. Substring rather than equality, because a value can arrive inside a composite argument
+// such as "<ref>:<path>" or "<ref>^{commit}".
+func firstUserValue(args, values []string) int {
+	for i, a := range args {
+		for _, v := range values {
+			if strings.Contains(a, v) {
+				return i
+			}
+		}
+	}
+	return -1
 }

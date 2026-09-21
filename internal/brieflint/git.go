@@ -170,7 +170,7 @@ func (o Options) revExists(ctx context.Context, ref string) (bool, error) {
 // would report a repository problem as a rule violation — inconsistent with every other
 // query in this file, which treats an unclassifiable failure as unevaluable.
 func (o Options) objectType(ctx context.Context, ref, path string) (string, bool, error) {
-	res := o.git(ctx, o.Repo, "ls-tree", "--full-tree", ref, "--", path)
+	res := o.git(ctx, o.Repo, "ls-tree", "--full-tree", "--end-of-options", ref, "--", path)
 	switch {
 	case res.err != nil:
 		return "", false, res.err
