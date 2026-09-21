@@ -194,6 +194,16 @@ func TestClassify_HarnessConfigIsNotInertProse(t *testing.T) {
 		}},
 		{"a nested package's CLAUDE.md", []string{"internal/orchestrator/CLAUDE.md"}},
 		{"harness config mixed with real prose", []string{"README.md", ".claude/settings.json"}},
+		// The directory segment is compared separately from the basename, so a fold applied to
+		// only one half leaves the other open. APFS is case-insensitive, so a committed
+		// .Claude/ is the same directory to the session that reads it.
+		{"mixed-case dir, agent definition", []string{".Claude/agents/ttorch-reviewer-security.md"}},
+		{"upper-case dir", []string{".CLAUDE/agents/x.md"}},
+		{"mixed-case dir, dot-slash prefix", []string{"./.Claude/agents/x.md"}},
+		{"mixed-case dir, nested", []string{"sub/.Claude/agents/x.md"}},
+		{"mixed-case basename", []string{"Claude.md"}},
+		{"upper-case basename", []string{"CLAUDE.MD"}},
+		{"mixed-case AGENTS", []string{"Agents.md"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

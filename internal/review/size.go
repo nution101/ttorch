@@ -87,13 +87,16 @@ var docBasenames = map[string]bool{
 
 // harnessConfigBasenames are agent-instruction files: prose by extension, configuration by
 // effect. A session reads them from its working directory and follows what they say, so a
-// change to one changes how an agent behaves. Compared case-insensitively.
-var harnessConfigBasenames = map[string]bool{"CLAUDE.MD": true, "AGENTS.MD": true}
+// change to one changes how an agent behaves. Compared with strings.EqualFold, so it is a
+// slice rather than a map: a map lookup needs a normalized key, and the normalization that
+// looked right (strings.ToUpper) is not the folding that decides here.
+var harnessConfigBasenames = []string{"CLAUDE.md", "AGENTS.md"}
 
 // harnessConfigDir is the directory whose contents configure an agent session: settings,
 // hooks that run around the session, and subagent definitions that outrank the installed
 // ones. Matched as a whole PATH COMPONENT, so a prose file that merely mentions the word
-// (notes/claude-usage.md) is unaffected.
+// (notes/claude-usage.md) is unaffected, and matched case-INSENSITIVELY, because the
+// filesystem this runs on is.
 const harnessConfigDir = ".claude"
 
 // isHarnessConfig reports whether p configures an agent session rather than documenting the
@@ -102,12 +105,22 @@ const harnessConfigDir = ".claude"
 // .md files classify as docs-only and drop the security reviewer. Dropping that reviewer is
 // what a worker subverting the review would want, since it is the one that runs outside the
 // worker's worktree.
+// Both halves fold, and they have to fold the same way. The first version folded only the
+// basename and left the directory segment an exact byte compare, so `.Claude/agents/x.md`
+// classified as docs-only and dropped the security reviewer, which is the reviewer this whole
+// change exists to keep. Folding is strings.EqualFold (Unicode simple folding) rather than
+// upper- or lower-casing, so U+212A KELVIN SIGN and U+017F LATIN SMALL LETTER LONG S fold too.
+// macOS is case-insensitive, so a committed `.Claude/` is the same directory to the session
+// that reads it: the guard has to be at least as insensitive as the filesystem it defends.
 func isHarnessConfig(p string) bool {
-	if harnessConfigBasenames[strings.ToUpper(path.Base(p))] {
-		return true
+	base := path.Base(p)
+	for _, name := range harnessConfigBasenames {
+		if strings.EqualFold(base, name) {
+			return true
+		}
 	}
 	for _, seg := range strings.Split(path.Clean(p), "/") {
-		if seg == harnessConfigDir {
+		if strings.EqualFold(seg, harnessConfigDir) {
 			return true
 		}
 	}
