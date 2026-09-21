@@ -118,10 +118,35 @@ const (
 	// launches. Overridable via TTORCH_MAX_CLAIMS_PER_TICK; a value <= 0 means no cap.
 	defaultMaxClaimsPerTick = 8
 
+	// defaultGateTickBudget bounds the wall clock ONE gate pass may spend before it stops
+	// starting new tasks. The pass claims every candidate up front, holds those claims for its
+	// whole run, and gates serially, and the tick loop runs dispatch, supervise, gate, then
+	// land in order. So a slow gate pass is time in which nothing dispatches, nothing lands and
+	// no dead worker is recovered.
+	//
+	// The pass has always been able to be slow. gateOnceAt runs TrustPrep at an episode
+	// boundary, TrustPrep validates the committed sha, and on a content-cache miss that is the
+	// repository's real suite. So the first gate of N new tasks already ran N suites back to
+	// back inside one tick. A process-local authority memo adds a second occasion, the first
+	// tick after a restart, but it does not create the class.
+	//
+	// This is a THROUGHPUT bound, not a liveness fix, and the distinction matters for how hard
+	// to lean on it. Nothing is starved: the land claim's lease is two hours against a pass
+	// measured in minutes, ReclaimExpiredLeases only touches active tasks so a done task under
+	// a gate claim is never re-dispatched, and the recovery passes work off grace thresholds,
+	// so a late supervise nudges late rather than killing a healthy worker. What a long pass
+	// costs is delay, once, self-clearing as the memo warms.
+	//
+	// The check is made AFTER each task, so a pass always makes progress however small the
+	// budget, and a single task that overruns is never abandoned mid-gate. Overridable via
+	// TTORCH_GATE_TICK_BUDGET (a Go duration); a value <= 0 means no cap.
+	defaultGateTickBudget = 60 * time.Second
+
 	envIdleNudgeGrace   = "TTORCH_IDLE_NUDGE_GRACE"
 	envMaxIdleNudges    = "TTORCH_MAX_IDLE_NUDGES"
 	envMaxClaimsPerTick = "TTORCH_MAX_CLAIMS_PER_TICK"
 	envSerializeOverlap = "TTORCH_SERIALIZE_OVERLAP"
+	envGateTickBudget   = "TTORCH_GATE_TICK_BUDGET"
 )
 
 // Dispatch-failure backoff/park bounds — the fix for an unbacked-off dispatch hot loop. When a
@@ -298,6 +323,14 @@ type Scheduler struct {
 	// unchanged); New() sets the production default from the env-or-default.
 	MaxClaimsPerTick int
 
+	// GateTickBudget caps the wall clock one gate pass spends before it stops starting new
+	// tasks; the ones it did not reach are re-derived and picked up next tick. It is zero on a
+	// bare struct (no cap — existing tests and any hand-built Scheduler see the old behavior);
+	// New() populates it from the env-or-default. A value <= 0 disables the cap, matching how
+	// MaxClaimsPerTick reads a non-positive value. See defaultGateTickBudget for why the pass
+	// needs bounding at all.
+	GateTickBudget time.Duration
+
 	// SerializeOverlap is the safety off-switch for parallel-overlap dispatch. By DEFAULT (false)
 	// the scheduler dispatches file/prefix footprint-overlapping tasks in PARALLEL: two workers
 	// touching the same source file in SEPARATE pool worktrees are not a hazard — git isolates
@@ -409,6 +442,7 @@ func New(m *orchestrator.Manager, interval time.Duration, log io.Writer) *Schedu
 		MaxIdleNudges:     maxIdleNudgesFromEnv(),
 		IdleConfirmations: defaultIdleConfirmations,
 		MaxClaimsPerTick:  maxClaimsPerTickFromEnv(),
+		GateTickBudget:    gateTickBudgetFromEnv(),
 
 		// Parallel-overlap dispatch is the default; TTORCH_SERIALIZE_OVERLAP=1 restores the
 		// pre-parallel serialize-on-dispatch behavior. See the SerializeOverlap field.
@@ -500,6 +534,18 @@ func maxIdleNudgesFromEnv() int {
 		}
 	}
 	return defaultMaxIdleNudges
+}
+
+// gateTickBudgetFromEnv resolves the per-pass gate budget from TTORCH_GATE_TICK_BUDGET (a Go
+// duration like "90s"), falling back to defaultGateTickBudget when unset or unparseable. A
+// configured value of 0 (or negative) is honored as "no cap".
+func gateTickBudgetFromEnv() time.Duration {
+	if v := strings.TrimSpace(os.Getenv(envGateTickBudget)); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return defaultGateTickBudget
 }
 
 // maxClaimsPerTickFromEnv resolves the per-tick claim ceiling from TTORCH_MAX_CLAIMS_PER_TICK,

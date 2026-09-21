@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/orchestrator"
@@ -291,5 +292,97 @@ func TestConcurrentRunGateOnceNoDoubleGate(t *testing.T) {
 		if c != 1 {
 			t.Errorf("task %s recorded %d times, want exactly 1", id, c)
 		}
+	}
+}
+
+// TestRunGateOnceStopsAtTheTickBudget bounds how long one gate pass can hold the tick.
+//
+// The pass claims every candidate up front, holds those claims for the whole pass, and runs
+// serially, and the tick loop runs dispatch, supervise, gate, then land in order. So a gate
+// pass that takes ten minutes is ten minutes in which nothing is dispatched, nothing is landed
+// and no dead worker is recovered. A single gate can take minutes whenever it runs the
+// repository's real suite, which TrustPrep does at an episode boundary on a cache miss, so N
+// candidates can cost N suites back to back.
+//
+// After each task the pass checks its wall-clock budget and stops starting new ones. The
+// unreached candidates keep their place — their claims are released with the rest, and the next
+// tick re-derives and picks them up.
+func TestRunGateOnceStopsAtTheTickBudget(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	for _, id := range []string{"b1", "b2", "b3", "b4"} {
+		addDone(t, s, repo, id, db.KindShip, "")
+	}
+
+	f := &fakeFleet{gateable: map[string]bool{repo: true}, gateDelay: 40 * time.Millisecond}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}, GateTickBudget: 10 * time.Millisecond}
+	n, err := sc.RunGateOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunGateOnce: %v", err)
+	}
+	if got := len(f.gatedIDs()); got != 1 {
+		t.Fatalf("a pass over budget must stop after the task that spent it, gated %d: %v", got, f.gatedIDs())
+	}
+	if n != 1 {
+		t.Fatalf("recorded count = %d, want 1", n)
+	}
+	// Every claim the pass took is released, including the ones it never reached, so the next
+	// tick can claim them rather than backing off a lease this tick is no longer using.
+	for _, id := range []string{"b1", "b2", "b3", "b4"} {
+		if lo := leaseOwner(t, s, id); lo != "" {
+			t.Errorf("claim on %s must be released at the end of the pass, got lease %q", id, lo)
+		}
+	}
+
+	// The next tick picks up where this one stopped.
+	f2 := &fakeFleet{gateable: map[string]bool{repo: true}}
+	sc2 := &Scheduler{Store: s, Fleet: f2, Pool: worktree.Pool{Max: 100}}
+	if _, err := sc2.RunGateOnce(ctx); err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+	if got := len(f2.gatedIDs()); got != 4 {
+		t.Fatalf("the next tick must re-derive every candidate, gated %d: %v", got, f2.gatedIDs())
+	}
+}
+
+// TestRunGateOnceBudgetDoesNotSplitAFastTick is the must-not-trip side: the budget exists to cap
+// a pass that is doing real work, not to dribble out a steady state. A tick whose candidates all
+// gate in microseconds must gate every one of them.
+func TestRunGateOnceBudgetDoesNotSplitAFastTick(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	for _, id := range []string{"q1", "q2", "q3", "q4", "q5"} {
+		addDone(t, s, repo, id, db.KindShip, "")
+	}
+	f := &fakeFleet{gateable: map[string]bool{repo: true}}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}, GateTickBudget: gateTickBudgetFromEnv()}
+	n, err := sc.RunGateOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunGateOnce: %v", err)
+	}
+	if n != 5 || len(f.gatedIDs()) != 5 {
+		t.Fatalf("a fast tick must gate every candidate, recorded %d over %v", n, f.gatedIDs())
+	}
+}
+
+// TestRunGateOnceBudgetOffMeansNoCap: a budget of zero or less disables the cap, matching how
+// MaxClaimsPerTick reads a non-positive value. A hand-built Scheduler leaves the field zero, so
+// this is also what keeps every existing test and any embedder seeing the old behaviour.
+func TestRunGateOnceBudgetOffMeansNoCap(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	repo := "/repo"
+	for _, id := range []string{"z1", "z2", "z3"} {
+		addDone(t, s, repo, id, db.KindShip, "")
+	}
+	f := &fakeFleet{gateable: map[string]bool{repo: true}, gateDelay: 15 * time.Millisecond}
+	sc := &Scheduler{Store: s, Fleet: f, Pool: worktree.Pool{Max: 100}} // GateTickBudget unset
+	if _, err := sc.RunGateOnce(ctx); err != nil {
+		t.Fatalf("RunGateOnce: %v", err)
+	}
+	if got := len(f.gatedIDs()); got != 3 {
+		t.Fatalf("an unset budget must not cap the pass, gated %d: %v", got, f.gatedIDs())
 	}
 }

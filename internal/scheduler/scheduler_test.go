@@ -55,6 +55,7 @@ type fakeFleet struct {
 	gateOut   map[string]orchestrator.GateOutcome // per-task GateOnce outcome (default GateRecorded)
 	gateErr   map[string]error                    // per-task forced GateOnce error
 	gateCalls []string                            // task ids GateOnce was called on, in order
+	gateDelay time.Duration                       // wall clock each GateOnce burns (a real suite run)
 	idem      *gateIdem                           // shared cross-instance idempotency (see GateOnce)
 }
 
@@ -219,7 +220,11 @@ func (f *fakeFleet) GateOnce(taskID string) (orchestrator.GateOutcome, error) {
 	f.gateCalls = append(f.gateCalls, taskID)
 	gerr := f.gateErr[taskID]
 	out, hasOut := f.gateOut[taskID]
+	delay := f.gateDelay
 	f.mu.Unlock()
+	// Model the expensive case: a record whose authority validate has to run the real suite
+	// because this process has not run it for this tree (a scheduler restart empties the memo).
+	time.Sleep(delay)
 	if gerr != nil {
 		return orchestrator.GateSkipped, gerr
 	}

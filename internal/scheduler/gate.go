@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"time"
 
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/orchestrator"
@@ -40,6 +41,14 @@ import (
 // exactly the verdict state the land pass already expects, and the land pass's own gate (a
 // fresh, commit-pinned passing verdict + a single-use approval consumed at the fast-forward)
 // remains the authority over whether anything merges.
+//
+// The pass is bounded by GateTickBudget: after each task it checks its wall clock and stops
+// starting new ones, leaving the rest for the next tick. It gates serially while holding every
+// candidate's claim, and the tick loop runs dispatch, supervise, gate, then land in order, so
+// an unbounded pass is time in which nothing dispatches, nothing lands and no dead worker is
+// recovered. A gate can take minutes whenever it has to run the repository's real suite, which
+// TrustPrep does at an episode boundary on a content-cache miss. See defaultGateTickBudget for
+// what the bound does and does not claim to fix.
 //
 // It is a no-op (returns 0) when nothing is done, nothing is gateable, or every done task is
 // either already gated or still has reviewers in flight.
@@ -121,11 +130,21 @@ func (sc *Scheduler) RunGateOnce(ctx context.Context) (int, error) {
 	defer releaseAll() // release the whole tick's claims once gating is done
 
 	recorded := 0
-	for _, id := range claimed {
+	started := time.Now()
+	for i, id := range claimed {
 		select {
 		case <-ctx.Done():
 			return recorded, ctx.Err() // deferred releaseAll frees the held claims
 		default:
+		}
+		// Budget check, made BETWEEN tasks: a pass always gates at least one candidate however
+		// small the budget, and a task that overruns is never abandoned part-way through its
+		// own gate. The ones not reached keep their place: the deferred releaseAll frees their
+		// claims with the rest, and the next tick re-derives them from the board.
+		if i > 0 && sc.GateTickBudget > 0 && time.Since(started) >= sc.GateTickBudget {
+			sc.logf("gate pass spent its %s budget after %d task(s); %d left for the next tick",
+				sc.GateTickBudget, i, len(claimed)-i)
+			break
 		}
 		outcome, gerr := sc.Fleet.GateOnce(id)
 		if gerr != nil {
