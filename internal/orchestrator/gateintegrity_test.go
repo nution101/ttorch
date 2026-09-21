@@ -820,3 +820,59 @@ func gateBlockedPayload(t *testing.T, m *Manager, id string) string {
 	}
 	return payload
 }
+
+// TestTrustPrep_SweepsLegacyFlatReportsButNotControlFiles: reports written at the top of the
+// inputs dir by an older ttorch are inert (nothing reads them), so the sweep is tidying, and
+// tidying near control files has to be exact. The discriminator is "parses as a report",
+// which is why this test cares more about what survives than about what moves.
+func TestTrustPrep_SweepsLegacyFlatReportsButNotControlFiles(t *testing.T) {
+	m, head, dir := preppedTrustedTask(t, "legacyflat", "lf1", "exit 0")
+
+	// A report in the old flat position, and a decoy named like a dimension that is not one.
+	b, err := json.Marshal(review.Report{Dimension: review.DimensionScope, ReviewedSHA: head})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := filepath.Join(dir, review.DimensionScope+review.ReportSuffix)
+	if err := os.WriteFile(legacy, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	notAReport := filepath.Join(dir, "notes.json")
+	if err := os.WriteFile(notAReport, []byte(`{"note":"keep me"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	control := map[string][]byte{}
+	for _, name := range []string{review.PrepStampFile, review.StagedValidateFile, reviewersFileName, gateProgressFile} {
+		if b, err := os.ReadFile(filepath.Join(dir, name)); err == nil {
+			control[name] = b
+		}
+	}
+	if len(control) < 3 {
+		t.Fatalf("expected the control files to exist before the sweep, got %d", len(control))
+	}
+
+	if _, err := m.TrustPrep("lf1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Every control file is still there, byte for byte where prep did not rewrite it.
+	for name := range control {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Errorf("the sweep removed the control file %s: %v", name, err)
+		}
+	}
+	if b, err := os.ReadFile(notAReport); err != nil || string(b) != `{"note":"keep me"}` {
+		t.Errorf("the sweep moved a .json file that is not a report: %v %s", err, b)
+	}
+	if _, err := os.Stat(legacy); err == nil {
+		t.Error("the legacy flat report is still sitting beside the control files")
+	}
+	moved, err := filepath.Glob(filepath.Join(dir, supersededDirName, "*", legacyReportsDirName, review.DimensionScope+review.ReportSuffix))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(moved) == 0 {
+		t.Error("the legacy flat report should be archived, not deleted")
+	}
+}

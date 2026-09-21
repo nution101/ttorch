@@ -40,6 +40,10 @@ const reviewersFileName = "reviewers.json"
 // episode's belong.
 const supersededDirName = "superseded"
 
+// legacyReportsDirName holds reports swept from the old flat layout, kept apart from the
+// current episode's so the archive says which layout each file came from.
+const legacyReportsDirName = "legacy-flat"
+
 // reviewerBriefSuffix names the prompt file the daemon writes for one dimension's reviewer.
 // Like the report suffix it is joined through review.InputPath, never by hand.
 const reviewerBriefSuffix = ".reviewer-brief.md"
@@ -419,6 +423,20 @@ func (m *Manager) archivePriorReports(taskID, dir string) {
 		}
 	}
 	var archive string
+	ensureArchive := func() bool {
+		if archive != "" {
+			return true
+		}
+		// The archive keeps the same shape as the inputs dir, reports under reports/, so a
+		// restored file goes back where it came from and the namespaces stay apart.
+		archive = filepath.Join(dir, supersededDirName, time.Now().UTC().Format("20060102T150405Z"))
+		if err := os.MkdirAll(review.ReportsDir(archive), 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "ttorch: could not archive the previous review reports in %s: %v\n", dir, err)
+			archive = ""
+			return false
+		}
+		return true
+	}
 	for _, dim := range dims {
 		// reviewers.json sits in a directory a worker can write, so a dimension name read
 		// back from it is untrusted input, and this loop would otherwise make it both halves
@@ -433,14 +451,8 @@ func (m *Manager) archivePriorReports(taskID, dir string) {
 		if _, err := os.Stat(report); err != nil {
 			continue
 		}
-		if archive == "" {
-			// The archive keeps the same shape as the inputs dir, reports under reports/, so
-			// a restored file goes back where it came from and the namespaces stay apart.
-			archive = filepath.Join(dir, supersededDirName, time.Now().UTC().Format("20060102T150405Z"))
-			if err := os.MkdirAll(review.ReportsDir(archive), 0o755); err != nil {
-				fmt.Fprintf(os.Stderr, "ttorch: could not archive the previous review reports in %s: %v\n", dir, err)
-				return
-			}
+		if !ensureArchive() {
+			return
 		}
 		dest, err := review.InputPath(archive, dim, review.ReportSuffix)
 		if err != nil {
@@ -448,6 +460,51 @@ func (m *Manager) archivePriorReports(taskID, dir string) {
 		}
 		if err := os.Rename(report, dest); err != nil {
 			fmt.Fprintf(os.Stderr, "ttorch: could not archive the previous %s review report in %s: %v\n", dim, dir, err)
+		}
+	}
+	m.archiveLegacyFlatReports(dir, ensureArchive, func() string { return archive })
+}
+
+// archiveLegacyFlatReports sweeps reports left at the TOP of an inputs dir by a ttorch that
+// wrote them there, before reports moved into reports/. Nothing reads them any more (the
+// fold looks only in reports/, and a dimension with no report there blocks), so this is
+// tidying rather than a fix: it stops superseded reviews accumulating beside the control
+// files, where the next person to look has to work out which layout each file came from.
+//
+// A file is swept only if it PARSES as a review report carrying both a dimension and a
+// reviewed sha. That is the discriminator rather than a list of control-file basenames to
+// avoid, because a list of names to avoid is what put a report on top of gate-progress.json
+// in the first place: prep.json, validate.json, reviewers.json, gate-progress.json and the
+// advisory verdict files carry none of those fields, so none of them can match, however the
+// dimension set is named.
+func (m *Manager) archiveLegacyFlatReports(dir string, ensureArchive func() bool, archive func() string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), review.ReportSuffix) {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		b, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var r review.Report
+		if err := json.Unmarshal(b, &r); err != nil || r.Dimension == "" || r.ReviewedSHA == "" {
+			continue // not a report: a control file, an advisory verdict, or something else
+		}
+		if !ensureArchive() {
+			return
+		}
+		dest := filepath.Join(archive(), legacyReportsDirName, e.Name())
+		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "ttorch: could not archive the legacy review report %s: %v\n", path, err)
+			continue
+		}
+		if err := os.Rename(path, dest); err != nil {
+			fmt.Fprintf(os.Stderr, "ttorch: could not archive the legacy review report %s: %v\n", path, err)
 		}
 	}
 }
