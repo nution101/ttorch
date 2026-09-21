@@ -221,7 +221,7 @@ with no brief is unchanged). Five rules:
 | `prohibition` | A prohibition states the invariant it protects and the allowed end state, rather than banning `push`/`merge`/PR outright |
 | `standards` | The brief points at the standards the project expects |
 
-Two details matter in practice:
+Some details that matter in practice:
 
 - **Which ref a citation is resolved against.** A cited path *without* a line number is about the
   work's base, so it is resolved at `--ref` (the declared target by default). A `file:line`

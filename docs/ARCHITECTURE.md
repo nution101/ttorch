@@ -409,7 +409,7 @@ So the checks run at `ttorch task add` (whenever a brief is supplied) and standa
 exist, a hard count that carries a verify-yourself hedge, a prohibition stated as an invariant plus
 an allowed end state, and a pointer to the project's standards.
 
-Three properties are load-bearing:
+These properties are load-bearing:
 
 - **Three outcomes, three exit statuses.** Passed (0), a rule violated (1), and a check that COULD
   NOT be evaluated (3) are distinct. An unreachable remote, a ref that does not resolve, or a
