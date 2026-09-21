@@ -591,35 +591,55 @@ func TestSpawnReviewer_RefusesAnUnusableDimensionName(t *testing.T) {
 	}
 }
 
-// TestNoUnvalidatedDimensionSink is the guard for the sink after the ones fixed here. A
-// dimension name must not reach a filesystem call without going through review.InputPath,
-// which validates it first. The scan walks the WHOLE repository, cmd/ included, and looks for
-// any file-touching call on a line that also mentions a dimension variable, not only
-// filepath.Join: a sink can build a path by concatenation just as easily.
+// TestNoUnvalidatedDimensionSink is a LINTER, not a proof. Read what it actually does before
+// relying on it.
 //
-// What it does not cover, stated so nobody reads it as more than it is: a dimension name
-// reaching the manager as TEXT rather than as a path. internal/cli validates the prepared set
-// before printing it, but no scan enforces that. Closing that class properly means a distinct
-// type for a validated name, so an unvalidated string cannot be passed at all, and that
-// changes ReviewersFor's signature.
+// What it does: walks every non-test .go file in the repository and flags a line that
+// contains BOTH a call from fileSink's list AND the bare identifier `dim` or `dimension`.
+// That catches the shape the traversal took, and it is why the exemption below is one exact
+// line rather than a whole file.
+//
+// What it does NOT catch, measured rather than guessed (a security review ran these two
+// regexes against 16 realistic sinks and 15 were missed):
+//
+//   - any identifier other than the bare token: `dims[0]`, `dims[i]`, `d`, `name`, a struct
+//     field. `dims` is the identifier the production code itself uses, and \b(dim|dimension)\b
+//     does not match it
+//   - a call split across lines, which is most of them once the arguments are long
+//   - a path built on one line and used on the next, which is the normal way to write it
+//   - indirection: os.ReadFile(r.reportPath()), a helper, a closure, a method
+//   - the calls missing from fileSink: os.Symlink, os.Link, os.Chmod, os.Chtimes,
+//     os.Truncate, os.CreateTemp, path.Join, exec.CommandContext, anything in io/fs or a
+//     third-party package
+//   - every sink that is not a filesystem call at all: a tmux target, a printed line, a
+//     prompt handed to a reviewer
+//
+// So a clean run means "nobody wrote the one shape this catches", not "no unvalidated sink
+// exists". The thing that would actually close the class is a distinct type for a validated
+// dimension name, so an unvalidated string cannot be passed to a sink at all; this test
+// exists because that type is not here yet, and it should be deleted when it arrives.
 func TestNoUnvalidatedDimensionSink(t *testing.T) {
-	// The one place a dimension name may legitimately be turned into a path.
-	const allowed = "internal/review/prep.go"
+	// Exempt the ONE line that may legitimately join a dimension into a path: the validating
+	// constructor itself. Matched by exact text, not by file, so any other line in that file
+	// is still scanned and any edit to this one has to be looked at.
+	allowed := map[string]string{
+		"internal/review/prep.go": "return filepath.Join(inputsDir, ReportsDirName, dim+suffix), nil",
+	}
 	root := filepath.Join("..", "..")
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 			return err
 		}
 		rel := filepath.ToSlash(strings.TrimPrefix(filepath.Clean(path), filepath.Clean(root)+string(filepath.Separator)))
-		if rel == allowed {
-			return nil
-		}
 		b, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
 		for i, line := range strings.Split(string(b), "\n") {
 			if !fileSink.MatchString(line) || !dimensionToken.MatchString(line) {
+				continue
+			}
+			if strings.TrimSpace(line) == allowed[rel] {
 				continue
 			}
 			t.Errorf("%s:%d builds a filesystem call from a dimension name; use review.InputPath so the name is validated:\n\t%s",
@@ -632,8 +652,8 @@ func TestNoUnvalidatedDimensionSink(t *testing.T) {
 	}
 }
 
-// fileSink matches a call that touches the filesystem, so a dimension name on the same line
-// is being turned into a path one way or another.
+// fileSink matches SOME filesystem calls, listed rather than derived, which is one of the
+// reasons the test above is a linter rather than a guarantee.
 var fileSink = regexp.MustCompile(`filepath\.Join\(|os\.(WriteFile|ReadFile|Open|OpenFile|Create|Rename|Remove|RemoveAll|Stat|Mkdir|MkdirAll|ReadDir)\(|exec\.Command\(`)
 
 // dimensionToken matches an identifier a dimension name is carried in.
