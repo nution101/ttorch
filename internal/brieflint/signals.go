@@ -100,28 +100,27 @@ var recountSignal = stemRe(
 	"find the actual", "find the true",
 )
 
-// hedgeWindow is how far a hedge may sit from the count it hedges: the sentence carrying the
-// number, and the one immediately after it. A hedge further away than that is not attached
-// to anything, which is how a brief could carry a hard count and satisfy this rule with
-// unrelated prose elsewhere.
-const hedgeWindow = 2
-
-// hedgedAt reports whether the hard count in sents[i] carries a hedge attached to it: within
-// the window, something saying the figure is not to be trusted, or telling the reader to
+// hedgedAt reports whether the hard count in sents[i] carries a hedge attached to it:
+// something in reach saying the figure is not to be trusted, or telling the reader to
 // establish it again.
+//
+// Reach is the block holding the count and the block after it: the paragraph or list item
+// the number sits in, and the next one. That is structural rather than a sentence budget.
+// Counting sentences meant an aside between the count and its hedge ("Note: I grepped for
+// the bare name") spent the budget on the aside, and the brief was reported as unhedged
+// although a careful author had hedged it in the next breath.
 func hedgedAt(sents []span, i int) bool {
-	for j := i; j < i+hedgeWindow && j < len(sents); j++ {
-		if distrustSignal.MatchString(sents[j].text) || recountSignal.MatchString(sents[j].text) {
+	for _, s := range sents {
+		if s.blk != sents[i].blk && s.blk != sents[i].blk+1 {
+			continue
+		}
+		if distrustSignal.MatchString(s.text) || recountSignal.MatchString(s.text) {
 			return true
 		}
 	}
 	return false
 }
 
-// reportsTheNumber reports whether the brief asks anywhere for the figure the reader ends up
-// with. This half stays brief-scoped: one "tell me the number you find" legitimately covers
-// every count below it. It is necessary but not sufficient, since the attached hedge above
-// is what distinguishes a real hedge from prose that happens to mention results.
 func reportsTheNumber(b *brief) bool {
 	for _, s := range sentences(b.raw) {
 		if reportSignal.MatchString(s.text) && numberSignal.MatchString(s.text) {
@@ -168,41 +167,161 @@ var createSignal = stemRe(
 )
 
 // span is a slice of the brief with its byte offset, so a match can be reported with the
-// line it came from.
+// line it came from, and the index of the block it belongs to.
 type span struct {
 	text string
 	off  int
+	blk  int
 }
 
-// sentences splits text into sentence-ish spans, preserving offsets. A newline always ends
-// a span — a brief is Markdown, where a bullet or a heading is a sentence even without a
-// full stop — and so does sentence punctuation, but ONLY when whitespace or the end of the
-// text follows it. That proviso is what keeps "internal/cli/cli.go:40" in one piece: a
-// splitter that broke on every dot and colon would cut a cited path in half, both in the
-// quoted text and in the path extraction that reads these spans.
+// blockMarker opens a Markdown block: a bullet, a heading, a quote, a table row, a fence,
+// or a numbered or lettered list item. Its trailing space is part of the match, so the
+// scanner can start after it.
+var blockMarker = regexp.MustCompile("^[ \t]*(?:```|\\||(?:[-*+>]+|#{1,6}|[0-9]{1,3}[.)]|[A-Za-z][.)])[ \t]+)")
+
+// abbrevs are words whose trailing dot is not a sentence end. Dotted initialisms (e.g., i.e.,
+// U.S.) are recognised by shape instead, so this list only needs the ones that end in a
+// single dot.
+var abbrevs = map[string]bool{
+	"etc": true, "cf": true, "vs": true, "approx": true, "resp": true, "al": true,
+	"fig": true, "incl": true, "excl": true, "viz": true, "dr": true, "mr": true,
+	"mrs": true, "ms": true, "prof": true, "jr": true, "sr": true, "eg": true, "ie": true,
+}
+
+// blockRange is one Markdown block: a paragraph, a list item, a heading. Soft-wrapped lines
+// belong to the block they continue.
+type blockRange struct{ start, end int }
+
+// blocks groups text into Markdown blocks. A blank line ends a block, and a line opening
+// with a block marker starts one; any other line continues the block above it.
+//
+// Joining soft-wrapped lines is the point. An earlier version ended a span at every newline,
+// which cut the wrapped sentences of an ordinary brief into fragments and pushed a hedge out
+// of reach of the count it hedged.
+func blocks(text string) []blockRange {
+	var out []blockRange
+	cur := blockRange{-1, -1}
+	flush := func() {
+		if cur.start >= 0 {
+			out = append(out, cur)
+			cur = blockRange{-1, -1}
+		}
+	}
+	for off := 0; off <= len(text); {
+		end := len(text)
+		next := len(text) + 1
+		if nl := strings.IndexByte(text[off:], '\n'); nl >= 0 {
+			end = off + nl
+			next = end + 1
+		}
+		line := text[off:end]
+		switch {
+		case strings.TrimSpace(line) == "":
+			flush()
+		case cur.start < 0 || blockMarker.MatchString(line):
+			flush()
+			cur = blockRange{off, end}
+		default:
+			cur.end = end
+		}
+		off = next
+	}
+	flush()
+	return out
+}
+
+// sentences splits text into sentence-ish spans, preserving offsets and block membership.
+//
+// Only . ! and ? end a sentence, and only when whitespace or the end of the block follows
+// AND the next thing along can begin one. Three kinds of ordinary prose broke the simpler
+// rule this replaced:
+//
+//   - A cited path. "internal/cli/cli.go:40" must stay in one piece, both in the quoted text
+//     and in the path extraction that reads these spans. That is why a terminator needs
+//     whitespace after it, and why a colon is not a terminator at all.
+//   - An abbreviation. "Add e.g. internal/new/thing.go" split at "e.g." and left the create
+//     verb in an earlier fragment, so a brief asking for a new file was reported as citing a
+//     missing one.
+//   - A list marker. "1. There are 21 occurrences" split into "1" and the rest, which spent
+//     the hedge lookahead on markup.
 func sentences(text string) []span {
 	var out []span
-	emit := func(s string, off int) {
+	emit := func(s string, off, blk int) {
+		for len(s) > 0 && isSpace(s[0]) {
+			s = s[1:]
+			off++
+		}
 		if strings.TrimSpace(s) != "" {
-			out = append(out, span{text: s, off: off})
+			out = append(out, span{text: s, off: off, blk: blk})
 		}
 	}
-	pos := 0
-	for i := 0; i < len(text); i++ {
-		switch text[i] {
-		case '\n':
-		case '.', '!', '?', ';', ':':
-			if i+1 < len(text) && !isSpace(text[i+1]) {
+	for bi, b := range blocks(text) {
+		bt := text[b.start:b.end]
+		pos := len(blockMarker.FindString(bt))
+		for i := pos; i < len(bt); i++ {
+			if c := bt[i]; c != '.' && c != '!' && c != '?' {
 				continue
 			}
-		default:
-			continue
+			if !endsSentence(bt, i) {
+				continue
+			}
+			emit(bt[pos:i], b.start+pos, bi)
+			pos = i + 1
 		}
-		emit(text[pos:i], pos)
-		pos = i + 1
+		emit(bt[pos:], b.start+pos, bi)
 	}
-	emit(text[pos:], pos)
 	return out
+}
+
+// endsSentence reports whether the terminator at i closes a sentence rather than sitting
+// inside a path, an abbreviation or a decimal.
+func endsSentence(s string, i int) bool {
+	if i+1 < len(s) && !isSpace(s[i+1]) {
+		return false
+	}
+	if s[i] != '.' {
+		return true
+	}
+	if isAbbrev(s, i) {
+		return false
+	}
+	j := i + 1
+	for j < len(s) && isSpace(s[j]) {
+		j++
+	}
+	return j >= len(s) || startsSentence(s[j])
+}
+
+// startsSentence reports whether c can open a sentence: a capital, a digit, or the opening
+// punctuation a sentence can start with.
+func startsSentence(c byte) bool {
+	switch {
+	case c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		return true
+	}
+	return strings.IndexByte("\"'(*_[`", c) >= 0
+}
+
+// isAbbrev reports whether the dot at position dot ends an abbreviation: either a word in
+// abbrevs, or a single letter already preceded by a dot, which is the shape of e.g., i.e.
+// and U.S.
+func isAbbrev(s string, dot int) bool {
+	j := dot
+	for j > 0 && isLetter(s[j-1]) {
+		j--
+	}
+	w := strings.ToLower(s[j:dot])
+	if w == "" {
+		return false
+	}
+	if len(w) == 1 {
+		return j > 0 && s[j-1] == '.'
+	}
+	return abbrevs[w]
+}
+
+func isLetter(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
 }
 
 func isSpace(c byte) bool {

@@ -37,27 +37,68 @@ func TestStemRePhraseAcrossLines(t *testing.T) {
 }
 
 func TestSentencesKeepOffsets(t *testing.T) {
-	text := "first thing. second thing\nthird thing"
-	got := sentences(text)
-	if len(got) != 3 {
-		t.Fatalf("want 3 sentences, got %d: %+v", len(got), got)
-	}
-	for _, s := range got {
+	text := "First thing. Second thing\nwrapped on.\n\n- A bullet."
+	for _, s := range sentences(text) {
 		if text[s.off:s.off+len(s.text)] != s.text {
 			t.Fatalf("offset %d does not point at %q", s.off, s.text)
 		}
 	}
 }
 
-func TestSpanTrimStripsMarkdown(t *testing.T) {
-	s := span{text: "  - **do not push**   to\n   main "}
-	if got, want := s.trim(), "**do not push** to main"; got != want {
-		t.Fatalf("trim() = %q, want %q", got, want)
+// The splitter is measured against prose shaped like a real brief, because the two false
+// positives it was rewritten for were both reachable only from ordinary writing: a numbered
+// list, an aside introduced with a colon, and "e.g.".
+func TestSentencesSplitsRealProse(t *testing.T) {
+	cases := map[string]struct {
+		text string
+		want []string
+	}{
+		"a numbered list keeps its marker with its text": {
+			"1. There are 21 occurrences of the old helper.\n2. Verify the count yourself.",
+			[]string{"There are 21 occurrences of the old helper", "Verify the count yourself"},
+		},
+		"a colon introduces, it does not terminate": {
+			"Note: I grepped for the bare name.",
+			[]string{"Note: I grepped for the bare name"},
+		},
+		"an abbreviation is not a sentence end": {
+			"Add e.g. internal/new/thing.go as a new config file.",
+			[]string{"Add e.g. internal/new/thing.go as a new config file"},
+		},
+		"a soft-wrapped line is one sentence": {
+			"Fix the regression at internal/cli/cli.go:40 before you\ntouch anything else.",
+			[]string{"Fix the regression at internal/cli/cli.go:40 before you touch anything else"},
+		},
+		"a cited path survives intact": {
+			"See internal/cli/cli.go:40. Then stop.",
+			[]string{"See internal/cli/cli.go:40", "Then stop"},
+		},
+		"a heading is its own span": {
+			"## Rule 3\n\nThere are 21 occurrences.",
+			[]string{"Rule 3", "There are 21 occurrences"},
+		},
+		"a bullet list is one span per bullet": {
+			"- Do not push.\n- Do not open a PR.",
+			[]string{"Do not push", "Do not open a PR"},
+		},
+	}
+	for name, tc := range cases {
+		var got []string
+		for _, s := range sentences(tc.text) {
+			got = append(got, s.trim())
+		}
+		if len(got) != len(tc.want) {
+			t.Errorf("%s: want %d spans %q, got %d: %q", name, len(tc.want), tc.want, len(got), got)
+			continue
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Errorf("%s: span %d = %q, want %q", name, i, got[i], tc.want[i])
+			}
+		}
 	}
 }
 
-// A hedge counts only where it is attached to the count: in the sentence carrying the
-// number or the one immediately after. Boilerplate elsewhere in the brief is not a hedge.
 func TestHedgedAtRequiresAttachment(t *testing.T) {
 	cases := map[string]struct {
 		brief string
@@ -67,8 +108,12 @@ func TestHedgedAtRequiresAttachment(t *testing.T) {
 			"There are 21 occurrences, give or take, so count them yourself.", true},
 		"next sentence": {
 			"There are 21 occurrences. That figure may be wrong.", true},
-		"two sentences later": {
-			"There are 21 occurrences. Fix them. That figure may be wrong.", false},
+		"later in the same paragraph": {
+			"There are 21 occurrences. Fix them. That figure may be wrong.", true},
+		"across an aside, in the next list item": {
+			"1. There are 21 occurrences of the old helper. Note: I grepped for the bare\n   name, not the qualified one.\n2. Verify the count yourself before you start.", true},
+		"two blocks away": {
+			"There are 21 occurrences.\n\nFix them all.\n\nThat figure may be wrong.", false},
 		"the reviewer's boilerplate": {
 			"There are 21 occurrences of the old helper. Fix them. Check the build afterwards and note the results.", false},
 		"bare check nearby is not a hedge": {
@@ -80,10 +125,11 @@ func TestHedgedAtRequiresAttachment(t *testing.T) {
 		sents := sentences(tc.brief)
 		counts := hardCounts(sents)
 		if len(counts) != 1 {
-			t.Fatalf("%s: fixture must state exactly one hard count, got %d", name, len(counts))
+			t.Errorf("%s: fixture must state exactly one hard count, got %d", name, len(counts))
+			continue
 		}
 		if got := hedgedAt(sents, counts[0]); got != tc.want {
-			t.Fatalf("%s: hedgedAt = %v, want %v for %q", name, got, tc.want, tc.brief)
+			t.Errorf("%s: hedgedAt = %v, want %v for %q", name, got, tc.want, tc.brief)
 		}
 	}
 }

@@ -213,7 +213,10 @@ var bareFileExts = map[string]bool{
 // rejected rather than reported as missing files.
 func citationOf(tok string) (citation, bool) {
 	tok = strings.Trim(tok, "`\"'()[]{}<>,;")
-	tok = strings.TrimRight(tok, ".")
+	// A trailing dot or colon is punctuation: "see dev/report.md: the rule set" cites
+	// dev/report.md. A colon that introduces a LINE keeps its digits, so :40 survives this
+	// and is split off below.
+	tok = strings.TrimRight(tok, ".:")
 	if tok == "" {
 		return citation{}, false
 	}
