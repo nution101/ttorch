@@ -1231,6 +1231,93 @@ func (m *Manager) Gateable(repo string) bool {
 	return projectinit.ReadMode(repo) == "trusted"
 }
 
+// isolatedReviewDimensions names the review dimensions whose reviewer session runs OUTSIDE the
+// worker's worktree, in a scratch workspace holding the staged diff and a BARE mirror of the
+// repo.
+//
+// Everything a Claude session resolves from its cwd is content the worker can commit: project
+// .claude/settings.json hooks, project .claude/agents/ definitions that outrank the installed
+// ones, CLAUDE.md. Guarding those paths in the diff is the move that has not converged across
+// four review rounds, because each round found a resolver the previous list did not know
+// about. Moving the session's cwd out of the tree stops the enumeration instead of extending
+// it: it no longer matters what config a worker commits, because no reviewer session is ever
+// inside the tree that defines it.
+//
+// This is a PILOT on one dimension rather than the whole set, because it has a real cost: the
+// reviewer loses ripgrep over a working tree and reads surrounding source through
+// `git -C <bare> show` and `git grep <tree-ish>` instead, which the brief spells out. Security
+// is the dimension piloted — it is the one a forged empty report damages most, and the one the
+// hook attack in dev/trust-step12/EVIDENCE.md is demonstrated against. Correctness and scope
+// keep running in the worktree until the pilot's review quality has been measured.
+//
+// It does not cover the skill-driven path, where the manager dispatches ttorch-reviewer-*
+// subagents from its own cwd. That path's exposure is the DEFAULT BRANCH's CLAUDE.md and
+// .claude/, which is a different problem.
+var isolatedReviewDimensions = map[string]bool{review.DimensionSecurity: true}
+
+// reviewWorkspaceDir is the scratch cwd for an isolated dimension's reviewer: a per-dimension
+// directory under the review inputs, so two isolated reviewers never share a mirror and the
+// episode teardown can drop it wholesale.
+func reviewWorkspaceDir(inputsDir, dim string) string {
+	return filepath.Join(inputsDir, "workspace", dim)
+}
+
+// reviewerCwd returns the directory a dimension's reviewer session runs in, and the bare mirror
+// it reads source from ("" when there is none). An isolated dimension gets a freshly
+// materialized scratch workspace (see prepareReviewWorkspace); every other dimension still runs
+// in the worker's worktree at the reviewed commit.
+func (m *Manager) reviewerCwd(dim, inputsDir, repo, wt, head string) (cwd, bare string, err error) {
+	if !isolatedReviewDimensions[dim] {
+		return wt, "", nil
+	}
+	return prepareReviewWorkspace(inputsDir, dim, repo, wt, head)
+}
+
+// prepareReviewWorkspace materializes the scratch cwd an isolated reviewer runs in and returns
+// it together with the bare mirror inside it. The workspace holds:
+//
+//   - diff.patch — a copy of the committed three-dot diff TrustPrep staged, so the reviewer's
+//     primary input sits in its own cwd.
+//   - repo.git — a BARE mirror of the project repo. Bare means no working tree, so there is no
+//     .claude/, no CLAUDE.md and no project config of any kind for the session to discover. A
+//     clone writes the mirror a fresh config and never copies the source's hooks, so nothing
+//     executable comes across either. The reviewer reads surrounding source out of it at the
+//     reviewed commit with `git -C <bare> show <sha>:<path>` and searches it with
+//     `git -C <bare> grep <pattern> <sha>`.
+//
+// It is rebuilt from scratch on every dispatch, so a re-dispatch after the worker advanced
+// never reviews against a stale mirror. A local clone hardlinks its objects, so the rebuild
+// costs little.
+func prepareReviewWorkspace(inputsDir, dim, repo, wt, head string) (cwd, bare string, err error) {
+	cwd = reviewWorkspaceDir(inputsDir, dim)
+	if err := os.RemoveAll(cwd); err != nil {
+		return "", "", err
+	}
+	if err := os.MkdirAll(cwd, 0o755); err != nil {
+		return "", "", err
+	}
+	// Best-effort: prep always stages diff.patch before a reviewer is dispatched, and the brief
+	// also names it by absolute path in the inputs dir, so a missing copy is not fatal here.
+	if patch, rerr := os.ReadFile(filepath.Join(inputsDir, "diff.patch")); rerr == nil {
+		if werr := os.WriteFile(filepath.Join(cwd, "diff.patch"), patch, 0o644); werr != nil {
+			return "", "", werr
+		}
+	}
+	bare = filepath.Join(cwd, "repo.git")
+	if out, cerr := exec.Command("git", "clone", "--mirror", "--quiet", repo, bare).CombinedOutput(); cerr != nil {
+		return "", "", fmt.Errorf("mirror %s for review: %w: %s", repo, cerr, strings.TrimSpace(string(out)))
+	}
+	// The reviewed commit is normally reachable from the worker's branch, which the mirror
+	// copies. Fall back to fetching it from the worktree by ref when it is not (a detached
+	// worker HEAD), so the reviewer can always read the source it is judging.
+	if exec.Command("git", "-C", bare, "cat-file", "-e", head+"^{commit}").Run() != nil {
+		if out, ferr := exec.Command("git", "-C", bare, "fetch", "--no-tags", "--quiet", wt, "+HEAD:refs/ttorch/reviewed").CombinedOutput(); ferr != nil {
+			return "", "", fmt.Errorf("fetch the reviewed commit %s into the review mirror: %w: %s", short(head), ferr, strings.TrimSpace(string(out)))
+		}
+	}
+	return cwd, bare, nil
+}
+
 // reviewerWindow is the tmux window name for one dimension's daemon-dispatched reviewer:
 // stable and deterministic so the gate can recognize a still-running reviewer (idempotent
 // dispatch) and tear it down when the episode ends. Distinct prefix ("rv-") from worker
@@ -1270,6 +1357,12 @@ func (m *Manager) reviewReportPinned(dir, dim, head string) bool {
 // window is idle and holds no pool slot). Called when the episode reaches a terminal outcome.
 func (m *Manager) teardownReviewers(taskID string, dims []string) {
 	for _, dim := range dims {
+		// An isolated reviewer's scratch workspace holds a bare mirror of the repo. It is
+		// rebuilt from scratch on the next dispatch, so dropping it here keeps one mirror per
+		// in-flight reviewer rather than one per task per episode.
+		if isolatedReviewDimensions[dim] {
+			_ = os.RemoveAll(reviewWorkspaceDir(m.P.ReviewInputsDir(taskID), dim))
+		}
 		window := reviewerWindow(taskID, dim)
 		if window == "" || !tmux.WindowExists(m.Session, window) {
 			continue
@@ -1341,19 +1434,18 @@ func (m *Manager) writeGateProgress(dir string, p gateProgress) {
 // dimension, and writes the same commit-pinned <dim>.json report — so the daemon orchestrates
 // the real adversarial reviewers, it does not replace them with a rubber stamp.
 //
-// It runs in the worker's worktree (wt), at the reviewed commit, so the reviewer can read the
-// source the diff touches; it never edits the tree (review is read-only). It is idempotent —
-// it no-ops when the dimension's window already exists — so a re-dispatch never doubles a
-// running reviewer.
+// Where it runs depends on the dimension (see isolatedReviewDimensions and reviewerCwd): an
+// isolated dimension runs in a scratch workspace outside the worker's tree, reading source
+// from a bare mirror; the rest still run in the worker's worktree (wt) at the reviewed commit.
+// Either way it never edits anything, review is read-only. It is idempotent: it no-ops when
+// the dimension's window already exists, so a re-dispatch never doubles a running reviewer.
 //
 // The idempotence probe uses WindowExistsErr, not the bool WindowExists, because this is the
 // one call site where the bool's timeout fold is wrong. WindowExists answers "present" for a
 // probe that timed out, which is right for the callers that would otherwise duplicate an
 // agent, but here it would make spawnReviewer return nil having launched nothing, and the
-// caller in gateOnceAt counts an attempt for every nil. With maxReviewerAttempts at 2 that
-// halves the retry budget during exactly the tmux hang the deadline exists to survive.
-// Reporting the timeout instead reaches the "does not burn an attempt (nothing started)"
-// path, and the next tick retries.
+// caller in gateOnceAt counts an attempt for every launch. Reporting the timeout instead
+// leaves the retry to the next tick.
 //
 // Only a timeout is treated that way. Any other probe failure means the window is genuinely
 // not there, including the one that matters here: list-windows fails when the shared session
@@ -1385,17 +1477,24 @@ func (m *Manager) spawnReviewer(taskID, dim, inputsDir, head, repo, wt string) e
 	if err := tmux.EnsureSession(m.Session); err != nil {
 		return err
 	}
+	cwd, bare, err := m.reviewerCwd(dim, inputsDir, repo, wt, head)
+	if err != nil {
+		return err
+	}
 	h := harness.Resolve()
 	sid := harness.NewSessionID()
 	// Pre-accept the harness folder-trust prompt and write the trimmed worker settings (no AI
-	// co-author trailer) so the reviewer runs autonomously, exactly like a worker spawn.
-	_ = harness.WriteWorkerSettings(h, wt)
-	harness.TrustWorktree(h, repo, wt)
-	brief := reviewerBrief(taskID, dim, inputsDir, head, reportPath)
+	// co-author trailer) for the directory the session ACTUALLY runs in, so the reviewer runs
+	// autonomously without depending on the folder trust the worker's own spawn granted over
+	// the worktree. That spawn's trust entry is untouched; this only stops the reviewer relying
+	// on it.
+	_ = harness.WriteWorkerSettings(h, cwd)
+	harness.TrustWorktree(h, repo, cwd)
+	brief := reviewerBrief(taskID, dim, inputsDir, head, reportPath, bare)
 	if err := os.WriteFile(briefPath, []byte(brief), 0o644); err != nil {
 		return err
 	}
-	if err := m.newWindow(window, wt, "review · "+dim+" · "+taskID); err != nil {
+	if err := m.newWindow(window, cwd, "review · "+dim+" · "+taskID); err != nil {
 		return err
 	}
 	cmd := harness.BriefCommand(h, briefPath, sid, reviewerEffort, reviewerModel)
@@ -1414,7 +1513,12 @@ func (m *Manager) spawnReviewer(taskID, dim, inputsDir, head, repo, wt string) e
 // the gate consumes: a commit-pinned <dim>.json following the findings contract. Go owns the
 // verdict aggregation, so a missing or malformed report fails the gate closed regardless of
 // what the session does.
-func reviewerBrief(taskID, dim, inputsDir, head, reportPath string) string {
+//
+// bare is the review workspace's bare mirror for an isolated dimension, or "" when the session
+// runs in the worker's worktree. When it is set the brief MUST teach the git read path, because
+// the session has no working tree to search and a reviewer that silently gives up on reading
+// callers writes a worse report rather than an honest "I could not check this".
+func reviewerBrief(taskID, dim, inputsDir, head, reportPath, bare string) string {
 	return fmt.Sprintf(`# Adversarial trust-gate review — %s dimension (task %s)
 
 You are the **%s** reviewer in ttorch's adversarial trust gate, dispatched by the scheduler
@@ -1439,5 +1543,39 @@ review is "findings": [], and reviewedSha MUST equal %s verbatim.
 If the `+"`ttorch-reviewer-%s`"+` subagent is unavailable, perform the review yourself per the
 exact same contract and write %s. Either way the ONLY required output is that file. When it is
 written, you are done — do not modify the repository.
-`, dim, taskID, dim, dim, dim, inputsDir, head, inputsDir, dim, reportPath, dim, head, head, dim, reportPath)
+%s`, dim, taskID, dim, dim, dim, inputsDir, head, inputsDir, dim, reportPath, dim, head, head, dim, reportPath, bareSourceSection(bare, head))
+}
+
+// bareSourceSection is the part of a reviewer brief that replaces a working tree. An isolated
+// reviewer's cwd is a scratch workspace, so there is nothing to ripgrep; it reads and searches
+// the repository through a bare mirror at the reviewed commit instead. `git grep` over a
+// tree-ish recovers most of what a tree search gave (it takes a pattern, -n, and a pathspec),
+// which is why the cost of moving the session out of the tree is a worse review experience
+// rather than a blind one. It returns "" for a dimension that still runs in the worktree.
+func bareSourceSection(bare, head string) string {
+	if bare == "" {
+		return ""
+	}
+	return fmt.Sprintf(`
+## Reading source: there is no working tree here
+
+Your working directory is a scratch workspace, NOT a checkout of the project, because a
+reviewer must not run inside the tree it is judging. Nothing under your cwd is project source
+and there is nothing to ripgrep. The repository is a BARE mirror at:
+
+    %s
+
+Read and search it AT THE REVIEWED COMMIT (%s):
+
+    git -C %s ls-tree -r --name-only %s            # every path at the reviewed commit
+    git -C %s show %s:<path>                       # one file's full contents
+    git -C %s grep -n <pattern> %s -- <pathspec>   # search the whole tree
+    git -C %s log --oneline -20 %s -- <path>       # how a file got this way
+
+Use these wherever you would otherwise have searched a checkout. Reading the callers of a
+changed function, the other implementations of an interface, or the tests that cover the
+touched code is still your job — the mirror makes all of it available, so a finding you could
+have caught by reading around the diff is still yours to catch. If some check genuinely cannot
+be made this way, say so in the report rather than passing quietly.
+`, bare, short(head), bare, head, bare, head, bare, head, bare, head)
 }
