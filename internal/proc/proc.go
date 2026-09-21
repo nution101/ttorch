@@ -25,8 +25,20 @@ import (
 // short enough that no caller notices.
 const WaitDelay = 2 * time.Second
 
-// Command is exec.CommandContext plus the two settings that make ctx an enforceable bound.
-// Callers use the returned *exec.Cmd exactly as they would one from exec.CommandContext.
+// Command is exec.CommandContext plus the three settings that make ctx an enforceable
+// bound. Set Dir, Env, Stdin, Stdout, Stderr and the rest as usual.
+//
+// Three fields carry the guarantee and a caller must not reassign them, because each one
+// silently defeats it rather than failing:
+//
+//   - SysProcAttr holds Setpgid, which is what gives the child a group of its own.
+//     Assigning a fresh &syscall.SysProcAttr{} to add an unrelated field drops it, and the
+//     group kill below then aims at whatever group the parent happens to be in. Modify the
+//     struct Command returns rather than replacing it.
+//   - Cancel is the group kill. Replacing it restores the default, which kills the process
+//     alone and leaves everything it forked.
+//   - WaitDelay is the backstop for a child that leaves the group. Zeroing it means Wait
+//     waits forever on a pipe such a child still holds.
 func Command(ctx context.Context, name string, arg ...string) *exec.Cmd {
 	c := exec.CommandContext(ctx, name, arg...)
 	// A new process group, so one signal reaches everything the command forked.
