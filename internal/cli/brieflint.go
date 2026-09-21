@@ -159,8 +159,17 @@ func printBriefLint(w io.Writer, path string, rep brieflint.Report) {
 // "2 of 5 rules ran" are different claims and only the second is checkable.
 func coverage(rep brieflint.Report) string {
 	s := fmt.Sprintf("%d of %d rules ran", rep.Evaluated(), rep.Total())
-	if n := rep.Total() - rep.Evaluated(); n > 0 {
-		s += fmt.Sprintf(" (%d disabled by project config)", n)
+	// Name the real reason. Reporting an --offline skip as a project disable would send a
+	// reader to an AGENTS.md that never mentioned the rule.
+	var why []string
+	if n := rep.Total() - rep.Evaluated() - rep.Skipped(); n > 0 {
+		why = append(why, fmt.Sprintf("%d disabled by project config", n))
+	}
+	if rep.Skipped() > 0 {
+		why = append(why, fmt.Sprintf("%d skipped for --offline", rep.Skipped()))
+	}
+	if len(why) > 0 {
+		s += " (" + strings.Join(why, ", ") + ")"
 	}
 	return s
 }

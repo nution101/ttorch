@@ -100,6 +100,9 @@ type Report struct {
 	Notes []string
 	// evaluated is how many rules ran (see Evaluated).
 	evaluated int
+	// skipped is how many rules --offline skipped. Tracked apart from the project's
+	// disables so a summary line can name the real reason a rule did not run.
+	skipped int
 }
 
 // Violations counts the StatusFail findings.
@@ -138,6 +141,10 @@ func (r Report) Evaluated() int { return r.evaluated }
 
 // Total is how many rules exist, disabled ones included.
 func (r Report) Total() int { return len(rules) }
+
+// Skipped is how many rules Options.Offline skipped. Total-Evaluated-Skipped is how many
+// the project disabled.
+func (r Report) Skipped() int { return r.skipped }
 
 // Options describes what a single run may consult. The zero value is valid: it lints the
 // brief's text alone and reports every ref-dependent check as indeterminate rather than
@@ -280,6 +287,7 @@ func Lint(text string, opt Options) Report {
 			continue
 		case opt.Offline && r.network:
 			rep.Notes = append(rep.Notes, fmt.Sprintf("rule %s: SKIPPED for --offline, so the remote was never asked", r.id))
+			rep.skipped++
 			continue
 		}
 		findings, notes := r.run(ctx, b, opt)

@@ -349,7 +349,7 @@ func TestCmdBriefLintOfflineKeepsTheLocalRules(t *testing.T) {
 	if got := exitOf(t, err); got != exitLintPartial {
 		t.Fatalf("offline must report reduced coverage, want exit %d, got %d (%v)\n%s", exitLintPartial, got, err, out)
 	}
-	for _, want := range []string{"rule target-branch: SKIPPED for --offline", "4 of 5 rules ran"} {
+	for _, want := range []string{"rule target-branch: SKIPPED for --offline", "4 of 5 rules ran (1 skipped for --offline)"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("want %q in the output:\n%s", want, out)
 		}
