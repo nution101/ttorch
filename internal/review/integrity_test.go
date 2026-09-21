@@ -391,6 +391,22 @@ func TestAggregate_DimensionNameCannotReachOutsideTheInputsDir(t *testing.T) {
 	}
 }
 
+// TestAggregate_EmptyDimensionSetBlocks: nothing was reviewed, so there is nothing to pass.
+// An empty required set must read like a no-checks validate does, not like a clean sweep.
+func TestAggregate_EmptyDimensionSetBlocks(t *testing.T) {
+	const sha = "abc123def456"
+	dir := t.TempDir()
+	stagePrep(t, dir, sha, greenValidate())
+
+	v, err := Aggregate(dir, sha, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Overall != Block {
+		t.Fatalf("overall = %q, want %q: an empty dimension set read as a pass", v.Overall, Block)
+	}
+}
+
 // TestValidDimensionName pins the allow-list: what a dimension MAY be, rather than what it
 // must not be. Every rejected case below either reaches another directory or collides with
 // another dimension's file on a case-insensitive filesystem.
