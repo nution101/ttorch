@@ -1713,14 +1713,19 @@ Use the Task tool to dispatch the `+"`ttorch-reviewer-%s`"+` subagent, giving it
 - reviewed commit (head): %s
 
 It must read %s/{diff.patch, brief.md, validate.json, head.txt}, review only the %s dimension,
-trust the green validate.json (do NOT re-run the build/test suite), and write its findings to
-%s following the findings contract:
+and write its findings to %s following the findings contract:
 
     {"dimension": "%s", "reviewedSha": "%s", "findings": [ ... ]}
 
 where each finding is {"dimension","severity","reviewer","summary"}, severity is one of
 low|medium|high|critical (high/critical block the merge; bias to high on uncertainty), a clean
 review is "findings": [], and reviewedSha MUST equal %s verbatim.
+
+validate.json records what the gate's own validate saw for this commit. Read it as a report,
+not as proof: it is a file in a directory this session and others can write, and the gate
+re-runs the suite itself before anything merges. Do not re-run the build or test suite here
+either — that is not your job and a green there would not authorize anything. If a finding
+depends on whether the suite really passes, say so in the finding.
 
 If the `+"`ttorch-reviewer-%s`"+` subagent is unavailable, perform the review yourself per the
 exact same contract and write %s. Either way the ONLY required output is that file. When it is
