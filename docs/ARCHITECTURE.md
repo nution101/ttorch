@@ -237,8 +237,10 @@ passing commit-pinned verdict plus a fresh green validate auto-mints the approva
   own gate), and a repo with **no checks detected is a hard block**, never a pass. Without
   the script, the trusted auto-merge is refused and a human `ttorch approve` is required.
 - A trusted auto-merge **cannot change a gate-definition file** (`.ttorch/validate.sh` or
-  `AGENTS.md`); such a diff is refused. A human approval does not wave it through either: it
-  needs `ttorch approve <id> --allow-gate-change`, and the merge audit line names the file.
+  `AGENTS.md`); such a diff is refused. On a **gated** merge (trusted mode, or any mode with
+  `--require-verdict`) a human approval does not wave it through either: it needs
+  `ttorch approve <id> --allow-gate-change`, and the merge audit line names the file. An
+  ungated `local`/`validated` merge does not run the check.
   The scope lives on the approval token, so an expired token re-minted from the durable
   verdict comes back without it and the merge refuses again (fail closed). This makes a gate
   change an explicit, audited act; it does not make the token unwritable by a process running

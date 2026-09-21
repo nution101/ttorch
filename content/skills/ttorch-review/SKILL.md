@@ -147,13 +147,17 @@ invalidates the verdict — re-prep, re-review, re-record.
   fall back to ecosystem detection (`go.mod`/`package.json`) on the worker's checkout,
   which the worker controls, so the auto path is refused and a human `ttorch approve` is
   required instead. A repo with no detectable checks fails closed (a hard block).
-- **No merge changes the gate's own definition unless the approval says so by name.** If a
-  worker's diff touches `.ttorch/validate.sh` or `AGENTS.md`, an auto-merge is refused
+- **No GATED merge changes the gate's own definition unless the approval says so by name.**
+  If a worker's diff touches `.ttorch/validate.sh` or `AGENTS.md`, an auto-merge is refused
   outright, and a plain `ttorch approve` is refused too — the lead must run
   `ttorch approve <id> --allow-gate-change`, and the merge's audit line then names the file
-  that changed. This is not a barrier: anything running as the lead can still write the
+  that changed. Gated means trusted mode or `--require-verdict`; a `local`/`validated` merge
+  without `--require-verdict` does not run this check at all, and still merges a
+  gate-definition change on a plain approval with nothing in the audit naming it. This is
+  not a barrier even where it does run: anything running as the lead can still write the
   approval token with that scope in it. What it removes is the silent skip — before, any
-  human approval waved a gate change through with nothing in the audit log naming it.
+  human approval waved a gate change through, in every mode, with nothing in the audit log
+  naming it.
 
 ## Findings contract
 
