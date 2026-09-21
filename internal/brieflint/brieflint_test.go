@@ -37,6 +37,10 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	if v := os.Getenv(childEnv); v != "" {
+		runTestChild(v)
+		return
+	}
 	root, err := os.MkdirTemp("", "brieflint-fixture-*")
 	if err != nil {
 		panic(err)
@@ -728,6 +732,54 @@ func TestTargetBranchFanOutIsCapped(t *testing.T) {
 	}
 	if r.Outcome() == OutcomePass {
 		t.Fatal("a run that could not verify every target must not read as a pass")
+	}
+}
+
+// The same bound one level down: the number of paths a brief cites decides how much local
+// git work its reader does, and a line count reads the blob. This was the one cap of the
+// four with no test.
+func TestCitationFanOutIsCapped(t *testing.T) {
+	repo, _ := fixture(t)
+	var b strings.Builder
+	b.WriteString("# Task\n\nBase is origin/main in this repository.\n\nFollow this repo's conventions.\n\n")
+	const cited = maxCitations + 6
+	for i := 0; i < cited; i++ {
+		fmt.Fprintf(&b, "Touch pkg/gen-%d.go please.\n", i)
+	}
+	b.WriteString("\nNo changes to a product branch and no PR until I say so. Commit on your own branch and report the sha.\n")
+
+	// Answer every path query with a real blob, so the only finding left is the cap itself.
+	spy := &spyGit{answer: func(args []string) (gitResult, bool) {
+		if args[0] == "ls-tree" {
+			return gitResult{stdout: "100644 blob 0123456789abcdef\tpkg/gen.go\n"}, true
+		}
+		return gitResult{}, false
+	}}
+	r := Lint(b.String(), Options{Repo: repo, Ref: "origin/main", git: spy.fn})
+
+	if got := spy.count("ls-tree"); got != maxCitations {
+		t.Fatalf("a brief citing %d paths resolved %d of them, want the cap of %d", cited, got, maxCitations)
+	}
+	var capped *Finding
+	for i := range r.Findings {
+		if r.Findings[i].Rule == RuleFilePaths && strings.Contains(r.Findings[i].Detail, "past the first") {
+			capped = &r.Findings[i]
+		}
+	}
+	if capped == nil {
+		t.Fatalf("the unchecked citations must be reported: %+v", r.Findings)
+	}
+	if capped.Status != StatusIndeterminate {
+		t.Fatalf("unchecked citations must be %s, got %s", StatusIndeterminate, capped.Status)
+	}
+	if !strings.Contains(capped.Detail, fmt.Sprintf("%d cited path(s)", cited-maxCitations)) {
+		t.Fatalf("the finding must say how many went unchecked: %s", capped.Detail)
+	}
+	if !strings.Contains(capped.Detail, "pkg/gen-") {
+		t.Fatalf("the finding must name where the cap bit: %s", capped.Detail)
+	}
+	if r.Outcome() == OutcomePass {
+		t.Fatal("a run that could not resolve every citation must not read as a pass")
 	}
 }
 
