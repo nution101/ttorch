@@ -15,7 +15,6 @@ import (
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/projectinit"
 	"github.com/nution101/ttorch/internal/review"
-	"github.com/nution101/ttorch/internal/validate"
 )
 
 // preppedTrustedTask stands up a trusted repo whose default-branch gate script is gateBody,
@@ -155,13 +154,13 @@ func backdateFile(t *testing.T, path string, d time.Duration) {
 func TestTrustRecord_RedStagedValidateCannotPass(t *testing.T) {
 	m, head, dir := preppedTrustedTask(t, "redstaged", "rs2", "echo cannot run the suite here; exit 1")
 
-	// Precondition: prep really did stage a red validate for the reviewed commit.
-	staged, ok := m.reusablePrepValidate("rs2", head)
-	if !ok {
-		t.Fatal("prep must stage a validate pinned to the reviewed commit")
-	}
-	if len(validate.Failures(staged)) == 0 {
-		t.Fatalf("this test needs a failing staged validate, got %+v", staged)
+	// Precondition: prep really did stage a red validate for the reviewed commit. Read
+	// through review.ValidateState rather than the staged pair: reusablePrepValidate is gone,
+	// because reusing that pair as an authority was the defect it was removed for, and a test
+	// precondition does not need it back. ValidateState resolves the same episode FOR head
+	// and reports "failed:<steps>" when the staged suite went red.
+	if state := review.ValidateState(dir, head); !strings.HasPrefix(state, "failed:") {
+		t.Fatalf("this test needs a failing staged validate pinned to the reviewed commit, got %q", state)
 	}
 
 	// Every reviewer comes back clean over those inputs.

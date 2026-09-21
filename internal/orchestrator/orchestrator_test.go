@@ -1024,6 +1024,7 @@ func deliveryHarness(t *testing.T, tag string) (*Manager, string) {
 	if !tmux.Available() {
 		t.Skip("tmux not installed")
 	}
+	freshProcessValidate(t)
 	repo := newRepoMain(t)
 	seedTtorchSourceMarker(t, repo)
 	session := fmt.Sprintf("ttorch-%s-%d", tag, os.Getpid())
@@ -3599,10 +3600,12 @@ func stageValidate(t *testing.T, dir, sha string, results []validate.Result) {
 	}
 }
 
-// TestValidateForMerge_ReusesPinnedPrepValidate: when trust prep staged a green validate
-// pinned to the exact sha being merged, validateForMerge returns that staged result and
-// does NOT re-run the gate — the redundant full-suite run is skipped.
-func TestValidateForMerge_ReusesPinnedPrepValidate(t *testing.T) {
+// TestMergeValidate_IgnoresStagedPrepValidate: a green validate.json/head.txt pair pinned
+// to the exact sha being merged no longer short-circuits the merge gate. The pair is two files
+// in the review-inputs dir written from one results value in one call, so it was never two
+// independent measurements, and any process running as the lead can write it. The merge must
+// run the suite itself.
+func TestMergeValidate_IgnoresStagedPrepValidate(t *testing.T) {
 	m, repo := deliveryHarness(t, "vfmreuse")
 	counter := filepath.Join(t.TempDir(), "runs")
 	countingGateScript(t, repo, counter)
@@ -3615,28 +3618,28 @@ func TestValidateForMerge_ReusesPinnedPrepValidate(t *testing.T) {
 	stageValidate(t, m.P.ReviewInputsDir("rz1"), head, []validate.Result{{Name: "gate", Passed: true}})
 
 	c0 := gateRunCount(t, counter)
-	green, results, reused, err := m.validateForMerge(repo, "rz1", head)
+	green, results, reused, err := validateForAuthority(repo, head)
 	if err != nil {
-		t.Fatalf("validateForMerge: %v", err)
+		t.Fatalf("validateForAuthority: %v", err)
 	}
-	if !reused {
-		t.Fatal("a validate pinned to the exact merged sha must be reused, not re-run")
+	if reused {
+		t.Fatal("the staged pair must not be treated as a run this process performed")
+	}
+	if got := gateRunCount(t, counter); got != c0+1 {
+		t.Fatalf("the merge gate must run the real suite despite the staged pair: %d extra run(s), want 1", got-c0)
 	}
 	if !green || len(results) != 1 || !results[0].Passed {
-		t.Fatalf("reused result should be the staged green validate, got green=%v results=%+v", green, results)
-	}
-	if got := gateRunCount(t, counter); got != c0 {
-		t.Fatalf("reuse must not run the gate again: gate ran %d extra time(s)", got-c0)
+		t.Fatalf("the fresh run of a genuinely green tree should be green, got green=%v results=%+v", green, results)
 	}
 	_, _ = m.Teardown("rz1", true)
 }
 
-// TestValidateForMerge_RevalidatesWhenHeadMoved: when the staged validate pins to an older
-// sha than the one being merged, validateForMerge ignores the stale (here deliberately
+// TestMergeValidate_RevalidatesWhenHeadMoved: when the staged validate pins to an older
+// sha than the one being merged, the merge gate ignores the stale (here deliberately
 // failing) result and runs a fresh validate of the CURRENT sha — preserving the safety
 // property that the merged commit is validated, never trusting a result for a different
 // commit.
-func TestValidateForMerge_RevalidatesWhenHeadMoved(t *testing.T) {
+func TestMergeValidate_RevalidatesWhenHeadMoved(t *testing.T) {
 	m, repo := deliveryHarness(t, "vfmreval")
 	counter := filepath.Join(t.TempDir(), "runs")
 	countingGateScript(t, repo, counter)
@@ -3654,9 +3657,9 @@ func TestValidateForMerge_RevalidatesWhenHeadMoved(t *testing.T) {
 	stageValidate(t, m.P.ReviewInputsDir("rv1"), head1, []validate.Result{{Name: "gate", Passed: false}})
 
 	c0 := gateRunCount(t, counter)
-	green, results, reused, err := m.validateForMerge(repo, "rv1", head2)
+	green, results, reused, err := validateForAuthority(repo, head2)
 	if err != nil {
-		t.Fatalf("validateForMerge: %v", err)
+		t.Fatalf("validateForAuthority: %v", err)
 	}
 	if reused {
 		t.Fatal("a validate pinned to a different sha must NOT be reused")
@@ -3670,11 +3673,12 @@ func TestValidateForMerge_RevalidatesWhenHeadMoved(t *testing.T) {
 	_, _ = m.Teardown("rv1", true)
 }
 
-// TestMergeLocal_ReusesPrepValidateForUnchangedHead is the headline behavior: in a trusted
-// auto-merge whose committed sha is unchanged since trust prep validated it, the merge
-// reuses prep's commit-pinned validate.json instead of re-running the identical suite — yet
-// still fast-forwards (the merged commit remains backed by a green, pinned validate).
-func TestMergeLocal_ReusesPrepValidateForUnchangedHead(t *testing.T) {
+// TestMergeLocal_ReusesThisProcessValidateForUnchangedHead locks the cost of dropping the
+// staged-pair shortcut. In a trusted auto-merge whose committed sha is unchanged since prep,
+// the merge still does not re-run the suite — but for a different reason than before: prep ran
+// it in THIS process for this exact tree and gate, so validateForAuthority serves its own
+// memoized green. One gate episode is still one real suite run.
+func TestMergeLocal_ReusesThisProcessValidateForUnchangedHead(t *testing.T) {
 	m, repo := deliveryHarness(t, "mlreuse")
 	counter := filepath.Join(t.TempDir(), "runs")
 	countingGateScript(t, repo, counter)
@@ -3710,7 +3714,7 @@ func TestMergeLocal_ReusesPrepValidateForUnchangedHead(t *testing.T) {
 		t.Fatal("the merged commit must be fast-forwarded onto the default branch")
 	}
 	if after := gateRunCount(t, counter); after != before {
-		t.Fatalf("merge re-ran the gate %d extra time(s); it should reuse prep's commit-pinned validate", after-before)
+		t.Fatalf("merge re-ran the gate %d extra time(s); it should reuse the green this process already produced for this tree", after-before)
 	}
 	_, _ = m.Teardown("mr1", true)
 }
@@ -3741,12 +3745,12 @@ func TestStagedGreen(t *testing.T) {
 	}
 }
 
-// TestValidateForMerge_ReusedEmptyResultIsNotGreen exercises the no-checks edge ON the
-// reuse path: trust prep can stage an empty/null validate.json (no checks detected) pinned
-// to the merged sha. Reuse must return that result as-is and read it as NOT green — a hard
-// block — rather than fall through to a fresh run or, worse, treat an empty result as a
-// pass. This is the reuse-path counterpart of the fresh-path no-checks hard block.
-func TestValidateForMerge_ReusedEmptyResultIsNotGreen(t *testing.T) {
+// TestMergeValidate_IgnoresStagedEmptyResult is the must-not-trip direction of dropping the
+// staged pair: an empty (no-checks-detected) validate.json pinned to the merged sha used to be
+// reused verbatim and read as a hard block. Now it is ignored like any other staged result, so
+// a genuinely green tree is not blocked by a file someone left behind — the gate runs the real
+// suite and decides from that.
+func TestMergeValidate_IgnoresStagedEmptyResult(t *testing.T) {
 	m, repo := deliveryHarness(t, "vfmempty")
 	counter := filepath.Join(t.TempDir(), "runs")
 	countingGateScript(t, repo, counter)
@@ -3755,26 +3759,19 @@ func TestValidateForMerge_ReusedEmptyResultIsNotGreen(t *testing.T) {
 		t.Fatal(err)
 	}
 	head := commitFeature(t, task.Worktree, "feature.txt", "new\n")
-	// An empty (no-checks-detected) validate, pinned to the exact merged sha — exactly what
-	// prep stages for a repo with no detectable checks.
+	// An empty (no-checks-detected) validate, pinned to the exact merged sha.
 	stageValidate(t, m.P.ReviewInputsDir("ze1"), head, nil)
 
 	c0 := gateRunCount(t, counter)
-	green, results, reused, err := m.validateForMerge(repo, "ze1", head)
+	green, results, _, err := validateForAuthority(repo, head)
 	if err != nil {
-		t.Fatalf("validateForMerge: %v", err)
+		t.Fatalf("validateForAuthority: %v", err)
 	}
-	if !reused {
-		t.Fatal("an empty result pinned to the exact sha is still a reusable pinned result")
+	if got := gateRunCount(t, counter); got != c0+1 {
+		t.Fatalf("the staged empty result must not short-circuit the gate: %d extra run(s), want 1", got-c0)
 	}
-	if green {
-		t.Fatal("a no-checks (empty) staged result must NOT read as green — the safety guard")
-	}
-	if len(results) != 0 {
-		t.Fatalf("the empty staged result should be returned verbatim, got %+v", results)
-	}
-	if got := gateRunCount(t, counter); got != c0 {
-		t.Fatalf("reusing an empty result must not fall through to a fresh gate run: %d extra run(s)", got-c0)
+	if !green || len(results) != 1 {
+		t.Fatalf("the real suite of a green tree decides, got green=%v results=%+v", green, results)
 	}
 	_, _ = m.Teardown("ze1", true)
 }

@@ -673,9 +673,11 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 		// A trusted auto-mint's green authority MUST be the default-branch gate script,
 		// never ecosystem detection on the worker's checkout (which the worker controls
 		// via go.mod/package.json). Without it, leave the verdict advisory — a human must
-		// approve — and skip validation entirely so no worker-defined checks run.
+		// approve — and skip validation entirely so no worker-defined checks run. The green
+		// comes from validateForAuthority, so it is one this process ran: the on-disk
+		// validate cache is a file the worker can write and cannot mint an approval.
 		if cerr == nil && terr == nil && clean && !touched && hasDefaultBranchGateScript(t.Project) {
-			green, _, _ = validateCommitted(t.Project, sha)
+			green, _, _, _ = validateForAuthority(t.Project, sha)
 		}
 		if green {
 			if err := approval.Grant(m.P.ApprovalFile(taskID), ttl, approvalPayload("auto", sha, nil)); err != nil {

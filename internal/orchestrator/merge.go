@@ -296,12 +296,13 @@ func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error)
 			gateChange = strings.Join(touchedGateFiles, ",")
 		}
 		// Validate the COMMITTED sha (an immutable detached checkout), using the gate
-		// definition from the DEFAULT BRANCH. No checks detected is a hard BLOCK. When trust
-		// prep already validated this EXACT sha (its commit-pinned validate.json is still the
-		// gate's notion of green for this commit), reuse that result rather than re-run the
-		// identical full suite — only HEAD moving since prep, or no pinned result, forces a
-		// fresh run. The merged commit is still backed by a green, commit-pinned validate.
-		green, results, _, err := m.validateForMerge(repo, taskID, workerHead)
+		// definition from the DEFAULT BRANCH. No checks detected is a hard BLOCK. The green
+		// must be one THIS PROCESS produced: neither the staged validate.json/head.txt pair
+		// nor the on-disk validate cache authorizes a merge, because both are files any
+		// process running as the lead can write (see validateForAuthority). When this process
+		// already ran the suite for this exact tree and gate — prep or the land pass normally
+		// has — the run is reused and the suite does not run twice.
+		green, results, _, err := validateForAuthority(repo, workerHead)
 		if err != nil {
 			return "", err
 		}
@@ -824,8 +825,10 @@ func (m *Manager) landPrep(t db.Task, spec landSpec, fetchMu *sync.Mutex) (landP
 		}
 	}
 
-	// (3) Validate the REBASED tree. Must be green; no checks detected is a hard block.
-	green, results, err := validateCommitted(spec.repo, rebasedHead)
+	// (3) Validate the REBASED tree. Must be green; no checks detected is a hard block. This
+	// green gates the land, so it goes through validateForAuthority — a result this process
+	// produced, never one read back from the on-disk cache.
+	green, results, _, err := validateForAuthority(spec.repo, rebasedHead)
 	if err != nil {
 		return zero, fmt.Errorf("land: could not validate the rebased tree for %q: %w", spec.taskID, err)
 	}
@@ -835,10 +838,11 @@ func (m *Manager) landPrep(t db.Task, spec landSpec, fetchMu *sync.Mutex) (landP
 		}
 		return zero, fmt.Errorf("land: %d of %d checks failed on the rebased tree for %q; fix them in the worker and re-run land", len(validate.Failures(results)), len(results), spec.taskID)
 	}
-	// Stage the rebased validate commit-pinned to the rebased commit, so the gated merge reuses
-	// it (validateForMerge) rather than re-running the identical suite under the serialized FF
-	// lock — the validate cost stays here, in concurrent prep, off the critical section. Only
-	// gated merges re-validate, so only they need the staged result.
+	// Stage the rebased validate commit-pinned to the rebased commit, so the review inputs and
+	// the audit record describe the tree that actually merges rather than the pre-rebase one.
+	// The gated merge no longer READS this pair as its green (see validateForAuthority); it does
+	// not re-run the suite either, because the run just above memoized the green for this exact
+	// tree, so the validate cost still stays here, off the serialized fast-forward.
 	if spec.gated {
 		if err := m.stagePrepValidate(spec.taskID, rebasedHead, results); err != nil {
 			return zero, fmt.Errorf("land: could not stage the rebased validate for %q: %w", spec.taskID, err)
@@ -868,9 +872,9 @@ func (m *Manager) landPrep(t db.Task, spec landSpec, fetchMu *sync.Mutex) (landP
 }
 
 // stagePrepValidate persists results as the commit-pinned gate validate for taskID: validate.json
-// plus head.txt pinned to sha, exactly as TrustPrep stages it. A later merge of EXACTLY sha then
-// reuses it (validateForMerge / reusablePrepValidate) instead of re-running the suite. The sha is
-// immutable, so the staged green is a faithful, commit-pinned record of the tree that merges.
+// plus head.txt pinned to sha, exactly as TrustPrep stages it. It is a reviewer input and an
+// audit record of what the gate saw for that commit — not an authorization: the merge gate
+// re-derives its own green (validateForAuthority) rather than reading this pair back.
 func (m *Manager) stagePrepValidate(taskID, sha string, results []validate.Result) error {
 	dir := m.P.ReviewInputsDir(taskID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {

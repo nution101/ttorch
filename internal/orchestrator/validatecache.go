@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/nution101/ttorch/internal/paths"
 	"github.com/nution101/ttorch/internal/validate"
@@ -90,4 +91,58 @@ func storeValidateCache(key string, results []validate.Result) {
 	if err := os.Rename(tmpName, validateCacheFile(key)); err != nil {
 		os.Remove(tmpName)
 	}
+}
+
+// processValidate memoizes the GREEN validate results THIS PROCESS actually produced, keyed by
+// the same content key as the on-disk cache. It is the trust gate's only reusable green.
+//
+// The on-disk cache cannot be that, and the reason is not that its key is weak — the key is a
+// git tree hash, which is a cryptographic content identity, and the invariant it proves (a hit
+// is served only for a byte-identical tree under an identical gate script) is true. The reason
+// is that the invariant addresses the wrong adversary. It proves the cache cannot serve a
+// result computed for a DIFFERENT tree. It says nothing about an entry that was never computed
+// at all, and both inputs to the key — the worker's own tree hash and the default-branch
+// .ttorch/validate.sh — are readable by the worker, so any process running as the lead can
+// write a green entry for its own tree. Against the diff channel (hostile content committed to
+// the repo) the on-disk cache is fine; against a live session running as the lead it is an
+// unauthenticated green.
+//
+// Authenticating entries with a per-install secret was considered and rejected rather than
+// shipped as a fix: the secret is readable by the same uid as the process it would be
+// defending against, so it would read as a control in the changelog and be one nowhere. What
+// is left that a local process cannot forge is provenance in memory: an entry is reusable as
+// an AUTHORITY only if this process ran the suite and observed the green itself. The on-disk
+// cache keeps its job as a performance record for REPORTING — the reviewers' validate.json and
+// any status output — where a forged green misleads a reader but authorizes nothing.
+//
+// Entries are small (a handful of validate.Results under a 64-hex key) and a long-lived
+// scheduler accumulates at most one per distinct tree it gates, so the map is left unbounded.
+var (
+	processValidateMu sync.Mutex
+	processValidate   = map[string][]validate.Result{}
+)
+
+// loadProcessValidate returns the green results this process produced for key, if any.
+func loadProcessValidate(key string) ([]validate.Result, bool) {
+	processValidateMu.Lock()
+	defer processValidateMu.Unlock()
+	results, ok := processValidate[key]
+	return results, ok
+}
+
+// storeProcessValidate records a green this process produced. Only runAndRecordGate calls it,
+// and only after a real suite run, so a cache HIT can never become a memoized authority.
+func storeProcessValidate(key string, results []validate.Result) {
+	processValidateMu.Lock()
+	defer processValidateMu.Unlock()
+	processValidate[key] = results
+}
+
+// resetProcessValidate drops every memoized green. It exists for the tests: the fixtures build
+// byte-identical trees under identical gate scripts, so they share a content key and would
+// otherwise serve each other's results across test boundaries.
+func resetProcessValidate() {
+	processValidateMu.Lock()
+	defer processValidateMu.Unlock()
+	processValidate = map[string][]validate.Result{}
 }

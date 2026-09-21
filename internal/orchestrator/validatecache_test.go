@@ -61,6 +61,7 @@ func cacheEntries(t *testing.T) []string {
 // real gate-resolution, tree-hashing, and cache I/O directly, so it runs in the fast lane.
 func cacheRepo(t *testing.T) (repo, head string) {
 	t.Helper()
+	freshProcessValidate(t)
 	repo = newRepoMain(t)
 	commitGateScript(t, repo, "exit 0")
 	t.Setenv("TTORCH_VALIDATE_CACHE_DIR", t.TempDir())

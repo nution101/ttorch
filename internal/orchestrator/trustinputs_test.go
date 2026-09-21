@@ -14,6 +14,8 @@ import (
 	"github.com/nution101/ttorch/internal/paths"
 	"github.com/nution101/ttorch/internal/projectinit"
 	"github.com/nution101/ttorch/internal/review"
+	"github.com/nution101/ttorch/internal/validate"
+	"github.com/nution101/ttorch/internal/worktree"
 )
 
 // trustHarness stands up the trust gate's real inputs — a git repo whose DEFAULT BRANCH
@@ -28,6 +30,7 @@ func trustHarness(t *testing.T, id, mode, gateBody string) (m *Manager, repo, wt
 	t.Setenv("TTORCH_HOME", t.TempDir())
 	t.Setenv("TTORCH_VALIDATE_CACHE_DIR", t.TempDir())
 	t.Setenv("TTORCH_NO_AUTOTRUST", "1")
+	freshProcessValidate(t)
 
 	repo = newRepoMain(t)
 	if _, err := projectinit.Init(repo, mode); err != nil {
@@ -213,4 +216,104 @@ func TestTrustRecord_DocsOnlyDiffStaysReduced(t *testing.T) {
 	if v.Overall != review.Pass {
 		t.Fatalf("a docs-only diff must still pass on the reduced set: %q (%+v)", v.Overall, v.Findings)
 	}
+}
+
+// TestValidateAuthority_IgnoresForgedStagedPairAndCache is the red proof for 1b+1c together.
+// A tree that genuinely FAILS the default-branch gate is presented with (a) a green,
+// head-pinned validate.json — the staged pair the merge gate used to prefer — and (b) a
+// matching green on-disk cache entry under the key the worker can compute from its own tree
+// hash and the default-branch script. Before the fix the merge validate returned green having
+// run nothing. After it, the suite runs and comes back RED.
+func TestValidateAuthority_IgnoresForgedStagedPairAndCache(t *testing.T) {
+	m, repo, wt := trustHarness(t, "v1", "trusted", "exit 1") // the gate genuinely fails
+	head := commitCodeFiles(t, wt)
+
+	// (a) the staged pair, green and pinned to exactly this sha.
+	stageValidate(t, m.P.ReviewInputsDir("v1"), head, greenGateResults)
+	// (b) a green cache entry under the real key for this tree + this gate script.
+	forgeValidateCacheEntry(t, repo, head, greenGateResults)
+
+	green, results, _, err := validateForAuthority(repo, head)
+	if err != nil {
+		t.Fatalf("validateForAuthority: %v", err)
+	}
+	if green {
+		t.Fatal("a forged staged pair plus a forged cache entry must not produce a green that authorizes a merge")
+	}
+	if len(validate.Failures(results)) == 0 {
+		t.Fatalf("the merge validate must report the real failing suite, got %+v", results)
+	}
+}
+
+// forgeValidateCacheEntry writes results as the on-disk cache entry for sha's tree under repo's
+// default-branch gate script — exactly the entry any process running as the lead can compute
+// and write, since both inputs to the key are readable by the worker.
+func forgeValidateCacheEntry(t *testing.T, repo, sha string, results []validate.Result) {
+	t.Helper()
+	def := resolveGateDefinition(repo)
+	if !def.hasScript {
+		t.Fatal("the harness repo must define a default-branch gate script")
+	}
+	tree, err := worktree.TreeHash(repo, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storeValidateCache(validateCacheKey(tree, def.script), results)
+	if _, ok := loadValidateCache(validateCacheKey(tree, def.script)); !ok {
+		t.Fatal("the forged cache entry must be readable, or the proof is vacuous")
+	}
+}
+
+// TestValidateAuthority_HonestTreeStaysGreen is the must-not-trip side: with no forgery at all,
+// an honest tree under a passing gate still validates green through the authority path.
+func TestValidateAuthority_HonestTreeStaysGreen(t *testing.T) {
+	_, repo, wt := trustHarness(t, "v2", "trusted", "exit 0")
+	head := commitCodeFiles(t, wt)
+	green, results, _, err := validateForAuthority(repo, head)
+	if err != nil {
+		t.Fatalf("validateForAuthority: %v", err)
+	}
+	if !green || len(results) == 0 {
+		t.Fatalf("an honest green tree must authorize: green=%v results=%+v", green, results)
+	}
+}
+
+// TestValidateAuthority_ReusesThisProcessRun proves 1c kept the performance property it is
+// allowed to keep: the on-disk cache stops being an authority, but a green THIS PROCESS
+// actually produced is reused, so one gate episode runs the real suite once rather than three
+// times (prep, record, merge).
+func TestValidateAuthority_ReusesThisProcessRun(t *testing.T) {
+	counter := filepath.Join(t.TempDir(), "runs")
+	_, repo, wt := trustHarness(t, "v3", "trusted", "printf x >> '"+counter+"'\nexit 0")
+	head := commitCodeFiles(t, wt)
+
+	_, _, reused, err := validateForAuthority(repo, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reused {
+		t.Fatal("the first authority validate of a tree cannot be a reuse")
+	}
+	if got := gateRunCount(t, counter); got != 1 {
+		t.Fatalf("the first authority validate must run the real suite once, ran %d", got)
+	}
+	_, _, reused, err = validateForAuthority(repo, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reused {
+		t.Fatal("a second authority validate of the same tree must reuse this process's own run")
+	}
+	if got := gateRunCount(t, counter); got != 1 {
+		t.Fatalf("reuse must not re-run the suite, total runs %d", got)
+	}
+}
+
+// freshProcessValidate isolates a test from any in-process validate memo another test left
+// behind. The harness repos are byte-identical trees under identical gate scripts, so they
+// share a content key; without this a later test could be served an earlier test's green.
+func freshProcessValidate(t *testing.T) {
+	t.Helper()
+	resetProcessValidate()
+	t.Cleanup(resetProcessValidate)
 }

@@ -68,7 +68,7 @@ var decidingFunctions = []string{
 	// the gate's definition, its execution, and its content-addressed cache
 	"resolveGateDefinition", "runGate", "gateGreen", "runGateOnCommitted",
 	"validateCommitted", "stagedGreen", "hasDefaultBranchGateScript",
-	"validateForMerge", "reusablePrepValidate",
+	"validateForAuthority", "loadProcessValidate",
 	"validateCacheKey", "loadValidateCache", "storeValidateCache",
 	// the gate-config guard
 	"matchesGateConfig", "diffTouchesGateConfig",

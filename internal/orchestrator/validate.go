@@ -3,7 +3,6 @@ package orchestrator
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"go/parser"
 	"go/token"
@@ -757,95 +756,103 @@ var runGateOnCommitted = func(repo, sha string, def gateDefinition) (bool, []val
 	return runGate(co, def)
 }
 
-// validateCommitted resolves the trust gate's green/results decision for the committed sha,
-// backed by a content-addressed cache so an identical tree validated under an identical gate
-// re-runs the (often minutes-long) suite exactly ONCE — collapsing the re-validations a
-// worker's iteration, trust-prep, and land otherwise trigger (a rebase mints a new commit sha
-// but the SAME tree, so the old commit-keyed reuse missed on every rebase). It is the single
-// choke point every caller (landPrep, validateForMerge, gate.go's auto-mint green check and
-// scoring) goes through, so caching here benefits all of them uniformly.
-//
-// Flow: resolve the gate definition from the DEFAULT BRANCH. When the default branch defines
-// NO .ttorch/validate.sh, the gate falls back to ecosystem detection on the checkout — whose
-// checks depend on the worker's own tree and are not a stable, content-hashable authority — so
-// it is NEVER cached (run fresh every time, exactly as before). Otherwise key the cache on
-// (tree hash, gate script): on a HIT return the cached GREEN results; on a MISS run the real
-// suite and, only when green, Store it (a red tree is being iterated on, and caching a red
-// risks pinning a flaky failure).
-//
-// SAFETY INVARIANT (proven in validatecache_test.go, stated at validateCacheKey): a hit is
-// served ONLY for a BYTE-IDENTICAL tree AND identical gate definition — the git tree hash is a
-// cryptographic content identity — so it can never serve a result for a different tree or
-// different checks. Caching is strictly UNDER this function: it changes only WHETHER the suite
-// re-runs, never the (green, results, err) decision. A hit reproduces the identical decision
-// (stagedGreen faithfully mirrors gateGreen for a persisted GREEN set, exactly as
-// reusablePrepValidate does), and the "no checks detected => NOT green (hard block)" rule is
-// preserved: a no-checks run is never green, so is never cached, so a hit is always green.
-func validateCommitted(repo, sha string) (bool, []validate.Result, error) {
-	def := resolveGateDefinition(repo)
-	// No default-branch script ⇒ the ecosystem-detection fallback is not a cacheable gate
-	// authority: run fresh, with no cache read or write.
+// gateContentKey resolves the gate definition for repo and the content-addressed key for
+// sha's tree under it: (git TREE hash, gate script), exactly as validateCacheKey documents.
+// keyed is false when there is no stable key to compute — the default branch defines no
+// .ttorch/validate.sh (the ecosystem-detection fallback depends on the worker's own tree and
+// is not a hashable authority), or the tree hash cannot be read. Both callers then run fresh
+// with no reuse of any kind.
+func gateContentKey(repo, sha string) (def gateDefinition, key string, keyed bool) {
+	def = resolveGateDefinition(repo)
 	if !def.hasScript {
-		return runGateOnCommitted(repo, sha, def)
+		return def, "", false
 	}
 	tree, err := worktree.TreeHash(repo, sha)
 	if err != nil {
-		// Cannot compute the content key ⇒ fail closed to a fresh, uncached run rather than
+		// Cannot compute the content key => fail closed to a fresh, uncached run rather than
 		// risk keying on a bad value; validation still proceeds correctly.
-		return runGateOnCommitted(repo, sha, def)
+		return def, "", false
 	}
-	key := validateCacheKey(tree, def.script)
-	if results, ok := loadValidateCache(key); ok {
-		return stagedGreen(results), results, nil
-	}
+	return def, validateCacheKey(tree, def.script), true
+}
+
+// runAndRecordGate runs the real suite against an immutable detached checkout of sha and, when
+// it comes back GREEN, records it BOTH in this process's memo (making it reusable as an
+// authority — this process observed it) and in the on-disk cache (making it reusable for
+// reporting by a later process). A red tree is recorded nowhere: it is being iterated on, and
+// pinning a red risks pinning a flake.
+func runAndRecordGate(repo, sha string, def gateDefinition, key string) (bool, []validate.Result, error) {
 	green, results, err := runGateOnCommitted(repo, sha, def)
-	if err != nil {
+	if err != nil || !green {
 		return green, results, err
 	}
-	if green {
-		storeValidateCache(key, results)
-	}
+	storeProcessValidate(key, results)
+	storeValidateCache(key, results)
 	return green, results, nil
 }
 
-// validateForMerge resolves the trust gate's green/results decision for the committed sha,
-// reusing the commit-pinned validate trust prep already staged (validate.json, pinned by
-// head.txt) when it pins to EXACTLY this sha — so the identical commit is not run through
-// the full suite twice (once at prep, once at the merge). It falls back to a fresh
-// validateCommitted whenever no staged result pins to this sha: the worker advanced HEAD
-// since prep, or prep never ran. reused reports which path was taken. The green semantics
-// are identical either way (validateCommitted persisted the same []validate.Result prep
-// staged), so the merged commit is always backed by a green, commit-pinned validate — the
-// gate just stops re-running it.
-func (m *Manager) validateForMerge(repo, taskID, sha string) (green bool, results []validate.Result, reused bool, err error) {
-	if staged, ok := m.reusablePrepValidate(taskID, sha); ok {
-		return stagedGreen(staged), staged, true, nil
+// validateCommitted resolves the trust gate's green/results decision for the committed sha for
+// REPORTING: the reviewers' validate.json and anything that displays a pass/fail tally. It is
+// backed by the on-disk content-addressed cache, so an identical tree validated under an
+// identical gate re-runs the (often minutes-long) suite at most once per machine.
+//
+// It is NOT the authority. The on-disk cache is a file any process running as the lead can
+// write, and the worker session is such a process (see processValidate for why authenticating
+// the entries would be theatre rather than a control). A green served from that cache is
+// therefore a performance record and an input the reviewers read, never the green that mints
+// an approval or clears a merge. Those callers go through validateForAuthority.
+//
+// Flow: resolve the content key from the DEFAULT BRANCH definition. With no default-branch
+// .ttorch/validate.sh the gate falls back to ecosystem detection on the checkout — whose checks
+// depend on the worker's own tree and are not a stable, hashable authority — so it runs fresh,
+// uncached, exactly as before. Otherwise a HIT returns the cached GREEN results and a MISS runs
+// the real suite and records it.
+//
+// The "no checks detected => NOT green (a hard block)" rule is preserved on every path: a
+// no-checks run is never green, so is never recorded, so a hit is always green (stagedGreen
+// faithfully mirrors gateGreen for a persisted GREEN set).
+func validateCommitted(repo, sha string) (bool, []validate.Result, error) {
+	def, key, keyed := gateContentKey(repo, sha)
+	if !keyed {
+		return runGateOnCommitted(repo, sha, def)
 	}
-	green, results, err = validateCommitted(repo, sha)
-	return green, results, false, err
+	if results, ok := loadValidateCache(key); ok {
+		return stagedGreen(results), results, nil
+	}
+	return runAndRecordGate(repo, sha, def, key)
 }
 
-// reusablePrepValidate returns the validate results trust prep staged for taskID IF AND
-// ONLY IF they are pinned (via head.txt) to exactly sha — i.e. the staged run validated
-// the very commit now being merged. A missing/mismatched head.txt, or an unreadable or
-// malformed validate.json, yields ok=false so the caller re-validates rather than trusts a
-// stale or absent result. It reads committed objects' recorded outcome only; the immutable
-// sha guarantees the tree behind the result is unchanged.
-func (m *Manager) reusablePrepValidate(taskID, sha string) ([]validate.Result, bool) {
-	dir := m.P.ReviewInputsDir(taskID)
-	pinned, err := os.ReadFile(filepath.Join(dir, "head.txt"))
-	if err != nil || strings.TrimSpace(string(pinned)) != sha {
-		return nil, false
+// validateForAuthority resolves the trust gate's green/results decision for the committed sha
+// where that decision AUTHORIZES something: the trusted auto-mint, the land pass's check of the
+// rebased tree, and the merge gate itself. It is the same decision validateCommitted makes over
+// the same immutable detached checkout under the same default-branch definition, with one
+// difference — the only green it will reuse is one THIS PROCESS produced by running the suite
+// (processValidate). It never reads the on-disk cache, which any local process can write.
+//
+// The merge gate used to PREFER the commit-pinned validate trust prep staged (validate.json,
+// pinned by head.txt) whenever that pair named exactly the sha being merged. That reuse is gone
+// too. The pair is two files written from a single results value in a single call, so it was
+// never two independent measurements, and both are writable by any process running as the lead,
+// which made "the merged commit is backed by a green validate" a statement about a file rather
+// than about a run. The pair remains what it is good for: an input the reviewers read and an
+// audit record of what the gate saw.
+//
+// reused reports that the suite did not run because this process had already run it for a
+// byte-identical tree under an identical gate. That reuse is what keeps one gate episode to one
+// real suite run across prep, record and merge, so removing the on-disk cache and the staged
+// pair from the authority path costs at most one extra run per episode rather than one per
+// step.
+func validateForAuthority(repo, sha string) (green bool, results []validate.Result, reused bool, err error) {
+	def, key, keyed := gateContentKey(repo, sha)
+	if !keyed {
+		green, results, err = runGateOnCommitted(repo, sha, def)
+		return green, results, false, err
 	}
-	raw, err := os.ReadFile(filepath.Join(dir, review.StagedValidateFile))
-	if err != nil {
-		return nil, false
+	if memo, ok := loadProcessValidate(key); ok {
+		return stagedGreen(memo), memo, true, nil
 	}
-	var results []validate.Result
-	if err := json.Unmarshal(raw, &results); err != nil {
-		return nil, false
-	}
-	return results, true
+	green, results, err = runAndRecordGate(repo, sha, def, key)
+	return green, results, false, err
 }
 
 // stagedGreen mirrors gateGreen's pass semantics for a persisted result set, where the
