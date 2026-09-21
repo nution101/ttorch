@@ -1884,7 +1884,7 @@ func cmdApprove(args []string) error {
 	id := args[0]
 	fs := flag.NewFlagSet("approve", flag.ContinueOnError)
 	ttl := fs.Duration("ttl", 10*time.Minute, "how long the approval stays valid")
-	allowGateChange := fs.Bool("allow-gate-change", false, "also authorize a diff that modifies the gate's own definition (.ttorch/validate.sh, AGENTS.md)")
+	allowGateChange := fs.Bool("allow-gate-change", false, "also authorize a diff that modifies the gate's own definition (the validate script, AGENTS.md, the embedded reviewer/manager instructions, the CI workflows, and the Go code that decides a merge)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}

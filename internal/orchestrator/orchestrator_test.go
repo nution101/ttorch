@@ -1891,6 +1891,19 @@ func TestMatchesGateConfig(t *testing.T) {
 		{"a reviewer definition", "content/agents/ttorch-reviewer-security.md", true},
 		{"another reviewer definition", "content/agents/ttorch-reviewer-scope.md", true},
 
+		// The deciding Go code. The four orchestrator files are named exactly; the three
+		// supporting packages are covered wholesale because each is small and single-purpose.
+		{"the gate implementation", "internal/orchestrator/gate.go", true},
+		{"the merge gate", "internal/orchestrator/merge.go", true},
+		{"the gate-config guard itself", "internal/orchestrator/validate.go", true},
+		{"the validate cache", "internal/orchestrator/validatecache.go", true},
+		{"the findings contract", "internal/review/review.go", true},
+		{"the reviewer-set classifier", "internal/review/size.go", true},
+		{"the approval token", "internal/approval/approval.go", true},
+		{"the check runner", "internal/validate/validate.go", true},
+		{"the delivery-mode parser", "internal/projectinit/projectinit.go", true},
+		{"the full-suite CI authority", ".github/workflows/ci.yml", true},
+
 		// Case-folding: both sides are folded, so a differently-cased spelling of a covered
 		// file is caught. "AGENTS.md" is the entry a one-sided fold would miss.
 		{"the mode config, lowercased", "agents.md", true},
@@ -1898,6 +1911,7 @@ func TestMatchesGateConfig(t *testing.T) {
 		{"a skill path, mixed case", "Content/Skills/ttorch-review/SKILL.md", true},
 		{"a reviewer definition, mixed case", "Content/Agents/TTorch-Reviewer-Security.md", true},
 		{"the validate script, mixed case", ".TTorch/Validate.SH", true},
+		{"a deciding go file, mixed case", "Internal/Orchestrator/Gate.go", true},
 
 		{"a non-reviewer agent definition", "content/agents/golang-pro.md", false},
 		{"the worker agent definition", "content/agents/ttorch-worker.md", false},
@@ -1905,7 +1919,11 @@ func TestMatchesGateConfig(t *testing.T) {
 		{"a docs copy of the mode config", "docs/AGENTS.md", false},
 		{"a validate script somewhere else", "sub/.ttorch/validate.sh", false},
 		{"a directory that merely starts the same", "contents/skills/x.md", false},
-		{"ordinary source", "internal/orchestrator/merge.go", false},
+		{"ordinary orchestrator source", "internal/orchestrator/spawn.go", false},
+		{"the land queue", "internal/orchestrator/landqueue.go", false},
+		{"ordinary source elsewhere", "internal/cli/cli.go", false},
+		{"a non-workflow github file", ".github/CODEOWNERS", false},
+		{"a package that merely starts the same", "internal/reviewer/x.go", false},
 
 		// Folding must not widen the match past a same-file respelling.
 		{"a mixed-case near-miss", "Contents/Skills/x.md", false},

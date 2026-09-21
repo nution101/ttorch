@@ -40,24 +40,77 @@ func (m *Manager) Validate(taskID string) ([]validate.Result, error) {
 	return results, nil
 }
 
-// gateConfigFiles define the trust gate itself by exact path: the validation script (what
-// green means) and the repo's delivery-mode/gate config (whether the gate runs at all).
-var gateConfigFiles = []string{".ttorch/validate.sh", "AGENTS.md"}
+// gateConfigFiles define the trust gate itself by exact path. Two kinds of file are here.
+//
+// The repo-local gate config — ".ttorch/validate.sh" (what green means) and "AGENTS.md"
+// (whether the gate runs at all) — exists in every ttorch-managed repo and takes effect on
+// the very next gate run.
+//
+// The rest is ttorch's own DECIDING CODE: the four files in this package that resolve,
+// enforce and cache the gate's decision. They exist only in this repo, and a change to them
+// takes effect one step later than a config change — it alters the NEXT binary, after a
+// build and an install, not the running one. That extra step is a real difference but a thin
+// one, because the maintainer self-updates routinely; a landed weakening of gate.go reaches
+// every repo on the machine the first time they do.
+//
+// They are listed by exact FILE and not as "internal/orchestrator/", because the package is
+// 39% of this repo's commits and covering all of it would put more than half of every change
+// behind --allow-gate-change (measured: see gateconfig_test.go's anchor test and
+// docs/ARCHITECTURE.md). A file-granular list over a package that gets refactored decays
+// silently, so TestGateConfigCoversTheDecidingCode fails if any of the deciding functions
+// moves to a file this list does not name.
+var gateConfigFiles = []string{
+	".ttorch/validate.sh",
+	"AGENTS.md",
+	"internal/orchestrator/gate.go",
+	"internal/orchestrator/merge.go",
+	"internal/orchestrator/validate.go",
+	"internal/orchestrator/validatecache.go",
+}
 
-// gateConfigPrefixes define the gate's own INSTRUCTIONS by path prefix. These are not
-// documentation about the gate; they are the text the gate executes on. content.go embeds the
+// gateConfigPrefixes define the gate by path prefix, where the covered unit is a directory
+// (or a filename family) rather than a named file.
+//
+// content/skills/ and content/agents/ttorch-reviewer- are the gate's own INSTRUCTIONS — not
+// documentation about the gate, but the text the gate executes on. content.go embeds the
 // whole content/ tree and installer.desiredFiles lays it down under ~/.claude: content/skills/
 // becomes ~/.claude/skills (the ttorch-review procedure the manager follows, the ttorch-manager
 // instructions, the ttorch-validate procedure) and content/agents/ttorch-reviewer-*.md becomes
 // ~/.claude/agents (the adversarial reviewers' own definitions, including the security
 // reviewer). A landed change to any of them alters what the gate does on the NEXT run, for
 // every repo on the machine, with no further review — the same delayed diff-channel effect
-// AGENTS.md has, which is why they belong here alongside it.
+// AGENTS.md has, which is why they belong alongside it. "content/agents/ttorch-reviewer-" is a
+// FILENAME prefix and deliberately does not cover the other agent definitions in that
+// directory, which the gate does not dispatch.
 //
-// Matched by prefix, not exactly, because the set is a directory of files rather than two
-// named ones. "content/agents/ttorch-reviewer-" is a FILENAME prefix and deliberately does not
-// cover the other agent definitions in that directory, which the gate does not dispatch.
-var gateConfigPrefixes = []string{"content/skills/", "content/agents/ttorch-reviewer-"}
+// internal/review/ is the verdict itself: the findings contract, the severity-to-block rule,
+// and the diff-size classifier that decides WHICH reviewers run at all. internal/approval/ is
+// the token the whole --allow-gate-change scope rides on. internal/validate/ decides what a
+// passing check is (gateGreen is a thin wrapper over validate.Failures). internal/projectinit/
+// parses AGENTS.md into the delivery mode and the auto-mint staleness bound, so it decides
+// whether the gate runs at all and for how long an auto-approval stays good — covering the
+// config file but not the code that reads it would be a gap of exactly the kind this guard
+// exists to close. All four are whole packages because each is small and single-purpose, so
+// the prefix is the honest unit and carries none of the refactor brittleness the orchestrator
+// file list does.
+//
+// .github/workflows/ is here because .ttorch/validate.sh on this repo runs only the FAST lane
+// and says so in its own header: the full suite, including the orchestrator e2e tests, runs in
+// CI as the required check. CI is therefore half of what "validated" means for this repo, and
+// a landed weakening of ci.yml weakens every later change's validation through exactly the
+// delayed diff channel that put the skills on this list. The trusted gate does not itself
+// consult CI, which is the argument against including it; it loses to the fact that the gate
+// script defers to CI by name. It costs 5 commits in 196, so the blast-radius argument that
+// keeps internal/orchestrator/ off the list does not apply.
+var gateConfigPrefixes = []string{
+	"content/skills/",
+	"content/agents/ttorch-reviewer-",
+	"internal/review/",
+	"internal/approval/",
+	"internal/validate/",
+	"internal/projectinit/",
+	".github/workflows/",
+}
 
 // matchesGateConfig reports whether a repository path names a gate-definition file. Matching
 // is exact against gateConfigFiles and by prefix against gateConfigPrefixes.

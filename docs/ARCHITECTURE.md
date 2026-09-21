@@ -237,12 +237,18 @@ passing commit-pinned verdict plus a fresh green validate auto-mints the approva
   own gate), and a repo with **no checks detected is a hard block**, never a pass. Without
   the script, the trusted auto-merge is refused and a human `ttorch approve` is required.
 - A trusted auto-merge **cannot change a gate-definition file**; such a diff is refused. The
-  covered set is `.ttorch/validate.sh`, `AGENTS.md`, `content/skills/**` and
-  `content/agents/ttorch-reviewer-*` — the last two because `content.go` embeds them and the
-  installer lays them down under `~/.claude`, so they are the gate's live reviewer and manager
-  instructions, not documentation about the gate. On a **gated** merge (trusted mode, or any
-  mode with `--require-verdict`) a human approval does not wave it through either: it needs
-  `ttorch approve <id> --allow-gate-change`, and the merge audit line names the file.
+  covered set is `.ttorch/validate.sh` and `AGENTS.md` (the repo-local gate config, present in
+  every managed repo), `content/skills/**` and `content/agents/ttorch-reviewer-*` (which
+  `content.go` embeds and the installer lays down under `~/.claude`, so they are the gate's
+  live reviewer and manager instructions, not documentation about the gate), `internal/review/**`,
+  `internal/approval/**`, `internal/validate/**`, `internal/projectinit/**` (which parses
+  `AGENTS.md` into the delivery mode) and
+  `internal/orchestrator/{gate,merge,validate,validatecache}.go` (the Go code that decides),
+  and `.github/workflows/**` (the full suite, which `.ttorch/validate.sh` defers to by name
+  because it runs only the fast lane). Paths are matched case-insensitively on both sides. On
+  a **gated** merge (trusted mode, or any mode with `--require-verdict`) a human approval does
+  not wave it through either: it needs `ttorch approve <id> --allow-gate-change`, and the
+  merge audit line names the file.
 - An ungated `local`/`validated` merge **does not run the check at all**. That path lands an
   `AGENTS.md` change on a plain human approval with no gate-config check and no audit line
   naming it, and `AGENTS.md` is what `projectinit.ReadMode` reads to decide trusted mode — so
@@ -254,6 +260,58 @@ passing commit-pinned verdict plus a fresh green validate auto-mints the approva
   as the lead.
 - The audit record is written and flushed **before** the irreversible fast-forward; an
   unauditable merge aborts.
+
+### Why the gate-config set stops where it does
+
+The guard's cost is a flag on every merge that trips it, so the set is bounded by measurement
+rather than by what sounds prudent. Measured over the **196 non-merge commits reachable from
+`b642ba6`**, counting a commit once if it touches any covered path:
+
+| Set | Commits | Share |
+|---|---|---|
+| `.ttorch/validate.sh` + `AGENTS.md` (the original guard) | 10 | 5% |
+| + `content/skills/**`, `content/agents/ttorch-reviewer-*` | 44 | 22% |
+| + `internal/review/**` | 48 | 25% |
+| + `internal/approval/**` | 47 | 24% |
+| + `internal/validate/**` | 46 | 23% |
+| + `internal/projectinit/**` | 47 | 24% |
+| + `.github/workflows/**` | 49 | 25% |
+| + `internal/orchestrator/{gate,merge,validate,validatecache}.go` | 52 | 27% |
+| **the set above, all together** | **68** | **35%** |
+| ~~+ `internal/orchestrator/**` and `internal/review/**` wholesale~~ | 109 | 56% |
+
+(Each middle row is the landed 22% set plus that one addition, so the rows overlap and do not
+sum. An earlier count of the same corpus reported 9 and 43 for the first two rows; the
+difference is the root commit, which `git diff-tree` skips without `--root`. It changes no
+conclusion.)
+
+The last row is the answer to "why not just cover the packages". `internal/orchestrator/`
+alone is 78 of the 196 commits — spawn, the land queue, the scheduler wiring, the overlap
+planner — and covering it wholesale puts **more than half of every change** behind the flag. A
+flag that fires on most commits is not a signal; it is a formality, and it launders a real
+gate change through a habit. The four files that actually resolve, enforce and cache the
+decision cost 8 commits instead of 62.
+
+A file list over a package is brittle in a way a directory prefix is not: this package has
+already been re-split once (`140d2b91`), and a later split that moved `MergeLocal` into a new
+file would drop it out of coverage silently. `TestGateConfigCoversTheDecidingCode` parses the
+package and fails if any deciding function lands in a file `gateConfigFiles` does not name, so
+that decay is loud.
+
+`.github/workflows/**` is in for a different reason. The trusted gate never consults CI, which
+is the argument against it — but this repo's `.ttorch/validate.sh` runs only `make test-fast`
+and says in its own header that the full suite, including the orchestrator e2e tests, runs in
+CI as the required check. CI is therefore half of what "validated" means here, and weakening
+`ci.yml` weakens every later change's validation through the same delayed diff channel that
+put the skills on the list. It costs 5 commits.
+
+What the numbers do not fix: at 35%, roughly one merge in three in this repo needs
+`--allow-gate-change`, and the flag is a boolean. A lead who passes it by reflex authorizes
+exactly as much as one who read the diff. The audit line naming the file survives either way,
+which is the guard's durable half. Making the flag take the expected paths — so a bare
+`--allow-gate-change` stops working and the approval names what it covers — is the obvious
+next step and is not done here.
+
 
 The **approval token** (in `internal/approval`) and the **review verdict** (in the DB) are
 deliberately distinct authorizations — "a human read this" vs. "the reviewers passed it" —

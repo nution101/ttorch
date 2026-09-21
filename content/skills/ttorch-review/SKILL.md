@@ -148,13 +148,33 @@ invalidates the verdict — re-prep, re-review, re-record.
   which the worker controls, so the auto path is refused and a human `ttorch approve` is
   required instead. A repo with no detectable checks fails closed (a hard block).
 - **No GATED merge changes the gate's own definition unless the approval says so by name.**
-  The covered set is `.ttorch/validate.sh`, `AGENTS.md`, everything under `content/skills/`,
-  and `content/agents/ttorch-reviewer-*` — including this file, which is embedded and
-  installed to `~/.claude/skills`, so a landed edit to it changes what the gate does on the
-  next run for every repo on the machine. If a worker's diff touches any of them, an
-  auto-merge is refused outright, and a plain `ttorch approve` is refused too — the lead must
-  run `ttorch approve <id> --allow-gate-change`, and the merge's audit line then names the
-  file that changed.
+  The covered set is:
+
+  | Covered | Why it is the gate |
+  |---|---|
+  | `.ttorch/validate.sh` | what "green" means for this repo |
+  | `AGENTS.md` | whether the gate runs at all (`projectinit.ReadMode`) |
+  | `content/skills/**` | the ttorch-review, ttorch-manager and ttorch-validate procedures — **including this file** |
+  | `content/agents/ttorch-reviewer-*` | the adversarial reviewers' own definitions |
+  | `internal/review/**` | the findings contract, the severity-to-block rule, and the classifier that picks which reviewers run |
+  | `internal/approval/**` | the approval token the `--allow-gate-change` scope rides on |
+  | `internal/validate/**` | what counts as a passing check |
+  | `internal/projectinit/**` | parses `AGENTS.md` into the delivery mode and the auto-mint staleness bound |
+  | `internal/orchestrator/{gate,merge,validate,validatecache}.go` | the Go code that resolves, enforces and caches the decision |
+  | `.github/workflows/**` | the full suite: `.ttorch/validate.sh` runs only the fast lane and defers to CI by name |
+
+  `content/skills/` and `content/agents/ttorch-reviewer-*` are embedded by `content.go` and
+  installed to `~/.claude`, so a landed edit changes what the gate does on the next run for
+  every repo on the machine. The Go entries take effect one step later — they change the next
+  binary, after a build and an install — which is a real difference but a thin one, since the
+  maintainer self-updates routinely.
+
+  If a worker's diff touches any of these, an auto-merge is refused outright, and a plain
+  `ttorch approve` is refused too — the lead must run
+  `ttorch approve <id> --allow-gate-change`, and the merge's audit line then names the file
+  that changed. Paths are matched case-insensitively on both sides, so a differently-cased
+  spelling of a covered file is caught.
+
 - **What that claim does NOT cover**, stated so nobody reads it as wider than it is:
   - Gated means trusted mode or `--require-verdict`. A `local`/`validated` merge without
     `--require-verdict` does not run this check at all, so it still merges a gate-definition
@@ -163,12 +183,23 @@ invalidates the verdict — re-prep, re-review, re-record.
     (auto-merge) unaudited.
   - `~/.claude/agents/ttorch-reviewer-*.md` and `~/.claude/skills/` as they exist ON DISK. The
     guard sees a diff; these files live outside any repo and anything running as the lead can
-    overwrite them directly. No diff-channel guard can ever see that.
-  - `internal/orchestrator/*.go` and `internal/review/*.go` — the deciding code. A diff there
-    changes the NEXT binary, not the running one, and covering it is a separate piece of work.
-  - `.github/workflows/*`, `.ttorch/offload/*`, `.ttorch/junk-check.sh`.
-  - The match is byte-exact and does not case-fold, so on a case-insensitive filesystem a
-    differently-cased path naming a covered file is not caught.
+    overwrite them directly. No diff-channel guard can ever see that. Covering the repo copies
+    under `content/` narrows the channel; it does not close it.
+  - **The rest of `internal/orchestrator/`** — `spawn.go`, `landqueue.go`, `autostart.go`,
+    `overlap.go` and the others. This is a deliberate, measured exclusion, not an oversight.
+    Over the 196 non-merge commits reachable from `b642ba6`, covering the whole package would
+    put **54%** of all commits behind `--allow-gate-change` and the flag would stop being a
+    signal; the four named files cost **8** commits. `TestGateConfigCoversTheDecidingCode`
+    fails if a deciding function moves out of those four, so the narrower list cannot decay
+    into false coverage without someone noticing.
+  - `.ttorch/offload/*` and `.ttorch/junk-check.sh` — named in earlier reviews; neither exists
+    in this repo, and only `.ttorch/validate.sh` is matched, not the `.ttorch/` directory.
+  - `internal/cli/` wires the `--allow-gate-change` flag but is not covered: it is 29% of this
+    repo's commits on its own.
+  - The flag is a boolean, so the cheapest way to defeat the guard is habit. About a third of
+    this repo's own commits now trip it, and a lead who passes the flag without reading has
+    given exactly the same authorization as one who read. What survives that is the audit
+    line, which names the file either way.
   - None of it is a barrier. Anything running as the lead can write the approval token with
     the `allow-gate-change` scope already in it. What the guard removes is the silent skip.
 
