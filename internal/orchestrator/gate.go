@@ -1400,7 +1400,26 @@ var isolatedReviewDimensions = map[string]bool{review.DimensionSecurity: true}
 // and NOT the review-inputs dir, because a session's cwd ancestors are on its configuration
 // path, and the inputs dir is the directory whose CONTENT the gate cannot vouch for.
 func (m *Manager) reviewWorkspaceDir(taskID, dim string) string {
+	if !safePathComponent(taskID) || !safePathComponent(dim) {
+		return ""
+	}
 	return filepath.Join(m.P.ReviewWorkspaceDir(taskID), dim)
+}
+
+// safePathComponent reports whether s can be joined into a path as a single component without
+// escaping it. The workspace path is built from a task id and a dimension and then handed to
+// os.RemoveAll, and nothing else in the tree validates a task id, so
+// ReviewWorkspaceDir("../../../../tmp/victim") resolves outside the ttorch home and the
+// episode teardown would delete whatever is there. Task ids are written by the manager rather
+// than by a worker, so this is a guard against a malformed id rather than a hostile one, but a
+// delete path assembled from an unvalidated string should not depend on that.
+//
+// A caller that gets "" must skip the operation rather than fall back to a shorter path: the
+// parent of a per-dimension workspace is the per-task root, and deleting that on a bad
+// component would be the same mistake one level up.
+func safePathComponent(s string) bool {
+	return s != "" && s != "." && s != ".." &&
+		!strings.ContainsAny(s, `/\`) && !strings.ContainsRune(s, os.PathSeparator)
 }
 
 // reviewerCwd returns the directory a dimension's reviewer session runs in, and the bare mirror
@@ -1411,7 +1430,11 @@ func (m *Manager) reviewerCwd(taskID, dim, inputsDir, repo, wt, head string) (cw
 	if !isolatedReviewDimensions[dim] {
 		return wt, "", nil
 	}
-	return prepareReviewWorkspace(m.reviewWorkspaceDir(taskID, dim), inputsDir, repo, wt, head)
+	ws := m.reviewWorkspaceDir(taskID, dim)
+	if ws == "" {
+		return "", "", fmt.Errorf("refusing to build a review workspace for task %q dimension %q: not a single safe path component", taskID, dim)
+	}
+	return prepareReviewWorkspace(ws, inputsDir, repo, wt, head)
 }
 
 // prepareReviewWorkspace materializes the scratch cwd an isolated reviewer runs in and returns
@@ -1518,7 +1541,9 @@ func (m *Manager) teardownReviewers(taskID string, dims []string) {
 		// rebuilt from scratch on the next dispatch, so dropping it here keeps one mirror per
 		// in-flight reviewer rather than one per task per episode.
 		if isolatedReviewDimensions[dim] {
-			_ = os.RemoveAll(m.reviewWorkspaceDir(taskID, dim))
+			if ws := m.reviewWorkspaceDir(taskID, dim); ws != "" {
+				_ = os.RemoveAll(ws)
+			}
 		}
 		window := reviewerWindow(taskID, dim)
 		if window == "" || !tmux.WindowExists(m.Session, window) {

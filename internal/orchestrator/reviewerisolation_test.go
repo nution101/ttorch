@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/nution101/ttorch/internal/paths"
 	"github.com/nution101/ttorch/internal/review"
 )
 
@@ -369,5 +370,33 @@ func TestReviewWorkspace_RefusesWhenTheReviewedCommitIsMissing(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), short(head)) {
 		t.Fatalf("the error must name the commit it could not serve, got %v", err)
+	}
+}
+
+// TestReviewWorkspaceDir_RefusesATraversingTaskID: the workspace path is built from a task id
+// and then handed to os.RemoveAll. Nothing in the tree validates a task id, so
+// ReviewWorkspaceDir("../../../../tmp/victim") resolves outside the ttorch home and the
+// teardown deletes whatever is there. Task ids come from the manager rather than from a
+// worker, which is why this is not critical, but a delete path built from an unvalidated
+// string should not be one bad id away from removing an unrelated directory.
+func TestReviewWorkspaceDir_RefusesATraversingTaskID(t *testing.T) {
+	t.Setenv("TTORCH_HOME", t.TempDir())
+	m := &Manager{P: paths.Default()}
+	home := m.P.ReviewWorkspaceDir("")
+
+	for _, id := range []string{
+		"../../../../tmp/victim",
+		"..",
+		"a/../../b",
+		"/etc",
+		"foo/bar",
+	} {
+		got := m.reviewWorkspaceDir(id, review.DimensionSecurity)
+		if got == "" {
+			continue // refused outright, which is the safe answer
+		}
+		if !strings.HasPrefix(filepath.Clean(got), filepath.Clean(filepath.Dir(home))+string(filepath.Separator)) {
+			t.Errorf("task id %q escapes the workspace root: %s", id, got)
+		}
 	}
 }
