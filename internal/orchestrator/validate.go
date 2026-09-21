@@ -8,7 +8,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"unicode"
+
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/review"
@@ -137,42 +139,30 @@ var gateConfigPrefixes = []string{
 	".github/workflows/",
 }
 
-// foldRune maps r to the lowest code point in its Unicode simple-case-folding orbit, so every
-// spelling that a case-insensitive filesystem treats as one character maps to one key.
+// fsIdentityKey is the key under which two repository paths are THE SAME FILE on a
+// case-insensitive, normalizing filesystem. It is the only path comparison in this guard.
 //
-// strings.ToLower is NOT this relation, and the difference is exploitable. ToLower is simple
-// lowercasing; APFS and NTFS compare with case FOLDING, which is wider. U+017F LATIN SMALL
-// LETTER LONG S folds together with 's' and 'S' but lowercases to itself, so "agentſ.md"
-// lowercased is still "agentſ.md" and matches nothing — while the filesystem happily resolves
-// it onto AGENTS.md. U+212A KELVIN SIGN behaves the same against 'k'. unicode.SimpleFold walks
-// the whole orbit, which is what the filesystem does.
-func foldRune(r rune) rune {
-	lowest := r
-	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
-		if f < lowest {
-			lowest = f
-		}
-	}
-	return lowest
-}
-
-// foldKey is the canonical form a path is matched under: every rune reduced to its
-// case-folding orbit's lowest code point.
+// It must model what the filesystem does, not what Go's string package makes convenient, and
+// the two are not the same. Two earlier versions of this comparison were exploitable:
 //
-// It covers Unicode SIMPLE folding only. It does NOT cover full folding (the multi-character
-// expansions, e.g. the ﬁ ligature to "fi") and it does NOT cover NFC/NFD normalization, which
-// APFS also applies — so a composed and a decomposed spelling of the same accented path fold
-// to different keys here while the filesystem sees one file. That is survivable only because
-// every covered path is pure ASCII, which TestGateConfigPathsAreASCII enforces: the moment
-// someone adds a non-ASCII entry, normalization becomes a live bypass and that test fails to
-// say so. The collision check is the backstop for everything spelling-based matching misses.
-func foldKey(s string) string {
-	var b strings.Builder
-	b.Grow(len(s))
-	for _, r := range s {
-		b.WriteRune(foldRune(r))
-	}
-	return b.String()
+//	strings.ToLower   simple LOWERCASING. Missed U+017F (ſ), which folds with 's' but
+//	                  lowercases to itself: "agentſ.md" evaded the guard and overwrote
+//	                  AGENTS.md on checkout.
+//	unicode.SimpleFold single-rune folding. Missed the MULTI-RUNE full folds, which are the
+//	                  ones that reach an ASCII target: U+FB01 (ﬁ) folds to "fi", so "Makeﬁle"
+//	                  evaded the guard and substituted the Makefile the gate itself executes.
+//	                  U+FB06 (ﬆ) → "st" and U+00DF (ß) → "ss" reach internal/inﬆaller/ and
+//	                  any covered path containing a double s the same way.
+//
+// So: NFD-normalize, apply Unicode FULL case folding, normalize again — the canonical
+// caseless match, which is what APFS compares under. TestFSIdentityKeyMatchesTheFilesystem
+// checks this against the real filesystem by creating both files and seeing whether they
+// collide, rather than against anybody's reading of the tables.
+//
+// cases.Caser is documented as possibly stateful and not safe to share, so a Caser is built
+// per call rather than cached in a package var.
+func fsIdentityKey(p string) string {
+	return norm.NFD.String(cases.Fold().String(norm.NFD.String(p)))
 }
 
 // matchesGateConfig reports whether a repository path names a gate-definition file. Matching
@@ -197,14 +187,14 @@ func foldKey(s string) string {
 // race the guard loses eventually. diffTouchesGateConfig therefore also refuses any changed
 // path that COLLIDES with another path in the resulting tree, whatever either is called.
 func matchesGateConfig(name string) bool {
-	folded := foldKey(name)
+	folded := fsIdentityKey(name)
 	for _, g := range gateConfigFiles {
-		if folded == foldKey(g) {
+		if folded == fsIdentityKey(g) {
 			return true
 		}
 	}
 	for _, p := range gateConfigPrefixes {
-		if strings.HasPrefix(folded, foldKey(p)) {
+		if strings.HasPrefix(folded, fsIdentityKey(p)) {
 			return true
 		}
 	}
@@ -438,6 +428,13 @@ func hasDefaultBranchGateScript(repo string) bool {
 type gateConfigHit struct {
 	Path   string
 	Reason string
+	// Blocking marks a hit that NO approval clears, --allow-gate-change included. A gate
+	// CHANGE is a legitimate act that needs naming; a path collision or a control character
+	// in a filename is not a change to anything, it is a diff that cannot be checked out
+	// deterministically. There is no spelling of "I meant to add two index entries that
+	// resolve to one file", so offering a flag for it would only turn an attack into a
+	// formality the lead can wave through.
+	Blocking bool
 }
 
 // diffTouchesGateConfig reports whether the COMMITTED diff base..rev changes the gate's own
@@ -446,6 +443,10 @@ type gateConfigHit struct {
 // by reverting the bytes in the worktree. A nil hit means the diff is clean.
 //
 // Three refusals, in increasing order of how little they trust the path's spelling:
+//
+// The first two are BLOCKING: no approval clears them, --allow-gate-change included. They are
+// not gate changes a lead might legitimately authorize, they are diffs that do not have one
+// well-defined checkout.
 //
 //  1. A changed path carrying a C0 control character or DEL. It cannot be rendered into a
 //     line-delimited audit record safely and no legitimate change introduces one.
@@ -461,7 +462,11 @@ type gateConfigHit struct {
 //     because the guard cannot know which entry wins the checkout.
 //
 //     The comparison is against the WHOLE tree, not just the changed list: in the attack only
-//     the new entry is in the diff, so pairwise comparison within the diff sees nothing.
+//     the new entry is in the diff, so pairwise comparison within the diff sees nothing. It
+//     is keyed on fsIdentityKey, which models the filesystem (full folding + NFD) rather than
+//     mirroring matchesGateConfig — keying the backstop on the same relation as the matcher
+//     would make it blind to exactly what the matcher is blind to, which is what an earlier
+//     version of this function did while its comment claimed otherwise.
 //
 //  3. A changed path that matches the gate set (matchesGateConfig).
 //
@@ -475,8 +480,9 @@ func diffTouchesGateConfig(repo, base, rev string) (*gateConfigHit, error) {
 	for _, n := range changed {
 		if hostilePath(n) {
 			return &gateConfigHit{
-				Path:   sanitizePathForMessage(n),
-				Reason: fmt.Sprintf("adds a path containing a control character (%s); such a path cannot be recorded in the audit log unambiguously", sanitizePathForMessage(n)),
+				Path:     sanitizePathForMessage(n),
+				Reason:   fmt.Sprintf("adds a path containing a control character (%s); such a path cannot be recorded in the audit log unambiguously", sanitizePathForMessage(n)),
+				Blocking: true,
 			}, nil
 		}
 	}
@@ -510,11 +516,11 @@ func collidesInTree(repo, rev string, changed []string) (*gateConfigHit, error) 
 	sort.Strings(tree)
 	byKey := make(map[string][]string, len(tree))
 	for _, p := range tree {
-		k := foldKey(p)
+		k := fsIdentityKey(p)
 		byKey[k] = append(byKey[k], p)
 	}
 	for _, n := range changed {
-		for _, other := range byKey[foldKey(n)] {
+		for _, other := range byKey[fsIdentityKey(n)] {
 			if other == n {
 				continue
 			}
@@ -522,6 +528,7 @@ func collidesInTree(repo, rev string, changed []string) (*gateConfigHit, error) 
 				Path: n,
 				Reason: fmt.Sprintf("adds %q, which resolves to the same file as %q on a case-insensitive or normalizing filesystem; a checkout writes one over the other and the guard cannot tell which wins",
 					sanitizePathForMessage(n), sanitizePathForMessage(other)),
+				Blocking: true,
 			}, nil
 		}
 	}

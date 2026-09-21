@@ -236,3 +236,114 @@ func TestSanitizeAuditLine(t *testing.T) {
 		}
 	}
 }
+
+// TestGateGuard_FullFoldMakefileSubstitution is the round-3 attack, and it is worse than the
+// round-2 one because the payload is what the gate runs.
+//
+// Makefile is in the covered set precisely because .ttorch/validate.sh does nothing but
+// `make lint` and `make test-fast`. U+FB01 (ﬁ) full-folds to "fi", so Makeﬁle and Makefile are
+// one file on APFS — verified by creating both, not by reading a table. unicode.SimpleFold
+// only walks single-rune orbits and does not know about the multi-rune full folds, so the
+// round-2 guard returned nil for a diff adding Makeﬁle and the substituted Makefile
+// (lint: @true, test-fast: @true) was what the gate then executed. The gate approved the
+// replacement of its own validation.
+//
+// The refusal must be BLOCKING: --allow-gate-change does not clear it. There is no legitimate
+// change that adds a second index entry resolving onto an existing file.
+func TestGateGuard_FullFoldMakefileSubstitution(t *testing.T) {
+	m, repo := deliveryHarness(t, "fbfold")
+	commitGateScript(t, repo, "exit 0")
+	if _, err := projectinit.Init(repo, "trusted"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "Makefile"), []byte("lint:\n\t@echo real\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "-A")
+	gitIn(t, repo, "commit", "-q", "-m", "add the real Makefile")
+	task, err := m.Spawn("fb1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = m.Teardown("fb1", true) }()
+	wt := task.Worktree
+
+	// The substitute gate: every check passes trivially.
+	neutered := "lint:\n\t@true\ntest-fast:\n\t@true\n"
+	if err := os.WriteFile(filepath.Join(wt, "sub.tmp"), []byte(neutered), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	blob := gitIn(t, wt, "hash-object", "-w", "sub.tmp")
+	if err := os.Remove(filepath.Join(wt, "sub.tmp")); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, wt, "update-index", "--add", "--cacheinfo", "100644,"+blob+",Makeﬁle")
+	gitIn(t, wt, "commit", "-q", "-m", "add a build tweak")
+	head := gitIn(t, wt, "rev-parse", "HEAD")
+
+	// Setup check: the diff must not name Makefile, or it would trip the plain match and
+	// prove nothing about the fold.
+	changed, err := worktree.ChangedFiles(repo, worktree.DefaultBranch(repo), head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range changed {
+		if c == "Makefile" {
+			t.Fatal("setup: the attack must not modify Makefile directly")
+		}
+	}
+
+	hit, err := diffTouchesGateConfig(repo, worktree.DefaultBranch(repo), head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hit == nil {
+		t.Fatal("substituting the Makefile the gate executes must not pass the guard")
+	}
+	if !hit.Blocking {
+		t.Fatal("a collision must be BLOCKING; --allow-gate-change must not be able to clear it")
+	}
+
+	// End to end, including the flag: it still does not merge.
+	writeReviewReports(t, m.P.ReviewInputsDir("fb1"), head, nil)
+	if _, err := m.TrustRecord("fb1", "", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if approval.Valid(m.P.ApprovalFile("fb1")) {
+		t.Fatal("a Makefile substitution must not auto-approve in trusted mode")
+	}
+	defHead := gitIn(t, repo, "rev-parse", "HEAD")
+	// Two refusals are in play and which one fires first depends on the filesystem, so the
+	// test asserts what is true on both rather than pretending one platform is the world.
+	//
+	// On a case-folding filesystem a colliding tree can NEVER produce a clean worktree —
+	// whichever entry wins the checkout, the other reads as modified — so MergeLocal's
+	// clean-worktree check fires before the guard. On a case-sensitive one both entries
+	// materialize, the worktree is clean, and the gate-config guard is the only thing
+	// standing. The precise property (Blocking, so no flag clears it) is asserted above
+	// against diffTouchesGateConfig directly, which is platform-independent.
+	sawGuard := false
+	for _, scoped := range []bool{false, true} {
+		if err := m.Approve("fb1", time.Minute, scoped); err != nil {
+			t.Fatal(err)
+		}
+		_, err := m.MergeLocal("fb1", false)
+		if err == nil {
+			t.Fatalf("the substitution merged with allow-gate-change=%v", scoped)
+		}
+		switch {
+		case strings.Contains(err.Error(), "does not clear it"):
+			sawGuard = true
+		case strings.Contains(err.Error(), "is not clean"):
+			// The collision made the checkout inconsistent; refused earlier, still refused.
+		default:
+			t.Fatalf("unexpected refusal with allow-gate-change=%v: %v", scoped, err)
+		}
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") != defHead {
+		t.Fatal("the substitution must not have merged")
+	}
+	if !sawGuard {
+		t.Log("the clean-worktree check refused first on this filesystem; the guard's blocking refusal is covered by the diffTouchesGateConfig assertions above")
+	}
+}

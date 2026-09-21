@@ -178,14 +178,16 @@ invalidates the verdict — re-prep, re-review, re-record.
   that changed.
 
   **Matching on the name alone is not enough, so the guard does not rely on it.** Paths are
-  compared under Unicode simple case *folding* on both sides, not `strings.ToLower` — U+017F
-  (long s) folds to `s` on APFS but lowercases to itself, so `agentſ.md` is a spelling of
-  `AGENTS.md` that a lowercasing guard misses while the filesystem resolves it onto the real
-  file. Beyond that, the guard refuses any changed path that **collides** with a different
-  path in the resulting tree, whether or not either one is in the table above. That is the
-  control that does not depend on anticipating a spelling: the attacker picks the name, but
-  the attack always needs two index entries landing on one file. It also refuses a changed
-  path containing a control character, which cannot be written into a one-line audit record.
+  compared under `fsIdentityKey` — NFD, Unicode FULL case folding, NFD again — which is what
+  a case-insensitive normalizing filesystem compares under. Two weaker versions of this were
+  exploitable: `strings.ToLower` missed U+017F (`agentſ.md` → `AGENTS.md`), and
+  `unicode.SimpleFold` missed the multi-rune full folds (`Makeﬁle` → `Makefile`, which is the
+  Makefile `.ttorch/validate.sh` executes). Beyond the name, the guard **refuses outright**
+  any changed path that collides with a different path in the resulting tree, whether or not
+  either is in the table above, and any changed path containing a control character. Those
+  two refusals are blocking: `--allow-gate-change` does not clear them, because a diff with
+  two index entries resolving to one file has no single well-defined checkout and there is
+  nothing for an approval to be an approval of.
 
 - **What that claim does NOT cover**, stated so nobody reads it as wider than it is:
   - Gated means trusted mode or `--require-verdict`. A `local`/`validated` merge without
@@ -210,14 +212,19 @@ invalidates the verdict — re-prep, re-review, re-record.
     repo's commits on its own (56/196). `internal/db/` holds the verdict row the merge trusts
     for `Overall == pass` and is likewise excluded at 12% (23/196, +16 over the shipped set).
     Both are cost judgements, not oversights.
-  - Unicode **full** folding (multi-character expansions such as the ﬁ ligature) and NFC/NFD
-    normalization, which APFS also applies. Every covered path is pure ASCII today, which
-    makes both unreachable, and `TestGateConfigPathsAreASCII` fails the moment someone adds a
-    non-ASCII entry so the gap cannot open quietly. The collision check backstops them.
+  - Filesystems whose folding rules differ from Unicode's. `fsIdentityKey` models APFS and
+    NTFS; `TestFSIdentityKeyMatchesTheFilesystem` creates each known colliding pair on the
+    real filesystem and fails if the key disagrees, so the guard is measured against the
+    machine rather than against a reading of the Unicode tables. A filesystem that collapses
+    something Unicode does not would still be missed.
   - Git will not tell you. `git clone` warns about a collision; `git worktree add --detach` —
     what the gate uses to build the checkout it validates — exits 0 with nothing on stderr and
     silently drops the losing entry. The gate's own collision check is load-bearing, not a
     second opinion.
+  - Untrusted text on the lead's terminal is escaped, not sanitized away. `worktree.warnf`
+    escapes control bytes before printing git's stderr, so an ANSI sequence in a committed
+    filename or `.gitattributes` is shown rather than executed; the text itself still reaches
+    the screen and can still say whatever the worker wants it to say.
   - The anchor tests ask a narrow question. `TestGateConfigCoversTheDecidingCode` catches a
     listed deciding function MOVING into an uncovered file, and
     `TestOrchestratorFilesAreClassified` catches a NEW file nobody classified. Neither notices

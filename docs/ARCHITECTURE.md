@@ -316,19 +316,47 @@ name", which was not true of what the test does.
 
 ### Why name-matching is not the load-bearing control
 
-`matchesGateConfig` folds both sides with Unicode simple case folding, not `strings.ToLower`.
-The difference is exploitable rather than pedantic: APFS and NTFS compare with case *folding*,
-which is a wider relation than lowercasing. U+017F LATIN SMALL LETTER LONG S folds together
-with `s` but lowercases to itself, so a second index entry named `agentſ.md` lowercases to
-something that matches nothing while the filesystem resolves it straight onto `AGENTS.md`. The
-worker never touches `AGENTS.md`; the checkout does it for them, and the repo comes out in
-trusted mode with attacker-chosen content. U+212A KELVIN SIGN does the same against `k`.
+Both the matcher and the collision check compare under one function, `fsIdentityKey`: NFD,
+Unicode **full** case folding, NFD again — the canonical caseless match, which is what APFS
+compares under. Two weaker versions of this shipped first, and each was exploitable:
 
-Folding fixes that spelling. It does not fix the class, because the attacker picks the
-spelling and the guard would have to anticipate every collapse rule of every filesystem. So
-the guard also refuses **any changed path that collides with a different path in the resulting
-tree**, whether or not either one is in the covered set. The attack always needs two index
-entries resolving to one file, and that is observable without recognising either name.
+| version | missed | attack |
+|---|---|---|
+| `strings.ToLower` | simple lowercasing | U+017F `ſ` folds with `s` but lowercases to itself: `agentſ.md` overwrites `AGENTS.md`, which sets delivery-mode |
+| `unicode.SimpleFold` | multi-rune FULL folds | U+FB01 `ﬁ` folds to `fi`: `Makeﬁle` substitutes the `Makefile` that `.ttorch/validate.sh` executes |
+
+The second is worse than the first. `Makefile` is in the covered set *because* the validate
+script does nothing but run `make lint` and `make test-fast`, so an attacker who substitutes
+it substitutes what the gate runs, and the gate approves the substitution. U+FB06 `ﬆ` → `st`
+reaches `internal/inﬆaller/` and `internal/orcheﬆrator/gate.go` the same way, and U+00DF `ß`
+→ `ss` reaches any covered path with a double s.
+
+Folding correctly fixes those spellings. It does not fix the class, because the attacker picks
+the spelling and the guard would otherwise have to anticipate every collapse rule of every
+filesystem. So the guard also refuses **any changed path that collides with a different path
+in the resulting tree**, whether or not either one is in the covered set. The attack always
+needs two index entries resolving to one file, and that is observable without recognising
+either name — provided the collision key models the filesystem rather than mirroring the
+matcher. An earlier version keyed it on the same relation the matcher used, which made the
+backstop blind to exactly what the matcher was blind to while its comment claimed the
+opposite.
+
+A collision, and a control character in a path, are **blocking**: no approval clears them,
+`--allow-gate-change` included. A gate change is a legitimate act that needs naming; a diff
+whose checkout is not well-defined is not a change to anything, and offering a flag for it
+would turn the attack into a formality a lead can wave through.
+
+This is measured, not reasoned. `TestFSIdentityKeyMatchesTheFilesystem` creates each known
+colliding pair on the real filesystem, reads one back to see whether they became one file, and
+fails if `fsIdentityKey` disagrees. Both previous rounds were lost to reasoning about Unicode
+tables instead of asking the machine.
+
+The full folding and normalization come from `golang.org/x/text` (`cases.Fold`, `unicode/norm`),
+a new direct dependency. It is a real cost — a `golang.org/x` module in the gate's own path,
+pinned at v0.41.0 because v0.42.0 raises the Go directive to 1.26. The alternative was
+hand-rolling the CaseFolding full mappings, which is a bounded table, plus NFD, which is not;
+and a hand-rolled Unicode table in a security control going quietly stale against a new
+Unicode revision is the exact failure this section already documents twice.
 
 The comparison is against the whole tree rather than the changed list, because in the attack
 only the new entry is in the diff — `AGENTS.md` is untouched, so comparing changed paths
@@ -346,14 +374,24 @@ a collision warning into `ErrPathCollision`. The gate-config guard runs **before
 validate for the same reason: a colliding tree validates the wrong bytes and would cache that
 result green under the real tree's hash.
 
-Two residual limits are recorded rather than fixed. Unicode *full* folding (multi-character
-expansions such as the ﬁ ligature) and NFC/NFD normalization, which APFS also applies, are out
-of scope while every covered path is pure ASCII — `TestGateConfigPathsAreASCII` fails the
-moment that stops being true. And reading the diff with `-z` removed git's C-quoting, which
-had been the only thing keeping a raw newline out of a path name; a covered path containing a
-newline would write a second, well-formed, fabricated merge record into the newline-delimited
-audit log. The guard refuses control characters in a changed path, and `sanitizeAuditLine`
-escapes them at the sink so every other call site is covered too.
+Two further channels were opened by earlier rounds of this work and are closed at their sinks.
+Reading the diff with `-z` removed git's C-quoting, which had been the only thing keeping a raw
+newline out of a path name; a covered path containing a newline would write a second,
+well-formed, fabricated merge record into the newline-delimited audit log. The guard refuses
+control characters in a changed path, and `sanitizeAuditLine` escapes them in `writeAudit` so
+every call site is covered. Separately, surfacing git's stderr put attacker-controlled bytes on
+the lead's terminal — a committed `.gitattributes` with an invalid attribute name makes git
+echo it back, ANSI escapes included, while exiting 0 — so `worktree.warnf` escapes control
+bytes before printing, and the escaped form is what goes into `ErrPathCollision` too.
+
+Both sinks were chosen over per-call-site escaping for the same reason: every caller shares the
+exposure and no caller can be relied on to remember.
+
+An earlier `TestGateConfigPathsAreASCII` claimed the covered set was safe because "ASCII has no
+decomposed form and no multi-character fold". That is true in one direction only — an ASCII
+path has no non-ASCII spelling of its own, but it is *reachable by* one, which is the whole
+`Makeﬁle` attack. The test passed while the property it named did not hold. It is replaced by
+the filesystem-measured test above.
 
 `Makefile`, `content.go` and `internal/orchestrator/audit.go` each cost **zero** additional
 commits — in 196 commits none has ever been touched without something already covered being

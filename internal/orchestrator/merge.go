@@ -228,6 +228,11 @@ func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error)
 		if hit, terr := diffTouchesGateConfig(repo, def, workerHead); terr != nil {
 			return "", terr
 		} else if hit != nil {
+			// A BLOCKING hit is not a gate change anyone can authorize: the diff has no single
+			// well-defined checkout, so there is nothing for an approval to be an approval OF.
+			if hit.Blocking {
+				return "", fmt.Errorf("trust gate: %q %s; this is refused outright and --allow-gate-change does not clear it — the diff must not contain it at all", taskID, hit.Reason)
+			}
 			if tokBy == "auto" {
 				return "", fmt.Errorf("trust gate: %q %s; a trusted auto-merge cannot alter its own gate — the lead must approve it explicitly with 'ttorch approve %s --allow-gate-change'", taskID, hit.Reason, taskID)
 			}

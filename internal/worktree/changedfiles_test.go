@@ -2,6 +2,7 @@ package worktree
 
 import (
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -188,4 +189,80 @@ func caseInsensitiveFS(t *testing.T, dir string) bool {
 	defer os.Remove(probe)
 	_, err := os.Stat(filepath.Join(dir, "caseprobe.tmp"))
 	return err == nil
+}
+
+// TestWarnf_EscapesUntrustedGitOutput: checkedGitRaw hands warnf git's own stderr, which
+// carries whatever a worker committed in a filename or a .gitattributes line. A terminal
+// EXECUTES ANSI escape sequences, so raw stderr on the lead's screen is a channel for
+// recolouring text, erasing the line above, or moving the cursor — fabricating what the lead
+// appears to be reading, in a warning they were shown precisely so they would look.
+//
+// Escaping happens in warnf itself rather than at each call site, so every caller is covered.
+func TestWarnf_EscapesUntrustedGitOutput(t *testing.T) {
+	hostile := "\x1b[31mPWNED\x1b[0m\rttorch: everything is fine\n"
+	got := escapeForTerminal("git diff: " + hostile)
+	for _, forbidden := range []struct{ b, name string }{
+		{"\x1b", "ESC"}, {"\r", "CR"}, {"\n", "LF"},
+	} {
+		if strings.Contains(got, forbidden.b) {
+			t.Errorf("escapeForTerminal left a raw %s in %q", forbidden.name, got)
+		}
+	}
+	for _, want := range []string{`\e`, `\r`, `\n`, "PWNED"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("escapeForTerminal(%q) = %q, want it to contain %q", hostile, got, want)
+		}
+	}
+	if escapeForTerminal("ordinary text") != "ordinary text" {
+		t.Error("escapeForTerminal must leave clean text alone")
+	}
+}
+
+// TestCheckedGitRaw_EscapesStderrItSurfaces is the end-to-end half: real git stderr, produced
+// by a real committed .gitattributes, reaching the lead's TERMINAL through the real gate path.
+//
+// AddDetached is that path — it is how the trust gate materializes the checkout it validates.
+// An invalid attribute name makes git echo the offending line to stderr and exit 0, so a
+// worker controls text that lands on the lead's screen during an ordinary gate run.
+//
+// It captures os.Stderr rather than substituting warnf. Substituting it would test the stub:
+// the escaping lives INSIDE warnf's default implementation, on purpose, so that every caller
+// is covered without having to remember. Only the real writer proves that.
+func TestCheckedGitRaw_EscapesStderrItSurfaces(t *testing.T) {
+	repo := makeRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, ".gitattributes"), []byte("* \x1b[31mPWNED\x1b[0m=bad\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, repo, "add", "-A")
+	gitT(t, repo, "commit", "-q", "-m", "hostile gitattributes")
+	head := gitT(t, repo, "rev-parse", "HEAD")
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := os.Stderr
+	os.Stderr = w
+	addErr := AddDetached(repo, filepath.Join(t.TempDir(), "co"), head)
+	os.Stderr = orig
+	w.Close()
+	out, _ := io.ReadAll(r)
+	r.Close()
+
+	if addErr != nil {
+		t.Fatalf("the checkout itself should succeed: %v", addErr)
+	}
+	got := string(out)
+	if !strings.Contains(got, "PWNED") {
+		t.Skipf("this git build printed nothing recognisable to stderr: %q", got)
+	}
+	if strings.Contains(got, "\x1b") {
+		t.Errorf("a raw ESC reached the terminal; a terminal EXECUTES these: %q", got)
+	}
+	if strings.Contains(got, "\r") {
+		t.Errorf("a raw CR reached the terminal, which rewrites the line: %q", got)
+	}
+	if !strings.Contains(got, `\e`) {
+		t.Errorf("the ESC bytes must be shown as an escape, got: %q", got)
+	}
 }

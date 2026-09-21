@@ -9,7 +9,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"unicode"
 
 	"github.com/nution101/ttorch/internal/approval"
 	"github.com/nution101/ttorch/internal/projectinit"
@@ -39,7 +38,7 @@ var decidingFunctions = []string{
 	// the audit record a trusted merge refuses to proceed without
 	"writeAudit", "sanitizeAuditLine",
 	// the path-spelling and collision controls the guard rests on
-	"foldRune", "foldKey", "hostilePath", "collidesInTree", "sanitizePathForMessage",
+	"fsIdentityKey", "hostilePath", "collidesInTree", "sanitizePathForMessage",
 }
 
 // nonDecidingFiles are the files in this package that have been LOOKED AT and judged not to
@@ -330,25 +329,121 @@ func TestOrchestratorFilesAreClassified(t *testing.T) {
 	}
 }
 
-// TestGateConfigPathsAreASCII pins the precondition that lets foldKey be enough.
+// collidingPairs are path pairs that a case-insensitive, normalizing filesystem resolves to
+// one file. Each was verified on APFS by creating both files and reading one back, not by
+// reading a Unicode table — the last two rounds of this work were both lost to reasoning
+// about folding instead of measuring it.
+var collidingPairs = []struct {
+	a, b, why string
+}{
+	{"gate.go", "gate.GO", "plain case"},
+	{"AGENTS.md", "agent\u017f.md", "U+017F long s: folds with 's', lowercases to itself"},
+	{"k.txt", "\u212a.txt", "U+212A kelvin sign: folds with 'k'"},
+	{"Makefile", "Make\ufb01le", "U+FB01 fi ligature: FULL fold to \"fi\", missed by single-rune folding"},
+	{"installer.txt", "in\ufb06aller.txt", "U+FB06 st ligature: full fold to \"st\""},
+	{"ass.txt", "a\u00df.txt", "U+00DF sharp s: full fold to \"ss\""},
+	{"cafe\u0301.md", "caf\u00e9.md", "NFD vs NFC of the same name"},
+}
+
+// distinctPairs must NOT share a key. Folding and normalizing widen the relation, and a key
+// that collapses genuinely different files would refuse ordinary merges forever.
+var distinctPairs = [][2]string{
+	{"Makefile", "Makefile2"},
+	{"internal/review/review.go", "internal/reviewer/review.go"},
+	{"content/skills/a.md", "content/skills/b.md"},
+	{"AGENTS.md", "AGENT.md"},
+	{"gate.go", "gates.go"},
+}
+
+// TestFSIdentityKeyMatchesTheFilesystem checks the guard's notion of "the same file" against
+// the filesystem's, by creating both paths and seeing whether one overwrites the other.
 //
-// foldKey applies Unicode SIMPLE case folding. It does not apply full folding or NFC/NFD
-// normalization, and APFS applies both. While every covered path is pure ASCII that gap is
-// unreachable: ASCII has no decomposed form and no multi-character fold. The first non-ASCII
-// entry makes normalization a live bypass — a composed and a decomposed spelling of the same
-// covered path would fold to different keys while the filesystem sees one file.
+// It replaces an earlier TestGateConfigPathsAreASCII, which asserted the wrong invariant. That
+// test's premise — repeated in the docs — was that ASCII covered paths are safe because "ASCII
+// has no decomposed form and no multi-character fold". That is true in one direction only: an
+// ASCII path has no non-ASCII spelling of its own, but it is REACHABLE BY one, which is
+// exactly the Makeﬁle attack. The test passed while the property it claimed to guarantee did
+// not hold.
 //
-// If this test fails, the entry is not necessarily wrong, but foldKey must normalize (NFC)
-// before folding and the limits recorded in validate.go and the docs must be rewritten.
-func TestGateConfigPathsAreASCII(t *testing.T) {
-	for _, set := range [][]string{gateConfigFiles, gateConfigPrefixes} {
-		for _, p := range set {
-			for _, r := range p {
-				if r > unicode.MaxASCII {
-					t.Errorf("gate-config entry %q contains non-ASCII %q: foldKey does not normalize, so a decomposed spelling of this path would evade the guard. Add NFC normalization to foldKey and update the stated limits before adding it.", p, r)
-					break
-				}
-			}
+// Measuring beats asserting here. If a future Go, Unicode revision or filesystem changes
+// either side, this fails rather than continuing to agree with a table nobody rechecked.
+func TestFSIdentityKeyMatchesTheFilesystem(t *testing.T) {
+	dir := t.TempDir()
+	if !caseFoldingDir(t, dir) {
+		t.Skip("case-sensitive filesystem: it collapses nothing, so there is nothing to agree with")
+	}
+	for _, tc := range collidingPairs {
+		fsCollides := filesCollide(t, dir, tc.a, tc.b)
+		keyCollides := fsIdentityKey(tc.a) == fsIdentityKey(tc.b)
+		if fsCollides && !keyCollides {
+			t.Errorf("%s: the filesystem resolves %q and %q to one file but fsIdentityKey does not — a diff adding %q would evade the guard and substitute %q on checkout",
+				tc.why, tc.a, tc.b, tc.b, tc.a)
+		}
+		if !fsCollides && keyCollides {
+			t.Logf("%s: fsIdentityKey collapses %q/%q but this filesystem does not; over-matching is the safe direction", tc.why, tc.a, tc.b)
 		}
 	}
+	for _, p := range distinctPairs {
+		if fsIdentityKey(p[0]) == fsIdentityKey(p[1]) {
+			t.Errorf("fsIdentityKey collapses %q and %q, which are different files; the key is too wide and would refuse ordinary merges", p[0], p[1])
+		}
+	}
+}
+
+// TestMatchesGateConfig_FullFoldSpellings: the covered set must be matched under the same
+// relation, so a full-fold spelling of a covered path is recognised as naming it.
+func TestMatchesGateConfig_FullFoldSpellings(t *testing.T) {
+	for _, tc := range []struct {
+		path string
+		why  string
+	}{
+		{"Make\ufb01le", "U+FB01: the Makefile the gate executes via .ttorch/validate.sh"},
+		{"internal/in\ufb06aller/installer.go", "U+FB06 in a covered prefix"},
+		{"internal/orche\ufb06rator/gate.go", "U+FB06 in a covered deciding file"},
+		{"agent\u017f.md", "U+017F: the delivery-mode config"},
+		{"content/skill\ufb06/x.md", "U+FB06 does not appear in 'skills'; must NOT match"},
+	} {
+		got := matchesGateConfig(tc.path)
+		want := tc.path != "content/skill\ufb06/x.md"
+		if got != want {
+			t.Errorf("%s: matchesGateConfig(%q) = %v, want %v", tc.why, tc.path, got, want)
+		}
+	}
+}
+
+// caseFoldingDir reports whether dir's filesystem folds case at all.
+func caseFoldingDir(t *testing.T, dir string) bool {
+	t.Helper()
+	probe := filepath.Join(dir, "CaseProbe.tmp")
+	if err := os.WriteFile(probe, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(probe)
+	_, err := os.Stat(filepath.Join(dir, "caseprobe.tmp"))
+	return err == nil
+}
+
+// filesCollide writes a and b in dir and reports whether they turned out to be one file.
+func filesCollide(t *testing.T, dir, a, b string) bool {
+	t.Helper()
+	pa, pb := filepath.Join(dir, a), filepath.Join(dir, b)
+	for _, p := range []string{pa, pb} {
+		_ = os.Remove(p)
+	}
+	defer func() {
+		for _, p := range []string{pa, pb} {
+			_ = os.Remove(p)
+		}
+	}()
+	if err := os.WriteFile(pa, []byte("A"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pb, []byte("B"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(pa)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(got) == "B"
 }

@@ -33,8 +33,44 @@ func git(args ...string) (string, error) {
 // warnf prints a non-fatal operational warning to stderr, where the manager that ran
 // the spawn sees it. It is a package var so tests can capture warnings instead of
 // inspecting stderr; production writes a "ttorch: " line to match the rest of the CLI.
+//
+// The formatted message is escaped before it reaches the terminal. Some of what this prints
+// is git's own stderr, which carries whatever a worker put in a committed filename or a
+// .gitattributes line — including ANSI escape sequences, which a terminal EXECUTES. A CSI
+// sequence can recolour the lead's screen, erase the line above it, or move the cursor, so a
+// warning is a place to fabricate what the lead appears to be reading. Escaping at this sink
+// rather than at each call site is deliberate: every caller shares the exposure and no caller
+// can be relied on to remember, which is the same reasoning as the audit log's sanitizer.
 var warnf = func(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "ttorch: "+format+"\n", args...)
+	fmt.Fprintln(os.Stderr, "ttorch: "+escapeForTerminal(fmt.Sprintf(format, args...)))
+}
+
+// escapeForTerminal renders untrusted text safe to print: every C0 control character and DEL
+// becomes a visible escape, so ESC (the lead byte of every ANSI sequence), CR (which rewrites
+// the current line) and LF (which fabricates a second line) are shown rather than obeyed.
+func escapeForTerminal(s string) string {
+	if strings.IndexFunc(s, func(r rune) bool { return r < 0x20 || r == 0x7f }) < 0 {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	for _, r := range s {
+		switch {
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r == '\r':
+			b.WriteString(`\r`)
+		case r == '\t':
+			b.WriteString(`\t`)
+		case r == 0x1b:
+			b.WriteString(`\e`)
+		case r < 0x20 || r == 0x7f:
+			fmt.Fprintf(&b, `\x%02x`, r)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // RepoRoot returns the top-level directory of the git repo containing dir.
@@ -515,7 +551,8 @@ func gitRaw(args ...string) (stdout, stderr string, err error) {
 	stderr = errBuf.String()
 	if err != nil {
 		if msg := strings.TrimSpace(stderr); msg != "" {
-			return "", stderr, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, msg)
+			// Escaped: this text ends up in a CLI error the lead reads on a terminal.
+			return "", stderr, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, escapeForTerminal(msg))
 		}
 		return "", stderr, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
 	}
@@ -532,7 +569,7 @@ func checkedGitRaw(args ...string) (string, error) {
 	}
 	if msg := strings.TrimSpace(stderr); msg != "" {
 		if collisionWarning(msg) {
-			return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), ErrPathCollision, msg)
+			return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), ErrPathCollision, escapeForTerminal(msg))
 		}
 		warnf("git %s: %s", strings.Join(args, " "), msg)
 	}
