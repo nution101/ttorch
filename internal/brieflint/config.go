@@ -3,6 +3,7 @@ package brieflint
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -98,6 +99,19 @@ func LoadConfig(dir string) Config {
 	return c
 }
 
+// quoteAll renders values read out of AGENTS.md for the terminal. That file is part of the
+// repository under review and a worker can commit it, so its contents are untrusted text on
+// a path a human reads: quoting keeps a value carrying control bytes or newlines from
+// writing its own line in the report. Brief-derived quotes already go through %q; this is
+// the config side of the same rule.
+func quoteAll(vals []string) []string {
+	out := make([]string, len(vals))
+	for i, v := range vals {
+		out[i] = strconv.Quote(v)
+	}
+	return out
+}
+
 // splitList parses a comma-separated value, dropping blank entries so `a,,b` and a trailing
 // comma are not mistaken for empty pointers.
 func splitList(s string) []string {
@@ -116,7 +130,7 @@ func (c Config) describe() string {
 	var parts []string
 	switch {
 	case len(c.Standards) > 0:
-		parts = append(parts, "brief-standards: "+strings.Join(c.Standards, ", "))
+		parts = append(parts, "brief-standards: "+strings.Join(quoteAll(c.Standards), ", "))
 	case c.StandardsEmpty:
 		parts = append(parts, "brief-standards: declared but EMPTY")
 	default:

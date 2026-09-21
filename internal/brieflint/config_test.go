@@ -85,7 +85,7 @@ func TestConfigDescribe(t *testing.T) {
 	cases := map[string]Config{
 		"brief-standards: none declared":       {},
 		"brief-standards: declared but EMPTY":  {StandardsEmpty: true},
-		"brief-standards: docs/x.md":           {Standards: []string{"docs/x.md"}},
+		`brief-standards: "docs/x.md"`:         {Standards: []string{"docs/x.md"}},
 		"disabled: target-branch, hard-counts": {Disabled: map[RuleID]bool{RuleHardCounts: true, RuleTargetBranch: true}},
 	}
 	for want, c := range cases {
