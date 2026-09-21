@@ -347,6 +347,8 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 // report moved too. A fixed list would leave exactly those reports sitting where the current
 // episode's belong. The gate's own set and the advisory QA audit are unioned in, so a
 // dimension DROPPED from the prepared set, or a missing/malformed record, is still covered.
+// Names from that record are validated before they are used as paths, since the file they
+// come from is worker-reachable (see review.ValidDimensionName).
 func (m *Manager) archivePriorReports(taskID, dir string) {
 	var dims []string
 	seen := map[string]bool{}
@@ -358,6 +360,15 @@ func (m *Manager) archivePriorReports(taskID, dir string) {
 	}
 	var archive string
 	for _, dim := range dims {
+		// reviewers.json sits in a directory a worker can write, so a dimension name read
+		// back from it is untrusted input, and this loop would otherwise make it both halves
+		// of an os.Rename. A name that is not a plain label names a file this review has
+		// nothing to do with, so it is skipped rather than repaired: there is no correct
+		// archive destination for it, and a worker should not be able to steer a move at all.
+		if !review.ValidDimensionName(dim) {
+			fmt.Fprintf(os.Stderr, "ttorch: ignoring unusable review dimension name %q in %s\n", dim, dir)
+			continue
+		}
 		report := filepath.Join(dir, dim+".json")
 		if _, err := os.Stat(report); err != nil {
 			continue

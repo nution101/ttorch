@@ -453,3 +453,49 @@ func auditLineFor(t *testing.T, m *Manager, match string) string {
 	}
 	return found
 }
+
+// TestTrustPrep_DimensionNameCannotMoveFilesOutsideTheReviewDir is the escape test for the
+// archive. reviewers.json lives in a directory a worker can write, so a dimension name read
+// back from it is hostile input, and the archive turns that name into both halves of an
+// os.Rename. A name with path separators therefore moves a file the review has nothing to do
+// with. Nothing outside the review dir may be touched.
+func TestTrustPrep_DimensionNameCannotMoveFilesOutsideTheReviewDir(t *testing.T) {
+	const escape = "../../sentinel"
+	m, head, dir := preppedTrustedTask(t, "traversal", "tv1", "exit 0")
+	writeReportsForPreppedInputs(t, dir, head, nil)
+
+	// A file well outside the review inputs dir, in the same shape the archive would move.
+	target := filepath.Clean(filepath.Join(dir, escape+".json"))
+	if target == filepath.Join(dir, "sentinel.json") {
+		t.Fatalf("the escape path did not leave the review dir: %s", target)
+	}
+	const content = "untouched\n"
+	if err := os.WriteFile(target, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	addPreparedDimension(t, dir, escape)
+
+	if _, err := m.TrustPrep("tv1"); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("a dimension name moved a file out of %s: %v", target, err)
+	}
+	if string(b) != content {
+		t.Errorf("the file outside the review dir was modified: %q", b)
+	}
+	moved, err := filepath.Glob(filepath.Join(dir, supersededDirName, "*", "*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range moved {
+		if strings.Contains(p, "sentinel") {
+			t.Errorf("a file from outside the review dir was archived: %s", p)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "sentinel.json")); err == nil {
+		t.Error("a file from outside the review dir was moved into the review dir")
+	}
+}

@@ -356,3 +356,60 @@ func TestValidateState(t *testing.T) {
 		}
 	})
 }
+
+// TestAggregate_DimensionNameCannotReachOutsideTheInputsDir: a dimension name is not
+// configuration, it is a value read back from reviewers.json in a directory a worker can
+// write. The fold builds a file path out of it, so a name carrying path separators reaches
+// files the review dir does not contain. Here a perfectly valid report sits OUTSIDE the
+// inputs dir and a traversing dimension name points at it; it must not satisfy that
+// dimension.
+func TestAggregate_DimensionNameCannotReachOutsideTheInputsDir(t *testing.T) {
+	const sha = "abc123def456"
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "review")
+	outside := "../outside"
+
+	stagePrep(t, dir, sha, greenValidate())
+	for _, d := range dims {
+		writeReport(t, dir, d, sha, nil)
+	}
+	// A clean, correctly pinned report the fold would happily accept, one level up.
+	writeReport(t, parent, "outside", sha, nil)
+
+	v, err := Aggregate(dir, sha, append(append([]string(nil), dims...), outside))
+	if err != nil {
+		t.Fatalf("a rejected dimension name must fold to a block, not a hard error: %v", err)
+	}
+	if v.Overall != Block {
+		t.Fatalf("overall = %q, want %q: a report outside the inputs dir satisfied a dimension", v.Overall, Block)
+	}
+	if !findingMentions(v, "unusable dimension name") {
+		t.Errorf("the verdict must say the dimension name was rejected; findings = %+v", v.Findings)
+	}
+	if ReportCurrent(dir, outside, sha) {
+		t.Error("ReportCurrent accepted a report reached by traversing out of the inputs dir")
+	}
+}
+
+// TestValidDimensionName pins the allow-list: what a dimension MAY be, rather than what it
+// must not be. Every rejected case below either reaches another directory or collides with
+// another dimension's file on a case-insensitive filesystem.
+func TestValidDimensionName(t *testing.T) {
+	ok := []string{"correctness", "scope", "security", "qa", "convention", "perf-2", "a_b", "x"}
+	bad := []string{
+		"", " ", ".", "..", "../outside", "a/b", `a\b`, "/etc/passwd", "~/.claude",
+		"a.json", "a b", "Scope", "qa\x00", "café",
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"-lead", "2fast",
+	}
+	for _, n := range ok {
+		if !ValidDimensionName(n) {
+			t.Errorf("ValidDimensionName(%q) = false, want true", n)
+		}
+	}
+	for _, n := range bad {
+		if ValidDimensionName(n) {
+			t.Errorf("ValidDimensionName(%q) = true, want false", n)
+		}
+	}
+}

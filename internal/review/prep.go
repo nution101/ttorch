@@ -113,6 +113,42 @@ func ValidateState(inputsDir, sha string) string {
 	}
 }
 
+// maxDimensionNameLen bounds a dimension name. Nothing legitimate comes close; the bound
+// keeps a name from producing an unusable filename.
+const maxDimensionNameLen = 32
+
+// ValidDimensionName reports whether name may be used as a dimension. Every dimension name
+// becomes a file path ("<name>.json") in the review inputs dir, and names are read back from
+// reviewers.json, which lives in a directory a worker can write. So a name is untrusted
+// input, and this states what one MAY be rather than what it must not be: 1 to 32 characters,
+// starting with a lowercase ASCII letter, continuing with lowercase ASCII letters, digits,
+// '-' or '_'.
+//
+// An allow-list, because the deny-list version of this check has to anticipate every way a
+// string can name another file: "..", "/", "\", an absolute path, a NUL, a trailing dot or
+// space, a Windows drive or stream, a Unicode character that normalizes to a separator. Miss
+// one and the check is decorative. Nothing in this set can name anything but a plain child of
+// the directory it is joined to.
+//
+// Lowercase only, because macOS and Windows filesystems are case-insensitive: allowing
+// "Scope" alongside "scope" would let two dimensions share one report file, so one
+// reviewer's findings could stand in for another's.
+func ValidDimensionName(name string) bool {
+	if name == "" || len(name) > maxDimensionNameLen {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+		case i > 0 && (c >= '0' && c <= '9' || c == '-' || c == '_'):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // prepState is the episode the reports in an inputs dir are folded against: the marker's
 // content, the moment it was written (its mtime), whether it could be read at all, and the
 // staged validate the reviewers themselves read, which the marker is cross-checked against.
@@ -205,6 +241,12 @@ func greenWord(green bool) string {
 // only for the hard case a caller must surface rather than block on: a report pinned to a
 // different commit.
 func currentReport(inputsDir, dim, sha string, prep prepState) (Report, string, error) {
+	// Before the name becomes a path: a dimension whose name is not a plain label could
+	// address a file the inputs dir does not contain, and a report found that way must never
+	// stand in for a review of this diff.
+	if !ValidDimensionName(dim) {
+		return Report{}, fmt.Sprintf("unusable dimension name %q in the prepared reviewer set, so no report can be read for it", dim), nil
+	}
 	path := filepath.Join(inputsDir, dim+".json")
 	b, err := os.ReadFile(path)
 	if err != nil {

@@ -118,7 +118,8 @@ func DiffID(patch []byte) string {
 }
 
 // Aggregate folds the per-dimension reports in inputsDir into a single verdict for
-// sha. Every dimension in dimensions must be present, pinned to sha, and written during
+// sha. Every dimension must have a usable name (ValidDimensionName), and its report must be
+// present, pinned to sha, and written during
 // the CURRENT review episode: a missing, malformed, or superseded report, or any finding
 // at High severity or above, yields a "block" verdict (fail closed). The episode's staged
 // validate is folded too — a review over a commit whose checks did not pass cannot yield
