@@ -411,9 +411,13 @@ an allowed end state, and a pointer to the project's standards.
 
 These properties are load-bearing:
 
-- **Three outcomes, three exit statuses.** Passed (0), a rule violated (1), and a check that COULD
-  NOT be evaluated (3) are distinct. An unreachable remote, a ref that does not resolve, or a
-  `file:line` citation with no ref to resolve it against is reported, never passed.
+- **Each outcome has its own exit status.** Passed (0), a rule violated (1), a check that COULD
+  NOT be evaluated (3), and everything that ran passing while the project had disabled a rule (4)
+  are distinct. An unreachable remote, a ref that does not resolve, or a `file:line` citation with
+  no ref to resolve it against is reported, never passed. 0 and 4 are separate because a caller
+  reading only the status could otherwise not tell five rules passing from one rule passing;
+  `task add` proceeds on 4, so a project's declared disable narrows what is checked without
+  breaking its own dispatch.
 - **The ref a citation is resolved against is explicit, and its default is useful.** A bare path
   is resolved at the base (`--ref`, defaulting to the brief's declared target). A `file:line`
   citation is about the commit it was read at, which `--citations-ref` names; a gate finding

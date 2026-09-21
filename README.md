@@ -240,12 +240,19 @@ Some details that matter in practice:
   but a miss there is reported as *unevaluable* rather than failed, because the line may perfectly
   well exist at the commit it was read at. Both refs, and whether the citations ref was given or
   defaulted, are named in the output.
-- **A check that cannot run never passes.** Exit `0` means every enabled rule was evaluated and
-  passed, `1` that a rule was violated, `3` that at least one check *could not be evaluated* (an
+- **A check that cannot run never passes.** Exit `0` means every rule was evaluated and passed,
+  `1` that a rule was violated, `3` that at least one check *could not be evaluated* (an
   unreachable remote, a ref that does not resolve, a line citation the base cannot settle, or a
-  project that disabled every rule), and `2` a usage error. One run reports every violation, with
-  the rule named and the offending text quoted, and every summary line says how many of the rules
+  project that disabled every rule), `4` that everything which ran passed but the project had
+  disabled at least one rule, and `2` a usage error. One run reports every violation, with the
+  rule named and the offending text quoted, and every summary line says how many of the rules
   ran, so an outcome cannot be read without its coverage.
+
+  `task add` treats `4` as a pass and proceeds, printing the coverage line. A project that
+  disables a rule has declared that in its own `AGENTS.md`; refusing every briefed add there
+  would break dispatch for the project and push people to `--no-brief-lint`, which skips all
+  five rules instead of one. The separate status is for the caller who wants to insist on full
+  coverage.
 - **A brief is untrusted input**, pasted from issues and written by agents, and two rules query git
   once per item they find in it. So one run has an aggregate git budget (45s), the remote check
   verifies at most 3 distinct targets, and at most 64 distinct cited paths are resolved. Whatever a

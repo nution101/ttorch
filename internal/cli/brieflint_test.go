@@ -178,10 +178,10 @@ func TestCmdBriefLintProjectOverrides(t *testing.T) {
 	out, err := captureStdout(t, func() error {
 		return cmdBriefLint([]string{writeBrief(t, defectiveBrief), "--repo", repo})
 	})
-	if got := exitOf(t, err); got != 0 {
-		t.Fatalf("with those rules disabled the brief passes, got exit %d (%v)\n%s", got, err, out)
+	if got := exitOf(t, err); got != exitLintPartial {
+		t.Fatalf("with those rules disabled nothing is violated but coverage is reduced, want exit %d, got %d (%v)\n%s", exitLintPartial, got, err, out)
 	}
-	for _, want := range []string{"rule target-branch: DISABLED", "rule standards: DISABLED", "AGENTS.md", "2 of 5 rules ran (3 disabled by project config): passed"} {
+	for _, want := range []string{"rule target-branch: DISABLED", "rule standards: DISABLED", "AGENTS.md", "2 of 5 rules ran (3 disabled by project config): everything that ran passed"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("an override must be visible in the output, want %q:\n%s", want, out)
 		}
@@ -289,5 +289,39 @@ func TestCmdBriefLintQuotesConfigValues(t *testing.T) {
 	}
 	if !strings.Contains(out, `\x1b[31mINJECTED`) {
 		t.Fatalf("the value must still be shown, escaped:\n%s", out)
+	}
+}
+
+// A full pass and a partial one must not look the same to a caller that reads only the
+// exit status, and the add path must still proceed on the partial one.
+func TestCmdBriefLintDistinguishesReducedCoverage(t *testing.T) {
+	repo := lintRepo(t)
+	agents := filepath.Join(repo, "AGENTS.md")
+	brief := writeBrief(t, cleanBrief)
+
+	out, err := captureStdout(t, func() error { return cmdBriefLint([]string{brief, "--repo", repo}) })
+	if got := exitOf(t, err); got != 0 {
+		t.Fatalf("a full pass must exit 0, got %d (%v)\n%s", got, err, out)
+	}
+	if !strings.Contains(out, "5 of 5 rules ran: passed") {
+		t.Fatalf("a full pass must say so plainly:\n%s", out)
+	}
+
+	if err := os.WriteFile(agents, []byte("# Fixture\n\n- brief-lint-disable: standards\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err = captureStdout(t, func() error { return cmdBriefLint([]string{brief, "--repo", repo}) })
+	if got := exitOf(t, err); got != exitLintPartial {
+		t.Fatalf("one disabled rule must exit %d, got %d (%v)\n%s", exitLintPartial, got, err, out)
+	}
+	if strings.Contains(out, "rules ran (1 disabled by project config): passed") {
+		t.Fatalf("a partial run must not report a bare pass:\n%s", out)
+	}
+
+	// task add reads the report, not the exit status, and proceeds: a declared disable
+	// narrows what is checked without breaking the project's own dispatch.
+	out, err = captureStdout(t, func() error { return lintBriefForAdd(cleanBrief, repo, "") })
+	if err != nil {
+		t.Fatalf("task add must proceed on reduced coverage, got %v\n%s", err, out)
 	}
 }

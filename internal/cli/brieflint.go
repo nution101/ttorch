@@ -26,6 +26,19 @@ const (
 	// evaluated (an unreachable remote, a ref that does not resolve, a file:line citation
 	// with no ref to resolve it against).
 	exitLintIndeterminate = 3
+	// exitLintPartial: every rule that ran passed, but the project disabled at least one,
+	// so the run cannot claim the brief passed the rule set. Without this, 5-of-5 and
+	// 1-of-5 were both exit 0 and a caller reading only the status could not tell them
+	// apart. It is a separate status rather than a reuse of 3 because the run is not
+	// unevaluable: what ran, ran and passed.
+	//
+	// `task add` deliberately does NOT refuse on this one, and the split is the whole
+	// point. A project that disables a rule in its AGENTS.md has declared that in the
+	// repository; refusing every briefed add there would break dispatch for that project
+	// and push people to --no-brief-lint, which skips five rules instead of one. So the
+	// caller who wants to insist on full coverage reads the exit status, and the add path
+	// proceeds and prints what ran.
+	exitLintPartial = 4
 )
 
 // lintError carries a brief-lint outcome's exit status out to Main. Its message is what the
@@ -87,6 +100,9 @@ func briefLintOutcome(rep brieflint.Report, who string) error {
 	case brieflint.OutcomeIndeterminate:
 		return lintError{fmt.Sprintf("%s: %s, %s — resolve them (or disable the rule in AGENTS.md) rather than treating this as a pass", who, coverage(rep), describeLintCounts(rep)), exitLintIndeterminate}
 	default:
+		if rep.Evaluated() < rep.Total() {
+			return lintError{fmt.Sprintf("%s: %s — everything that ran passed, but this is not a pass of the rule set", who, coverage(rep)), exitLintPartial}
+		}
 		return nil
 	}
 }
@@ -112,7 +128,13 @@ func printBriefLint(w io.Writer, path string, rep brieflint.Report) {
 		fmt.Fprintf(w, "  · %s\n", n)
 	}
 	if len(rep.Findings) == 0 {
-		fmt.Fprintf(w, "\n%s: passed\n", coverage(rep))
+		verdict := "passed"
+		if rep.Evaluated() < rep.Total() {
+			// Not "passed": what ran passed, and the rules the project turned off were not
+			// checked at all.
+			verdict = "everything that ran passed"
+		}
+		fmt.Fprintf(w, "\n%s: %s\n", coverage(rep), verdict)
 		return
 	}
 	fmt.Fprintln(w)
@@ -156,6 +178,13 @@ func lintBriefForAdd(text, repo, citationsRef string) error {
 	})
 	printBriefLint(os.Stdout, "the supplied brief", rep)
 	err := briefLintOutcome(rep, "task add")
+	var le lintError
+	if errors.As(err, &le) && le.code == exitLintPartial {
+		// Reduced coverage is reported, not refused: see exitLintPartial for why the add
+		// path and the standalone exit status part company here.
+		fmt.Fprintf(os.Stderr, "note: %s. The add proceeds; the rules the project disabled were not checked.\n", coverage(rep))
+		return nil
+	}
 	switch {
 	case err == nil:
 	case rep.Outcome() == brieflint.OutcomeIndeterminate:
