@@ -132,9 +132,12 @@ func (r Report) Outcome() Outcome {
 }
 
 // Evaluated is how many rules actually ran: the rule set less whatever the project
-// disabled. A summary must count what ran, so a run with rules turned off cannot claim the
-// whole set passed.
+// disabled. Every summary states it against Total, so no run can claim more coverage than
+// it had.
 func (r Report) Evaluated() int { return r.evaluated }
+
+// Total is how many rules exist, disabled ones included.
+func (r Report) Total() int { return len(rules) }
 
 // Options describes what a single run may consult. The zero value is valid: it lints the
 // brief's text alone and reports every ref-dependent check as indeterminate rather than
@@ -270,6 +273,17 @@ func Lint(text string, opt Options) Report {
 		rep.Findings = append(rep.Findings, findings...)
 		rep.Notes = append(rep.Notes, notes...)
 		rep.evaluated++
+	}
+	// A run that evaluated nothing is not a pass. The project under review supplies this
+	// configuration, ttorch itself writes AGENTS.md through learnings promotion, and any
+	// worker can commit it, so the brief being reviewed can turn off its own reviewer. One
+	// line doing that must read as "nothing was checked", not as "checked and fine".
+	if rep.evaluated == 0 {
+		rep.Findings = append(rep.Findings, Finding{
+			Rule:   RuleConfig,
+			Status: StatusIndeterminate,
+			Detail: fmt.Sprintf("nothing was checked: all %d rules are disabled by project config (%s). A lint that evaluates no rule cannot report a pass", len(rules), opt.Config.disableSource()),
+		})
 	}
 	return rep
 }

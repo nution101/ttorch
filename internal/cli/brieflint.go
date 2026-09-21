@@ -83,9 +83,9 @@ func cmdBriefLint(args []string) error {
 func briefLintOutcome(rep brieflint.Report, who string) error {
 	switch rep.Outcome() {
 	case brieflint.OutcomeFail:
-		return lintError{fmt.Sprintf("%s: %s", who, describeLintCounts(rep)), exitLintViolation}
+		return lintError{fmt.Sprintf("%s: %s, %s", who, coverage(rep), describeLintCounts(rep)), exitLintViolation}
 	case brieflint.OutcomeIndeterminate:
-		return lintError{fmt.Sprintf("%s: %s — resolve them (or disable the rule in AGENTS.md) rather than treating this as a pass", who, describeLintCounts(rep)), exitLintIndeterminate}
+		return lintError{fmt.Sprintf("%s: %s, %s — resolve them (or disable the rule in AGENTS.md) rather than treating this as a pass", who, coverage(rep), describeLintCounts(rep)), exitLintIndeterminate}
 	default:
 		return nil
 	}
@@ -112,9 +112,7 @@ func printBriefLint(w io.Writer, path string, rep brieflint.Report) {
 		fmt.Fprintf(w, "  · %s\n", n)
 	}
 	if len(rep.Findings) == 0 {
-		// Count what actually RAN, so a run with rules disabled cannot claim the whole set
-		// passed.
-		fmt.Fprintf(w, "\nall %d enabled rules passed%s\n", rep.Evaluated(), disabledSuffix(rep))
+		fmt.Fprintf(w, "\n%s: passed\n", coverage(rep))
 		return
 	}
 	fmt.Fprintln(w)
@@ -129,16 +127,18 @@ func printBriefLint(w io.Writer, path string, rep brieflint.Report) {
 			fmt.Fprintf(w, "        offending text: %q\n", f.Quote)
 		}
 	}
-	fmt.Fprintf(w, "\n%s\n", describeLintCounts(rep))
+	fmt.Fprintf(w, "\n%s: %s\n", coverage(rep), describeLintCounts(rep))
 }
 
-// disabledSuffix names how many rules a project turned off, for the summary line.
-func disabledSuffix(rep brieflint.Report) string {
-	n := len(brieflint.Rules()) - rep.Evaluated()
-	if n <= 0 {
-		return ""
+// coverage states how much of the rule set actually ran. It leads every summary line on
+// every path, so no outcome can be read without knowing what it covers: "passed" and
+// "2 of 5 rules ran" are different claims and only the second is checkable.
+func coverage(rep brieflint.Report) string {
+	s := fmt.Sprintf("%d of %d rules ran", rep.Evaluated(), rep.Total())
+	if n := rep.Total() - rep.Evaluated(); n > 0 {
+		s += fmt.Sprintf(" (%d disabled by project config)", n)
 	}
-	return fmt.Sprintf(" (%d disabled)", n)
+	return s
 }
 
 // lintBriefForAdd runs the same rules in front of `ttorch task add`, where the cost of a
@@ -156,7 +156,14 @@ func lintBriefForAdd(text, repo, citationsRef string) error {
 	})
 	printBriefLint(os.Stdout, "the supplied brief", rep)
 	err := briefLintOutcome(rep, "task add")
-	if err != nil {
+	switch {
+	case err == nil:
+	case rep.Outcome() == brieflint.OutcomeIndeterminate:
+		// Say plainly that this is not a verdict on the brief. The lint reaches the network
+		// for the target-branch check, so an unreachable remote lands here, and a worker
+		// whose add was refused should not go looking for a defect in the text.
+		fmt.Fprintf(os.Stderr, "note: nothing was added, and this is NOT a verdict on the brief: the lint could not finish. An unreachable remote, a ref that does not resolve, or a citation it could not settle all land here. Resolve it, or re-run with --no-brief-lint to add the brief as written.\n")
+	default:
 		fmt.Fprintf(os.Stderr, "note: nothing was added. Fix the brief, or re-run with --no-brief-lint to add it as written.\n")
 	}
 	return err

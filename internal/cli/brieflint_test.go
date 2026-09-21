@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/nution101/ttorch/internal/brieflint"
 )
 
 // lintRepo builds a neutral fixture repository: one commit on a base branch pushed to a
@@ -100,7 +102,7 @@ func TestCmdBriefLintExitStatuses(t *testing.T) {
 	if got := exitOf(t, err); got != 0 {
 		t.Fatalf("a clean brief must exit 0, got %d (%v)\n%s", got, err, out)
 	}
-	if !strings.Contains(out, "all 5 enabled rules passed") {
+	if !strings.Contains(out, "5 of 5 rules ran: passed") {
 		t.Fatalf("unexpected output:\n%s", out)
 	}
 
@@ -179,7 +181,7 @@ func TestCmdBriefLintProjectOverrides(t *testing.T) {
 	if got := exitOf(t, err); got != 0 {
 		t.Fatalf("with those rules disabled the brief passes, got exit %d (%v)\n%s", got, err, out)
 	}
-	for _, want := range []string{"rule target-branch: DISABLED", "rule standards: DISABLED", "AGENTS.md", "all 2 enabled rules passed (3 disabled)"} {
+	for _, want := range []string{"rule target-branch: DISABLED", "rule standards: DISABLED", "AGENTS.md", "2 of 5 rules ran (3 disabled by project config): passed"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("an override must be visible in the output, want %q:\n%s", want, out)
 		}
@@ -219,5 +221,73 @@ func TestRunOnlyHonoursThisPackagesExitStatuses(t *testing.T) {
 	// A brief-lint outcome still chooses its own.
 	if got := run(lintError{"three rules could not be evaluated", exitLintIndeterminate}); got != exitLintIndeterminate {
 		t.Fatalf("run(lintError) = %d, want %d", got, exitLintIndeterminate)
+	}
+}
+
+// A repository that turns off every rule must not get a clean gate out of it. The summary
+// must not say passed, and the exit status must be the cannot-evaluate one, because every
+// non-human consumer reads the status and not the notes.
+func TestCmdBriefLintRefusesWhenEveryRuleIsDisabled(t *testing.T) {
+	repo := lintRepo(t)
+	var ids []string
+	for _, id := range brieflint.Rules() {
+		ids = append(ids, string(id))
+	}
+	if err := os.WriteFile(filepath.Join(repo, "AGENTS.md"),
+		[]byte("# Fixture\n\n- brief-lint-disable: "+strings.Join(ids, ", ")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := captureStdout(t, func() error {
+		return cmdBriefLint([]string{writeBrief(t, defectiveBrief), "--repo", repo})
+	})
+	if got := exitOf(t, err); got != exitLintIndeterminate {
+		t.Fatalf("a run with every rule disabled must exit %d, got %d (%v)\n%s", exitLintIndeterminate, got, err, out)
+	}
+	if strings.Contains(out, "passed") {
+		t.Fatalf("a run that evaluated nothing must not use the word passed:\n%s", out)
+	}
+	for _, want := range []string{"0 of 5 rules ran", "nothing was checked"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output must state %q:\n%s", want, out)
+		}
+	}
+}
+
+// Every summary line says how much of the rule set ran, so an outcome cannot be read without
+// its coverage. Checked on all three paths: pass, violation, and cannot-evaluate.
+func TestCmdBriefLintAlwaysReportsCoverage(t *testing.T) {
+	repo := lintRepo(t)
+	briefs := map[string]string{
+		"pass":      cleanBrief,
+		"violation": defectiveBrief,
+		"unevaluable": strings.Replace(cleanBrief, "Base is origin/main in this repository.",
+			"Base is origin/main in this repository. See pkg/thing.go:4000.", 1),
+	}
+	for name, brief := range briefs {
+		out, _ := captureStdout(t, func() error {
+			return cmdBriefLint([]string{writeBrief(t, brief), "--repo", repo})
+		})
+		if !strings.Contains(out, "of 5 rules ran") {
+			t.Fatalf("%s: summary must state coverage:\n%s", name, out)
+		}
+	}
+}
+
+// AGENTS.md belongs to the repository under review, so its values are untrusted text on a
+// path a human reads. They must not be able to write their own line in the report.
+func TestCmdBriefLintQuotesConfigValues(t *testing.T) {
+	repo := lintRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, "AGENTS.md"),
+		[]byte("# Fixture\n\n- brief-standards: docs/x.md\u001b[31mINJECTED\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := captureStdout(t, func() error {
+		return cmdBriefLint([]string{writeBrief(t, cleanBrief), "--repo", repo})
+	})
+	if strings.Contains(out, "\u001b") {
+		t.Fatalf("a control byte from AGENTS.md reached the terminal raw:\n%q", out)
+	}
+	if !strings.Contains(out, `\x1b[31mINJECTED`) {
+		t.Fatalf("the value must still be shown, escaped:\n%s", out)
 	}
 }

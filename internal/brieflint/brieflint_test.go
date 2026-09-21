@@ -951,3 +951,117 @@ func firstUserValue(args, values []string) int {
 	}
 	return -1
 }
+
+// --- a check that did not run is not a pass ---------------------------------------------
+
+// The project under review supplies this configuration, and a worker can commit it, so one
+// line in AGENTS.md can turn off every rule. That run must read as "nothing was checked".
+func TestEveryRuleDisabledIsNotAPass(t *testing.T) {
+	repo, _ := fixture(t)
+	var ids []string
+	for _, id := range Rules() {
+		ids = append(ids, string(id))
+	}
+	writeAgents(t, repo, "- brief-lint-disable: "+strings.Join(ids, ", ")+"\n")
+
+	// A brief that violates several rules, so a pass here could only come from not looking.
+	r := Lint("# Task\n\nJust do it. Do NOT push.\n", Options{Repo: repo, Ref: "origin/main", Config: LoadConfig(repo)})
+	if r.Evaluated() != 0 {
+		t.Fatalf("want no rule evaluated, got %d", r.Evaluated())
+	}
+	if r.Outcome() != OutcomeIndeterminate {
+		t.Fatalf("outcome: want %s, got %s (%+v)", OutcomeIndeterminate, r.Outcome(), r.Findings)
+	}
+	f := requireStatus(t, r, RuleConfig, StatusIndeterminate)
+	if !strings.Contains(f.Detail, "nothing was checked") {
+		t.Fatalf("the finding must say nothing was checked: %s", f.Detail)
+	}
+	if r.Total() != len(Rules()) {
+		t.Fatalf("Total() = %d, want %d", r.Total(), len(Rules()))
+	}
+}
+
+// A project turning off SOME rules is a legitimate override: what ran still decides the
+// outcome. The count of what ran is what keeps that honest, and it is asserted at the CLI.
+func TestPartialDisableStillJudgesWhatRan(t *testing.T) {
+	repo, _ := fixture(t)
+	writeAgents(t, repo, "- brief-lint-disable: hard-counts\n")
+	r := Lint(satisfying, Options{Repo: repo, Config: LoadConfig(repo)})
+	if r.Outcome() != OutcomePass {
+		t.Fatalf("outcome: want %s, got %s (%+v)", OutcomePass, r.Outcome(), r.Findings)
+	}
+	if r.Evaluated() != r.Total()-1 {
+		t.Fatalf("evaluated %d of %d, want one fewer than the whole set", r.Evaluated(), r.Total())
+	}
+}
+
+// --- the create exemption is earned per mention, by a verb that governs the path ---------
+
+// A retrospective verb does not exempt anything: this citation is fabricated and the
+// sentence only mentions adding in passing.
+func TestCreateExemptionNeedsTheVerbToGovernTheCitation(t *testing.T) {
+	repo, _ := fixture(t)
+	brief := strings.Replace(satisfying, "Touch pkg/thing.go and docs/guide.md.",
+		"The regression at pkg/nope/ghost.go:9999 came from adding the cache.", 1)
+	r := Lint(brief, Options{Repo: repo, Ref: "origin/main"})
+	f := requireStatus(t, r, RuleFilePaths, StatusIndeterminate)
+	if !strings.Contains(f.Detail, "pkg/nope/ghost.go") {
+		t.Fatalf("the fabricated citation must be reported, not exempted: %s", f.Detail)
+	}
+	if hasNote(r, "asks for them to be created") {
+		t.Fatalf("nothing should have been exempted: %v", r.Notes)
+	}
+}
+
+// An exemption belongs to the mention that earned it. A later reference to the same path is
+// still checked, so one "Add x" near the top cannot cover the whole brief.
+func TestCreateExemptionDoesNotCarryToOtherMentions(t *testing.T) {
+	repo, _ := fixture(t)
+	brief := strings.Replace(satisfying, "Touch pkg/thing.go and docs/guide.md.",
+		"Add pkg/new/helper.go with the new code. Then fix the bug in pkg/new/helper.go that the old code left behind.", 1)
+	r := Lint(brief, Options{Repo: repo, Ref: "origin/main"})
+	f := requireStatus(t, r, RuleFilePaths, StatusFail)
+	if !strings.Contains(f.Detail, "pkg/new/helper.go does not exist") {
+		t.Fatalf("the second mention must be checked: %s", f.Detail)
+	}
+}
+
+// The exemption still works for the case it exists for: a file the brief asks to be written,
+// mentioned only that way.
+func TestCreateExemptionStillCoversAFileTheBriefAsksFor(t *testing.T) {
+	repo, _ := fixture(t)
+	brief := strings.Replace(satisfying, "Touch pkg/thing.go and docs/guide.md.",
+		"Write dev/report/EVIDENCE.md with the results.", 1)
+	r := Lint(brief, Options{Repo: repo, Ref: "origin/main"})
+	requireClean(t, r, RuleFilePaths)
+	if !hasNote(r, "dev/report/EVIDENCE.md") {
+		t.Fatalf("the exemption must still be reported: %v", r.Notes)
+	}
+}
+
+// --- the hedge must be attached to the count ---------------------------------------------
+
+// The brief that motivated this rule said 21 when the answer was 7. Prose elsewhere that
+// mentions checking and results is not a hedge.
+func TestRuleHardCountsRejectsBoilerplate(t *testing.T) {
+	repo, _ := fixture(t)
+	brief := strings.Replace(satisfying, "Touch pkg/thing.go and docs/guide.md.",
+		"There are 21 occurrences of the old helper. Fix them. Check the build afterwards and note the results.", 1)
+	r := Lint(brief, Options{Repo: repo})
+	f := requireStatus(t, r, RuleHardCounts, StatusFail)
+	if !strings.Contains(f.Detail, "no hedge attached to it") {
+		t.Fatalf("unexpected detail: %s", f.Detail)
+	}
+}
+
+// A hedge that is attached but never asks for the number is a different failure, and says so.
+func TestRuleHardCountsRejectsAHedgeThatAsksForNothing(t *testing.T) {
+	repo, _ := fixture(t)
+	brief := strings.Replace(satisfying, "Touch pkg/thing.go and docs/guide.md.",
+		"There are 21 occurrences of the old helper, though that figure may be wrong. Fix them.", 1)
+	r := Lint(brief, Options{Repo: repo})
+	f := requireStatus(t, r, RuleHardCounts, StatusFail)
+	if !strings.Contains(f.Detail, "never asks for the worker's own number") {
+		t.Fatalf("unexpected detail: %s", f.Detail)
+	}
+}
