@@ -24,6 +24,8 @@ import (
 	"os/exec"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -38,6 +40,12 @@ const WaitDelay = 2 * time.Second
 // CombinedOutput return it instead of running such a command, so a disarm is loud.
 var ErrDisarmed = errors.New("proc: timeout enforcement is disarmed")
 
+// ErrUnverifiable reports a command whose enforcement could not be established either way.
+// It is deliberately separate from ErrDisarmed: "this is wrong" and "I cannot tell" are
+// different answers, and only the first is a finding about the caller's code. Both refuse to
+// run, because a gate that runs what it cannot vouch for is worse than one that stops.
+var ErrUnverifiable = errors.New("proc: timeout enforcement could not be verified")
+
 // Command is exec.CommandContext plus the three settings that make ctx an enforceable
 // bound. Set Dir, Env, Stdin, Stdout, Stderr and the rest as usual, then start it with this
 // package's Start, Run or CombinedOutput.
@@ -49,40 +57,83 @@ func Command(ctx context.Context, name string, arg ...string) *exec.Cmd {
 	c := exec.CommandContext(ctx, name, arg...)
 	// A new process group, so one signal reaches everything the command forked.
 	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	c.Cancel = groupKill(c)
+	c.Cancel = (&killer{cmd: c}).cancel
 	c.WaitDelay = WaitDelay
 	return c
 }
 
-// groupKill is the Cancel this package installs: it signals the child's whole process
-// group rather than the child alone.
+// killer owns the group kill for exactly ONE command. Cancel is a method value on it rather
+// than a bare closure, which is what lets Check ask two different questions: whether the
+// function is one of ours, and whether it belongs to the command being checked.
 //
-// Every closure this function returns shares one code pointer, which is how Check tells the
-// group kill apart from a replacement (see groupKillPC). That holds only while the function
-// is not inlined: inlining gives each call site its own copy of the closure, and the
-// comparison then rejects commands this package built itself. Hence the directive, and
-// TestCancelIdentityIsStable, which compares a real command's Cancel against groupKillPC.
+// The second question is the one that matters and the one an earlier version never asked.
+// `cp := *c` and `c.Cancel = other.Cancel` both leave a Cancel that closes over a DIFFERENT
+// command, whose Process is nil, so it returns without signalling and the forked grandchild
+// outlives the deadline. Both passed a check that only compared code pointers.
+type killer struct{ cmd *exec.Cmd }
+
+// probe lets Check ask a Cancel which command it belongs to without killing anything.
 //
-//go:noinline
-func groupKill(c *exec.Cmd) func() error {
-	return func() error {
-		if c.Process == nil {
-			return nil
+// The question is only askable before the command starts, which is the only time Check is
+// meant to run, and that is also what keeps a probe from ever suppressing a real kill: the
+// probe is answered on the path where Process is nil and there is nothing to signal, so a
+// cancel with a live process goes straight to the kill whatever any probe is doing.
+var (
+	probeMu   sync.Mutex // one probe at a time
+	probeWant atomic.Pointer[exec.Cmd]
+	probeHit  atomic.Bool
+)
+
+func (k *killer) cancel() error {
+	if k.cmd.Process == nil {
+		if probeWant.Load() == k.cmd {
+			probeHit.Store(true)
 		}
-		// Negative pid: the group, not just the leader.
-		return syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
+		return nil
 	}
+	// Negative pid: the group, not just the leader.
+	return syscall.Kill(-k.cmd.Process.Pid, syscall.SIGKILL)
 }
 
-// groupKillPC is the code pointer of the closure groupKill returns. Func values are not
-// comparable in Go, but every closure produced by one func literal shares a code pointer,
-// so this distinguishes "the Cancel Command installed" from "some other function".
-var groupKillPC = reflect.ValueOf(groupKill(nil)).Pointer()
-
-// Check reports whether c can still enforce its context deadline, naming everything it has
-// lost. A nil error means all three settings are intact.
+// cancelPC is the code pointer of killer.cancel as a method value. Func values are not
+// comparable in Go, but every method value of one method shares the wrapper's code pointer,
+// so this tells "a Cancel this package installed" from "some other function". It is checked
+// first, and only so that Check never invokes a function a caller supplied.
 //
-// Each of the three fails silently rather than loudly, which is why this exists:
+// A mismatch fails closed, which is a decision and not a default. At runtime a mismatch is
+// indistinguishable from a deliberate replacement, so there is nothing safer to do with one.
+// The risk that argues the other way is a toolchain change moving this wrapper's code
+// pointer: Check would then reject every command and leave the validate gate permanently
+// red. TestCancelIdentityIsStable is the guard, comparing a real command's Cancel to this
+// value, so such a change fails a build rather than a gate in the field. The closure this
+// replaced needed a go:noinline pragma to keep the property; a method value keeps it with no
+// pragma, under -l, -l=4, -N -l, -trimpath, -buildmode=pie, -race, -ldflags=-s -w and PGO.
+var cancelPC = reflect.ValueOf((&killer{}).cancel).Pointer()
+
+// boundTo reports whether c.Cancel is the group kill belonging to c. The caller must have
+// established that c.Cancel is one of ours and that c has not started.
+func boundTo(c *exec.Cmd) bool {
+	probeMu.Lock()
+	defer probeMu.Unlock()
+	probeHit.Store(false)
+	probeWant.Store(c)
+	defer probeWant.Store(nil)
+	_ = c.Cancel()
+	return probeHit.Load()
+}
+
+// Check reports whether c can still kill its whole process group when its context ends,
+// naming everything it has lost. A nil error means the group kill is intact and bound to c.
+//
+// What Check cannot see is the context itself: exec.Cmd keeps it unexported, so a command
+// built with context.Background() passes. Check answers "when the deadline fires, does the
+// whole tree die", not "is there a deadline".
+//
+// Call it before Start. The binding below is established by asking the installed Cancel
+// which command it holds, which is only safe while there is no process to signal; on a
+// started command Check returns ErrUnverifiable rather than guessing either way.
+//
+// Each of these fails silently rather than loudly, which is why this exists:
 //
 //   - SysProcAttr.Setpgid gives the child a process group of its own. Without it the child
 //     stays in its parent's group, no group carries the child's pid as its id, and the kill
@@ -95,6 +146,11 @@ var groupKillPC = reflect.ValueOf(groupKill(nil)).Pointer()
 //     own.
 //   - Cancel is the group kill. Replacing it with anything else, os/exec's default
 //     included, goes back to killing the process alone and leaving what it forked.
+//   - Cancel must be the group kill BOUND TO THIS COMMAND. A copied exec.Cmd, or a Cancel
+//     lifted from another command, carries a kill that captured a different Cmd; it finds
+//     that Cmd's nil Process, returns without signalling, and the tree survives on the
+//     WaitDelay backstop alone. (Measured: both shapes let a forked grandchild run to
+//     completion while Run returned at the deadline.)
 //   - WaitDelay bounds the wait on pipes. Zeroing it means Wait blocks for as long as a
 //     child that escaped the group holds the write end, with no deadline reaching it.
 func Check(c *exec.Cmd) error {
@@ -112,8 +168,14 @@ func Check(c *exec.Cmd) error {
 	switch {
 	case c.Cancel == nil:
 		lost = append(lost, "Cancel is nil, so the deadline kills the process alone and leaves whatever it forked")
-	case reflect.ValueOf(c.Cancel).Pointer() != groupKillPC:
+	case reflect.ValueOf(c.Cancel).Pointer() != cancelPC:
 		lost = append(lost, "Cancel is not the group kill this package installed")
+	case c.Process != nil:
+		// The binding can only be established before the command starts. Say that rather
+		// than pass a command whose kill has not been vouched for.
+		return fmt.Errorf("%w: Check must run before Start, so the group kill's binding can be established without signalling anything", ErrUnverifiable)
+	case !boundTo(c):
+		lost = append(lost, "Cancel belongs to a different command, so the deadline would signal that command's process group and not this one's (a copied exec.Cmd, or a Cancel taken from another command, does exactly this)")
 	}
 	if c.WaitDelay == 0 {
 		lost = append(lost, "WaitDelay is zero, so Wait can block forever on a pipe an escaped child holds")

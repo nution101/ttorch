@@ -339,22 +339,77 @@ func TestCheckAcceptsAnIntactCommand(t *testing.T) {
 }
 
 // Check tells the installed Cancel from a replacement by code pointer, which relies on every
-// closure from one func literal sharing one. Pin that, because the check is worthless if the
-// comparison is accidentally true or accidentally false.
+// method value of one method sharing the wrapper's pointer. Pin that, because the check is
+// worthless if the comparison is accidentally true or accidentally false.
 func TestCancelIdentityIsStable(t *testing.T) {
 	a := Command(context.Background(), "true")
 	b := Command(context.Background(), "false")
 	// The comparison Check actually performs. An earlier version of this test compared the
-	// two commands to each other and an unrelated func to groupKillPC, but never a real
-	// command to groupKillPC, so it passed while Check rejected every command in the
-	// package: groupKill was being inlined, giving each call site its own closure.
-	if reflect.ValueOf(a.Cancel).Pointer() != groupKillPC {
+	// two commands to each other and an unrelated func to the recorded pointer, but never a
+	// real command to it, so it passed while Check rejected every command in the package.
+	if reflect.ValueOf(a.Cancel).Pointer() != cancelPC {
 		t.Fatal("a command from Command does not carry the installed Cancel, so Check rejects valid commands")
 	}
 	if reflect.ValueOf(a.Cancel).Pointer() != reflect.ValueOf(b.Cancel).Pointer() {
 		t.Fatal("two commands from Command carry different Cancel code pointers, so Check would reject valid commands")
 	}
-	if reflect.ValueOf(func() error { return nil }).Pointer() == groupKillPC {
+	if reflect.ValueOf(func() error { return nil }).Pointer() == cancelPC {
 		t.Fatal("an unrelated func matches the installed Cancel, so Check would accept a replacement")
+	}
+}
+
+// Identity is not enough: the installed Cancel has to belong to the command being checked.
+// A struct copy and a borrowed Cancel both carry a correct-looking Cancel that closes over
+// a different command, whose Process is nil, so the kill returns without signalling and the
+// grandchild outlives the deadline. Both used to pass Check.
+func TestCheckRejectsAMisboundCancel(t *testing.T) {
+	t.Run("copy", func(t *testing.T) {
+		c := Command(context.Background(), "sh", "-c", "exit 0")
+		cp := *c
+		assertMisbound(t, &cp)
+	})
+	t.Run("crossbound", func(t *testing.T) {
+		c := Command(context.Background(), "sh", "-c", "exit 0")
+		other := Command(context.Background(), "sh", "-c", "exit 0")
+		c.Cancel = other.Cancel
+		assertMisbound(t, c)
+	})
+}
+
+func assertMisbound(t *testing.T, c *exec.Cmd) {
+	t.Helper()
+	err := Check(c)
+	if err == nil {
+		t.Fatal("Check accepted a Cancel bound to a different command")
+	}
+	if !errors.Is(err, ErrDisarmed) {
+		t.Fatalf("Check error = %v, want it to wrap ErrDisarmed", err)
+	}
+	if !strings.Contains(err.Error(), "belongs to a different command") {
+		t.Fatalf("Check error = %q, want it to name the binding", err)
+	}
+	if err := Run(c); !errors.Is(err, ErrDisarmed) {
+		t.Fatalf("Run error = %v, want ErrDisarmed", err)
+	}
+	if c.Process != nil {
+		t.Fatal("a refused command must not have been started")
+	}
+}
+
+// Probing must not be able to suppress a real kill, so it is answered only on the path where
+// there is no process to signal. A command that has already started cannot be probed, and
+// Check says that rather than guessing.
+func TestCheckOnAStartedCommandIsUnverifiableNotWrong(t *testing.T) {
+	c := Command(context.Background(), "sh", "-c", "sleep 0.2")
+	if err := Start(c); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Wait() }()
+	err := Check(c)
+	if !errors.Is(err, ErrUnverifiable) {
+		t.Fatalf("Check error = %v, want ErrUnverifiable", err)
+	}
+	if errors.Is(err, ErrDisarmed) {
+		t.Fatal("a command that cannot be checked is not the same as one that is wrong")
 	}
 }
