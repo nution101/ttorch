@@ -345,11 +345,15 @@ func runOnce(dir string, s Step, to time.Duration) attempt {
 	// timeout, so a hung command's children (servers, watchers) are reaped too.
 	c := proc.Command(ctx, s.Cmd[0], s.Cmd[1:]...)
 	c.Dir = dir
-	// proc.CombinedOutput verifies that enforcement is still in place before it starts
-	// anything, so a check can never run here with an unenforceable timeout.
+	// proc.CombinedOutput re-checks the group kill before it starts anything, so a check
+	// cannot run here with that kill removed or wired to another command. It does not see
+	// the deadline: exec.Cmd keeps its context unexported, so a command built with
+	// context.Background() passes the same check. The WithTimeout above is this function's
+	// guarantee; proc's is that when the deadline fires, the whole group dies.
 	out, err := proc.CombinedOutput(c)
-	if errors.Is(err, proc.ErrDisarmed) {
-		// Fail closed and say why: a check whose timeout cannot end it must not run at all.
+	if errors.Is(err, proc.ErrDisarmed) || errors.Is(err, proc.ErrUnverifiable) {
+		// Fail closed on both. A kill that is gone and a kill that cannot be vouched for
+		// are the same risk here: a step that could outlive the timeout meant to end it.
 		return attempt{output: err.Error(), passed: false, exitCode: -1}
 	}
 	exitCode := 0
