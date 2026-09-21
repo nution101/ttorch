@@ -609,7 +609,8 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 	if verdict.Overall == review.Pass && projectinit.ReadMode(t.Project) == "trusted" {
 		base := worktree.DefaultBranch(t.Project)
 		clean, cerr := worktree.IsClean(t.Worktree)
-		touched, _, terr := diffTouchesGateConfig(t.Project, base, sha)
+		hit, terr := diffTouchesGateConfig(t.Project, base, sha)
+		touched := hit != nil
 		green := false
 		// A trusted auto-mint's green authority MUST be the default-branch gate script,
 		// never ecosystem detection on the worker's checkout (which the worker controls

@@ -480,29 +480,81 @@ func ShowFile(repo, ref, repoPath string) (string, bool) {
 	return string(out), true
 }
 
-// gitRaw runs git and returns stdout VERBATIM, with stderr kept separate. It exists
-// alongside git() for MACHINE-READABLE output: git() folds stderr into the result and
-// trims it, so a warning line ("warning: ...") would be glued onto the first record of a
-// listing and a trailing NUL separator would be eaten. A reader that parses git's output
-// by separator must not be handed either.
-func gitRaw(args ...string) (string, error) {
+// ErrPathCollision marks a git invocation whose own stderr reported that two index entries
+// resolve to ONE file on the target filesystem ("the following paths have collided"). It is
+// distinct from an ordinary git failure because the command SUCCEEDS: git warns, picks a
+// winner, and exits 0. Every caller that materializes or lists a tree treats it as fatal,
+// because a tree with a collision is not the tree that ends up on disk — which is exactly the
+// substitution the trust gate's gate-config guard exists to refuse.
+var ErrPathCollision = errors.New("two paths in this tree collide into one file on the target filesystem")
+
+// collisionWarning reports whether git's stderr carries its path-collision warning. git's
+// wording has been stable ("warning: the following paths have collided (e.g. case-insensitive
+// paths on a case-insensitive filesystem)"), but the match is deliberately loose: it keys on
+// "collid", so a reworded or localized variant that still says the word is caught. A false
+// positive costs a refused merge the lead can re-drive; a false negative loses the only signal
+// git gives for this attack.
+func collisionWarning(stderr string) bool {
+	return strings.Contains(strings.ToLower(stderr), "collid")
+}
+
+// gitRaw runs git and returns stdout VERBATIM plus stderr SEPARATELY. It exists alongside
+// git() for MACHINE-READABLE output: git() folds stderr into the result and trims it, so a
+// warning line would be glued onto the first record of a listing and a trailing NUL separator
+// would be eaten. A reader that parses git's output by separator must not be handed either.
+//
+// stderr is returned rather than dropped on success. git reports the path-collision warning
+// on a SUCCESSFUL command, so discarding stderr whenever the exit code is zero throws away
+// the one signal git gives that two index entries are about to become one file. Callers must
+// inspect it; checkedGitRaw is the wrapper that does so for them.
+func gitRaw(args ...string) (stdout, stderr string, err error) {
 	cmd := exec.Command("git", args...)
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
+	var errBuf strings.Builder
+	cmd.Stderr = &errBuf
 	out, err := cmd.Output()
+	stderr = errBuf.String()
 	if err != nil {
-		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, msg)
+		if msg := strings.TrimSpace(stderr); msg != "" {
+			return "", stderr, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, msg)
 		}
-		return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+		return "", stderr, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
 	}
-	return string(out), nil
+	return string(out), stderr, nil
+}
+
+// checkedGitRaw runs gitRaw and acts on the stderr of a SUCCESSFUL command: a collision
+// warning becomes ErrPathCollision (fail closed), and anything else is surfaced through
+// warnf so an operational git message is visible rather than swallowed.
+func checkedGitRaw(args ...string) (string, error) {
+	out, stderr, err := gitRaw(args...)
+	if err != nil {
+		return "", err
+	}
+	if msg := strings.TrimSpace(stderr); msg != "" {
+		if collisionWarning(msg) {
+			return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), ErrPathCollision, msg)
+		}
+		warnf("git %s: %s", strings.Join(args, " "), msg)
+	}
+	return out, nil
+}
+
+// splitNUL turns git's -z output into paths, dropping the empty record left by the trailing
+// separator. It never splits on newlines, which a path may legitimately contain.
+func splitNUL(out string) []string {
+	var files []string
+	for _, n := range strings.Split(out, "\x00") {
+		if n != "" {
+			files = append(files, n)
+		}
+	}
+	return files
 }
 
 // ChangedFiles returns the repo-relative paths changed between base and the COMMITTED
-// rev — committed objects, never the working tree. It is the sole input to the trust
-// gate's gate-config guard (orchestrator.diffTouchesGateConfig), so the list must be
-// complete and every path must be spelled the way the guard matches it.
+// rev — committed objects, never the working tree. It is an input to the trust gate's
+// gate-config guard (orchestrator.diffTouchesGateConfig), so the list must be complete and
+// every path must be spelled the way the guard matches it.
 //
 // It therefore uses `--name-only -z`: NUL-separated and UNQUOTED regardless of
 // core.quotePath. Plain `--name-only` C-quotes any path containing non-ASCII bytes,
@@ -513,18 +565,31 @@ func gitRaw(args ...string) (string, error) {
 // fragments, neither of which is a real path. internal/review/size.go states this same
 // requirement for the reviewer-set classifier and orchestrator.diffFiles already meets it;
 // this is the gate-config guard's half of it.
+//
+// Removing the quoting removes an incidental defence: a quoted path could not carry a raw
+// newline or control byte into a caller. orchestrator.hostilePath now refuses those
+// explicitly, and the audit sink escapes them, rather than relying on git's display quoting.
 func ChangedFiles(path, base, rev string) ([]string, error) {
-	out, err := gitRaw("-C", path, "diff", "--name-only", "-z", base, rev)
+	out, err := checkedGitRaw("-C", path, "diff", "--name-only", "-z", base, rev)
 	if err != nil {
 		return nil, err
 	}
-	var files []string
-	for _, n := range strings.Split(out, "\x00") {
-		if n != "" {
-			files = append(files, n)
-		}
+	return splitNUL(out), nil
+}
+
+// TreeFiles returns every path in rev's committed tree, NUL-separated and unquoted.
+//
+// The gate-config guard needs the WHOLE tree, not just the diff. The collision attack adds
+// one new index entry ("agent\u017f.md") beside an UNCHANGED covered file ("AGENTS.md"): only
+// the new entry appears in base..rev, so a guard that compares changed paths against each
+// other sees one path and nothing to collide with. Comparing each changed path against the
+// full resulting tree is what makes the pair visible.
+func TreeFiles(path, rev string) ([]string, error) {
+	out, err := checkedGitRaw("-C", path, "ls-tree", "-r", "--name-only", "-z", rev)
+	if err != nil {
+		return nil, err
 	}
-	return files, nil
+	return splitNUL(out), nil
 }
 
 // AddDetached creates a temporary linked worktree at dir checked out (detached) to rev,
@@ -532,7 +597,17 @@ func ChangedFiles(path, base, rev string) ([]string, error) {
 // can be validated free of mutation by a running worker. The caller must RemoveWorktree
 // it when done. dir must not already exist.
 func AddDetached(repo, dir, rev string) error {
-	_, err := git("-C", repo, "worktree", "add", "--detach", dir, rev)
+	// checkedGitRaw, not git(): this is the command that actually MATERIALIZES the tree, so
+	// it is where git emits "the following paths have collided" — on a successful checkout,
+	// having silently picked one entry as the winner. The trust gate validates this checkout
+	// and then fast-forwards the sha it came from, so a collision here means the bytes
+	// validated are not the bytes the tree defines. Fail closed rather than validate a
+	// coin-flip.
+	//
+	// -q because `git worktree add` writes its "Preparing worktree" progress to stderr, and
+	// checkedGitRaw surfaces anything on stderr; without it every gate run would print a
+	// warning about nothing and the real signal would be lost in it.
+	_, err := checkedGitRaw("-C", repo, "worktree", "add", "-q", "--detach", dir, rev)
 	return err
 }
 

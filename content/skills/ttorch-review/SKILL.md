@@ -162,6 +162,9 @@ invalidates the verdict — re-prep, re-review, re-record.
   | `internal/projectinit/**` | parses `AGENTS.md` into the delivery mode and the auto-mint staleness bound |
   | `internal/orchestrator/{gate,merge,validate,validatecache}.go` | the Go code that resolves, enforces and caches the decision |
   | `.github/workflows/**` | the full suite: `.ttorch/validate.sh` runs only the fast lane and defers to CI by name |
+  | `Makefile` | `.ttorch/validate.sh` does nothing but run `make lint` and `make test-fast` |
+  | `content.go`, `internal/installer/**` | decide which embedded file becomes which installed reviewer definition |
+  | `internal/orchestrator/audit.go` | the merge record a trusted merge refuses to proceed without |
 
   `content/skills/` and `content/agents/ttorch-reviewer-*` are embedded by `content.go` and
   installed to `~/.claude`, so a landed edit changes what the gate does on the next run for
@@ -172,8 +175,17 @@ invalidates the verdict — re-prep, re-review, re-record.
   If a worker's diff touches any of these, an auto-merge is refused outright, and a plain
   `ttorch approve` is refused too — the lead must run
   `ttorch approve <id> --allow-gate-change`, and the merge's audit line then names the file
-  that changed. Paths are matched case-insensitively on both sides, so a differently-cased
-  spelling of a covered file is caught.
+  that changed.
+
+  **Matching on the name alone is not enough, so the guard does not rely on it.** Paths are
+  compared under Unicode simple case *folding* on both sides, not `strings.ToLower` — U+017F
+  (long s) folds to `s` on APFS but lowercases to itself, so `agentſ.md` is a spelling of
+  `AGENTS.md` that a lowercasing guard misses while the filesystem resolves it onto the real
+  file. Beyond that, the guard refuses any changed path that **collides** with a different
+  path in the resulting tree, whether or not either one is in the table above. That is the
+  control that does not depend on anticipating a spelling: the attacker picks the name, but
+  the attack always needs two index entries landing on one file. It also refuses a changed
+  path containing a control character, which cannot be written into a one-line audit record.
 
 - **What that claim does NOT cover**, stated so nobody reads it as wider than it is:
   - Gated means trusted mode or `--require-verdict`. A `local`/`validated` merge without
@@ -195,7 +207,22 @@ invalidates the verdict — re-prep, re-review, re-record.
   - `.ttorch/offload/*` and `.ttorch/junk-check.sh` — named in earlier reviews; neither exists
     in this repo, and only `.ttorch/validate.sh` is matched, not the `.ttorch/` directory.
   - `internal/cli/` wires the `--allow-gate-change` flag but is not covered: it is 29% of this
-    repo's commits on its own.
+    repo's commits on its own (56/196). `internal/db/` holds the verdict row the merge trusts
+    for `Overall == pass` and is likewise excluded at 12% (23/196, +16 over the shipped set).
+    Both are cost judgements, not oversights.
+  - Unicode **full** folding (multi-character expansions such as the ﬁ ligature) and NFC/NFD
+    normalization, which APFS also applies. Every covered path is pure ASCII today, which
+    makes both unreachable, and `TestGateConfigPathsAreASCII` fails the moment someone adds a
+    non-ASCII entry so the gap cannot open quietly. The collision check backstops them.
+  - Git will not tell you. `git clone` warns about a collision; `git worktree add --detach` —
+    what the gate uses to build the checkout it validates — exits 0 with nothing on stderr and
+    silently drops the losing entry. The gate's own collision check is load-bearing, not a
+    second opinion.
+  - The anchor tests ask a narrow question. `TestGateConfigCoversTheDecidingCode` catches a
+    listed deciding function MOVING into an uncovered file, and
+    `TestOrchestratorFilesAreClassified` catches a NEW file nobody classified. Neither notices
+    a new deciding function added inside a file already judged non-deciding. That stays a
+    review responsibility.
   - The flag is a boolean, so the cheapest way to defeat the guard is habit. About a third of
     this repo's own commits now trip it, and a lead who passes the flag without reading has
     given exactly the same authorization as one who read. What survives that is the audit

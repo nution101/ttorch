@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/nution101/ttorch/internal/approval"
 	"github.com/nution101/ttorch/internal/projectinit"
@@ -35,6 +36,22 @@ var decidingFunctions = []string{
 	"Approve", "approvalPayload", "splitApprovalPayload", "remintFromVerdict",
 	// the merge and review decisions themselves
 	"MergeLocal", "TrustPrep", "TrustRecord", "carryVerdictForward", "gateCoversRebased",
+	// the audit record a trusted merge refuses to proceed without
+	"writeAudit", "sanitizeAuditLine",
+	// the path-spelling and collision controls the guard rests on
+	"foldRune", "foldKey", "hostilePath", "collidesInTree", "sanitizePathForMessage",
+}
+
+// nonDecidingFiles are the files in this package that have been LOOKED AT and judged not to
+// decide whether a change may merge. Together with gateConfigFiles they must account for every
+// non-test file in the package; TestOrchestratorFilesAreClassified enforces that, so a new
+// file forces one explicit decision instead of defaulting to uncovered.
+var nonDecidingFiles = map[string]string{
+	"internal/orchestrator/autostart.go":    "starts the scheduler daemon; every gate check still runs inside MergeLocal",
+	"internal/orchestrator/landqueue.go":    "serializes WHEN tasks land, not WHETHER; each land re-enters MergeLocal",
+	"internal/orchestrator/orchestrator.go": "Manager construction, task CRUD and status",
+	"internal/orchestrator/overlap.go":      "plans dispatch order from file footprints",
+	"internal/orchestrator/spawn.go":        "launches worker sessions",
 }
 
 // TestGateConfigCoversTheDecidingCode is the anchor for the file-granular half of
@@ -56,6 +73,13 @@ var decidingFunctions = []string{
 //
 // Fixing a failure means either moving the function back, or adding its new file to
 // gateConfigFiles and re-measuring the blast radius — not deleting the entry.
+//
+// WHAT THIS TEST DOES NOT DO: it asks one direction only. Each listed function must live in a
+// covered file. It cannot notice a NEW deciding function, and inside a file already classified
+// as non-deciding it cannot notice anything at all. TestOrchestratorFilesAreClassified covers
+// the new-FILE case; a new deciding function extracted into, say, landqueue.go is caught by
+// review or not at all. Do not describe either test as "fails if any deciding function lands
+// in an uncovered file" — that was claimed here before and it was not true.
 func TestGateConfigCoversTheDecidingCode(t *testing.T) {
 	fset := token.NewFileSet()
 	pkg, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
@@ -260,5 +284,71 @@ func TestMergeLocal_DecidingCodeChangeNeedsAllowGateChange(t *testing.T) {
 				t.Fatalf("an ordinary change must not be recorded as a gate change: %s", b)
 			}
 		})
+	}
+}
+
+// TestOrchestratorFilesAreClassified answers the reverse of the question
+// TestGateConfigCoversTheDecidingCode asks. That test walks a hand-written list of functions
+// and checks where they live, so a brand-new deciding function in a brand-new file passes it
+// in silence — which is how audit.go, holding the writeAudit that MergeLocal refuses to merge
+// without, sat uncovered and unlisted.
+//
+// This test walks the FILES instead. Every non-test file in the package must appear either in
+// gateConfigFiles (it decides, so changing it needs --allow-gate-change) or in
+// nonDecidingFiles with a reason (it was read and judged not to). A new file belongs to
+// neither and fails, which turns "nobody thought about it" into one deliberate line of
+// classification. It cannot judge the classification, only force it to exist.
+func TestOrchestratorFilesAreClassified(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	covered := map[string]bool{}
+	for _, f := range gateConfigFiles {
+		covered[f] = true
+	}
+	for _, e := range entries {
+		n := e.Name()
+		if e.IsDir() || !strings.HasSuffix(n, ".go") || strings.HasSuffix(n, "_test.go") {
+			continue
+		}
+		rel := "internal/orchestrator/" + n
+		_, classified := nonDecidingFiles[rel]
+		if covered[rel] == classified {
+			if classified {
+				t.Errorf("%s is in BOTH gateConfigFiles and nonDecidingFiles; it cannot be both", rel)
+				continue
+			}
+			t.Errorf("%s is new and unclassified. Decide: if a change to it can alter whether or how a merge is gated, add it to gateConfigFiles (and re-measure the blast radius in docs/ARCHITECTURE.md); otherwise add it to nonDecidingFiles with the reason.", rel)
+		}
+	}
+	// A stale entry is dead documentation that reads as a decision.
+	for rel := range nonDecidingFiles {
+		if _, err := os.Stat(filepath.Join("..", "..", filepath.FromSlash(rel))); err != nil {
+			t.Errorf("nonDecidingFiles names %s, which no longer exists", rel)
+		}
+	}
+}
+
+// TestGateConfigPathsAreASCII pins the precondition that lets foldKey be enough.
+//
+// foldKey applies Unicode SIMPLE case folding. It does not apply full folding or NFC/NFD
+// normalization, and APFS applies both. While every covered path is pure ASCII that gap is
+// unreachable: ASCII has no decomposed form and no multi-character fold. The first non-ASCII
+// entry makes normalization a live bypass — a composed and a decomposed spelling of the same
+// covered path would fold to different keys while the filesystem sees one file.
+//
+// If this test fails, the entry is not necessarily wrong, but foldKey must normalize (NFC)
+// before folding and the limits recorded in validate.go and the docs must be rewritten.
+func TestGateConfigPathsAreASCII(t *testing.T) {
+	for _, set := range [][]string{gateConfigFiles, gateConfigPrefixes} {
+		for _, p := range set {
+			for _, r := range p {
+				if r > unicode.MaxASCII {
+					t.Errorf("gate-config entry %q contains non-ASCII %q: foldKey does not normalize, so a decomposed spelling of this path would evade the guard. Add NFC normalization to foldKey and update the stated limits before adding it.", p, r)
+					break
+				}
+			}
+		}
 	}
 }

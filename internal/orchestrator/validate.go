@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/review"
@@ -53,12 +55,25 @@ func (m *Manager) Validate(taskID string) ([]validate.Result, error) {
 // one, because the maintainer self-updates routinely; a landed weakening of gate.go reaches
 // every repo on the machine the first time they do.
 //
-// They are listed by exact FILE and not as "internal/orchestrator/", because the package is
-// 39% of this repo's commits and covering all of it would put more than half of every change
-// behind --allow-gate-change (measured: see gateconfig_test.go's anchor test and
-// docs/ARCHITECTURE.md). A file-granular list over a package that gets refactored decays
-// silently, so TestGateConfigCoversTheDecidingCode fails if any of the deciding functions
-// moves to a file this list does not name.
+// The orchestrator entries are listed by exact FILE and not as "internal/orchestrator/",
+// because the package is 39% of this repo's commits and covering all of it would put more
+// than half of every change behind --allow-gate-change (measured: see docs/ARCHITECTURE.md).
+// audit.go is here because MergeLocal refuses to merge when writeAudit fails, so a one-line
+// change there strips the record from every trusted merge; it costs 0 additional commits,
+// since nothing has ever touched it alone.
+//
+// A file-granular list over a package that gets refactored decays silently, so two tests hold
+// it: TestGateConfigCoversTheDecidingCode catches a MOVE of a listed deciding function into an
+// unnamed file, and TestOrchestratorFilesAreClassified catches a NEW file that nobody has
+// classified either way. Neither can recognise a new deciding function inside an already-
+// classified non-deciding file; that remains a review responsibility and is stated as such.
+//
+// Makefile and content.go sit outside both packages and are here on the same delayed-diff
+// argument. .ttorch/validate.sh — the gate's validation authority, already covered — does
+// nothing but run `make lint` and `make test-fast`, so redefining those targets redefines
+// what green means without touching a covered script. content.go is the //go:embed that
+// decides which repo file becomes which installed reviewer definition; it costs 0 additional
+// commits, as does Makefile.
 var gateConfigFiles = []string{
 	".ttorch/validate.sh",
 	"AGENTS.md",
@@ -66,6 +81,9 @@ var gateConfigFiles = []string{
 	"internal/orchestrator/merge.go",
 	"internal/orchestrator/validate.go",
 	"internal/orchestrator/validatecache.go",
+	"internal/orchestrator/audit.go",
+	"Makefile",
+	"content.go",
 }
 
 // gateConfigPrefixes define the gate by path prefix, where the covered unit is a directory
@@ -94,6 +112,12 @@ var gateConfigFiles = []string{
 // the prefix is the honest unit and carries none of the refactor brittleness the orchestrator
 // file list does.
 //
+// internal/installer/ maps the embedded content/ tree onto ~/.claude — it decides WHICH
+// embedded file becomes ~/.claude/agents/ttorch-reviewer-security.md. Covering the reviewer
+// definitions while leaving the mapping open would let an uncovered file (content/agents/
+// ttorch-worker.md is deliberately excluded) be installed as a reviewer instead, through the
+// same delayed diff channel. 3 commits.
+//
 // .github/workflows/ is here because .ttorch/validate.sh on this repo runs only the FAST lane
 // and says so in its own header: the full suite, including the orchestrator e2e tests, runs in
 // CI as the required check. CI is therefore half of what "validated" means for this repo, and
@@ -109,34 +133,97 @@ var gateConfigPrefixes = []string{
 	"internal/approval/",
 	"internal/validate/",
 	"internal/projectinit/",
+	"internal/installer/",
 	".github/workflows/",
 }
 
-// matchesGateConfig reports whether a repository path names a gate-definition file. Matching
-// is exact against gateConfigFiles and by prefix against gateConfigPrefixes.
+// foldRune maps r to the lowest code point in its Unicode simple-case-folding orbit, so every
+// spelling that a case-insensitive filesystem treats as one character maps to one key.
 //
-// BOTH SIDES of every comparison are case-folded. Folding only the incoming path would leave
-// "AGENTS.md" — the one entry that is not already lowercase — unmatchable, which is the
-// half-folded-comparison bug this repo has shipped repeatedly; folding the literals too means
-// a mixed-case entry added later cannot reintroduce it. Callers must supply a slash-separated,
+// strings.ToLower is NOT this relation, and the difference is exploitable. ToLower is simple
+// lowercasing; APFS and NTFS compare with case FOLDING, which is wider. U+017F LATIN SMALL
+// LETTER LONG S folds together with 's' and 'S' but lowercases to itself, so "agentſ.md"
+// lowercased is still "agentſ.md" and matches nothing — while the filesystem happily resolves
+// it onto AGENTS.md. U+212A KELVIN SIGN behaves the same against 'k'. unicode.SimpleFold walks
+// the whole orbit, which is what the filesystem does.
+func foldRune(r rune) rune {
+	lowest := r
+	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+		if f < lowest {
+			lowest = f
+		}
+	}
+	return lowest
+}
+
+// foldKey is the canonical form a path is matched under: every rune reduced to its
+// case-folding orbit's lowest code point.
+//
+// It covers Unicode SIMPLE folding only. It does NOT cover full folding (the multi-character
+// expansions, e.g. the ﬁ ligature to "fi") and it does NOT cover NFC/NFD normalization, which
+// APFS also applies — so a composed and a decomposed spelling of the same accented path fold
+// to different keys here while the filesystem sees one file. That is survivable only because
+// every covered path is pure ASCII, which TestGateConfigPathsAreASCII enforces: the moment
+// someone adds a non-ASCII entry, normalization becomes a live bypass and that test fails to
+// say so. The collision check is the backstop for everything spelling-based matching misses.
+func foldKey(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		b.WriteRune(foldRune(r))
+	}
+	return b.String()
+}
+
+// matchesGateConfig reports whether a repository path names a gate-definition file. Matching
+// is exact against gateConfigFiles and by prefix against gateConfigPrefixes, with BOTH SIDES
+// reduced to foldKey first.
+//
+// Folding both sides matters because "AGENTS.md" is the one entry that is not already
+// lowercase; folding only the incoming path would leave it unmatchable, which is the
+// half-folded comparison this repo has shipped before. Callers must supply a slash-separated,
 // repo-relative path; worktree.ChangedFiles produces exactly that, unquoted.
 //
 // Folding makes the guard deliberately OVER-match on a case-sensitive filesystem, where
-// "Agents.md" is a genuinely different file from "AGENTS.md" and does not configure anything.
-// Over-matching costs an --allow-gate-change on a merge that did not need one; under-matching
-// merges a gate change unflagged. The guard takes the first. It also means the guard and
-// resolveGateDefinition can disagree — the resolver asks git for ".ttorch/validate.sh" by its
-// exact name — but only in that same safe direction: the guard flags a differently-cased
-// script the resolver would not load.
+// "Agents.md" is a genuinely different file that configures nothing. Over-matching costs an
+// --allow-gate-change on a merge that did not need one; under-matching merges a gate change
+// unflagged. The guard takes the first. It also means the guard and resolveGateDefinition can
+// disagree — the resolver asks git for ".ttorch/validate.sh" by its exact name — but only in
+// that same safe direction.
+//
+// Spelling-based matching is NECESSARY AND NOT SUFFICIENT, and the limit is structural rather
+// than a gap to be closed by folding harder: the attacker picks the spelling, and the guard
+// must anticipate every spelling a filesystem might collapse onto a covered name. That is a
+// race the guard loses eventually. diffTouchesGateConfig therefore also refuses any changed
+// path that COLLIDES with another path in the resulting tree, whatever either is called.
 func matchesGateConfig(name string) bool {
-	folded := strings.ToLower(name)
+	folded := foldKey(name)
 	for _, g := range gateConfigFiles {
-		if folded == strings.ToLower(g) {
+		if folded == foldKey(g) {
 			return true
 		}
 	}
 	for _, p := range gateConfigPrefixes {
-		if strings.HasPrefix(folded, strings.ToLower(p)) {
+		if strings.HasPrefix(folded, foldKey(p)) {
+			return true
+		}
+	}
+	return false
+}
+
+// hostilePath reports whether a repo path carries a byte that has no business in a filename
+// and that downstream consumers render verbatim.
+//
+// A C0 control character or DEL is the marker. The audit log is newline-delimited
+// (audit.go's "%s %s\n") and the merge record interpolates the matched path into it, so a
+// path containing a literal newline writes a second, well-formed, entirely fabricated
+// trusted-merge line. git's C-quoting used to make that unreachable; reading the file list
+// with -z removed the quoting along with the quoting bug, so the refusal has to be explicit.
+// The audit sink escapes control characters as well — this is the half that stops the path
+// from reaching a merge at all, that one is the half that protects every other call site.
+func hostilePath(name string) bool {
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
 			return true
 		}
 	}
@@ -345,20 +432,120 @@ func hasDefaultBranchGateScript(repo string) bool {
 	return ok
 }
 
-// diffTouchesGateConfig reports whether the COMMITTED diff base..rev modifies any
-// gate-definition file (and which one), so a merge of such a change can be refused in favor of
-// an explicit human approval. It reads committed objects, not the working tree, so the check
-// cannot be evaded by reverting the bytes in the worktree. The name returned is the first
-// match in git's order, which is what the refusal and the audit line report.
-func diffTouchesGateConfig(repo, base, rev string) (bool, string, error) {
-	names, err := worktree.ChangedFiles(repo, base, rev)
+// gateConfigHit describes why a committed diff counts as changing the gate's own definition.
+// Path is the changed path that tripped the guard — the value the merge's audit line records
+// as gate-change= — and Reason is the sentence the refusal shows the lead.
+type gateConfigHit struct {
+	Path   string
+	Reason string
+}
+
+// diffTouchesGateConfig reports whether the COMMITTED diff base..rev changes the gate's own
+// definition, so a merge of such a change can be refused in favour of an explicit human
+// approval. It reads committed objects, not the working tree, so the check cannot be evaded
+// by reverting the bytes in the worktree. A nil hit means the diff is clean.
+//
+// Three refusals, in increasing order of how little they trust the path's spelling:
+//
+//  1. A changed path carrying a C0 control character or DEL. It cannot be rendered into a
+//     line-delimited audit record safely and no legitimate change introduces one.
+//
+//  2. A changed path that COLLIDES with a different path in rev's resulting tree — two index
+//     entries the target filesystem resolves to one file. This is the control that does not
+//     depend on guessing spellings. The attack adds "agent\u017f.md" (U+017F folds to 's' on
+//     APFS) next to an UNCHANGED "AGENTS.md"; checkout writes the attacker's bytes into
+//     AGENTS.md and the repo is in trusted mode with attacker-chosen content. Spelling-based
+//     matching can be beaten by picking a spelling the guard did not anticipate, but the
+//     attack ALWAYS needs two entries landing on one file, and that is observable regardless
+//     of what either is called. It fires whether or not either path matches the gate set,
+//     because the guard cannot know which entry wins the checkout.
+//
+//     The comparison is against the WHOLE tree, not just the changed list: in the attack only
+//     the new entry is in the diff, so pairwise comparison within the diff sees nothing.
+//
+//  3. A changed path that matches the gate set (matchesGateConfig).
+//
+// A collision or a hostile path is reported with the changed path as Path, so the refusal and
+// the audit both name the entry the worker actually added.
+func diffTouchesGateConfig(repo, base, rev string) (*gateConfigHit, error) {
+	changed, err := worktree.ChangedFiles(repo, base, rev)
 	if err != nil {
-		return false, "", err
+		return nil, err
 	}
-	for _, n := range names {
-		if matchesGateConfig(n) {
-			return true, n, nil
+	for _, n := range changed {
+		if hostilePath(n) {
+			return &gateConfigHit{
+				Path:   sanitizePathForMessage(n),
+				Reason: fmt.Sprintf("adds a path containing a control character (%s); such a path cannot be recorded in the audit log unambiguously", sanitizePathForMessage(n)),
+			}, nil
 		}
 	}
-	return false, "", nil
+	if hit, err := collidesInTree(repo, rev, changed); err != nil || hit != nil {
+		return hit, err
+	}
+	for _, n := range changed {
+		if matchesGateConfig(n) {
+			return &gateConfigHit{Path: n, Reason: fmt.Sprintf("changes a gate-definition file (%s)", n)}, nil
+		}
+	}
+	return nil, nil
+}
+
+// collidesInTree reports the first changed path that shares a fold key with a DIFFERENT path
+// in rev's tree. Pairs are reported deterministically (the tree list is sorted before the
+// partner is chosen) so the same diff always produces the same refusal and the same audit
+// line, which matters for a record a human is meant to compare across runs.
+//
+// A pre-existing collision between two paths the diff does not touch is NOT reported: it
+// would block every unrelated merge in the repo forever with no way to land the fix. The
+// attack always introduces its own entry, so it always appears in the changed list.
+func collidesInTree(repo, rev string, changed []string) (*gateConfigHit, error) {
+	if len(changed) == 0 {
+		return nil, nil
+	}
+	tree, err := worktree.TreeFiles(repo, rev)
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(tree)
+	byKey := make(map[string][]string, len(tree))
+	for _, p := range tree {
+		k := foldKey(p)
+		byKey[k] = append(byKey[k], p)
+	}
+	for _, n := range changed {
+		for _, other := range byKey[foldKey(n)] {
+			if other == n {
+				continue
+			}
+			return &gateConfigHit{
+				Path: n,
+				Reason: fmt.Sprintf("adds %q, which resolves to the same file as %q on a case-insensitive or normalizing filesystem; a checkout writes one over the other and the guard cannot tell which wins",
+					sanitizePathForMessage(n), sanitizePathForMessage(other)),
+			}, nil
+		}
+	}
+	return nil, nil
+}
+
+// sanitizePathForMessage renders a path safely inside a one-line refusal or audit record,
+// escaping the control characters hostilePath refuses. It mirrors the audit sink's escaping
+// so a path never breaks the line it is written on, wherever it is rendered.
+func sanitizePathForMessage(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r == '\r':
+			b.WriteString(`\r`)
+		case r == '\t':
+			b.WriteString(`\t`)
+		case r < 0x20 || r == 0x7f:
+			fmt.Fprintf(&b, `\x%02x`, r)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }

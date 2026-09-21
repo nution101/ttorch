@@ -206,6 +206,36 @@ func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error)
 		if v.Overall != review.Pass {
 			return "", fmt.Errorf("trust gate: the review verdict for %q is %q, not pass; resolve the blocking findings and re-record", taskID, v.Overall)
 		}
+		// A gated merge may not change the gate's own definition unless the approval says so
+		// by name. Checked against the COMMITTED diff, so reverting the bytes in the worktree
+		// cannot hide it. A trusted AUTO-merge can never alter its own gate. A HUMAN approval
+		// can, but only one minted with --allow-gate-change; a plain human token is refused
+		// and the refusal names the offending file.
+		//
+		// This CLOSES NOTHING on its own. Any process running as the lead can still write the
+		// token file with the scope marker in it, and no change inside ttorch alters that. What
+		// it removes is the silent skip: this check previously did not run at all for a human
+		// token, so a gate change rode through on any human approval with nothing in the audit
+		// log naming it. Now it takes a deliberate flag and the merge's audit line records the
+		// file. Loud instead of silent, not blocked.
+		//
+		// It runs BEFORE the validate, not after. A diff carrying a path collision produces a
+		// checkout that is not the tree it came from — `git worktree add` drops the losing
+		// entry with no warning at all (proven in worktree's TestAddDetached_DoesNotWarnOnCollision) —
+		// so validating first would run the suite against the wrong bytes and, worse, cache
+		// that result green under the real tree's hash. Refuse the diff before anything reads
+		// it.
+		if hit, terr := diffTouchesGateConfig(repo, def, workerHead); terr != nil {
+			return "", terr
+		} else if hit != nil {
+			if tokBy == "auto" {
+				return "", fmt.Errorf("trust gate: %q %s; a trusted auto-merge cannot alter its own gate — the lead must approve it explicitly with 'ttorch approve %s --allow-gate-change'", taskID, hit.Reason, taskID)
+			}
+			if !tokAllowsGateChange {
+				return "", fmt.Errorf("trust gate: %q %s, but its approval does not authorize a gate change; re-approve with 'ttorch approve %s --allow-gate-change'", taskID, hit.Reason, taskID)
+			}
+			gateChange = hit.Path
+		}
 		// Validate the COMMITTED sha (an immutable detached checkout), using the gate
 		// definition from the DEFAULT BRANCH. No checks detected is a hard BLOCK. When trust
 		// prep already validated this EXACT sha (its commit-pinned validate.json is still the
@@ -221,29 +251,6 @@ func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error)
 				return "", fmt.Errorf("trust gate: no checks detected for %q; the gate requires a build/test/lint suite on the default branch (add .ttorch/validate.sh)", taskID)
 			}
 			return "", fmt.Errorf("trust gate: %d of %d checks failed for %q; fix them, re-validate, and re-record the verdict", len(validate.Failures(results)), len(results), taskID)
-		}
-		// A gated merge may not change the gate's own definition unless the approval says so
-		// by name. Checked against the COMMITTED diff, so reverting the bytes in the worktree
-		// cannot hide it. A trusted AUTO-merge can never alter its own gate. A HUMAN approval
-		// can, but only one minted with --allow-gate-change; a plain human token is refused
-		// and the refusal names the offending file.
-		//
-		// This CLOSES NOTHING on its own. Any process running as the lead can still write the
-		// token file with the scope marker in it, and no change inside ttorch alters that. What
-		// it removes is the silent skip: this check previously did not run at all for a human
-		// token, so a gate change rode through on any human approval with nothing in the audit
-		// log naming it. Now it takes a deliberate flag and the merge's audit line records the
-		// file. Loud instead of silent, not blocked.
-		if touched, name, terr := diffTouchesGateConfig(repo, def, workerHead); terr != nil {
-			return "", terr
-		} else if touched {
-			if tokBy == "auto" {
-				return "", fmt.Errorf("trust gate: %q changes a gate-definition file (%s); a trusted auto-merge cannot alter its own gate — the lead must approve it explicitly with 'ttorch approve %s --allow-gate-change'", taskID, name, taskID)
-			}
-			if !tokAllowsGateChange {
-				return "", fmt.Errorf("trust gate: %q changes a gate-definition file (%s), but its approval does not authorize a gate change; re-approve with 'ttorch approve %s --allow-gate-change'", taskID, name, taskID)
-			}
-			gateChange = name
 		}
 		// HEAD-unchanged bracket: the worker must not have advanced HEAD during the gate,
 		// so the sha we validated and pinned is still the sha that merges.

@@ -243,9 +243,12 @@ passing commit-pinned verdict plus a fresh green validate auto-mints the approva
   live reviewer and manager instructions, not documentation about the gate), `internal/review/**`,
   `internal/approval/**`, `internal/validate/**`, `internal/projectinit/**` (which parses
   `AGENTS.md` into the delivery mode) and
-  `internal/orchestrator/{gate,merge,validate,validatecache}.go` (the Go code that decides),
-  and `.github/workflows/**` (the full suite, which `.ttorch/validate.sh` defers to by name
-  because it runs only the fast lane). Paths are matched case-insensitively on both sides. On
+  `internal/orchestrator/{gate,merge,validate,validatecache,audit}.go` (the Go code that
+  decides, including the audit record a trusted merge refuses to proceed without),
+  `internal/installer/**` and `content.go` (which decide which embedded file becomes which
+  installed reviewer definition), `Makefile` (which `.ttorch/validate.sh` does nothing but
+  invoke), and `.github/workflows/**` (the full suite, which `.ttorch/validate.sh` defers to
+  by name because it runs only the fast lane). On
   a **gated** merge (trusted mode, or any mode with `--require-verdict`) a human approval does
   not wave it through either: it needs `ttorch approve <id> --allow-gate-change`, and the
   merge audit line names the file.
@@ -275,9 +278,12 @@ rather than by what sounds prudent. Measured over the **196 non-merge commits re
 | + `internal/approval/**` | 47 | 24% |
 | + `internal/validate/**` | 46 | 23% |
 | + `internal/projectinit/**` | 47 | 24% |
+| + `internal/installer/**` | 71 | 36% |
+| + `Makefile`, `content.go`, `internal/orchestrator/audit.go` (each 0 marginal) | 68 | 35% |
 | + `.github/workflows/**` | 49 | 25% |
 | + `internal/orchestrator/{gate,merge,validate,validatecache}.go` | 52 | 27% |
-| **the set above, all together** | **68** | **35%** |
+| **the set above, all together** | **71** | **36%** |
+| ~~+ `internal/db/`, excluded on cost~~ | 87 | 44% |
 | ~~+ `internal/orchestrator/**` and `internal/review/**` wholesale~~ | 109 | 56% |
 
 (Each middle row is the landed 22% set plus that one addition, so the rows overlap and do not
@@ -294,9 +300,76 @@ decision cost 8 commits instead of 62.
 
 A file list over a package is brittle in a way a directory prefix is not: this package has
 already been re-split once (`140d2b91`), and a later split that moved `MergeLocal` into a new
-file would drop it out of coverage silently. `TestGateConfigCoversTheDecidingCode` parses the
-package and fails if any deciding function lands in a file `gateConfigFiles` does not name, so
-that decay is loud.
+file would drop it out of coverage silently. Two tests hold it, and between them they cover
+less than the phrase "any deciding function" suggests:
+
+- `TestGateConfigCoversTheDecidingCode` walks a hand-written list of deciding functions and
+  fails if one has MOVED into a file `gateConfigFiles` does not name.
+- `TestOrchestratorFilesAreClassified` walks the files instead and fails on a NEW file that
+  appears in neither `gateConfigFiles` nor `nonDecidingFiles`, so a file nobody has looked at
+  cannot default to uncovered. This is the check `audit.go` needed and did not have.
+
+Neither notices a new deciding function added inside a file already classified as
+non-deciding. That stays a review responsibility. An earlier version of this section claimed
+the anchor test "fails if any deciding function lands in a file `gateConfigFiles` does not
+name", which was not true of what the test does.
+
+### Why name-matching is not the load-bearing control
+
+`matchesGateConfig` folds both sides with Unicode simple case folding, not `strings.ToLower`.
+The difference is exploitable rather than pedantic: APFS and NTFS compare with case *folding*,
+which is a wider relation than lowercasing. U+017F LATIN SMALL LETTER LONG S folds together
+with `s` but lowercases to itself, so a second index entry named `agentſ.md` lowercases to
+something that matches nothing while the filesystem resolves it straight onto `AGENTS.md`. The
+worker never touches `AGENTS.md`; the checkout does it for them, and the repo comes out in
+trusted mode with attacker-chosen content. U+212A KELVIN SIGN does the same against `k`.
+
+Folding fixes that spelling. It does not fix the class, because the attacker picks the
+spelling and the guard would have to anticipate every collapse rule of every filesystem. So
+the guard also refuses **any changed path that collides with a different path in the resulting
+tree**, whether or not either one is in the covered set. The attack always needs two index
+entries resolving to one file, and that is observable without recognising either name.
+
+The comparison is against the whole tree rather than the changed list, because in the attack
+only the new entry is in the diff — `AGENTS.md` is untouched, so comparing changed paths
+against each other sees one path and nothing to pair it with. A collision between two paths
+the diff does not touch is deliberately not reported: it would block every unrelated merge in
+the repo with no way to land the fix.
+
+Git will not do this for you. `git clone` prints "the following paths have collided";
+`git worktree add --detach`, which is what the gate uses to materialize the checkout it
+validates, exits 0 with nothing on stderr and silently drops the loser (pinned in
+`worktree.TestAddDetached_DoesNotWarnOnCollision`, which reads the attacker's bytes back out
+of `AGENTS.md` in that checkout). `worktree.gitRaw` also used to discard stderr on success,
+throwing away even the warning git does give; it now returns stderr, and `checkedGitRaw` turns
+a collision warning into `ErrPathCollision`. The gate-config guard runs **before** the
+validate for the same reason: a colliding tree validates the wrong bytes and would cache that
+result green under the real tree's hash.
+
+Two residual limits are recorded rather than fixed. Unicode *full* folding (multi-character
+expansions such as the ﬁ ligature) and NFC/NFD normalization, which APFS also applies, are out
+of scope while every covered path is pure ASCII — `TestGateConfigPathsAreASCII` fails the
+moment that stops being true. And reading the diff with `-z` removed git's C-quoting, which
+had been the only thing keeping a raw newline out of a path name; a covered path containing a
+newline would write a second, well-formed, fabricated merge record into the newline-delimited
+audit log. The guard refuses control characters in a changed path, and `sanitizeAuditLine`
+escapes them at the sink so every other call site is covered too.
+
+`Makefile`, `content.go` and `internal/orchestrator/audit.go` each cost **zero** additional
+commits — in 196 commits none has ever been touched without something already covered being
+touched too — and each decides the gate. `.ttorch/validate.sh` is covered but does nothing
+except run `make lint` and `make test-fast`, so redefining those targets redefines green
+without touching a covered script. `content.go` is the `//go:embed` that maps a repo file onto
+an installed reviewer definition, and `internal/installer/**` (3 commits) is the mapping
+itself: covering `content/agents/ttorch-reviewer-*` while leaving the mapping open would let a
+deliberately excluded file such as `content/agents/ttorch-worker.md` be installed as a reviewer
+instead. `audit.go` holds the only `writeAudit`, and `MergeLocal` refuses to merge when it
+fails, so one line there strips the record from every trusted merge.
+
+`internal/db/` is the one genuine cost judgement left out. It holds `Store.GetVerdict`, the row
+the merge trusts for `Overall == pass`; covering it costs 16 more commits (23/196 on its own,
+taking the set to 44%). Excluded on cost, recorded here and in the skill so it reads as a
+decision rather than an omission.
 
 `.github/workflows/**` is in for a different reason. The trusted gate never consults CI, which
 is the argument against it — but this repo's `.ttorch/validate.sh` runs only `make test-fast`
@@ -305,7 +378,7 @@ CI as the required check. CI is therefore half of what "validated" means here, a
 `ci.yml` weakens every later change's validation through the same delayed diff channel that
 put the skills on the list. It costs 5 commits.
 
-What the numbers do not fix: at 35%, roughly one merge in three in this repo needs
+What the numbers do not fix: at 36%, roughly one merge in three in this repo needs
 `--allow-gate-change`, and the flag is a boolean. A lead who passes it by reflex authorizes
 exactly as much as one who read the diff. The audit line naming the file survives either way,
 which is the guard's durable half. Making the flag take the expected paths — so a bare

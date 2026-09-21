@@ -1724,8 +1724,14 @@ func TestMergeLocal_RequireVerdictHumanApprover(t *testing.T) {
 // TestMergeLocal_GateUsesDefaultBranchScriptNotWorker is the lock-down guard: the gate's
 // validation authority is the .ttorch/validate.sh on the DEFAULT BRANCH, not the worker's
 // copy. The default branch's gate FAILS; the worker rewrites validate.sh on its own branch
-// to pass; the gate must still run the default-branch (failing) script. A human approval
-// isolates this from the gate-config-change rule (which only blocks AUTO merges).
+// to pass; the gate must still run the default-branch (failing) script.
+//
+// The approval carries --allow-gate-change, which is what isolates this from the
+// gate-config rule. Rewriting validate.sh IS a gate-definition change, and since step 6 a
+// plain human approval no longer waves one through; since the guard also moved ahead of the
+// validate (a colliding tree must never be validated), an unscoped approval now fails on the
+// gate-config refusal before the script ever runs. Scoping the approval lets the guard pass
+// and puts the validate back under test, which is the property this test exists for.
 func TestMergeLocal_GateUsesDefaultBranchScriptNotWorker(t *testing.T) {
 	m, repo := deliveryHarness(t, "defbranch")
 	commitGateScript(t, repo, "exit 1") // default-branch gate FAILS
@@ -1745,7 +1751,17 @@ func TestMergeLocal_GateUsesDefaultBranchScriptNotWorker(t *testing.T) {
 	if _, err := m.TrustRecord("db1", "", time.Minute); err != nil {
 		t.Fatal(err)
 	}
+	// Unscoped first: the gate-config guard refuses before anything is validated.
 	if err := m.Approve("db1", time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.MergeLocal("db1", true); err == nil {
+		t.Fatal("rewriting validate.sh must be refused without --allow-gate-change")
+	} else if !strings.Contains(err.Error(), "--allow-gate-change") {
+		t.Fatalf("expected the gate-config refusal, got: %v", err)
+	}
+	// Scoped: the guard passes, and the DEFAULT-BRANCH script still decides.
+	if err := m.Approve("db1", time.Minute, true); err != nil {
 		t.Fatal(err)
 	}
 	_, err = m.MergeLocal("db1", true)
@@ -1912,6 +1928,14 @@ func TestMatchesGateConfig(t *testing.T) {
 		{"a reviewer definition, mixed case", "Content/Agents/TTorch-Reviewer-Security.md", true},
 		{"the validate script, mixed case", ".TTorch/Validate.SH", true},
 		{"a deciding go file, mixed case", "Internal/Orchestrator/Gate.go", true},
+
+		// Unicode case FOLDING, not simple lowercasing. A case-insensitive filesystem folds;
+		// strings.ToLower does not, and these are the spellings that exploited the gap.
+		{"U+017F long s for AGENTS.md", "agent\u017f.md", true},
+		{"U+017F long s in a covered prefix", "content/skill\u017f/x.md", true},
+		{"U+017F in the validate script", ".ttorch/validate.\u017fh", true},
+		{"U+212A kelvin sign", "content/\u212Askills/x.md", false},
+		{"U+212A where a k is covered", "content/agents/ttorch-reviewer-\u212A.md", true},
 
 		{"a non-reviewer agent definition", "content/agents/golang-pro.md", false},
 		{"the worker agent definition", "content/agents/ttorch-worker.md", false},
