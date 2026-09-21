@@ -171,3 +171,53 @@ func contains(s []string, v string) bool {
 	}
 	return false
 }
+
+// TestClassify_HarnessConfigIsNotInertProse pins the hole an adversarial review found in the
+// trust-model step 2 pilot. A session's harness configuration — CLAUDE.md, AGENTS.md, anything
+// under .claude/ — carries instructions and hooks that change how an agent behaves, so it is
+// not inert prose however it is spelled. Two of those paths end in .md, and classifying a diff
+// of them as docs-only drops the security reviewer, which is the dimension that runs outside
+// the worker's worktree. A worker could then subvert every reviewer that did run by committing
+// only .md files.
+func TestClassify_HarnessConfigIsNotInertProse(t *testing.T) {
+	cases := []struct {
+		name  string
+		files []string
+	}{
+		{"root CLAUDE.md alone", []string{"CLAUDE.md"}},
+		{"AGENTS.md alone", []string{"AGENTS.md"}},
+		{"a reviewer's own agent definition", []string{".claude/agents/ttorch-reviewer-security.md"}},
+		{"harness config spelled entirely in .md", []string{
+			"CLAUDE.md",
+			".claude/agents/ttorch-reviewer-correctness.md",
+			".claude/agents/ttorch-reviewer-scope.md",
+		}},
+		{"a nested package's CLAUDE.md", []string{"internal/orchestrator/CLAUDE.md"}},
+		{"harness config mixed with real prose", []string{"README.md", ".claude/settings.json"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			size, dims := Classify(tc.files, 5, false, true)
+			if size == SizeDocsOnly {
+				t.Fatalf("harness config must not classify as docs-only: %v -> %s %v", tc.files, size, dims)
+			}
+			if !contains(dims, DimensionSecurity) {
+				t.Fatalf("harness config must keep the security reviewer: %v -> %s %v", tc.files, size, dims)
+			}
+		})
+	}
+}
+
+// TestClassify_RealProseIsStillDocsOnly is the must-not-trip side: ordinary documentation still
+// gets the reduced set. Widening the code bucket to cover harness config must not turn every
+// docs change into a three-dimension pass.
+func TestClassify_RealProseIsStillDocsOnly(t *testing.T) {
+	files := []string{"README.md", "docs/design.md", "CHANGELOG", "LICENSE", "notes/claude-usage.md"}
+	size, dims := Classify(files, 500, false, true)
+	if size != SizeDocsOnly {
+		t.Fatalf("ordinary prose must stay docs-only: %v -> %s %v", files, size, dims)
+	}
+	if contains(dims, DimensionSecurity) {
+		t.Fatalf("ordinary prose must not require a security review: %v", dims)
+	}
+}

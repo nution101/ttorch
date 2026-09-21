@@ -12,7 +12,9 @@ type Size string
 
 const (
 	// SizeDocsOnly is a diff whose every changed file is inert prose (Markdown, plain
-	// text, a LICENSE-style file): no executable surface, so no security review.
+	// text, a LICENSE-style file): no executable surface, so no security review. Agent
+	// configuration spelled as Markdown (CLAUDE.md, .claude/agents/*.md) is NOT inert and
+	// never qualifies — see isHarnessConfig.
 	SizeDocsOnly Size = "docs-only"
 	// SizeTrivial is a small single-file code change: low scope-creep risk, so scope
 	// review is dropped — but it is still code, so security review is KEPT.
@@ -52,7 +54,9 @@ var fullReviewers = []string{DimensionCorrectness, DimensionScope, DimensionSecu
 // uncertain and returns the full set, and the caller must likewise pass the full set
 // whenever the authoritative list could not be obtained. ok being false means git could
 // not produce a trustworthy stat (it too forces the full set). Security review is dropped
-// only for a diff with no code at all (docs-only); every code path keeps it.
+// only for a diff with no code at all (docs-only); every code path keeps it, and so does
+// every path that configures an agent session (CLAUDE.md, AGENTS.md, .claude/**), which is
+// configuration rather than prose however it is spelled — see isHarnessConfig.
 func Classify(files []string, lines int, binary, ok bool) (Size, []string) {
 	switch {
 	case !ok || len(files) == 0 || hasEmpty(files):
@@ -81,11 +85,45 @@ var docBasenames = map[string]bool{
 	"COPYING": true, "README": true, "CHANGELOG": true, "CONTRIBUTING": true,
 }
 
+// harnessConfigBasenames are agent-instruction files: prose by extension, configuration by
+// effect. A session reads them from its working directory and follows what they say, so a
+// change to one changes how an agent behaves. Compared case-insensitively.
+var harnessConfigBasenames = map[string]bool{"CLAUDE.MD": true, "AGENTS.MD": true}
+
+// harnessConfigDir is the directory whose contents configure an agent session: settings,
+// hooks that run around the session, and subagent definitions that outrank the installed
+// ones. Matched as a whole PATH COMPONENT, so a prose file that merely mentions the word
+// (notes/claude-usage.md) is unaffected.
+const harnessConfigDir = ".claude"
+
+// isHarnessConfig reports whether p configures an agent session rather than documenting the
+// project. It exists because two of those paths — CLAUDE.md and .claude/agents/*.md — are
+// spelled with a prose extension, and treating them as inert prose let a diff of nothing but
+// .md files classify as docs-only and drop the security reviewer. Dropping that reviewer is
+// what a worker subverting the review would want, since it is the one that runs outside the
+// worker's worktree.
+func isHarnessConfig(p string) bool {
+	if harnessConfigBasenames[strings.ToUpper(path.Base(p))] {
+		return true
+	}
+	for _, seg := range strings.Split(path.Clean(p), "/") {
+		if seg == harnessConfigDir {
+			return true
+		}
+	}
+	return false
+}
+
 // isDocFile reports whether p is an inert-prose documentation file. It is deliberately
 // conservative: only well-known prose extensions and basenames qualify, so anything that
 // could execute or carry configuration (.go, .sh, .yaml, .json, .html, .svg, …) is treated
-// as code and keeps the full reviewer set.
+// as code and keeps the full reviewer set. Agent-instruction files are configuration
+// whatever they are spelled (see isHarnessConfig), so they are checked first and never
+// qualify — README.md and docs/*.md still do.
 func isDocFile(p string) bool {
+	if isHarnessConfig(p) {
+		return false
+	}
 	base := path.Base(p)
 	if ext := strings.ToLower(path.Ext(base)); ext != "" {
 		return docExtensions[ext]
