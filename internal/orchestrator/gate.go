@@ -500,13 +500,23 @@ func (m *Manager) archiveLegacyFlatReports(dir string, ensureArchive func() bool
 		}
 		dest := filepath.Join(archive(), legacyReportsDirName, e.Name())
 		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-			fmt.Fprintf(os.Stderr, "ttorch: could not archive the legacy review report %s: %v\n", path, err)
+			legacySweepError(e.Name(), dir, err)
 			continue
 		}
 		if err := os.Rename(path, dest); err != nil {
-			fmt.Fprintf(os.Stderr, "ttorch: could not archive the legacy review report %s: %v\n", path, err)
+			legacySweepError(e.Name(), dir, err)
 		}
 	}
+}
+
+// legacySweepError reports a sweep failure without letting the filename write the message.
+// This is the one name in the gate that nothing validates: a filename may contain anything
+// but a slash and a NUL, so a worker that arranges the rename to fail (a directory already
+// sitting at the destination, say) chooses the text. The name is quoted and the error is
+// flattened to one line, because os.Rename's error repeats both paths inside itself.
+func legacySweepError(name, dir string, err error) {
+	fmt.Fprintf(os.Stderr, "ttorch: could not archive the legacy review report %s in %s: %s\n",
+		review.SafeQuote(name), dir, review.SafeLine(err.Error()))
 }
 
 // TrustRecord aggregates the reviewers' per-dimension reports for taskID into a
