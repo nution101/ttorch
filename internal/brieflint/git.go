@@ -67,8 +67,19 @@ type gitResult struct {
 // token is stdout as a single value (a ref, a byte count), whitespace stripped.
 func (r gitResult) token() string { return strings.TrimSpace(r.stdout) }
 
+// maxMsgBytes caps the git diagnostic carried into a finding. One line of git is a
+// sentence; anything longer is a remote talking at length into a report a human reads.
+const maxMsgBytes = 200
+
 // msg is the short diagnostic to quote when git failed for a reason the caller cannot
-// classify.
+// classify. It comes back QUOTED, because git's stderr is not ours: every git host relays
+// a server's "remote:" output verbatim, so ESC, CR and BEL arrive live and a crafted line
+// can erase what a manager just read and write its own. Reproduced with a remote emitting
+// "remote: \x1b[2K\rEVERYTHING IS FINE\a", which reached the terminal intact.
+//
+// strconv.Quote is the same treatment AGENTS.md values get: it escapes on unicode.IsPrint,
+// so control characters, the line and paragraph separators, and invalid UTF-8 all come out
+// as text rather than as instructions to the terminal.
 func (r gitResult) msg() string {
 	m := strings.TrimSpace(r.stderr)
 	if m == "" {
@@ -77,7 +88,10 @@ func (r gitResult) msg() string {
 	if i := strings.IndexByte(m, '\n'); i >= 0 {
 		m = m[:i]
 	}
-	return m
+	if len(m) > maxMsgBytes {
+		m = m[:maxMsgBytes] + "..."
+	}
+	return strconv.Quote(m)
 }
 
 // gitFunc runs git in dir, under ctx. Tests substitute it via Options.git to exercise the

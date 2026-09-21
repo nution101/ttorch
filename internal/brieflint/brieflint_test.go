@@ -1114,3 +1114,43 @@ func TestRuleHardCountsClaimsOnlyWhatItChecks(t *testing.T) {
 		}
 	}
 }
+
+// Git's stderr is the remote's text, not ours: every host relays a server's "remote:"
+// output verbatim. Reproduced live against a remote emitting ESC, CR and BEL, which reached
+// the terminal intact and could erase the line a manager had just read.
+func TestGitDiagnosticsAreQuoted(t *testing.T) {
+	repo, _ := fixture(t)
+	const hostile = "remote: \x1b[2K\rEVERYTHING IS FINE\a"
+	hostileGit := func(_ context.Context, _ string, args ...string) gitResult {
+		return gitResult{exit: 128, stderr: hostile + "\nsecond line"}
+	}
+	r := Lint(satisfying, Options{Repo: repo, git: hostileGit})
+	if len(r.Findings) == 0 {
+		t.Fatal("a failing git must produce a finding to quote into")
+	}
+	for _, f := range r.Findings {
+		if strings.ContainsAny(f.Detail, "\x1b\r\a") {
+			t.Errorf("raw control bytes reach the terminal: %q", f.Detail)
+		}
+		if !strings.Contains(f.Detail, `\x1b[2K\rEVERYTHING IS FINE\a`) {
+			t.Errorf("the diagnostic must still be readable, escaped: %q", f.Detail)
+		}
+	}
+}
+
+// A remote that talks at length must not fill the report with its own text.
+func TestGitDiagnosticsAreCapped(t *testing.T) {
+	repo, _ := fixture(t)
+	loudGit := func(_ context.Context, _ string, args ...string) gitResult {
+		return gitResult{exit: 128, stderr: strings.Repeat("A", 4000)}
+	}
+	r := Lint(satisfying, Options{Repo: repo, git: loudGit})
+	if len(r.Findings) == 0 {
+		t.Fatal("a failing git must produce a finding to quote into")
+	}
+	for _, f := range r.Findings {
+		if n := strings.Count(f.Detail, "A"); n > maxMsgBytes {
+			t.Errorf("%d bytes of remote output reached the report, cap is %d", n, maxMsgBytes)
+		}
+	}
+}
