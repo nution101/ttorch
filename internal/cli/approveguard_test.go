@@ -33,7 +33,7 @@ func TestStdinIsInteractiveDevice(t *testing.T) {
 	}
 	defer r.Close()
 	defer w.Close()
-	if stdinIsInteractiveDevice(r) {
+	if stdinIsInteractiveDevice(r, os.DevNull) {
 		t.Error("a pipe must not read as an interactive terminal")
 	}
 
@@ -45,7 +45,7 @@ func TestStdinIsInteractiveDevice(t *testing.T) {
 	if fi, err := devnull.Stat(); err == nil && fi.Mode()&os.ModeCharDevice == 0 {
 		t.Fatal("precondition: /dev/null should be a character device, so the identity check is what rejects it")
 	}
-	if stdinIsInteractiveDevice(devnull) {
+	if stdinIsInteractiveDevice(devnull, os.DevNull) {
 		t.Error("/dev/null must not read as an interactive terminal, even though it is a character device")
 	}
 
@@ -54,11 +54,11 @@ func TestStdinIsInteractiveDevice(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = closed.Close()
-	if stdinIsInteractiveDevice(closed) {
+	if stdinIsInteractiveDevice(closed, os.DevNull) {
 		t.Error("an unstattable fd must not read as an interactive terminal")
 	}
 
-	if !stdinIsInteractiveDevice(openInteractiveDevice(t)) {
+	if !stdinIsInteractiveDevice(openInteractiveDevice(t), os.DevNull) {
 		t.Error("a character device that is not /dev/null must read as interactive")
 	}
 }
@@ -69,24 +69,9 @@ func TestStdinIsInteractiveDevice(t *testing.T) {
 // Reaching this for real needs control of the process's view of /dev, which already defeats
 // the guard — the point is that a check which cannot evaluate does not pass.
 func TestStdinIsInteractiveDevice_FailsClosedOnStatError(t *testing.T) {
-	prev := devNullPath
-	devNullPath = filepath.Join(t.TempDir(), "no-such-null-device")
-	t.Cleanup(func() { devNullPath = prev })
-
-	if stdinIsInteractiveDevice(openInteractiveDevice(t)) {
+	missing := filepath.Join(t.TempDir(), "no-such-null-device")
+	if stdinIsInteractiveDevice(openInteractiveDevice(t), missing) {
 		t.Error("a stat error on the null device must refuse, not fall through to interactive")
-	}
-	// And through checkApproveCaller, with every OTHER reason to refuse removed: no worker
-	// context, and stdin on a character device that would otherwise be allowed. The stat
-	// error is then the only thing left that can produce a refusal.
-	clearWorkerContext(t)
-	swapApproveGuardStdin(t, openInteractiveDevice(t))
-	err := checkApproveCaller()
-	if err == nil {
-		t.Fatal("checkApproveCaller must refuse when the interactive test cannot evaluate")
-	}
-	if !strings.Contains(err.Error(), "interactive terminal") {
-		t.Fatalf("the refusal must come from the interactive test, got: %v", err)
 	}
 }
 
@@ -100,9 +85,8 @@ func TestCheckApproveCaller_RefusesNonInteractive(t *testing.T) {
 	}
 	defer r.Close()
 	defer w.Close()
-	swapApproveGuardStdin(t, r)
 
-	err = checkApproveCaller()
+	err = checkApproveCaller(r)
 	if err == nil {
 		t.Fatal("approve through a pipe must be refused")
 	}
@@ -117,9 +101,8 @@ func TestCheckApproveCaller_RefusesNonInteractive(t *testing.T) {
 func TestCheckApproveCaller_RefusesWorkerEnv(t *testing.T) {
 	clearWorkerContext(t)
 	t.Setenv("TTORCH_TASK_ID", "w7")
-	swapApproveGuardStdin(t, openInteractiveDevice(t))
 
-	err := checkApproveCaller()
+	err := checkApproveCaller(openInteractiveDevice(t))
 	if err == nil {
 		t.Fatal("approve from a worker's environment must be refused")
 	}
@@ -141,9 +124,8 @@ func TestCheckApproveCaller_RefusesWorkerTaskFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Chdir(sub)
-	swapApproveGuardStdin(t, openInteractiveDevice(t))
 
-	err := checkApproveCaller()
+	err := checkApproveCaller(openInteractiveDevice(t))
 	if err == nil {
 		t.Fatal("approve from inside a worktree with a .ttorch/task above cwd must be refused")
 	}
@@ -156,8 +138,7 @@ func TestCheckApproveCaller_RefusesWorkerTaskFile(t *testing.T) {
 // an interactive device, which is the lead running the command by hand.
 func TestCheckApproveCaller_AllowsLeadAtATerminal(t *testing.T) {
 	clearWorkerContext(t)
-	swapApproveGuardStdin(t, openInteractiveDevice(t))
-	if err := checkApproveCaller(); err != nil {
+	if err := checkApproveCaller(openInteractiveDevice(t)); err != nil {
 		t.Fatalf("the lead approving at a terminal must be allowed: %v", err)
 	}
 }
@@ -170,13 +151,6 @@ func clearWorkerContext(t *testing.T) {
 	t.Chdir(t.TempDir())
 }
 
-func swapApproveGuardStdin(t *testing.T, f *os.File) {
-	t.Helper()
-	prev := approveGuardStdin
-	approveGuardStdin = func() *os.File { return f }
-	t.Cleanup(func() { approveGuardStdin = prev })
-}
-
 // TestCmdApprove_GuardRunsBeforeAnyState proves the guard is actually WIRED INTO the command
 // and runs ahead of it: from a worker context `ttorch approve` never reaches the manager, so
 // it cannot mint a token whatever the task id; from a lead context at a terminal the same call
@@ -184,7 +158,11 @@ func swapApproveGuardStdin(t *testing.T, f *os.File) {
 func TestCmdApprove_GuardRunsBeforeAnyState(t *testing.T) {
 	clearWorkerContext(t)
 	t.Setenv("TTORCH_HOME", t.TempDir())
-	swapApproveGuardStdin(t, openInteractiveDevice(t))
+	// cmdApprove reads os.Stdin directly, so the test swaps the real thing rather than a
+	// seam: with it on a character device, the interactive test is not what refuses below.
+	prev := os.Stdin
+	os.Stdin = openInteractiveDevice(t)
+	t.Cleanup(func() { os.Stdin = prev })
 
 	t.Setenv("TTORCH_TASK_ID", "w3")
 	err := cmdApprove([]string{"w3"})

@@ -21,16 +21,6 @@ import (
 // are accidental and injected approvals — an agent wrapper, a script, a prompt-injected
 // command in a worker pane — and both of those are stopped by it.
 
-// approveGuardStdin is the file the guard inspects. It is a package seam so a test can drive
-// the check against a real pipe, socket or character device instead of the test binary's own
-// stdin.
-var approveGuardStdin = func() *os.File { return os.Stdin }
-
-// devNullPath is the null device the interactive test compares stdin against. It is a package
-// seam so a test can point it at a path that does not stat, and prove the check fails closed
-// rather than skipping the comparison.
-var devNullPath = os.DevNull
-
 // stdinIsInteractiveDevice reports whether f is a character device other than the null device.
 //
 // This is a character-device test, not a true isatty: it is the closest the standard library
@@ -40,7 +30,11 @@ var devNullPath = os.DevNull
 // ModeCharDevice alone reports /dev/null as a terminal, which would let exactly the case this
 // guard exists for straight through. Pipes and sockets (what an agent's shell tool hands a
 // child) are rejected by the mode test.
-func stdinIsInteractiveDevice(f *os.File) bool {
+//
+// Both inputs are parameters rather than package state on purpose: a security predicate whose
+// inputs are rebindable package vars is one careless in-package edit from being neutered
+// without a test noticing. The tests pass the fd and the device path directly.
+func stdinIsInteractiveDevice(f *os.File, nullDevice string) bool {
 	fi, err := f.Stat()
 	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
 		return false
@@ -48,7 +42,7 @@ func stdinIsInteractiveDevice(f *os.File) bool {
 	// Fail closed on a stat error: a check that cannot evaluate must not pass. Skipping the
 	// identity test here would let /dev/null stdin read as interactive, which is the exact
 	// case the guard exists for.
-	devnull, err := os.Stat(devNullPath)
+	devnull, err := os.Stat(nullDevice)
 	if err != nil {
 		return false
 	}
@@ -72,11 +66,11 @@ func workerContextSignal() string {
 // checkApproveCaller returns the refusal for an approve that does not look like the lead
 // running it by hand, or nil to let it through. A worker context is reported first: it is the
 // more specific signal, and its fix is not "get a terminal".
-func checkApproveCaller() error {
+func checkApproveCaller(stdin *os.File) error {
 	if signal := workerContextSignal(); signal != "" {
 		return fmt.Errorf("refusing to approve from inside a worker context (%s): approving is the lead's action. Run it from your own shell, outside the worktree", signal)
 	}
-	if !stdinIsInteractiveDevice(approveGuardStdin()) {
+	if !stdinIsInteractiveDevice(stdin, os.DevNull) {
 		return fmt.Errorf("refusing to approve without an interactive terminal: run 'ttorch approve' yourself at a terminal, not through a wrapper, a script, or an agent's shell tool")
 	}
 	return nil
