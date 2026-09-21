@@ -150,11 +150,16 @@ type Options struct {
 	// work targets. Empty means the target branch the brief itself declares.
 	Ref string
 	// CitationsRef is the ref a file:line citation is resolved against — the commit the
-	// citation is ABOUT, which is normally a worker's HEAD and not the base. A gate finding
-	// legitimately cites a line that exists at the reviewed commit and is past end-of-file
-	// on the base, so resolving such a citation against the base false-positives. Empty
-	// means no such ref was supplied, and every file:line citation is reported as
-	// indeterminate — never assumed good and never resolved against the base.
+	// citation is ABOUT, which is normally a worker's HEAD and not the base. Naming it makes
+	// the answer authoritative: a citation that does not resolve there is a violation.
+	//
+	// Empty means the citation is resolved against the base ref instead (Ref, or the target
+	// the brief declares), because pointing a worker at a line of existing code is the most
+	// ordinary thing a brief does and must not require a flag. A citation that resolves
+	// there passes; one that does not is reported as INDETERMINATE rather than failed,
+	// because on the base a miss is ambiguous — a gate finding legitimately cites a line
+	// that exists at the reviewed commit and is past end-of-file on the base, and calling
+	// that a violation is the false positive this rule exists to avoid.
 	CitationsRef string
 	// Config is the project's per-rule configuration (see LoadConfig).
 	Config Config
@@ -165,6 +170,11 @@ type Options struct {
 	// the caller (every `ttorch task add`) at the mercy of the text it was handed. Zero
 	// means defaultBudget. Whatever the budget does not cover is reported as unevaluable,
 	// naming what went unchecked — never passed over in silence.
+	//
+	// The deadline is enforced, not merely declared: see gitCommand, which kills the child's
+	// whole process group and caps the wait on pipes a fork might still hold. Killing git
+	// alone leaves the ssh it forked holding the output pipe, and the caller waits
+	// regardless of any deadline.
 	Budget time.Duration
 	// git runs a git command in Repo. Nil means the real git (see gitRun); tests substitute.
 	git gitFunc

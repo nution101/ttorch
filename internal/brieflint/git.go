@@ -8,12 +8,41 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
-// gitTimeout bounds ONE git call. It is a ceiling per call, not a budget for the run: the
-// run-wide budget is a context deadline every call derives from (see Options.Budget), so a
-// brief naming many refs cannot stall for N times this.
+// waitDelay is how long Wait may linger after git is gone before it closes the pipes and
+// gives up on them. It is the backstop for a child that outlived the group kill by leaving
+// the group; two seconds is long enough for an orderly flush of output already written.
+const waitDelay = 2 * time.Second
+
+// gitCommand builds the git invocation so that a deadline actually ends the work.
+//
+// exec.CommandContext on its own kills the process it started and nothing beneath it, and
+// git forks: ssh for an SSH remote, git-remote-https and a credential helper for an HTTPS
+// one. Those forks inherit the write end of the stdout pipe, so killing git alone leaves
+// them holding it, Run keeps blocking in the copy goroutines, and the deadline bounds
+// nothing. So git gets its own process group and the whole group is killed when ctx is
+// done, with WaitDelay capping the wait on any pipe a fork that left the group still holds.
+func gitCommand(ctx context.Context, args ...string) *exec.Cmd {
+	c := exec.CommandContext(ctx, "git", args...)
+	// A new process group, so one signal reaches everything git forked.
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	c.Cancel = func() error {
+		if c.Process == nil {
+			return nil
+		}
+		// Negative pid: the group, not just the leader.
+		return syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
+	}
+	c.WaitDelay = waitDelay
+	return c
+}
+
+// gitTimeout bounds ONE git call. It is a ceiling per call, not a budget for the run: every
+// call also derives from the run-wide deadline (see Options.Budget), and both are enforced
+// by gitCommand below rather than merely set.
 const gitTimeout = 20 * time.Second
 
 // maxBlobBytes caps the blob a line count will read. Counting the lines of a path means
@@ -66,7 +95,7 @@ func gitRun(ctx context.Context, dir string, args ...string) gitResult {
 	}
 	ctx, cancel := context.WithTimeout(ctx, gitTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := gitCommand(ctx, args...)
 	cmd.Dir = dir
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
