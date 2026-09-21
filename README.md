@@ -217,11 +217,19 @@ with no brief is unchanged). Five rules:
 | --- | --- |
 | `target-branch` | The brief names its target as `origin/<branch>`, and that branch exists on the remote |
 | `file-paths` | Every file path the brief cites exists at the ref the citation is about |
-| `hard-counts` | A brief stating "there are 21 occurrences" says, in that sentence or the next, that the figure may be wrong or should be counted again, and asks for the worker's own number |
+| `hard-counts` | A brief stating "there are 21 occurrences" carries verify-yourself wording near the number, and asks for the worker's own number |
 | `prohibition` | A prohibition states the invariant it protects and the allowed end state, rather than banning `push`/`merge`/PR outright |
 | `standards` | The brief points at the standards the project expects |
 
 Some details that matter in practice:
+
+- **What `hard-counts` checks is wording, not meaning.** It looks for hedge vocabulary in the
+  paragraph or list item holding the number, or the next one, and for a sentence asking the
+  worker to report a figure. It cannot tell a hedge from a sentence forbidding one: "I verified
+  the count myself, so do not re-count it" carries the same words as a hedge and passes. No
+  vocabulary fixes that, because the words are the same words. The rule catches a bare count
+  stated with nothing around it, which is the failure it was written for; it does not certify
+  that a brief hedges, and the output says so.
 
 - **Which ref a citation is resolved against.** A cited path *without* a line number is about the
   work's base, so it is resolved at `--ref` (the declared target by default). A `file:line`

@@ -496,6 +496,13 @@ func (o Options) checkLineCitations(ctx context.Context, cites []citation, ref s
 // in briefs have been wrong in practice. A brief that states a hard count must also tell
 // the worker to verify it and report their own number. See signals.go for why the hedge is
 // matched as decomposed word-stem signals rather than as accepted phrasings.
+//
+// What this rule can establish is that hedge WORDING sits near the count. It cannot
+// establish that the brief hedges. "I verified the count myself, so do not re-count it"
+// carries every stem a hedge carries and means the opposite, and no vocabulary fixes that,
+// because the words are the same words. Everything this rule prints says wording, not
+// meaning, so a reader is not told the brief hedges when what was checked is that it could
+// be read as hedging.
 
 // countNouns are the nouns that turn a bare number into a countable claim about the work.
 const countNouns = `occurrences?|instances?|places?|call[ -]?sites?|sites?|files?|tests?|cases?|matches?|usages?|uses|references?|refs?|hits?|callers?|functions?|methods?|packages?|modules?|errors?|warnings?|violations?|findings?|todos?|duplicates?|copies|copy`
@@ -544,7 +551,7 @@ func checkHardCounts(_ context.Context, b *brief, _ Options) ([]Finding, []strin
 		var detail string
 		switch {
 		case !hedgedAt(sents, i):
-			detail = "states a hard count with no hedge attached to it; in this sentence or the next, say the figure may be wrong or tell the worker to count it themselves"
+			detail = "states a hard count with no hedge wording near it; in this paragraph or list item, or the next one, say the figure may be wrong or tell the worker to count it themselves"
 		case !asksForTheNumber:
 			detail = "hedges the count but never asks for the worker's own number; tell them to report the figure they actually find"
 		default:
@@ -556,7 +563,7 @@ func checkHardCounts(_ context.Context, b *brief, _ Options) ([]Finding, []strin
 		})
 	}
 	if len(findings) == 0 {
-		return nil, []string{fmt.Sprintf("hard-counts: %d hard count(s), each hedged where it is stated", len(counts))}
+		return nil, []string{fmt.Sprintf("hard-counts: %d hard count(s), each with hedge wording in reach and a request for the worker's own number (wording only: the check cannot tell a hedge from a sentence forbidding one)", len(counts))}
 	}
 	return findings, nil
 }

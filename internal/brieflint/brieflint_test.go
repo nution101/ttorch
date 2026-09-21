@@ -1049,7 +1049,7 @@ func TestRuleHardCountsRejectsBoilerplate(t *testing.T) {
 		"There are 21 occurrences of the old helper. Fix them. Check the build afterwards and note the results.", 1)
 	r := Lint(brief, Options{Repo: repo})
 	f := requireStatus(t, r, RuleHardCounts, StatusFail)
-	if !strings.Contains(f.Detail, "no hedge attached to it") {
+	if !strings.Contains(f.Detail, "no hedge wording near it") {
 		t.Fatalf("unexpected detail: %s", f.Detail)
 	}
 }
@@ -1085,4 +1085,32 @@ func TestCreateExemptionStillBoundsTheLine(t *testing.T) {
 	brief = strings.Replace(satisfying, "Touch pkg/thing.go and docs/guide.md.",
 		"Write dev/report/EVIDENCE.md:120 with the findings.", 1)
 	requireClean(t, Lint(brief, Options{Repo: repo}), RuleFilePaths)
+}
+
+// The rule matches vocabulary, so a sentence forbidding a recount passes it. That is not
+// fixable by extending the vocabulary, and the point of this test is that nothing in the
+// output describes such a brief as hedged.
+func TestRuleHardCountsClaimsOnlyWhatItChecks(t *testing.T) {
+	repo, _ := fixture(t)
+	brief := strings.Replace(satisfying, "Touch pkg/thing.go and docs/guide.md.",
+		"There are 21 occurrences; I verified the count myself, so do not re-count it and do not report a different number.", 1)
+	r := Lint(brief, Options{Repo: repo})
+	requireClean(t, r, RuleHardCounts)
+	note := ""
+	for _, n := range r.Notes {
+		if strings.HasPrefix(n, "hard-counts:") {
+			note = n
+		}
+	}
+	if note == "" {
+		t.Fatalf("no hard-counts note in %v", r.Notes)
+	}
+	if !strings.Contains(note, "wording only") {
+		t.Errorf("the note must say what was matched, got %q", note)
+	}
+	for _, claim := range []string{"each hedged", "is hedged", "carries a hedge"} {
+		if strings.Contains(note, claim) {
+			t.Errorf("the note claims %q, which this rule cannot establish: %q", claim, note)
+		}
+	}
 }
