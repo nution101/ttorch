@@ -113,6 +113,10 @@ func ValidateState(inputsDir, sha string) string {
 	}
 }
 
+// ReportSuffix is the filename suffix of a per-dimension findings report. Paths are built
+// with InputPath rather than joined by hand, so the name is always validated first.
+const ReportSuffix = ".json"
+
 // maxDimensionNameLen bounds a dimension name. Nothing legitimate comes close; the bound
 // keeps a name from producing an unusable filename.
 const maxDimensionNameLen = 32
@@ -147,6 +151,20 @@ func ValidDimensionName(name string) bool {
 		}
 	}
 	return true
+}
+
+// InputPath returns the path of the dimension-named file "<dim><suffix>" inside a review
+// inputs dir, refusing any dimension name that could name something other than a plain child
+// of that dir (ValidDimensionName). Every sink that turns a dimension into a path goes
+// through here: the fold, the archive, and the reviewer launcher. Dimension names come from
+// reviewers.json, which sits in a directory a worker can write, so the join is the dangerous
+// operation and it lives in one place rather than at each call site, where the next sink
+// added would have to remember the check.
+func InputPath(inputsDir, dim, suffix string) (string, error) {
+	if !ValidDimensionName(dim) {
+		return "", fmt.Errorf("unusable review dimension name %q", dim)
+	}
+	return filepath.Join(inputsDir, dim+suffix), nil
 }
 
 // prepState is the episode the reports in an inputs dir are folded against: the marker's
@@ -244,10 +262,10 @@ func currentReport(inputsDir, dim, sha string, prep prepState) (Report, string, 
 	// Before the name becomes a path: a dimension whose name is not a plain label could
 	// address a file the inputs dir does not contain, and a report found that way must never
 	// stand in for a review of this diff.
-	if !ValidDimensionName(dim) {
+	path, err := InputPath(inputsDir, dim, ReportSuffix)
+	if err != nil {
 		return Report{}, fmt.Sprintf("unusable dimension name %q in the prepared reviewer set, so no report can be read for it", dim), nil
 	}
-	path := filepath.Join(inputsDir, dim+".json")
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return Report{}, "no review recorded for dimension " + dim, nil

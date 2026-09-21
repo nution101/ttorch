@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -499,3 +500,124 @@ func TestTrustPrep_DimensionNameCannotMoveFilesOutsideTheReviewDir(t *testing.T)
 		t.Error("a file from outside the review dir was moved into the review dir")
 	}
 }
+
+// TestGateOnce_UnusableDimensionNameDispatchesNothing: the dispatch loop turns a dimension
+// name into a tmux window name, a brief file path, and the report path it tells the reviewer
+// to write. A name that cannot be used for any of those must stop the episode before a
+// reviewer is launched, not be handed to the launcher.
+func TestGateOnce_UnusableDimensionNameDispatchesNothing(t *testing.T) {
+	const escape = "../../../evil"
+	m, _ := trustedTaskWithSubstantialDiff(t, "gate-baddim", "bd1")
+	t.Cleanup(func() { _, _ = m.Teardown("bd1", true) })
+	rec := recordingReviewer(t, false)
+
+	// Tick 1 preps and dispatches the real set; the worker then adds a hostile name to the
+	// prepared set, which the next tick reads back.
+	if out, err := m.GateOnce("bd1"); err != nil || out != GateDispatched {
+		t.Fatalf("tick1 = (%q, %v), want dispatched", out, err)
+	}
+	dir := m.P.ReviewInputsDir("bd1")
+	before := rec.total()
+	addPreparedDimension(t, dir, escape)
+
+	out, err := m.GateOnce("bd1")
+	if err != nil {
+		t.Fatalf("GateOnce: %v", err)
+	}
+	if rec.count(escape) != 0 {
+		t.Errorf("a reviewer was dispatched %d time(s) for an unusable dimension name", rec.count(escape))
+	}
+	if rec.total() != before {
+		t.Errorf("dispatches went from %d to %d; an unusable prepared set must dispatch nothing", before, rec.total())
+	}
+	if out != GateBlocked {
+		t.Errorf("outcome = %q, want %q", out, GateBlocked)
+	}
+	if _, ok := m.TrustShow("bd1"); ok {
+		t.Error("an unusable prepared set must not record a verdict")
+	}
+	if !hasGateBlockedEvent(t, m, "bd1") {
+		t.Error("the manager must be told the prepared set is unusable")
+	}
+}
+
+// TestSpawnReviewer_RefusesAnUnusableDimensionName covers the launcher sink: the dimension
+// name decides the brief file's path, the tmux window name, and the report path handed to
+// the reviewer. It must refuse before any of the three happens.
+//
+// The escape itself is shown by replica rather than by running the pre-fix launcher, because
+// that path ends in a real reviewer session being started. The replica performs the exact
+// construction the launcher used, so the sink's shape is the thing under test.
+func TestSpawnReviewer_RefusesAnUnusableDimensionName(t *testing.T) {
+	const escape = "../../evil"
+	m, _ := deliveryHarness(t, "spawnbaddim")
+	inputs := filepath.Join(t.TempDir(), "review")
+	if err := os.MkdirAll(inputs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Replica: joining the name by hand leaves the inputs dir, which is what made this a
+	// sink. The validated constructor refuses the same name.
+	legacy := filepath.Join(inputs, escape+reviewerBriefSuffix)
+	if filepath.Dir(legacy) == inputs {
+		t.Fatalf("the escape name does not leave the inputs dir: %s", legacy)
+	}
+	if _, err := review.InputPath(inputs, escape, reviewerBriefSuffix); err == nil {
+		t.Error("InputPath accepted a dimension name that leaves the inputs dir")
+	}
+
+	if err := m.spawnReviewer("sb1", escape, inputs, "deadbeef", ".", "."); err == nil {
+		t.Error("spawnReviewer accepted an unusable dimension name")
+	}
+	if _, err := os.Stat(legacy); err == nil {
+		t.Errorf("a brief was written outside the inputs dir: %s", legacy)
+	}
+	if entries, err := os.ReadDir(inputs); err != nil || len(entries) != 0 {
+		t.Errorf("the launcher wrote into the inputs dir for a refused dimension: %v", entries)
+	}
+	if reviewerWindow("sb1", escape) != "" {
+		t.Error("an unusable dimension name produced a tmux window name")
+	}
+	if m.reviewerWindowAlive("sb1", escape) {
+		t.Error("an unusable dimension name must never report a live window")
+	}
+}
+
+// TestNoUnvalidatedDimensionPathJoins is the guard for the sink after the ones fixed here.
+// Every path built from a dimension name must go through review.InputPath, so a new call
+// site cannot reintroduce the traversal by joining the name itself. It scans the non-test
+// sources for a filepath.Join that mentions a dimension variable.
+func TestNoUnvalidatedDimensionPathJoins(t *testing.T) {
+	// The one place a dimension name may legitimately be joined into a path.
+	allowed := map[string]bool{"internal/review/prep.go": true}
+	root := ".."
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return err
+		}
+		rel := filepath.ToSlash(strings.TrimPrefix(path, "../"))
+		if allowed["internal/"+rel] {
+			return nil
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for i, line := range strings.Split(string(b), "\n") {
+			if !strings.Contains(line, "filepath.Join(") {
+				continue
+			}
+			if dimensionToken.MatchString(line) {
+				t.Errorf("internal/%s:%d joins a dimension name into a path by hand; use review.InputPath so the name is validated:\n\t%s",
+					rel, i+1, strings.TrimSpace(line))
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// dimensionToken matches an identifier a dimension name is carried in.
+var dimensionToken = regexp.MustCompile(`\b(dim|dimension)\b`)

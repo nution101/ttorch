@@ -40,6 +40,10 @@ const reviewersFileName = "reviewers.json"
 // episode's belong.
 const supersededDirName = "superseded"
 
+// reviewerBriefSuffix names the prompt file the daemon writes for one dimension's reviewer.
+// Like the report suffix it is joined through review.InputPath, never by hand.
+const reviewerBriefSuffix = ".reviewer-brief.md"
+
 // scaledReviewers is the persisted reviewer-set decision: the change-size class and the
 // dimensions the trust gate requires for it. The manager reads it to spawn exactly those
 // reviewer subagents.
@@ -365,11 +369,11 @@ func (m *Manager) archivePriorReports(taskID, dir string) {
 		// of an os.Rename. A name that is not a plain label names a file this review has
 		// nothing to do with, so it is skipped rather than repaired: there is no correct
 		// archive destination for it, and a worker should not be able to steer a move at all.
-		if !review.ValidDimensionName(dim) {
-			fmt.Fprintf(os.Stderr, "ttorch: ignoring unusable review dimension name %q in %s\n", dim, dir)
+		report, err := review.InputPath(dir, dim, review.ReportSuffix)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ttorch: ignoring %v in %s\n", err, dir)
 			continue
 		}
-		report := filepath.Join(dir, dim+".json")
 		if _, err := os.Stat(report); err != nil {
 			continue
 		}
@@ -380,7 +384,11 @@ func (m *Manager) archivePriorReports(taskID, dir string) {
 				return
 			}
 		}
-		if err := os.Rename(report, filepath.Join(archive, dim+".json")); err != nil {
+		dest, err := review.InputPath(archive, dim, review.ReportSuffix)
+		if err != nil {
+			continue // unreachable: the name was validated above, and this states why
+		}
+		if err := os.Rename(report, dest); err != nil {
 			fmt.Fprintf(os.Stderr, "ttorch: could not archive the previous %s review report in %s: %v\n", dim, dir, err)
 		}
 	}
@@ -884,6 +892,20 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 	// or malformed, so this never under-reviews. prog.Dims remains only the cache the NEXT
 	// episode's reset tears down.
 	dims := m.ReviewersFor(taskID)
+	// Every name in that set is about to become a file path, a tmux target, and the report
+	// path a reviewer is told to write, and the set is read back from a worker-writable file.
+	// One unusable name stops the episode here: the fold would block on it anyway, and the
+	// alternative is handing it to the launcher. This checks the NAMES only; which dimensions
+	// are required, and where the set comes from, are not this pass's business.
+	for _, dim := range dims {
+		if !review.ValidDimensionName(dim) {
+			m.surfaceGateBlocked(taskID, head, fmt.Sprintf("the prepared reviewer set contains an unusable dimension name %q", dim))
+			prog.Outcome = gateOutcomeBlocked
+			m.writeGateProgress(dir, prog)
+			m.teardownReviewers(taskID, dims)
+			return GateBlocked, nil
+		}
+	}
 	if prog.Attempts == nil {
 		prog.Attempts = map[string]int{}
 	}
@@ -996,11 +1018,23 @@ func (m *Manager) Gateable(repo string) bool {
 // stable and deterministic so the gate can recognize a still-running reviewer (idempotent
 // dispatch) and tear it down when the episode ends. Distinct prefix ("rv-") from worker
 // windows ("wk-") so the two fleets never collide.
-func reviewerWindow(taskID, dim string) string { return "rv-" + taskID + "-" + dim }
+//
+// It returns "" for a dimension name that is not a plain label. Window names are tmux
+// TARGETS ("<session>:<window>"), so a name carrying tmux's own separators would be parsed
+// as a different target than the one meant; the value comes from a worker-writable file, so
+// it is not allowed to reach tmux at all. Callers treat "" as "there is no such window".
+func reviewerWindow(taskID, dim string) string {
+	if !review.ValidDimensionName(dim) {
+		return ""
+	}
+	return "rv-" + taskID + "-" + dim
+}
 
-// reviewerWindowAlive reports whether a dimension's reviewer window is still present.
+// reviewerWindowAlive reports whether a dimension's reviewer window is still present. A
+// dimension with no usable window name has no window.
 func (m *Manager) reviewerWindowAlive(taskID, dim string) bool {
-	return tmux.WindowExists(m.Session, reviewerWindow(taskID, dim))
+	window := reviewerWindow(taskID, dim)
+	return window != "" && tmux.WindowExists(m.Session, window)
 }
 
 // reviewReportPinned reports whether dimension dim's report in dir is the report the verdict
@@ -1020,7 +1054,7 @@ func (m *Manager) reviewReportPinned(dir, dim, head string) bool {
 func (m *Manager) teardownReviewers(taskID string, dims []string) {
 	for _, dim := range dims {
 		window := reviewerWindow(taskID, dim)
-		if !tmux.WindowExists(m.Session, window) {
+		if window == "" || !tmux.WindowExists(m.Session, window) {
 			continue
 		}
 		m.killPaneProcesses(window)
@@ -1092,6 +1126,17 @@ func (m *Manager) writeGateProgress(dir string, p gateProgress) {
 // it no-ops when the dimension's window already exists — so a re-dispatch never doubles a
 // running reviewer.
 func (m *Manager) spawnReviewer(taskID, dim, inputsDir, head, repo, wt string) error {
+	// First, before tmux, the harness, or any file: the dimension name decides a file path
+	// written under inputsDir, the tmux window name, and the report path handed to the
+	// reviewer. It arrives from a worker-writable file, so an unusable one launches nothing.
+	briefPath, err := review.InputPath(inputsDir, dim, reviewerBriefSuffix)
+	if err != nil {
+		return err
+	}
+	reportPath, err := review.InputPath(inputsDir, dim, review.ReportSuffix)
+	if err != nil {
+		return err
+	}
 	if err := m.requireTmux(); err != nil {
 		return err
 	}
@@ -1108,8 +1153,7 @@ func (m *Manager) spawnReviewer(taskID, dim, inputsDir, head, repo, wt string) e
 	// co-author trailer) so the reviewer runs autonomously, exactly like a worker spawn.
 	_ = harness.WriteWorkerSettings(h, wt)
 	harness.TrustWorktree(h, repo, wt)
-	briefPath := filepath.Join(inputsDir, dim+".reviewer-brief.md")
-	if err := os.WriteFile(briefPath, []byte(reviewerBrief(taskID, dim, inputsDir, head)), 0o644); err != nil {
+	if err := os.WriteFile(briefPath, []byte(reviewerBrief(taskID, dim, inputsDir, head, reportPath)), 0o644); err != nil {
 		return err
 	}
 	if err := m.newWindow(window, wt, "review · "+dim+" · "+taskID); err != nil {
@@ -1131,8 +1175,7 @@ func (m *Manager) spawnReviewer(taskID, dim, inputsDir, head, repo, wt string) e
 // the gate consumes: a commit-pinned <dim>.json following the findings contract. Go owns the
 // verdict aggregation, so a missing or malformed report fails the gate closed regardless of
 // what the session does.
-func reviewerBrief(taskID, dim, inputsDir, head string) string {
-	reportPath := filepath.Join(inputsDir, dim+".json")
+func reviewerBrief(taskID, dim, inputsDir, head, reportPath string) string {
 	return fmt.Sprintf(`# Adversarial trust-gate review — %s dimension (task %s)
 
 You are the **%s** reviewer in ttorch's adversarial trust gate, dispatched by the scheduler
