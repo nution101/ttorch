@@ -115,8 +115,16 @@ func storeValidateCache(key string, results []validate.Result) {
 // cache keeps its job as a performance record for REPORTING — the reviewers' validate.json and
 // any status output — where a forged green misleads a reader but authorizes nothing.
 //
-// Entries are small (a handful of validate.Results under a 64-hex key) and a long-lived
-// scheduler accumulates at most one per distinct tree it gates, so the map is left unbounded.
+// Entries hold only the DECISION SHAPE, never the checks' output. A validate.Result carries
+// Output — the whole CombinedOutput() of the check — and the on-disk cache, which stores the
+// same values under the same key, runs to gigabytes on this repo's own history (168 entries,
+// 3.3 GB, largest 74 MB). A process-global map with no eviction in a scheduler that stays up
+// for days would hold that resident. Nothing needs it to: the authority decision is
+// stagedGreen, which reads Passed, and the no-checks hard block reads len(). Output stays in
+// the on-disk record, which is read for reporting and for the reviewers' validate.json.
+//
+// What is left is one small struct per check per distinct tree the daemon touches, so the map
+// is left unbounded.
 var (
 	processValidateMu sync.Mutex
 	processValidate   = map[string][]validate.Result{}
@@ -130,12 +138,29 @@ func loadProcessValidate(key string) ([]validate.Result, bool) {
 	return results, ok
 }
 
-// storeProcessValidate records a green this process produced. Only runAndRecordGate calls it,
-// and only after a real suite run, so a cache HIT can never become a memoized authority.
+// storeProcessValidate records a green this process produced, stripped to the decision shape
+// by memoShape. Only runAndRecordGate calls it, and only after a real suite run, so a cache
+// HIT can never become a memoized authority.
 func storeProcessValidate(key string, results []validate.Result) {
 	processValidateMu.Lock()
 	defer processValidateMu.Unlock()
-	processValidate[key] = results
+	processValidate[key] = memoShape(results)
+}
+
+// memoShape copies results with the checks' output dropped. It preserves the per-check
+// identity and pass/fail that stagedGreen and the no-checks block read, and nothing else, so
+// a reused memo reproduces the identical decision while holding none of the log. It copies
+// rather than mutating, because the caller still returns the full results to its own caller.
+func memoShape(results []validate.Result) []validate.Result {
+	if results == nil {
+		return nil
+	}
+	out := make([]validate.Result, len(results))
+	for i, r := range results {
+		r.Output = ""
+		out[i] = r
+	}
+	return out
 }
 
 // resetProcessValidate drops every memoized green. It exists for the tests: the fixtures build

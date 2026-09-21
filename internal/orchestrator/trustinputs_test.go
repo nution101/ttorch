@@ -317,3 +317,57 @@ func freshProcessValidate(t *testing.T) {
 	resetProcessValidate()
 	t.Cleanup(resetProcessValidate)
 }
+
+// TestProcessValidate_MemoDropsCheckOutput pins the memory bound on the authority memo. A
+// validate.Result carries Output, the whole CombinedOutput() of the check, and this repo's own
+// on-disk cache — the same values under the same key — measures 3.3 GB across 168 entries with
+// a 74 MB largest. The memo is a process-global map with no eviction in a scheduler that runs
+// for days, so holding those would be hundreds of MB of test log nothing ever reads.
+//
+// Nothing needs to: the authority decision is stagedGreen(memo), which reads only Passed, and
+// the no-checks hard block reads only len(). The on-disk cache keeps the full output, because
+// that one is read for reporting and the reviewers' validate.json.
+func TestProcessValidate_MemoDropsCheckOutput(t *testing.T) {
+	bulky := strings.Repeat("x", 4096)
+	_, repo, wt := trustHarness(t, "pm1", "trusted", "printf '"+bulky+"'\nexit 0")
+	head := commitCodeFiles(t, wt)
+
+	green, results, _, err := validateForAuthority(repo, head)
+	if err != nil || !green {
+		t.Fatalf("the honest tree must be green: green=%v err=%v", green, err)
+	}
+	if !strings.Contains(results[0].Output, bulky) {
+		t.Fatal("the first run must return the real check output to its caller")
+	}
+
+	// The on-disk cache keeps the output: it is a reviewer input.
+	def := resolveGateDefinition(repo)
+	tree, err := worktree.TreeHash(repo, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := validateCacheKey(tree, def.script)
+	cached, ok := loadValidateCache(key)
+	if !ok || !strings.Contains(cached[0].Output, bulky) {
+		t.Fatalf("the on-disk cache must keep the check output for reporting, got ok=%v %+v", ok, cached)
+	}
+
+	// The memo does not, and still decides identically.
+	memo, ok := loadProcessValidate(key)
+	if !ok {
+		t.Fatal("a real green run must be memoized as this process's own")
+	}
+	for _, r := range memo {
+		if r.Output != "" {
+			t.Fatalf("the authority memo must not retain check output, got %d bytes", len(r.Output))
+		}
+	}
+	if !stagedGreen(memo) || len(memo) != len(results) {
+		t.Fatalf("the memo must reproduce the decision: green=%v len=%d want len=%d", stagedGreen(memo), len(memo), len(results))
+	}
+	green, reused := false, false
+	green, _, reused, err = validateForAuthority(repo, head)
+	if err != nil || !green || !reused {
+		t.Fatalf("the memoized green must still authorize on reuse: green=%v reused=%v err=%v", green, reused, err)
+	}
+}
