@@ -152,8 +152,8 @@ reference; this table covers the surface a lead and manager use day to day.
 | Command | Description |
 | --- | --- |
 | `ttorch tasks` | List tasks. Flags: `--project`, `--epic`, `--status s[,s…]`, `--tree` (projects→epics→phases→tasks), `--timeline <id>` |
-| `ttorch task add <id> --project <id>` | Create a pending backlog task (does not spawn). A supplied brief is lint-checked first. Flags: `--epic`, `--phase`, `--title`, `--touches`, `--brief`/`--brief-file`, `--citations-ref`, `--no-brief-lint` |
-| `ttorch brief-lint <file>` | Check a brief before it is stored on a task. Flags: `--repo`, `--remote`, `--ref`, `--citations-ref` |
+| `ttorch task add <id> --project <id>` | Create a pending backlog task (does not spawn). A supplied brief is lint-checked first. Flags: `--epic`, `--phase`, `--title`, `--touches`, `--brief`/`--brief-file`, `--citations-ref`, `--brief-lint-offline`, `--no-brief-lint` |
+| `ttorch brief-lint <file>` | Check a brief before it is stored on a task. Flags: `--repo`, `--remote`, `--ref`, `--citations-ref`, `--offline` |
 | `ttorch project add <repo>` / `project ls` | Register / list repos (caches delivery mode for display) |
 | `ttorch epic add` / `epic ls` / `epic set-status` | Manage epics under a project |
 | `ttorch phase add` / `phase ls` / `phase set-status` | Manage phases under an epic |
@@ -247,6 +247,12 @@ Some details that matter in practice:
   disabled at least one rule, and `2` a usage error. One run reports every violation, with the
   rule named and the offending text quoted, and every summary line says how many of the rules
   ran, so an outcome cannot be read without its coverage.
+
+  `--offline` skips the one rule that reaches the network (`target-branch`) and runs the
+  other four, which is the answer to an unreachable remote that does not involve skipping
+  every rule. The skip is counted as a rule that did not run, so an offline run reports
+  reduced coverage rather than a pass. `task add` takes the same escape as
+  `--brief-lint-offline`.
 
   `task add` treats `4` as a pass and proceeds, printing the coverage line. A project that
   disables a rule has declared that in its own `AGENTS.md`; refusing every briefed add there

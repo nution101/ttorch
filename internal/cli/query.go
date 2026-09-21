@@ -719,6 +719,7 @@ func cmdTaskAdd(args []string) error {
 	effort := fs.String("effort", "", "reasoning effort to dispatch at: low|medium|high|xhigh|max|ultracode|off (default: the scheduler's tier classifier)")
 	model := fs.String("model", "", "model to dispatch on: haiku|sonnet|opus|fable|opusplan or a full id (default: the scheduler's tier classifier)")
 	citationsRef := fs.String("citations-ref", "", "ref the brief's file:line citations were read at (a worker HEAD or reviewed sha) — passed to the brief lint, which otherwise resolves them against the base and reports an unresolved citation as unevaluable")
+	offline := fs.Bool("brief-lint-offline", false, "lint the brief without reaching the network: the target-branch rule is skipped and the rest still run, reported as reduced coverage (prefer this to --no-brief-lint when only the remote is the problem)")
 	noLint := fs.Bool("no-brief-lint", false, "store the brief without linting it (see 'ttorch brief-lint'); prefer disabling a specific rule in the project's AGENTS.md")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
@@ -767,7 +768,7 @@ func cmdTaskAdd(args []string) error {
 	// configuration), and only when a brief was supplied: an add with no brief behaves
 	// exactly as before.
 	if !*noLint {
-		if err := lintBriefForAdd(briefContent, proj.RepoPath, *citationsRef); err != nil {
+		if err := lintBriefForAdd(briefContent, proj.RepoPath, *citationsRef, *offline); err != nil {
 			return err
 		}
 	}

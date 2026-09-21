@@ -2316,14 +2316,18 @@ Backlog & planning (read the DB; includes pending backlog tasks):
   phase set-status <id> <status>          planned|in_progress|blocked|done|cancelled
   task add <id> --project <id> [--epic id] [--phase id] [--title "…"] [--touches "a,b"]
                           create a pending backlog task (does not spawn); a supplied
-                          brief is lint-checked first (--no-brief-lint to skip)
+                          brief is lint-checked first (--brief-lint-offline to skip
+                          only the network rule, --no-brief-lint to skip all five)
 
 Briefs:
   brief-lint <file>       check a brief before it is stored on a task: target branch
     [--repo <dir>]          declared and present on the remote, cited paths present,
-    [--remote <name>]       hard counts hedged, prohibitions bounded with an allowed end
-    [--ref <rev>]           state, standards pointed at. Exit 0 passed, 1 a rule was
-    [--citations-ref <rev>] violated, 3 a check COULD NOT be evaluated (never a pass).
+    [--remote <name>]       hard counts carrying verify-yourself wording, prohibitions
+    [--ref <rev>]           bounded with an allowed end state, standards pointed at.
+    [--citations-ref <rev>] Exit 0 passed, 1 a rule was violated, 3 a check COULD NOT be
+    [--offline]             evaluated (never a pass), 4 everything that ran passed but a
+                          rule was disabled. --offline skips the one rule that reaches
+                          the network and keeps the rest.
                           --ref is the base a cited path must exist at; --citations-ref
                           is the commit a file:line citation was read at (a worker HEAD
                           or reviewed sha). Without it, line citations resolve against

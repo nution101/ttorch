@@ -164,6 +164,12 @@ type Options struct {
 	// that exists at the reviewed commit and is past end-of-file on the base, and calling
 	// that a violation is the false positive this rule exists to avoid.
 	CitationsRef string
+
+	// Offline skips the rules that reach the network, and only those. Without it the
+	// choice on an unreachable remote was CANNOT-EVALUATE or --no-brief-lint, which skips
+	// all five rules to get past one. A skipped rule is counted as not evaluated and named
+	// in the notes, so an offline run reports reduced coverage rather than a pass.
+	Offline bool
 	// Config is the project's per-rule configuration (see LoadConfig).
 	Config Config
 	// Budget bounds the git work ONE run may do, in aggregate. A brief is untrusted input
@@ -200,15 +206,18 @@ const defaultBudget = 45 * time.Second
 type rule struct {
 	id  RuleID
 	run func(context.Context, *brief, Options) ([]Finding, []string)
+	// network is set on the one rule that leaves the machine. Options.Offline skips those
+	// and only those; every other rule reads the local repository.
+	network bool
 }
 
 // rules is the rule set, in report order.
 var rules = []rule{
-	{RuleTargetBranch, checkTargetBranch},
-	{RuleFilePaths, checkFilePaths},
-	{RuleHardCounts, checkHardCounts},
-	{RuleProhibition, checkProhibition},
-	{RuleStandards, checkStandards},
+	{id: RuleTargetBranch, run: checkTargetBranch, network: true},
+	{id: RuleFilePaths, run: checkFilePaths},
+	{id: RuleHardCounts, run: checkHardCounts},
+	{id: RuleProhibition, run: checkProhibition},
+	{id: RuleStandards, run: checkStandards},
 }
 
 // Rules returns every rule id, for help text and for validating a disable list.
@@ -263,10 +272,14 @@ func Lint(text string, opt Options) Report {
 		})
 	}
 	for _, r := range rules {
-		if opt.Config.Disabled[r.id] {
+		switch {
+		case opt.Config.Disabled[r.id]:
 			// Visible, never silent: an override the reader can see is an override they can
 			// question.
 			rep.Notes = append(rep.Notes, fmt.Sprintf("rule %s: DISABLED by project config (%s)", r.id, opt.Config.disableSource()))
+			continue
+		case opt.Offline && r.network:
+			rep.Notes = append(rep.Notes, fmt.Sprintf("rule %s: SKIPPED for --offline, so the remote was never asked", r.id))
 			continue
 		}
 		findings, notes := r.run(ctx, b, opt)
@@ -282,7 +295,7 @@ func Lint(text string, opt Options) Report {
 		rep.Findings = append(rep.Findings, Finding{
 			Rule:   RuleConfig,
 			Status: StatusIndeterminate,
-			Detail: fmt.Sprintf("nothing was checked: all %d rules are disabled by project config (%s). A lint that evaluates no rule cannot report a pass", len(rules), opt.Config.disableSource()),
+			Detail: fmt.Sprintf("nothing was checked: none of the %d rules ran (%s%s). A lint that evaluates no rule cannot report a pass", len(rules), opt.Config.disableSource(), offlineSuffix(opt.Offline)),
 		})
 	}
 	return rep
@@ -325,4 +338,13 @@ func joinRules(ids []RuleID) string {
 		s[i] = string(id)
 	}
 	return strings.Join(s, ", ")
+}
+
+// offlineSuffix names --offline in the nothing-was-checked detail when it is the reason, or
+// part of it, so the reader is not sent to AGENTS.md to look for a rule that is enabled.
+func offlineSuffix(offline bool) string {
+	if offline {
+		return ", plus --offline"
+	}
+	return ""
 }

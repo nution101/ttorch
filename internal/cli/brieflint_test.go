@@ -320,8 +320,46 @@ func TestCmdBriefLintDistinguishesReducedCoverage(t *testing.T) {
 
 	// task add reads the report, not the exit status, and proceeds: a declared disable
 	// narrows what is checked without breaking the project's own dispatch.
-	out, err = captureStdout(t, func() error { return lintBriefForAdd(cleanBrief, repo, "") })
+	out, err = captureStdout(t, func() error { return lintBriefForAdd(cleanBrief, repo, "", false) })
 	if err != nil {
 		t.Fatalf("task add must proceed on reduced coverage, got %v\n%s", err, out)
+	}
+}
+
+// --offline keeps the four local rules and drops the one that leaves the machine. Before
+// it, an unreachable remote left only --no-brief-lint, which skips five rules to get past
+// one.
+func TestCmdBriefLintOfflineKeepsTheLocalRules(t *testing.T) {
+	repo := lintRepo(t)
+	// A remote that cannot be reached: the target-branch rule is the only rule that asks.
+	if out, err := exec.Command("git", "-C", repo, "remote", "set-url", "origin", filepath.Join(t.TempDir(), "gone.git")).CombinedOutput(); err != nil {
+		t.Fatalf("pointing origin at nothing: %v: %s", err, out)
+	}
+
+	out, err := captureStdout(t, func() error {
+		return cmdBriefLint([]string{writeBrief(t, cleanBrief), "--repo", repo})
+	})
+	if got := exitOf(t, err); got != exitLintIndeterminate {
+		t.Fatalf("an unreachable remote must be unevaluable, got exit %d (%v)\n%s", got, err, out)
+	}
+
+	out, err = captureStdout(t, func() error {
+		return cmdBriefLint([]string{writeBrief(t, cleanBrief), "--repo", repo, "--offline"})
+	})
+	if got := exitOf(t, err); got != exitLintPartial {
+		t.Fatalf("offline must report reduced coverage, want exit %d, got %d (%v)\n%s", exitLintPartial, got, err, out)
+	}
+	for _, want := range []string{"rule target-branch: SKIPPED for --offline", "4 of 5 rules ran"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("want %q in the output:\n%s", want, out)
+		}
+	}
+
+	// The brief's defects are still caught with the network rule skipped.
+	out, err = captureStdout(t, func() error {
+		return cmdBriefLint([]string{writeBrief(t, defectiveBrief), "--repo", repo, "--offline"})
+	})
+	if got := exitOf(t, err); got != exitLintViolation {
+		t.Fatalf("offline must still fail a defective brief, got exit %d (%v)\n%s", got, err, out)
 	}
 }

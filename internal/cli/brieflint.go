@@ -11,7 +11,7 @@ import (
 	"github.com/nution101/ttorch/internal/brieflint"
 )
 
-const briefLintUsage = `usage: ttorch brief-lint <brief-file> [--repo <dir>] [--remote <name>] [--ref <rev>] [--citations-ref <rev>]`
+const briefLintUsage = `usage: ttorch brief-lint <brief-file> [--repo <dir>] [--remote <name>] [--ref <rev>] [--citations-ref <rev>] [--offline]`
 
 // Exit statuses for `ttorch brief-lint`. The three outcomes are deliberately distinct:
 // a check that could NOT run must never be indistinguishable from one that ran and passed.
@@ -70,6 +70,7 @@ func cmdBriefLint(args []string) error {
 	remote := fs.String("remote", "origin", "remote the declared target branch must exist on")
 	ref := fs.String("ref", "", "ref a cited path must exist at (default: the target branch the brief declares)")
 	citationsRef := fs.String("citations-ref", "", "ref a file:line citation is resolved against — the commit the citation was read at, such as a worker's HEAD or a reviewed sha (default: the base ref, where an unresolved citation is reported as unevaluable rather than failed, because the line may exist at the commit it was read at)")
+	offline := fs.Bool("offline", false, "skip the rules that reach the network (target-branch); the local rules still run, and the skip is reported as reduced coverage rather than a pass")
 	if err := fs.Parse(args[1:]); err != nil {
 		return lintError{err.Error(), exitLintUsage}
 	}
@@ -85,6 +86,7 @@ func cmdBriefLint(args []string) error {
 		Remote:       *remote,
 		Ref:          *ref,
 		CitationsRef: *citationsRef,
+		Offline:      *offline,
 		Config:       brieflint.LoadConfig(*repo),
 	})
 	printBriefLint(os.Stdout, path, rep)
@@ -167,13 +169,14 @@ func coverage(rep brieflint.Report) string {
 // defective brief is actually paid: the brief is copied into the task at add time, so this
 // is the last moment a fix reaches the worker. Both a violation and an unevaluable check
 // stop the add — an unevaluable check is not a pass — and both name the escape hatches.
-func lintBriefForAdd(text, repo, citationsRef string) error {
+func lintBriefForAdd(text, repo, citationsRef string, offline bool) error {
 	if strings.TrimSpace(text) == "" {
 		return nil
 	}
 	rep := brieflint.Lint(text, brieflint.Options{
 		Repo:         repo,
 		CitationsRef: citationsRef,
+		Offline:      offline,
 		Config:       brieflint.LoadConfig(repo),
 	})
 	printBriefLint(os.Stdout, "the supplied brief", rep)
