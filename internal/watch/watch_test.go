@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -218,6 +219,11 @@ func TestRun_TimeoutPrintsWatchTimeout(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "WATCH_TIMEOUT") {
 		t.Fatalf("output missing WATCH_TIMEOUT:\n%s", buf.String())
+	}
+	// The other half of the distinction TestRun_RefusedArmIsLoud pins: an armed watcher
+	// that merely timed out is a clean nil-error exit, never a refusal.
+	if res.Refused {
+		t.Fatalf("a clean timeout reported Refused: %+v", res)
 	}
 }
 
@@ -836,3 +842,104 @@ func TestPollArmedPRs_MergedEmittedOnce(t *testing.T) {
 }
 
 func ptr(s string) *string { return &s }
+
+// TestRun_RefusedArmIsLoud: when a genuinely live watcher already holds the singleton,
+// Run must NOT report a bare success. It returns Refused (naming the holder's pid) and a
+// SingletonHeldError matchable as ErrSingletonHeld, whose message carries the
+// WATCH_SINGLETON_HELD marker, the holding pid, and the `--reset` pointer.
+//
+// This is the regression the silent path cost us: Run used to return (Result{}, nil)
+// here, which cmdWatch rendered as exit 0 with zero output — byte-identical to a watcher
+// that armed and timed out quietly. A manager whose arm was refused therefore believed
+// itself armed while nothing was listening for worker events.
+func TestRun_RefusedArmIsLoud(t *testing.T) {
+	w, _, buf, _ := newWatcher(t)
+	p := w.P
+	holder := holdSingleton(t, p.WatchPIDFile(), os.Getppid(), "pane:live")
+	defer holder()
+
+	// A live holder serving the current session instance: alive pid, recorded token ==
+	// the live one, so acquire refuses rather than reaping (see
+	// TestAcquire_LiveHolderNotReaped) — and never signals, since isWatchProc is false.
+	w.lockRetry = 2 * time.Millisecond
+	w.briefGrace = 10 * time.Millisecond
+	w.resetGrace = 10 * time.Millisecond
+	w.procAlive = func(int) bool { return true }
+	w.isWatchProc = func(int) bool { return false }
+	w.sessionToken = func() string { return "pane:live" }
+
+	res, err := w.Run(context.Background())
+	if err == nil {
+		t.Fatalf("a refused arm returned no error — the silent exit-0 regression: %+v", res)
+	}
+	if !errors.Is(err, ErrSingletonHeld) {
+		t.Fatalf("refusal error = %v, want it to match ErrSingletonHeld", err)
+	}
+	if !res.Refused {
+		t.Fatalf("Result.Refused = false, want true: %+v", res)
+	}
+	if res.HolderPID != os.Getppid() {
+		t.Fatalf("Result.HolderPID = %d, want the recorded holder %d", res.HolderPID, os.Getppid())
+	}
+	if res.Fired || res.TimedOut || res.SelfExit {
+		t.Fatalf("a refused arm must not look like a wake/timeout/self-exit: %+v", res)
+	}
+	msg := err.Error()
+	for _, want := range []string{SingletonHeldMarker, fmt.Sprintf("pid %d", os.Getppid()), "--reset"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("refusal message %q missing %q", msg, want)
+		}
+	}
+	// The refusal must never be mistakable for the clean-timeout signal, on either
+	// channel: nothing on stdout, and no WATCH_TIMEOUT anywhere.
+	if buf.Len() != 0 {
+		t.Fatalf("a refused arm wrote to the watch stream: %q", buf.String())
+	}
+	if strings.Contains(msg, "WATCH_TIMEOUT") {
+		t.Fatalf("refusal message reuses the timeout marker: %q", msg)
+	}
+}
+
+// TestSingletonHeldError_UnknownHolder: the pid file is best-effort (a holder can release
+// between the refusal and the read), so a record we could not parse still yields a loud,
+// actionable message — just without a pid.
+func TestSingletonHeldError_UnknownHolder(t *testing.T) {
+	err := error(&SingletonHeldError{})
+	if !errors.Is(err, ErrSingletonHeld) {
+		t.Fatalf("err = %v, want it to match ErrSingletonHeld", err)
+	}
+	msg := err.Error()
+	for _, want := range []string{SingletonHeldMarker, "another ttorch watch process", "--reset"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("message %q missing %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "pid 0") {
+		t.Fatalf("message names a bogus pid: %q", msg)
+	}
+}
+
+// holdSingleton takes the watch singleton flock for the duration of a test, recording
+// (pid, token) the way a real holder does, and returns the release func. It stands in for
+// a live `ttorch watch` process without spawning one.
+func holdSingleton(t *testing.T, path string, pid int, token string) func() {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		t.Fatalf("test could not take the singleton lock: %v", err)
+	}
+	if _, err := f.WriteAt([]byte(formatWatchRecord(pid, token)), 0); err != nil {
+		t.Fatal(err)
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}
+}

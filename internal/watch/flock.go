@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,8 +16,47 @@ import (
 )
 
 // errLockHeld reports that the watch singleton flock is held by another live
-// watcher. It is not a failure — the loser simply has no work to do (§4.5).
+// watcher. It is the internal contention signal that acquire's self-heal branches on;
+// Run turns it into a LOUD SingletonHeldError, because a refused arm means this
+// invocation is not watching and its caller must be told so.
 var errLockHeld = errors.New("watch: singleton already held")
+
+// ErrSingletonHeld is the sentinel behind a refused arm: a live watcher already holds
+// the watch singleton, so this invocation did not watch and will surface nothing. It is
+// matchable with errors.Is; SingletonHeldError carries the holder detail.
+var ErrSingletonHeld = errors.New("watch singleton already held by a live watcher")
+
+// SingletonHeldMarker is the stable token every refusal message carries. It is the
+// counterpart to WATCH_TIMEOUT: the two outcomes are completely different — "I am not
+// armed, something else is" versus "I was armed and nothing happened" — so each gets its
+// own grep-able marker, and a refusal additionally exits non-zero. Before this, a refusal
+// exited 0 printing nothing, which was byte-identical to a quiet watch: a manager could
+// believe it was armed while nothing was listening for it.
+const SingletonHeldMarker = "WATCH_SINGLETON_HELD"
+
+// SingletonHeldError reports a refused arm and names the holder, so the caller can either
+// rely on that watcher or reap it. PID/Token are read from the singleton pid file, which
+// the holder maintains for observability (the flock itself is the truth), so they are
+// best-effort: a holder that released in the gap leaves PID 0 and the message falls back
+// to naming no pid.
+type SingletonHeldError struct {
+	PID   int    // the recorded holder's pid; 0 when the pid file was missing or garbled
+	Token string // the holder's manager-session instance token, when it recorded one
+}
+
+func (e *SingletonHeldError) Error() string {
+	holder := "another ttorch watch process"
+	if e.PID > 0 {
+		holder = fmt.Sprintf("ttorch watch pid %d", e.PID)
+	}
+	return fmt.Sprintf("%s: %s already holds the watch singleton, so this invocation did NOT watch "+
+		"and will surface no events. Either let that watcher surface the wake, or reap it with "+
+		"`ttorch watch --reset` and arm again.", SingletonHeldMarker, holder)
+}
+
+// Unwrap exposes the sentinel so callers match with errors.Is(err, ErrSingletonHeld)
+// rather than type-asserting.
+func (e *SingletonHeldError) Unwrap() error { return ErrSingletonHeld }
 
 // Flock retry bounds. A newly-armed watcher retries briefly so a slow orphan
 // release never drops a wake; --reset blocks longer, until the reaped orphan frees

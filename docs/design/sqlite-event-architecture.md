@@ -757,6 +757,7 @@ the last thing a turn does.
 ```
 ttorch watch loop:
   acquire watch singleton flock (paths.WatchPIDFile)            // §4.5
+  if refused (a LIVE holder kept it): print "WATCH_SINGLETON_HELD: ... pid <n> ... --reset"; exit non-zero
   since := flag or manager.watch_watermark
   loop:
     // each sweep opens and CLOSES its own short read tx (no read tx held across wait — §9 WAL)
@@ -838,6 +839,12 @@ of the surfaced batch.
   would otherwise fail to acquire the lock and silently exit.
 - A newly-armed `watch` that finds the lock held **retries briefly** (rather than exit-on-contention)
   so a slow orphan release never drops the wake.
+- A refusal is **loud**. When the retries expire against a genuinely live holder, `watch` prints
+  `WATCH_SINGLETON_HELD` naming the holding pid and pointing at `--reset`, and exits **non-zero**.
+  It previously exited 0 printing nothing, which was byte-identical to the clean-timeout exit — so
+  a manager whose arm was refused read the no-op as a quiet watch and stopped noticing worker
+  events entirely. The two endings now differ in both marker and exit status: `WATCH_TIMEOUT` +
+  exit 0 means armed-and-nothing-happened, `WATCH_SINGLETON_HELD` + non-zero means never armed.
 - `watch` also self-exits if the `manager` tmux window is absent (`tmux.WindowExists`,
   `tmux.go:105`) for N consecutive sweeps, so a crash that skips `--reset` can't leave a watcher
   blocking forever.

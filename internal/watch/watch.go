@@ -97,9 +97,13 @@ type Watcher struct {
 
 // Result reports how the watch loop ended, for the CLI and the tests.
 type Result struct {
-	Fired     bool       // an actionable batch was surfaced (exit 0, re-invoke the manager)
-	TimedOut  bool       // the timeout elapsed with nothing actionable (WATCH_TIMEOUT)
-	SelfExit  bool       // the manager window was absent for too long (§4.5)
+	Fired    bool // an actionable batch was surfaced (exit 0, re-invoke the manager)
+	TimedOut bool // the timeout elapsed with nothing actionable (WATCH_TIMEOUT)
+	SelfExit bool // the manager window was absent for too long (§4.5)
+	// Refused means the arm never watched at all: a live watcher held the singleton.
+	// It comes back with a SingletonHeldError, never as a bare success.
+	Refused   bool
+	HolderPID int        // the refusing holder's recorded pid (valid when Refused; 0 if unreadable)
 	Watermark int64      // the surfaced/persisted watermark (valid when Fired)
 	Batch     []db.Event // the coalesced, entity-deduped batch (valid when Fired)
 }
@@ -277,19 +281,26 @@ func (w *Watcher) dwellElapsed(now time.Time, t db.Task) bool {
 
 // Run acquires the watch singleton flock, then blocks on actionable events until one
 // is surfaced (Fired), the timeout elapses (TimedOut), the manager window is gone for
-// too long (SelfExit), or ctx is cancelled. It NEVER touches manager.awaiting_lead —
-// that flag is the §4.6 backstop it merely observes; the arming command (cmdWatch)
-// owns clearing it.
+// too long (SelfExit), or ctx is cancelled. A singleton already held by a live watcher
+// is a REFUSED arm: Run returns Refused plus a SingletonHeldError, never a bare success.
+// It NEVER touches manager.awaiting_lead — that flag is the §4.6 backstop it merely
+// observes; the arming command (cmdWatch) owns clearing it.
 func (w *Watcher) Run(ctx context.Context) (Result, error) {
 	lock, err := w.acquire(ctx)
 	if err != nil {
 		// A genuinely LIVE watcher serving the current manager session already owns the
-		// singleton: this arm has no work to do, so exit quietly — the holder will
-		// surface the wake. (An ORPHAN holder — dead pid, or a dead prior session's
-		// watcher — would have been reaped by acquire so this arm could take over,
-		// rather than leaving the manager blind.) ctx cancellation propagates as an error.
+		// singleton, so this arm has no work to do — the holder will surface the wake.
+		// (An ORPHAN holder — dead pid, or a dead prior session's watcher — would have
+		// been reaped by acquire so this arm could take over, rather than leaving the
+		// manager blind.) This used to return a bare success, which the CLI rendered as
+		// exit 0 with no output: byte-identical to a watcher that armed and timed out
+		// quietly, so a manager could believe itself armed while nothing was listening.
+		// It is now a loud error naming the holder, and the caller decides what to do.
+		// ctx cancellation propagates as an error.
 		if err == errLockHeld {
-			return Result{}, nil
+			rec, _ := readWatchRecord(w.P.WatchPIDFile())
+			return Result{Refused: true, HolderPID: rec.pid},
+				&SingletonHeldError{PID: rec.pid, Token: rec.token}
 		}
 		return Result{}, err
 	}

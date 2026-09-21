@@ -1369,6 +1369,14 @@ func cmdWait(_ []string) error {
 // the sense that it returns on the first wake; until then it holds its store and the
 // singleton flock for its lifetime. `--reset` reaps an orphan watcher instead of
 // watching (manager restart, §4.5).
+//
+// The three ways it can end are deliberately distinguishable, because the caller's next
+// move differs in each case and the manager's whole supervision rests on telling them
+// apart: a wake prints the batch and exits 0; a clean timeout prints WATCH_TIMEOUT and
+// exits 0 (armed, nothing happened — re-arm); a REFUSED arm exits NON-ZERO with a
+// WATCH_SINGLETON_HELD message naming the holder (never armed — rely on that watcher or
+// `--reset` it). The refusal used to be a silent exit 0, indistinguishable from the
+// quiet timeout, so a manager whose arm was refused went on believing it was watching.
 func cmdWatch(args []string) error {
 	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
 	since := fs.Int64("since", -1, "only surface events with id greater than this (default: manager.watch_watermark)")
@@ -1408,6 +1416,8 @@ func cmdWatch(args []string) error {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil
 		}
+		// A refused arm (watch.ErrSingletonHeld) deliberately falls through to the error
+		// return: it is the one outcome the caller MUST not read as a quiet watch.
 		return err
 	}
 	return nil
@@ -2269,7 +2279,10 @@ Supervision:
   watch                   block until an actionable DB event, print the coalesced
     [--since n]             batch + WATCH_WATERMARK, then exit (the manager arms this
     [--timeout d]           as a background task each non-blocking turn; --since
-    [--coalesce d]          defaults to the stored watermark; --timeout 0 blocks)
+    [--coalesce d]          defaults to the stored watermark; --timeout 0 blocks).
+                            A timeout prints WATCH_TIMEOUT and exits 0; an arm REFUSED
+                            because a live watcher already holds the singleton prints
+                            WATCH_SINGLETON_HELD with the holding pid and exits non-zero
   watch --reset           reap an orphan watcher and confirm the singleton is free
   await-lead [--clear]    mark the manager as awaiting the lead (the watcher stays
                           silent and never surfaces); --clear when the lead returns

@@ -112,7 +112,13 @@ every turn, every wake, every check-in.
    that can retask you, not the sole thing that drives you forward. Arming is **self-healing**:
    if an orphaned watcher left by a dead prior session still holds the watch singleton, the new
    `ttorch watch` reaps it and takes over instead of exiting silently — so a restart can
-   never leave you deaf to events (it never reaps a genuinely live watcher). `ttorch watch`
+   never leave you deaf to events (it never reaps a genuinely live watcher). When it is a
+   **genuinely live** watcher holding the singleton, your arm is **refused loudly**: it exits
+   non-zero with `WATCH_SINGLETON_HELD` naming the holding pid, so a refused arm can never be
+   mistaken for a quiet watch. Treat that as "I am not armed": either the named watcher is
+   really yours and will surface the wake, or reap it with `ttorch watch --reset` and arm
+   again. A clean timeout still prints `WATCH_TIMEOUT` and exits 0 — that one means you WERE
+   armed and nothing happened, so just re-arm. `ttorch watch`
    recovers a stalled *worker*; the symmetric backstop for *your own* stall — a turn that
    dies on a model-API error while work waits — is the **external `ttorch watchdog`** (set
    up once by the lead via launchd/cron, outside your session). It detects that you have
@@ -263,7 +269,7 @@ act, then re-check.
 | `ttorch spawn <id> <repo> [--scout] [--effort <level>] [--model <m>]` | start a worker on a task in an isolated workspace; `--effort low\|medium\|high\|xhigh\|max\|ultracode\|off` (how hard it thinks) and `--model haiku\|sonnet\|opus\|fable\|opusplan\|<id>` (which model) match capability to complexity (both persisted, restored on resume; scouts default to `high`; unset ⇒ the scheduler auto-tiers) |
 | `ttorch peek <id> [lines]` | read recent output from a worker |
 | `ttorch send <id> "<text>"` | type a message into a worker (steer / unblock) |
-| `ttorch watch [--since n]` | arm the event-driven watcher as a background task; it blocks until an actionable DB event, prints the batch, then exits to wake you (self-heals past an orphan holding the singleton) |
+| `ttorch watch [--since n]` | arm the event-driven watcher as a background task; it blocks until an actionable DB event, prints the batch, then exits to wake you (self-heals past an orphan holding the singleton). Three distinguishable endings: a batch + exit 0 (a wake), `WATCH_TIMEOUT` + exit 0 (armed, nothing happened), or `WATCH_SINGLETON_HELD` + **non-zero** (refused — a live watcher holds the singleton and you are NOT armed) |
 | `ttorch watch --reset` | manual fallback: reap any watcher orphaned by a prior session and confirm the singleton is free, then return (arming already self-heals past one) |
 | `ttorch await-lead [--clear]` | mark yourself awaiting the lead so the watcher stays silent; `--clear` when the lead returns |
 | `ttorch watchdog [--stall d] [--interval d]` | **external** manager-liveness net: re-pokes *you* if your own turn stalls (e.g. a model-API error) while actionable work waits. Runs outside your session (launchd/cron, or `--interval` as a standing background process); wakes you silently through the same DB-event channel `watch` uses — never a keystroke. Idle-aware: a no-op when nothing waits. Not something you arm each turn — it is a standing backstop the lead sets up once |
