@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -22,7 +23,15 @@ const helperEnv = "TTORCH_PROC_TEST_CHILD"
 
 func TestMain(m *testing.M) {
 	if v := os.Getenv(helperEnv); v != "" {
-		// v is "<sleep-duration> <marker-path>".
+		// v is "[setsid ]<sleep-duration> <marker-path>".
+		if rest, ok := strings.CutPrefix(v, "setsid "); ok {
+			// Leave the process group, so a kill aimed at the group cannot reach this
+			// process. The pipe it inherited stays open either way.
+			if _, err := syscall.Setsid(); err != nil {
+				os.Exit(4)
+			}
+			v = rest
+		}
 		parts := strings.SplitN(v, " ", 2)
 		d, err := time.ParseDuration(parts[0])
 		if err != nil {
@@ -41,14 +50,14 @@ func TestMain(m *testing.M) {
 // sharing its stdout and then blocks. Kill the parent alone and the child keeps the write end
 // of the pipe open, so a Wait that reads the pipe never returns. The child writes marker
 // after wait, so a test can see whether it outlived the deadline.
-func hangingCommand(t *testing.T, ctx context.Context, marker string, wait time.Duration) (*bytes.Buffer, func() error) {
+func hangingCommand(t *testing.T, ctx context.Context, marker string, wait time.Duration, opts ...string) (*bytes.Buffer, func() error) {
 	t.Helper()
 	self, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
 	c := Command(ctx, "sh", "-c", fmt.Sprintf("%q & sleep 120", self))
-	c.Env = append(os.Environ(), fmt.Sprintf("%s=%s %s", helperEnv, wait, marker))
+	c.Env = append(os.Environ(), fmt.Sprintf("%s=%s%s %s", helperEnv, strings.Join(opts, ""), wait, marker))
 	var out bytes.Buffer
 	c.Stdout = &out
 	c.Stderr = &out
@@ -116,5 +125,45 @@ func TestCommandUnderDeadlineCompletes(t *testing.T) {
 	}
 	if got := out.String(); got != "done\n" {
 		t.Fatalf("stdout = %q, want %q", got, "done\n")
+	}
+}
+
+// WaitDelay is the backstop for the case the group kill cannot cover: a child that leaves
+// the process group before the deadline, so kill(-pgid) never reaches it, while still
+// holding the pipe. The group kill is powerless there and Run would block forever on the
+// copy goroutines; WaitDelay is what releases the caller.
+//
+// The child is not reaped here, and cannot be. This asserts the bound on the caller, which
+// is all WaitDelay promises, and it is why the group kill is the primary mechanism rather
+// than this one.
+func TestWaitDelayReleasesTheCallerWhenAChildEscapesTheGroup(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "child-survived")
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	// The escaped child must hold the pipe for far longer than WaitDelay. An earlier
+	// version had it sleep 3s, so with WaitDelay removed Run still returned when the child
+	// exited of its own accord, and the test passed against the mutant it exists to catch.
+	const holdsPipeFor = 30 * time.Second
+	_, run := hangingCommand(t, ctx, marker, holdsPipeFor, "setsid ")
+
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() { done <- run() }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("want an error when the deadline fires")
+		}
+		el := time.Since(start)
+		// The deadline plus WaitDelay, with room for a loaded machine, and far short of the
+		// 30s the child holds the pipe for. Without WaitDelay, Run waits out the child.
+		if el > WaitDelay+5*time.Second {
+			t.Fatalf("Run took %s to return on a 300ms deadline with a %s wait delay", el, WaitDelay)
+		}
+		if el < WaitDelay {
+			t.Fatalf("Run returned in %s, before the %s wait delay: the child was reaped after all, so this is no longer testing the backstop", el, WaitDelay)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatalf("Run did not return 20s after a 300ms deadline: a child that left the process group holds the pipe, and nothing capped the wait on it")
 	}
 }
