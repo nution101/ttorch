@@ -118,7 +118,9 @@ lands, and recovers; the manager bridges the two with judgment.
    repo's checks (`ttorch validate`) and the adversarial-review gate (`ttorch trust …`),
    recording a durable, commit-pinned **verdict**. Gating produces a verdict; it never
    merges.
-6. **Land.** In most modes you run `ttorch approve <id>` and the gated work lands. In
+6. **Land.** In most modes you run `ttorch approve <id>` — yourself, in your own terminal,
+   since approve refuses a non-interactive invocation or one from inside a worker's
+   context — and the gated work lands. In
    **trusted** mode a passing verdict + a fresh green validate lands it with no separate
    approval (see below). The scheduler lands already-gated work for you.
 7. **Finish.** Delivered tasks return their worktree to the pool for reuse.

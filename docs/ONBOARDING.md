@@ -114,7 +114,9 @@ gates trusted work, lands, and recovers, and the manager bridges the two with ju
    repos the scheduler does this automatically; in other modes the manager runs it, and either
    way the manager adjudicates any gate the scheduler escalates. `ttorch review-diff <id>` shows
    the changes. Gating produces a verdict; it never merges.
-5. **Approve & land.** In most modes you run `ttorch approve <id>` and the gated work lands
+5. **Approve & land.** In most modes you run `ttorch approve <id>` yourself, in your own
+   terminal — it refuses a non-interactive invocation, and one made from inside a worker's
+   context ($TTORCH_TASK_ID, or a `.ttorch/task` at or above the cwd) — and the gated work lands
    (the scheduler lands already-gated work for you, or the manager runs `ttorch land`). In
    **trusted** mode a passing verdict + a fresh green validate lands it with no separate
    approval (§7). **Outside trusted mode, nothing merges without your approval.**

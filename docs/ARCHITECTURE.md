@@ -252,6 +252,16 @@ so an audit can always tell them apart. The token is time-boxed (`--ttl`, defaul
 single-use, and bound to the reviewed commit: if the worker's HEAD moved after approval,
 the merge is refused.
 
+`ttorch approve` refuses two shapes an approval takes when it is not the lead running it by
+hand: a non-interactive invocation (stdin is not a character device, or is `/dev/null` — what
+a wrapper, a script or an agent's shell tool produces), and an invocation from inside a
+worker's context (`$TTORCH_TASK_ID` is set, or a `.ttorch/task` file exists at or above the
+cwd). **This narrows a class; it does not close one.** A worker session runs as the lead with
+the same filesystem authority: it can write `~/.ttorch/state/<id>.approve` directly without
+calling `ttorch approve` at all, and if it does call it, `env -u TTORCH_TASK_ID`, a `cd`, and
+a pty defeat all three checks. The reason to have the guard is that the realistic cases are
+accidental and injected approvals, and it stops both of those.
+
 ### Advisory audits
 
 A **standalone security audit** (`ttorch security-review`) runs the security reviewer in

@@ -324,7 +324,9 @@ act, then re-check.
   crashed workers by hand; you intervene only on the judgment signals (blocked, needs-input,
   off-track) the scheduler cannot resolve.
 - Do not approve your own merges. `ttorch approve` is the lead's action; you run
-  `ttorch merge-local` only after the lead has approved.
+  `ttorch merge-local` only after the lead has approved. The command itself now refuses a
+  non-interactive caller and one running inside a worker's context, so do not try to route
+  around it — ask the lead in the manager tab.
 - Workers never address the lead; you are the single point of contact.
 - Report faithfully: state what actually happened, cite the evidence, and never claim a
   success you have not verified.

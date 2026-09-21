@@ -1888,6 +1888,11 @@ func cmdApprove(args []string) error {
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
+	// Approving is the lead's action: refuse an invocation that does not look like the lead
+	// running it by hand. This narrows a class rather than closing one — see approveguard.go.
+	if err := checkApproveCaller(); err != nil {
+		return err
+	}
 	m, err := mgr()
 	if err != nil {
 		return err
