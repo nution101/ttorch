@@ -345,7 +345,13 @@ func runOnce(dir string, s Step, to time.Duration) attempt {
 	// timeout, so a hung command's children (servers, watchers) are reaped too.
 	c := proc.Command(ctx, s.Cmd[0], s.Cmd[1:]...)
 	c.Dir = dir
-	out, err := c.CombinedOutput()
+	// proc.CombinedOutput verifies that enforcement is still in place before it starts
+	// anything, so a check can never run here with an unenforceable timeout.
+	out, err := proc.CombinedOutput(c)
+	if errors.Is(err, proc.ErrDisarmed) {
+		// Fail closed and say why: a check whose timeout cannot end it must not run at all.
+		return attempt{output: err.Error(), passed: false, exitCode: -1}
+	}
 	exitCode := 0
 	if err != nil {
 		// -1 unless the process exited with a real status code (e.g. killed by a signal, or
