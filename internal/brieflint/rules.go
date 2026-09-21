@@ -348,7 +348,13 @@ func checkFilePaths(ctx context.Context, b *brief, opt Options) ([]Finding, []st
 	for _, c := range cites {
 		if c.create {
 			created = append(created, c)
-			continue
+			// An exempted citation skips the EXISTENCE check, not the line bound. If it
+			// names a line and the file turns out to exist, the line is still checked
+			// against it; only a missing file is forgiven. Skipping both let
+			// "write dev/report.md:9999" past unexamined.
+			if c.line == 0 {
+				continue
+			}
 		}
 		if c.line > 0 {
 			withLine = append(withLine, c)
@@ -375,7 +381,7 @@ func checkFilePaths(ctx context.Context, b *brief, opt Options) ([]Finding, []st
 	}
 	if len(created) > 0 {
 		// Visible, never silent: an exemption the reader can see is one they can question.
-		notes = append(notes, fmt.Sprintf("file-paths: %d citation(s) not checked, the brief asks for them to be created: %s",
+		notes = append(notes, fmt.Sprintf("file-paths: %d citation(s) exempt from the existence check, the brief asks for them to be created: %s",
 			len(created), strings.Join(rawPaths(created), ", ")))
 	}
 	return findings, notes
@@ -448,6 +454,10 @@ func (o Options) checkLineCitations(ctx context.Context, cites []citation, ref s
 			})
 			continue
 		case !ok:
+			if c.create {
+				// The brief asked for this file; not existing yet is the point.
+				continue
+			}
 			findings = append(findings, Finding{
 				Rule: RuleFilePaths, Status: miss, Quote: c.quote, Line: c.src,
 				Detail: fmt.Sprintf("cited path %s does not exist at %s%s", c.path, ref, remedy),

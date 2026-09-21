@@ -1065,3 +1065,24 @@ func TestRuleHardCountsRejectsAHedgeThatAsksForNothing(t *testing.T) {
 		t.Fatalf("unexpected detail: %s", f.Detail)
 	}
 }
+
+// An exempted citation skips the existence check, not the line bound. Skipping both let a
+// fabricated line number through on any path the brief could be read as asking to create.
+func TestCreateExemptionStillBoundsTheLine(t *testing.T) {
+	repo, _ := fixture(t)
+
+	// pkg/thing.go exists on the base with fixtureShortLines lines, so the line is checkable
+	// and out of range even though the sentence asks for a write.
+	brief := strings.Replace(satisfying, "Touch pkg/thing.go and docs/guide.md.",
+		fmt.Sprintf("Write pkg/thing.go:%d with the new helper.", fixtureShortLines+9000), 1)
+	f := requireStatus(t, Lint(brief, Options{Repo: repo}), RuleFilePaths, StatusIndeterminate)
+	if !strings.Contains(f.Detail, fmt.Sprintf("has %d line(s)", fixtureShortLines)) {
+		t.Fatalf("want the line bound reported against the real file, got %q", f.Detail)
+	}
+
+	// A file the brief asks for that genuinely does not exist keeps its exemption, line
+	// number and all: there is nothing to bound it against yet.
+	brief = strings.Replace(satisfying, "Touch pkg/thing.go and docs/guide.md.",
+		"Write dev/report/EVIDENCE.md:120 with the findings.", 1)
+	requireClean(t, Lint(brief, Options{Repo: repo}), RuleFilePaths)
+}
