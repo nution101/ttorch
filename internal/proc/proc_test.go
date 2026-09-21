@@ -3,11 +3,12 @@ package proc
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
+	"reflect"
 	"strings"
 	"syscall"
 	"testing"
@@ -15,99 +16,147 @@ import (
 )
 
 // The tests re-exec this binary as the forked child (the os/exec package tests its own
-// process handling the same way). The child must be a SINGLE process that sleeps and then
+// process handling the same way). The child must be a SINGLE process that waits and then
 // writes a marker: a shell doing the same job forks, and when the group kill reaps its
 // child, the shell can run one more command in the moment before the signal reaches it. That
 // made an earlier version of this test report a leak roughly one run in five. The property
 // under test is whether the child outlives the deadline, so the fixture must not be able to
 // half-outlive it.
+//
+// Nothing here signals a pid. Every fixture process watches a stop file and exits when it
+// appears, so cleanup reaps them by writing that file rather than by kill(2). An earlier
+// version sent a bare SIGKILL to a pid read from a file, which on the passing path was a pid
+// the fixture no longer owned: the child is reaped at the 300ms deadline and the signal went
+// out around 2.3s later, so any process the OS had since given that pid would have taken it.
 const (
-	helperEnv = "TTORCH_PROC_TEST_CHILD" // "[setsid ]<sleep-duration> <marker-path>"
-	// helperPIDEnv names a file the child writes its own pid to before it does anything
-	// else. Cleanup needs it: a child that calls setsid is in a session of its own, so the
-	// group kill that reaps the rest of the fixture cannot reach it by any pid the parent
-	// knows.
-	helperPIDEnv = "TTORCH_PROC_TEST_CHILD_PIDFILE"
+	childEnv = "TTORCH_PROC_TEST_CHILD" // "[setsid ]<wait-duration> <marker-path>"
+	binEnv   = "TTORCH_PROC_TEST_BIN"   // this test binary, for the shell to fork
+	stopEnv  = "TTORCH_PROC_TEST_STOP"  // the stop file every fixture process watches
+	lockEnv  = "TTORCH_PROC_TEST_LOCK"  // the child holds a lock on this for its whole life
 )
 
+// childPoll is how often a fixture process checks for the stop file.
+const childPoll = 50 * time.Millisecond
+
 func TestMain(m *testing.M) {
-	if v := os.Getenv(helperEnv); v != "" {
-		// Record the pid first, before anything that can change how reachable this process
-		// is, so cleanup can always find it.
-		if f := os.Getenv(helperPIDEnv); f != "" {
-			if err := os.WriteFile(f, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
-				os.Exit(5)
-			}
-		}
-		if rest, ok := strings.CutPrefix(v, "setsid "); ok {
-			// Leave the process group, so a kill aimed at the group cannot reach this
-			// process. The pipe it inherited stays open either way.
-			if _, err := syscall.Setsid(); err != nil {
-				os.Exit(4)
-			}
-			v = rest
-		}
-		parts := strings.SplitN(v, " ", 2)
-		d, err := time.ParseDuration(parts[0])
-		if err != nil {
-			os.Exit(2)
-		}
-		time.Sleep(d)
-		if err := os.WriteFile(parts[1], []byte("survived\n"), 0o644); err != nil {
-			os.Exit(3)
-		}
-		os.Exit(0)
+	if v := os.Getenv(childEnv); v != "" {
+		os.Exit(runChild(v))
 	}
 	os.Exit(m.Run())
 }
 
+// runChild is the forked child: hold a lock for as long as this process lives, optionally
+// leave the process group, then wait out the duration and write the marker. It gives up
+// early if the stop file appears, which is how cleanup reaps it without signalling a pid.
+//
+// The lock is the liveness signal. It is released by the kernel when this process ends, for
+// any reason including SIGKILL, so a test can tell "the child is gone" from "the child is
+// still running" without naming a pid that may by then belong to someone else.
+func runChild(v string) int {
+	lock, err := os.OpenFile(os.Getenv(lockEnv), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return 5
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return 6
+	}
+	if rest, ok := strings.CutPrefix(v, "setsid "); ok {
+		// Leave the process group, so a kill aimed at the group cannot reach this process.
+		// The pipe it inherited stays open either way.
+		if _, err := syscall.Setsid(); err != nil {
+			return 4
+		}
+		v = rest
+	}
+	parts := strings.SplitN(v, " ", 2)
+	d, err := time.ParseDuration(parts[0])
+	if err != nil {
+		return 2
+	}
+	stop := os.Getenv(stopEnv)
+	for deadline := time.Now().Add(d); time.Now().Before(deadline); {
+		if _, err := os.Stat(stop); err == nil {
+			return 0
+		}
+		time.Sleep(childPoll)
+	}
+	if err := os.WriteFile(parts[1], []byte("survived\n"), 0o644); err != nil {
+		return 3
+	}
+	return 0
+}
+
 // hangingCommand builds a command of the shape that matters: a parent that forks a child
-// sharing its stdout and then blocks. Kill the parent alone and the child keeps the write end
-// of the pipe open, so a Wait that reads the pipe never returns. The child writes marker
+// sharing its stdout and then blocks. Kill the parent alone and the child keeps the write
+// end of the pipe open, so a Wait that reads the pipe never returns. The child writes marker
 // after wait, so a test can see whether it outlived the deadline.
+//
+// The shell blocks in a loop over the stop file rather than in sleep(1), so cleanup can end
+// it without signalling anything; the loop is bounded so that a test binary killed before
+// its cleanup runs still leaves nothing behind for longer than the old sleep did.
 func hangingCommand(t *testing.T, ctx context.Context, marker string, wait time.Duration, opts ...string) (*bytes.Buffer, func() error) {
 	t.Helper()
 	self, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := Command(ctx, "sh", "-c", fmt.Sprintf("%q & sleep 120", self))
-	pidFile := marker + ".childpid"
+	dir := t.TempDir()
+	stop := filepath.Join(dir, "stop")
+	lock := filepath.Join(dir, "child.lock")
+
+	// The binary path reaches the shell through the environment, never interpolated into
+	// the script: sh expands $ and backtick inside double quotes, and %q does not escape
+	// either of them.
+	script := `"$` + binEnv + `" &
+i=0
+while [ ! -f "$` + stopEnv + `" ] && [ "$i" -lt 120 ]; do
+  sleep 1
+  i=$((i+1))
+done`
+	c := Command(ctx, "sh", "-c", script)
 	c.Env = append(os.Environ(),
-		fmt.Sprintf("%s=%s%s %s", helperEnv, strings.Join(opts, ""), wait, marker),
-		fmt.Sprintf("%s=%s", helperPIDEnv, pidFile),
+		fmt.Sprintf("%s=%s%s %s", childEnv, strings.Join(opts, ""), wait, marker),
+		binEnv+"="+self,
+		stopEnv+"="+stop,
+		lockEnv+"="+lock,
 	)
-	t.Cleanup(func() { reapFixture(c, pidFile) })
 	var out bytes.Buffer
 	c.Stdout = &out
 	c.Stderr = &out
-	return &out, c.Run
+	t.Cleanup(func() { reapFixture(t, stop, lock) })
+	return &out, func() error { return Run(c) }
 }
 
-// reapFixture kills whatever the fixture still has running. Every test here starts a
-// process built to outlive its deadline, so without this a passing run leaves the escaped
-// child at ppid 1 for the length of its sleep, and a run where the group kill regressed
-// leaves the whole sh tree for the full two minutes with nothing bounding it.
+// reapFixture ends everything the fixture started and proves the child is gone.
 //
-// Both kills are best effort. By the time cleanup runs the group is normally already gone,
-// and ESRCH is the expected answer.
-func reapFixture(c *exec.Cmd, pidFile string) {
-	if c.Process != nil {
-		_ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
+// It signals nothing. Writing the stop file is what ends the shell and the child, so there
+// is no pid to get wrong. Taking the child's lock is what proves it: the kernel releases
+// that lock when the process ends however it ends, so acquiring it means the child is gone
+// and nothing else can make it look that way.
+func reapFixture(t *testing.T, stop, lock string) {
+	t.Helper()
+	if err := os.WriteFile(stop, nil, 0o644); err != nil && !os.IsNotExist(err) {
+		t.Errorf("writing the stop file: %v", err)
 	}
-	// The child records its own pid because a setsid child is in its own session and the
-	// group kill above cannot reach it. Signal the pid alone rather than its group: the
-	// child has no children of its own, and a group kill aimed at a pid this process no
-	// longer owns is a worse thing to get wrong.
-	b, err := os.ReadFile(pidFile)
+	f, err := os.OpenFile(lock, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
+		t.Errorf("opening the child lock: %v", err)
 		return
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
-	if err != nil || pid <= 0 {
-		return
+	defer f.Close()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("the fixture child still holds its lock 10s after the stop file was written: it outlived the test")
+			return
+		}
+		time.Sleep(childPoll)
 	}
-	_ = syscall.Kill(pid, syscall.SIGKILL)
 }
 
 func TestCommandKillsTheWholeGroupOnDeadline(t *testing.T) {
@@ -124,6 +173,9 @@ func TestCommandKillsTheWholeGroupOnDeadline(t *testing.T) {
 		if err == nil {
 			t.Fatal("want an error when the deadline fires")
 		}
+		if errors.Is(err, ErrDisarmed) {
+			t.Fatalf("the fixture never ran, so this asserted nothing: %v", err)
+		}
 		if el := time.Since(start); el > 10*time.Second {
 			t.Fatalf("Run took %s to return on a 300ms deadline", el)
 		}
@@ -132,7 +184,7 @@ func TestCommandKillsTheWholeGroupOnDeadline(t *testing.T) {
 	}
 
 	// Releasing the caller is only half of it. The child writes its marker a second in,
-	// which is three times the deadline: if it is there, the child outlived the kill and
+	// more than three times the deadline: if it is there, the child outlived the kill and
 	// went on working, and a deadline that leaks a process every time it fires bounds the
 	// waiting rather than the work.
 	time.Sleep(2 * time.Second)
@@ -143,13 +195,53 @@ func TestCommandKillsTheWholeGroupOnDeadline(t *testing.T) {
 	}
 }
 
+// WaitDelay is the backstop for the case the group kill cannot cover: a child that leaves
+// the process group before the deadline, so kill(-pgid) never reaches it, while still
+// holding the pipe. The group kill is powerless there and Run would block forever on the
+// copy goroutines; WaitDelay is what releases the caller.
+//
+// The child is not reaped by the deadline here, and cannot be. This asserts the bound on the
+// caller, which is all WaitDelay promises; cleanup is what ends the child, and it proves it.
+func TestWaitDelayReleasesTheCallerWhenAChildEscapesTheGroup(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "child-survived")
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	// The escaped child must hold the pipe for far longer than WaitDelay. An earlier
+	// version had it wait 3s, so with WaitDelay removed Run still returned when the child
+	// finished of its own accord, and the test passed against the mutant it exists to catch.
+	const holdsPipeFor = 30 * time.Second
+	_, run := hangingCommand(t, ctx, marker, holdsPipeFor, "setsid ")
+
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() { done <- run() }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("want an error when the deadline fires")
+		}
+		if errors.Is(err, ErrDisarmed) {
+			t.Fatalf("the fixture never ran, so this asserted nothing: %v", err)
+		}
+		el := time.Since(start)
+		if el > WaitDelay+5*time.Second {
+			t.Fatalf("Run took %s to return on a 300ms deadline with a %s wait delay", el, WaitDelay)
+		}
+		if el < WaitDelay {
+			t.Fatalf("Run returned in %s, before the %s wait delay: the child was reaped after all, so this is no longer testing the backstop", el, WaitDelay)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatalf("Run did not return 20s after a 300ms deadline: a child that left the process group holds the pipe, and nothing capped the wait on it")
+	}
+}
+
 // The ordinary path must be untouched: output is captured and the exit status is the
 // command's own.
 func TestCommandRunsNormally(t *testing.T) {
 	var out bytes.Buffer
 	c := Command(context.Background(), "sh", "-c", "echo hello; exit 3")
 	c.Stdout = &out
-	if err := c.Run(); err == nil {
+	if err := Run(c); err == nil {
 		t.Fatal("want the command's own non-zero exit")
 	} else if c.ProcessState.ExitCode() != 3 {
 		t.Fatalf("exit code = %d, want 3", c.ProcessState.ExitCode())
@@ -163,53 +255,106 @@ func TestCommandRunsNormally(t *testing.T) {
 func TestCommandUnderDeadlineCompletes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	var out bytes.Buffer
-	c := Command(ctx, "sh", "-c", "echo done")
-	c.Stdout = &out
-	if err := c.Run(); err != nil {
-		t.Fatalf("Run: %v", err)
+	out, err := CombinedOutput(Command(ctx, "sh", "-c", "echo done"))
+	if err != nil {
+		t.Fatalf("CombinedOutput: %v", err)
 	}
-	if got := out.String(); got != "done\n" {
-		t.Fatalf("stdout = %q, want %q", got, "done\n")
+	if string(out) != "done\n" {
+		t.Fatalf("output = %q, want %q", out, "done\n")
 	}
 }
 
-// WaitDelay is the backstop for the case the group kill cannot cover: a child that leaves
-// the process group before the deadline, so kill(-pgid) never reaches it, while still
-// holding the pipe. The group kill is powerless there and Run would block forever on the
-// copy goroutines; WaitDelay is what releases the caller.
-//
-// The child is not reaped here, and cannot be. This asserts the bound on the caller, which
-// is all WaitDelay promises, and it is why the group kill is the primary mechanism rather
-// than this one.
-func TestWaitDelayReleasesTheCallerWhenAChildEscapesTheGroup(t *testing.T) {
-	marker := filepath.Join(t.TempDir(), "child-survived")
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-	defer cancel()
-	// The escaped child must hold the pipe for far longer than WaitDelay. An earlier
-	// version had it sleep 3s, so with WaitDelay removed Run still returned when the child
-	// exited of its own accord, and the test passed against the mutant it exists to catch.
-	const holdsPipeFor = 30 * time.Second
-	_, run := hangingCommand(t, ctx, marker, holdsPipeFor, "setsid ")
+// --- the guarantee is checked, not just documented -------------------------------------
 
-	done := make(chan error, 1)
-	start := time.Now()
-	go func() { done <- run() }()
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("want an error when the deadline fires")
-		}
-		el := time.Since(start)
-		// The deadline plus WaitDelay, with room for a loaded machine, and far short of the
-		// 30s the child holds the pipe for. Without WaitDelay, Run waits out the child.
-		if el > WaitDelay+5*time.Second {
-			t.Fatalf("Run took %s to return on a 300ms deadline with a %s wait delay", el, WaitDelay)
-		}
-		if el < WaitDelay {
-			t.Fatalf("Run returned in %s, before the %s wait delay: the child was reaped after all, so this is no longer testing the backstop", el, WaitDelay)
-		}
-	case <-time.After(20 * time.Second):
-		t.Fatalf("Run did not return 20s after a 300ms deadline: a child that left the process group holds the pipe, and nothing capped the wait on it")
+// Every way of disarming a command must be refused rather than run. These are the four
+// fields Check names, each removed the way a caller plausibly would.
+func TestDisarmedCommandsAreRefused(t *testing.T) {
+	cases := map[string]struct {
+		disarm func(*exec.Cmd)
+		want   string
+	}{
+		"SysProcAttr replaced wholesale": {
+			// The plausible one: adding an unrelated field by assigning a fresh struct.
+			disarm: func(c *exec.Cmd) { c.SysProcAttr = &syscall.SysProcAttr{Foreground: false} },
+			want:   "Setpgid is false",
+		},
+		"SysProcAttr nil": {
+			disarm: func(c *exec.Cmd) { c.SysProcAttr = nil },
+			want:   "SysProcAttr is nil",
+		},
+		"joins an existing group": {
+			disarm: func(c *exec.Cmd) { c.SysProcAttr.Pgid = 1234 },
+			want:   "joins that group instead of leading its own",
+		},
+		"Cancel removed": {
+			disarm: func(c *exec.Cmd) { c.Cancel = nil },
+			want:   "Cancel is nil",
+		},
+		"Cancel replaced": {
+			disarm: func(c *exec.Cmd) { c.Cancel = func() error { return nil } },
+			want:   "not the group kill this package installed",
+		},
+		"WaitDelay zeroed": {
+			disarm: func(c *exec.Cmd) { c.WaitDelay = 0 },
+			want:   "WaitDelay is zero",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := Command(context.Background(), "sh", "-c", "exit 0")
+			tc.disarm(c)
+
+			err := Check(c)
+			if err == nil {
+				t.Fatal("Check accepted a disarmed command")
+			}
+			if !errors.Is(err, ErrDisarmed) {
+				t.Fatalf("Check error = %v, want it to wrap ErrDisarmed", err)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Check error = %q, want it to mention %q", err, tc.want)
+			}
+			// And the command must not run at all.
+			if err := Run(c); !errors.Is(err, ErrDisarmed) {
+				t.Fatalf("Run error = %v, want ErrDisarmed", err)
+			}
+			if err := Start(c); !errors.Is(err, ErrDisarmed) {
+				t.Fatalf("Start error = %v, want ErrDisarmed", err)
+			}
+			if _, err := CombinedOutput(c); !errors.Is(err, ErrDisarmed) {
+				t.Fatalf("CombinedOutput error = %v, want ErrDisarmed", err)
+			}
+			if c.Process != nil {
+				t.Fatal("a refused command must not have been started")
+			}
+		})
+	}
+}
+
+// An untouched command passes, so the check cannot be satisfied by rejecting everything.
+func TestCheckAcceptsAnIntactCommand(t *testing.T) {
+	if err := Check(Command(context.Background(), "sh", "-c", "exit 0")); err != nil {
+		t.Fatalf("Check rejected an untouched command: %v", err)
+	}
+}
+
+// Check tells the installed Cancel from a replacement by code pointer, which relies on every
+// closure from one func literal sharing one. Pin that, because the check is worthless if the
+// comparison is accidentally true or accidentally false.
+func TestCancelIdentityIsStable(t *testing.T) {
+	a := Command(context.Background(), "true")
+	b := Command(context.Background(), "false")
+	// The comparison Check actually performs. An earlier version of this test compared the
+	// two commands to each other and an unrelated func to groupKillPC, but never a real
+	// command to groupKillPC, so it passed while Check rejected every command in the
+	// package: groupKill was being inlined, giving each call site its own closure.
+	if reflect.ValueOf(a.Cancel).Pointer() != groupKillPC {
+		t.Fatal("a command from Command does not carry the installed Cancel, so Check rejects valid commands")
+	}
+	if reflect.ValueOf(a.Cancel).Pointer() != reflect.ValueOf(b.Cancel).Pointer() {
+		t.Fatal("two commands from Command carry different Cancel code pointers, so Check would reject valid commands")
+	}
+	if reflect.ValueOf(func() error { return nil }).Pointer() == groupKillPC {
+		t.Fatal("an unrelated func matches the installed Cancel, so Check would accept a replacement")
 	}
 }
