@@ -240,7 +240,11 @@ Two details matter in practice:
 - **A brief is untrusted input**, pasted from issues and written by agents, and two rules query git
   once per item they find in it. So one run has an aggregate git budget (45s), the remote check
   verifies at most 3 distinct targets, and at most 64 distinct cited paths are resolved. Whatever a
-  bound excludes is reported as unevaluable and named, never passed over.
+  bound excludes is reported as unevaluable and named, never passed over. The budget is enforced
+  rather than merely set: each git call runs in its own process group, which is killed when the
+  budget is spent, and the wait on any pipe an escaped fork still holds is capped at 2s. Killing
+  git alone is not enough, because the ssh or credential helper it forked keeps the output pipe
+  open.
 
 Per-project configuration lives in the repo's `AGENTS.md`, beside the delivery-mode line:
 

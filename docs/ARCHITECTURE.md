@@ -425,11 +425,19 @@ Three properties are load-bearing:
   positive the rule exists to avoid.
 - **Brief-driven work is bounded.** A brief is untrusted input, and two rules query git once per
   item they find in it, one of them over the network. One run therefore shares a single aggregate
-  git deadline (`Options.Budget`, 45s by default, which every call derives from and which always
-  wins over the 20s per-call ceiling), the remote check verifies at most `maxRemoteTargets`
+  git deadline (`Options.Budget`, 45s by default, which every call derives from alongside the 20s
+  per-call ceiling, the sooner of the two winning), the remote check verifies at most `maxRemoteTargets`
   distinct branches, at most `maxCitations` distinct paths are resolved, line counts are memoized
   per path, and a blob over `maxBlobBytes` is declined rather than read. Everything a bound
   excludes is reported as CANNOT-EVALUATE and named.
+
+  The deadline is enforced rather than declared. `exec.CommandContext` kills the process it
+  started and nothing below it, and with a buffer sink `Wait` also waits on the goroutines
+  copying the child's pipes, so a forked `ssh` holding the write end keeps the caller blocked
+  however long ago the deadline passed. So the lint starts git in its own process group, kills
+  the group when the deadline fires, and caps the post-kill wait on those pipes at two seconds
+  (`gitCommand`, `internal/brieflint/git.go`). `internal/validate` handles its own checks the
+  same way.
 - **Per-project configuration, visible overrides.** `- brief-standards:` and
   `- brief-lint-disable:` lines in the repo's `AGENTS.md` (read anywhere in the file, like
   `- auto-mint-max-age:`) set the expected standards pointer and turn individual rules off. Every
