@@ -78,6 +78,25 @@ func (p Paths) ValidateCacheDir() string {
 	return envOr("TTORCH_VALIDATE_CACHE_DIR", filepath.Join(p.Home, "validate-cache"))
 }
 
+// ReviewWorkspaceDir is the scratch cwd root for reviewer sessions that run OUTSIDE the
+// worker's worktree: one directory per task, holding a copy of the staged diff and a bare
+// mirror of the repo.
+//
+// It is deliberately NOT under ReviewInputsDir. A Claude session walks up from its cwd
+// looking for CLAUDE.md, so every ancestor of a reviewer's working directory is on that
+// session's configuration path, and the review-inputs dir is precisely the directory the
+// trust gate treats as untrusted — it holds the diff, the verdicts and the reviewer set, all
+// of which the gate must assume an adversary can write. Putting the reviewer's cwd inside it
+// would have made the one directory the gate distrusts an ancestor of the session doing the
+// distrusting.
+//
+// This narrows the plausible path, not the capability: everything under Home is writable by
+// any process running as the same user, which is the process channel and is not closed by
+// choosing a different directory.
+func (p Paths) ReviewWorkspaceDir(id string) string {
+	return filepath.Join(p.Home, "review-workspaces", id)
+}
+
 // Worktrees is the root for per-task isolated git worktrees.
 func (p Paths) Worktrees() string { return filepath.Join(p.Home, "worktrees") }
 

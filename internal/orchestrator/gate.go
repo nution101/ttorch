@@ -1256,21 +1256,23 @@ func (m *Manager) Gateable(repo string) bool {
 var isolatedReviewDimensions = map[string]bool{review.DimensionSecurity: true}
 
 // reviewWorkspaceDir is the scratch cwd for an isolated dimension's reviewer: a per-dimension
-// directory under the review inputs, so two isolated reviewers never share a mirror and the
-// episode teardown can drop it wholesale.
-func reviewWorkspaceDir(inputsDir, dim string) string {
-	return filepath.Join(inputsDir, "workspace", dim)
+// directory under the task's review-workspace root, so two isolated reviewers never share a
+// mirror and the episode teardown can drop it wholesale. The root is paths.ReviewWorkspaceDir
+// and NOT the review-inputs dir, because a session's cwd ancestors are on its configuration
+// path and the inputs dir is the directory the gate treats as untrusted.
+func (m *Manager) reviewWorkspaceDir(taskID, dim string) string {
+	return filepath.Join(m.P.ReviewWorkspaceDir(taskID), dim)
 }
 
 // reviewerCwd returns the directory a dimension's reviewer session runs in, and the bare mirror
 // it reads source from ("" when there is none). An isolated dimension gets a freshly
 // materialized scratch workspace (see prepareReviewWorkspace); every other dimension still runs
 // in the worker's worktree at the reviewed commit.
-func (m *Manager) reviewerCwd(dim, inputsDir, repo, wt, head string) (cwd, bare string, err error) {
+func (m *Manager) reviewerCwd(taskID, dim, inputsDir, repo, wt, head string) (cwd, bare string, err error) {
 	if !isolatedReviewDimensions[dim] {
 		return wt, "", nil
 	}
-	return prepareReviewWorkspace(inputsDir, dim, repo, wt, head)
+	return prepareReviewWorkspace(m.reviewWorkspaceDir(taskID, dim), inputsDir, repo, wt, head)
 }
 
 // prepareReviewWorkspace materializes the scratch cwd an isolated reviewer runs in and returns
@@ -1288,8 +1290,8 @@ func (m *Manager) reviewerCwd(dim, inputsDir, repo, wt, head string) (cwd, bare 
 // It is rebuilt from scratch on every dispatch, so a re-dispatch after the worker advanced
 // never reviews against a stale mirror. A local clone hardlinks its objects, so the rebuild
 // costs little.
-func prepareReviewWorkspace(inputsDir, dim, repo, wt, head string) (cwd, bare string, err error) {
-	cwd = reviewWorkspaceDir(inputsDir, dim)
+func prepareReviewWorkspace(dir, inputsDir, repo, wt, head string) (cwd, bare string, err error) {
+	cwd = dir
 	if err := os.RemoveAll(cwd); err != nil {
 		return "", "", err
 	}
@@ -1361,7 +1363,7 @@ func (m *Manager) teardownReviewers(taskID string, dims []string) {
 		// rebuilt from scratch on the next dispatch, so dropping it here keeps one mirror per
 		// in-flight reviewer rather than one per task per episode.
 		if isolatedReviewDimensions[dim] {
-			_ = os.RemoveAll(reviewWorkspaceDir(m.P.ReviewInputsDir(taskID), dim))
+			_ = os.RemoveAll(m.reviewWorkspaceDir(taskID, dim))
 		}
 		window := reviewerWindow(taskID, dim)
 		if window == "" || !tmux.WindowExists(m.Session, window) {
@@ -1477,7 +1479,7 @@ func (m *Manager) spawnReviewer(taskID, dim, inputsDir, head, repo, wt string) e
 	if err := tmux.EnsureSession(m.Session); err != nil {
 		return err
 	}
-	cwd, bare, err := m.reviewerCwd(dim, inputsDir, repo, wt, head)
+	cwd, bare, err := m.reviewerCwd(taskID, dim, inputsDir, repo, wt, head)
 	if err != nil {
 		return err
 	}
