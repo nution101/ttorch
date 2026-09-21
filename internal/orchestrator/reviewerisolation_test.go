@@ -304,3 +304,70 @@ func TestReviewerCwd_MarkdownOnlyHarnessConfigStillIsolatesSecurity(t *testing.T
 		t.Fatalf("every reviewer for %v runs inside the worktree that rewrote their instructions", dims)
 	}
 }
+
+// TestReviewWorkspace_DetachedWorkerHeadIsFetched covers the fallback's legitimate case: the
+// reviewed commit is on no branch, so `git clone --mirror` (which copies refs) does not bring
+// it across and it has to be fetched from the worktree. The reviewer must still be able to read
+// source at that commit.
+func TestReviewWorkspace_DetachedWorkerHeadIsFetched(t *testing.T) {
+	m, repo, wt := trustHarness(t, "iso6", "trusted", "exit 0")
+	inputsDir := m.P.ReviewInputsDir("iso6")
+	gitIn(t, wt, "checkout", "-q", "--detach")
+	head := commitFeature(t, wt, "detached.go", "package detached\n\n// ONLY_ON_A_DETACHED_HEAD\n")
+	if out := gitIn(t, repo, "branch", "--contains", head, "--all"); out != "" {
+		t.Fatalf("the proof is vacuous: %s is reachable from a ref (%q)", head, out)
+	}
+
+	_, bare, err := m.reviewerCwd("iso6", review.DimensionSecurity, inputsDir, repo, wt, head)
+	if err != nil {
+		t.Fatalf("a detached worker HEAD must still be fetched into the mirror: %v", err)
+	}
+	if got := gitOutOrFail(t, bare, "show", head+":detached.go"); !strings.Contains(got, "ONLY_ON_A_DETACHED_HEAD") {
+		t.Fatalf("the mirror must serve the detached reviewed commit, got %q", got)
+	}
+}
+
+// TestReviewWorkspace_RefusesWhenTheReviewedCommitIsMissing exercises the guard on the
+// fallback fetch. The fetch pulls the worktree's CURRENT HEAD, not the reviewed sha, so it can
+// succeed while bringing back a different commit. Reporting success then would hand the
+// reviewer a mirror in which every `git show <head>:<path>` the brief tells it to run fails
+// with an invalid object name, leaving a thin report and nothing but the brief's "say so"
+// instruction between that and a quiet pass.
+//
+// Reaching that state needs an object store that genuinely lacks the reviewed commit, which
+// this test builds by making the worker checkout an INDEPENDENT clone rather than a linked
+// worktree. With ttorch's real linked worktrees it does not arise: a clone from a local path
+// copies the whole object directory, unreachable objects included (verified: an orphaned
+// commit survives `git clone --mirror` both with and without --no-hardlinks, and is dropped
+// only over the file:// transport), and a linked worktree shares the repo's store. So this is
+// defence in depth against the mirror ever being built by a real transport, not a fix for a
+// live failure.
+func TestReviewWorkspace_RefusesWhenTheReviewedCommitIsMissing(t *testing.T) {
+	m, repo, _ := trustHarness(t, "iso7", "trusted", "exit 0")
+	inputsDir := m.P.ReviewInputsDir("iso7")
+
+	// An independent clone: its new commits never enter repo's object store.
+	wt := filepath.Join(t.TempDir(), "clone")
+	gitIn(t, filepath.Dir(wt), "clone", "--quiet", repo, wt)
+	gitIn(t, wt, "checkout", "-q", "--detach")
+	head := commitFeature(t, wt, "reviewed.go", "package reviewed\n")
+	// The worker amends: it resets past the reviewed commit and commits something else, so
+	// the reviewed sha is not an ancestor of the new HEAD and a fetch of HEAD cannot bring
+	// it back.
+	gitIn(t, wt, "reset", "--hard", "-q", "HEAD~1")
+	moved := commitFeature(t, wt, "amended.go", "package amended\n")
+	if exec.Command("git", "-C", wt, "merge-base", "--is-ancestor", head, moved).Run() == nil {
+		t.Fatal("the proof is vacuous: the reviewed commit is still an ancestor of the worker HEAD, so a fetch would bring it back")
+	}
+	if exec.Command("git", "-C", repo, "cat-file", "-e", head+"^{commit}").Run() == nil {
+		t.Fatal("the proof is vacuous: the reviewed commit is in the source repo, so the mirror will have it")
+	}
+
+	_, _, err := m.reviewerCwd("iso7", review.DimensionSecurity, inputsDir, repo, wt, head)
+	if err == nil {
+		t.Fatal("preparing a workspace whose mirror lacks the reviewed commit must be an error, not a silent success")
+	}
+	if !strings.Contains(err.Error(), short(head)) {
+		t.Fatalf("the error must name the commit it could not serve, got %v", err)
+	}
+}

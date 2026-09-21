@@ -1310,14 +1310,30 @@ func prepareReviewWorkspace(dir, inputsDir, repo, wt, head string) (cwd, bare st
 		return "", "", fmt.Errorf("mirror %s for review: %w: %s", repo, cerr, strings.TrimSpace(string(out)))
 	}
 	// The reviewed commit is normally reachable from the worker's branch, which the mirror
-	// copies. Fall back to fetching it from the worktree by ref when it is not (a detached
-	// worker HEAD), so the reviewer can always read the source it is judging.
-	if exec.Command("git", "-C", bare, "cat-file", "-e", head+"^{commit}").Run() != nil {
+	// copies. Fall back to fetching it from the worktree when it is not (a detached worker
+	// HEAD), so the reviewer can always read the source it is judging.
+	if !commitInMirror(bare, head) {
 		if out, ferr := exec.Command("git", "-C", bare, "fetch", "--no-tags", "--quiet", wt, "+HEAD:refs/ttorch/reviewed").CombinedOutput(); ferr != nil {
 			return "", "", fmt.Errorf("fetch the reviewed commit %s into the review mirror: %w: %s", short(head), ferr, strings.TrimSpace(string(out)))
 		}
 	}
+	// Re-check rather than trust the fetch. It pulls the worktree's CURRENT HEAD, which is
+	// only the reviewed commit while the worker has not moved; if it advanced between the
+	// gate pinning head and this dispatch, the fetch succeeds and brings back the WRONG
+	// commit. Reporting success there would hand the reviewer a mirror in which every
+	// `git show <head>:<path>` the brief tells it to run fails, and leave nothing but the
+	// brief's "say so in the report" between a broken read path and a quiet pass. A
+	// workspace that cannot serve the commit under review is an error; the gate then retries
+	// the dispatch next tick, by which point the moved head has re-prepped the episode.
+	if !commitInMirror(bare, head) {
+		return "", "", fmt.Errorf("the review mirror for %s does not contain the reviewed commit %s; the worker HEAD moved since the gate pinned it", filepath.Base(dir), short(head))
+	}
 	return cwd, bare, nil
+}
+
+// commitInMirror reports whether sha resolves to a commit object in the bare mirror.
+func commitInMirror(bare, sha string) bool {
+	return exec.Command("git", "-C", bare, "cat-file", "-e", sha+"^{commit}").Run() == nil
 }
 
 // reviewerWindow is the tmux window name for one dimension's daemon-dispatched reviewer:
