@@ -843,21 +843,34 @@ func TestTrustPrep_SweepsLegacyFlatReportsButNotControlFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The advisory verdict files. The second one carries BOTH a dimension and a reviewed
+	// sha, which is what a review.Verdict would marshal to if it ever grew a Dimension field
+	// (a plausible thing to want on a per-dimension advisory verdict). The sweep must spare
+	// it for a reason that does not depend on that field being absent.
+	if err := os.WriteFile(filepath.Join(dir, "security-verdict.json"),
+		[]byte(`{"overall":"block","reviewedSha":"`+head+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "qa-verdict.json"),
+		[]byte(`{"overall":"pass","reviewedSha":"`+head+`","dimension":"qa"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
 	control := map[string][]byte{}
-	for _, name := range []string{review.PrepStampFile, review.StagedValidateFile, reviewersFileName, gateProgressFile} {
+	for _, name := range []string{review.PrepStampFile, review.StagedValidateFile, reviewersFileName, gateProgressFile, "security-verdict.json", "qa-verdict.json"} {
 		if b, err := os.ReadFile(filepath.Join(dir, name)); err == nil {
 			control[name] = b
 		}
 	}
-	if len(control) < 3 {
-		t.Fatalf("expected the control files to exist before the sweep, got %d", len(control))
+	if len(control) < 5 {
+		t.Fatalf("expected the control and verdict files to exist before the sweep, got %d", len(control))
 	}
 
 	if _, err := m.TrustPrep("lf1"); err != nil {
 		t.Fatal(err)
 	}
 
-	// Every control file is still there.
+	// Every control and verdict file is still there.
 	for name := range control {
 		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
 			t.Errorf("the sweep removed %s: %v", name, err)

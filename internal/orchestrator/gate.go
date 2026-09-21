@@ -471,12 +471,20 @@ func (m *Manager) archivePriorReports(taskID, dir string) {
 // tidying rather than a fix: it stops superseded reviews accumulating beside the control
 // files, where the next person to look has to work out which layout each file came from.
 //
-// A file is swept only if it PARSES as a review report carrying both a dimension and a
-// reviewed sha. That is the discriminator rather than a list of control-file basenames to
-// avoid, because a list of names to avoid is what put a report on top of gate-progress.json
-// in the first place: prep.json, validate.json, reviewers.json, gate-progress.json and the
-// advisory verdict files carry none of those fields, so none of them can match, however the
-// dimension set is named.
+// A file is swept only if it parses as a review report whose dimension MATCHES ITS OWN
+// BASENAME, which is how a report was written in the flat layout: scope.json declared
+// dimension "scope". That is the discriminator rather than a list of control-file basenames
+// to avoid, because a list of names to avoid is what put a report on top of
+// gate-progress.json in the first place.
+//
+// Matching the name to the field, rather than just requiring both fields to be present, is
+// what keeps the advisory verdict files out by construction. A marshalled review.Verdict
+// DOES carry a top-level reviewedSha, so it half-parses as a report already; it is spared
+// today only because review.Verdict happens to have no Dimension field, and a per-dimension
+// advisory verdict is a plausible thing to want. Under the name match, security-verdict.json
+// would have to declare dimension "security-verdict" to be swept, which no verdict writer
+// does. prep.json, validate.json, reviewers.json and gate-progress.json carry no dimension
+// at all.
 func (m *Manager) archiveLegacyFlatReports(dir string, ensureArchive func() bool, archive func() string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -492,8 +500,11 @@ func (m *Manager) archiveLegacyFlatReports(dir string, ensureArchive func() bool
 			continue
 		}
 		var r review.Report
-		if err := json.Unmarshal(b, &r); err != nil || r.Dimension == "" || r.ReviewedSHA == "" {
-			continue // not a report: a control file, an advisory verdict, or something else
+		if err := json.Unmarshal(b, &r); err != nil || r.ReviewedSHA == "" {
+			continue // not a report: a control file or something else entirely
+		}
+		if r.Dimension != strings.TrimSuffix(e.Name(), review.ReportSuffix) {
+			continue // a verdict file, or a report whose name and dimension disagree
 		}
 		if !ensureArchive() {
 			return
