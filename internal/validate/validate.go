@@ -18,10 +18,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/nution101/ttorch/internal/ciparity"
+	"github.com/nution101/ttorch/internal/proc"
 )
 
 // Step is one named check to run in the worktree.
@@ -341,18 +341,10 @@ func runStep(dir string, s Step, to time.Duration) Result {
 func runOnce(dir string, s Step, to time.Duration) attempt {
 	ctx, cancel := context.WithTimeout(context.Background(), to)
 	defer cancel()
-	c := exec.CommandContext(ctx, s.Cmd[0], s.Cmd[1:]...)
+	// proc.Command runs the check in its own process group and kills the whole group on
+	// timeout, so a hung command's children (servers, watchers) are reaped too.
+	c := proc.Command(ctx, s.Cmd[0], s.Cmd[1:]...)
 	c.Dir = dir
-	// Run the command in its own process group and kill the whole group on timeout,
-	// so a hung command's children (servers, watchers) are reaped too.
-	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	c.Cancel = func() error {
-		if c.Process != nil {
-			return syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
-		}
-		return nil
-	}
-	c.WaitDelay = 2 * time.Second
 	out, err := c.CombinedOutput()
 	exitCode := 0
 	if err != nil {
