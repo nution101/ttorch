@@ -438,11 +438,21 @@ These properties are load-bearing:
   the group when the deadline fires, and caps the post-kill wait on those pipes at two seconds
   (`gitCommand`, `internal/brieflint/git.go`). `internal/validate` handles its own checks the
   same way.
-- **Per-project configuration, visible overrides.** `- brief-standards:` and
+- **Per-project configuration that cannot disarm the gate silently.** `- brief-standards:` and
   `- brief-lint-disable:` lines in the repo's `AGENTS.md` (read anywhere in the file, like
   `- auto-mint-max-age:`) set the expected standards pointer and turn individual rules off. Every
-  disable, and every citation exempted because the brief asks for the file to be created, is
-  echoed in the report rather than applied silently.
+  disable is echoed, every summary line states how many rules ran out of how many exist, and a
+  run that evaluated none of them is CANNOT-EVALUATE rather than a pass. That configuration
+  belongs to the repository under review and any worker can commit it, so it can narrow what is
+  checked but it cannot produce a green result from checking nothing. Values read out of that
+  file are printed quoted, like every brief-derived quote.
+- **Exemptions are earned, not inherited.** A cited path is exempt from the existence check only
+  where a create verb governs that mention: the verb must precede the path and sit within a few
+  words of it, so a retrospective "came from adding the cache" exempts nothing, and a later
+  reference to the same path is checked even if an earlier mention asked for it to be written.
+  A hard count's hedge must likewise sit in the sentence carrying the number or the one after,
+  and must say the figure is suspect or ask for it to be counted again; prose mentioning results
+  elsewhere is not a hedge.
 
 ## 10. On-disk layout
 

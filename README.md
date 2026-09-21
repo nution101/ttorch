@@ -217,7 +217,7 @@ with no brief is unchanged). Five rules:
 | --- | --- |
 | `target-branch` | The brief names its target as `origin/<branch>`, and that branch exists on the remote |
 | `file-paths` | Every file path the brief cites exists at the ref the citation is about |
-| `hard-counts` | A brief stating "there are 21 occurrences" also tells the worker to verify it and report their own number |
+| `hard-counts` | A brief stating "there are 21 occurrences" says, in that sentence or the next, that the figure may be wrong or should be counted again, and asks for the worker's own number |
 | `prohibition` | A prohibition states the invariant it protects and the allowed end state, rather than banning `push`/`merge`/PR outright |
 | `standards` | The brief points at the standards the project expects |
 
@@ -234,9 +234,10 @@ Some details that matter in practice:
   defaulted, are named in the output.
 - **A check that cannot run never passes.** Exit `0` means every enabled rule was evaluated and
   passed, `1` that a rule was violated, `3` that at least one check *could not be evaluated* (an
-  unreachable remote, a ref that does not resolve, a line citation the base cannot settle), and `2`
-  a usage error. One run reports every violation, with the rule named and the offending text
-  quoted.
+  unreachable remote, a ref that does not resolve, a line citation the base cannot settle, or a
+  project that disabled every rule), and `2` a usage error. One run reports every violation, with
+  the rule named and the offending text quoted, and every summary line says how many of the rules
+  ran, so an outcome cannot be read without its coverage.
 - **A brief is untrusted input**, pasted from issues and written by agents, and two rules query git
   once per item they find in it. So one run has an aggregate git budget (45s), the remote check
   verifies at most 3 distinct targets, and at most 64 distinct cited paths are resolved. Whatever a
@@ -257,8 +258,11 @@ Per-project configuration lives in the repo's `AGENTS.md`, beside the delivery-m
 configurable precisely so no repository is held to another's layout. A project that declares none
 falls back to accepting any explicit standards reference; a project that declares the key with an
 empty value is a broken declaration, reported as unevaluable rather than a pass.
-`brief-lint-disable` turns individual rules off, and every override is echoed in the output rather
-than applied silently.
+`brief-lint-disable` turns individual rules off. Every override is echoed in the output, the
+summary line always says how many rules ran out of how many exist, and a project that disables
+*all* of them gets exit 3 and "nothing was checked" rather than a pass: the configuration lives in
+the repository under review, ttorch writes that file itself through learnings promotion, and any
+worker can commit it, so a run that evaluated no rule must not read as a clean gate.
 
 ## The scheduler daemon
 
