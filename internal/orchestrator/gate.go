@@ -91,10 +91,10 @@ func (m *Manager) ReviewersFor(taskID string) []string {
 //
 // The DERIVED FLOOR is unioned on top, and it is a distinct property rather than a second
 // opinion on the same one. The stamp catches an edit made after prep. Re-deriving the set from
-// the committed diff catches the case where the stamp itself was written wrong, which matters
-// because prep.json sits 0o644 in the same worker-writable directory as reviewers.json. Neither
+// the committed diff catches a stamp that was wrong when it was written, which matters because
+// prep.json sits 0o644 in the same worker-writable directory as reviewers.json. Neither
 // subsumes the other, so both run and the result is their union: the floor can only raise the
-// requirement.
+// requirement, never lower it.
 //
 // With no stamp covering sha there is nothing to decide from, so it fails safe to the full
 // built-in set unioned with the file and the floor, never to fewer.
@@ -109,23 +109,71 @@ func (m *Manager) requiredDimensions(t db.Task, sha string) (required, dropped [
 }
 
 // derivedFloor re-derives the reviewer set from the committed diff, so the set a verdict must
-// cover does not rest entirely on records kept in a directory the worker can write.
+// cover does not rest entirely on records kept in a directory the worker can write. It is the
+// same review.Classify over the same authoritative git file list and line stat TrustPrep used.
 //
-// It is the same review.Classify over the same authoritative git file list and line stat
-// TrustPrep used. A rewritten `{"dimensions":["correctness"]}` over a two-file code change
-// cannot skip the scope and security reviewers, because the floor names them anyway.
+// IT IS DERIVED OVER EVERY CANDIDATE BASE, NOT ONE. A diff is only as honest as the ref it is
+// taken against, and a linked worktree shares refs/ with the project repo, so a live worker can
+// point origin/<default> at a commit that already carries its own changes and leave a harmless
+// remainder. Measured: two .go files plus a NOTES.md, poison origin/<default> at the code
+// commit, and the derived set drops from correctness+scope+security to correctness+scope.
+// Pairing that with a lowered reviewers.json defeats both halves at once. Deriving against
+// every base that resolves and unioning the results means an attacker has to poison all of
+// them; unpoisoned local <default> still sees the .go files and still demands security.
 //
-// Every failure path lands on the full three-dimension set: the base does not resolve, git
-// fails, or review.Classify's own ok flag goes false.
+// Every failure path lands on the full three-dimension set: no base resolves, git fails, or
+// review.Classify's own ok flag goes false.
+//
+// WHAT THIS DOES NOT CLOSE. Every candidate is a ref in a store the worker can write, so
+// poisoning all of them lowers the floor again. That is the process channel, and a session that
+// can write refs can write the approval token directly, which is one file and skips the gate
+// entirely. This makes the floor no longer the cheapest way through; it does not make it
+// unreachable.
 func (m *Manager) derivedFloor(t db.Task, sha string) []string {
-	base, err := reviewBase(t.Project, false)
-	if err != nil {
+	var floor []string
+	derived := false
+	for _, base := range candidateReviewBases(t.Project) {
+		files, filesOK := diffFiles(t.Worktree, base, sha)
+		lines, binary, statOK := diffLineStat(t.Worktree, base, sha)
+		_, dims := review.Classify(files, lines, binary, filesOK && statOK)
+		floor = unionDimensions(floor, dims)
+		derived = true
+	}
+	if !derived {
 		return append([]string(nil), requiredReviewers...)
 	}
-	files, filesOK := diffFiles(t.Worktree, base, sha)
-	lines, binary, statOK := diffLineStat(t.Worktree, base, sha)
-	_, derived := review.Classify(files, lines, binary, filesOK && statOK)
-	return derived
+	return floor
+}
+
+// candidateReviewBases lists every ref the branch could honestly be diffed against: the true
+// review base the merge targets, the raw local default, and the remote-tracking default. They
+// normally agree, and where they do the union is the same set a single base would give. Where
+// they disagree, one of them has been moved, and taking the union means the move cannot hide a
+// changed file. Only refs that resolve are returned; duplicates are dropped so a diff is not
+// computed twice for the same sha.
+func candidateReviewBases(repo string) []string {
+	def := worktree.DefaultBranch(repo)
+	var out []string
+	seen := map[string]bool{}
+	for _, ref := range []string{"", def, "origin/" + def} {
+		if ref == "" {
+			// The base the land path will actually use. Resolved without a fetch: prep has
+			// already fetched for this episode, and a fetch here would be a network round trip
+			// on a per-tick path for no added integrity.
+			b, err := reviewBase(repo, false)
+			if err != nil {
+				continue
+			}
+			ref = b
+		}
+		sha, err := worktree.ResolveRef(repo, ref)
+		if err != nil || seen[sha] {
+			continue
+		}
+		seen[sha] = true
+		out = append(out, sha)
+	}
+	return out
 }
 
 // unionDimensions merges two dimension sets, preserving order (the first set, in

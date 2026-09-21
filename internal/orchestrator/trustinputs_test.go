@@ -38,6 +38,16 @@ func trustHarness(t *testing.T, id, mode, gateBody string) (m *Manager, repo, wt
 	}
 	commitGateScript(t, repo, gateBody)
 
+	// Give the repo a real origin. Without one, worktree.RemoteExists is false, landBase
+	// never looks at origin/<default>, and reviewBase silently falls back to the local
+	// branch — so every base-resolution path that reads a remote-tracking ref went
+	// unexercised, which is how a poisonable base survived a whole test suite.
+	originDir := filepath.Join(t.TempDir(), "origin.git")
+	gitIn(t, filepath.Dir(originDir), "init", "--bare", "-q", "-b", "main", originDir)
+	gitIn(t, repo, "remote", "add", "origin", originDir)
+	gitIn(t, repo, "push", "-q", "origin", "main")
+	gitIn(t, repo, "fetch", "-q", "origin")
+
 	wt = filepath.Join(t.TempDir(), "wt")
 	gitIn(t, repo, "worktree", "add", "-q", "-b", "task/"+id, wt)
 
@@ -621,5 +631,79 @@ func TestRequiredDimensions_MixedCaseHarnessConfigStillDerivesSecurity(t *testin
 	}
 	if v.Overall != review.Block {
 		t.Fatalf("mixed-case harness config must not reach a pass on two clean reports: %q", v.Overall)
+	}
+}
+
+// TestRequiredDimensions_PoisonedOriginCannotLowerTheFloor is the base-resolution attack.
+//
+// requiredDimensions resolves its base through reviewBase, which prefers origin/<default>. A
+// linked worktree shares refs/remotes/* with the project repo, so a live worker can point that
+// ref at a commit already containing its own changes. The three-dot diff against that base then
+// shows fewer files than the worker actually changed, review.Classify sees a smaller change,
+// and the derived floor drops below what the diff demands. The floor is the whole of step 1a,
+// so lowering it defeats the dispatch set, the aggregation set and the audit line at once.
+//
+// Nothing is committed to do this, which places it in the process channel rather than the diff
+// channel. It is fixed here anyway because a floor a worker can lower is not a floor.
+func TestRequiredDimensions_PoisonedOriginCannotLowerTheFloor(t *testing.T) {
+	m, repo, wt := trustHarness(t, "pz1", "trusted", "exit 0")
+	// The code the worker actually wants unreviewed, then an inert commit on top. Poisoning
+	// the base to the code commit leaves a docs-only remainder. Poisoning it to HEAD itself
+	// would leave an EMPTY diff, which Classify already fails closed on, so the attack has to
+	// leave something harmless behind to be believed.
+	code := commitCodeFiles(t, wt)
+	head := commitFeature(t, wt, "NOTES.md", "# notes\n")
+
+	task, _, err := m.Store.GetTask(context.Background(), "pz1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeDims, _ := m.requiredDimensions(task, head)
+	before := strings.Join(beforeDims, " ")
+	if before != "correctness scope security" {
+		t.Fatalf("the harness must start from the full derived set, got %q", before)
+	}
+
+	// Prep honestly first. Its reviewBase(_, true) fetches, so a poison planted before this
+	// point is simply overwritten: the window is AFTER prep, which is also when every reviewer
+	// report is still outstanding.
+	dir, err := m.TrustPrep("pz1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Now both halves of the union, from the live session, nothing committed.
+	// One: point the shared remote-tracking ref at a commit that already carries the .go
+	// files, so the three-dot diff is NOTES.md alone and the DERIVED half reads docs-only.
+	gitIn(t, wt, "update-ref", "refs/remotes/origin/main", code)
+	if gitIn(t, repo, "rev-parse", "refs/remotes/origin/main") != code {
+		t.Fatal("the poison must be visible from the project repo, or the test proves nothing")
+	}
+	if got, _ := diffFiles(wt, "origin/main", head); strings.Join(got, " ") != "NOTES.md" {
+		t.Fatalf("the poison must make the diff look docs-only, got %v", got)
+	}
+	// Two: lower the RECORDED half to match, which is the step 1a attack. Either alone is
+	// caught by the union. Together they defeat it, which is why the base has to hold on its
+	// own rather than leaning on reviewers.json.
+	writeReviewersFile(t, dir, review.DimensionCorrectness, review.DimensionScope)
+
+	afterDims, _ := m.requiredDimensions(task, head)
+	after := strings.Join(afterDims, " ")
+	if after != "correctness scope security" {
+		t.Fatalf("a worker-writable ref must not lower the derived floor: %q -> %q", before, after)
+	}
+
+	// And the whole chain: satisfying only the lowered set must not produce a pass.
+	writeCleanReport(t, dir, review.DimensionCorrectness, head)
+	writeCleanReport(t, dir, review.DimensionScope, head)
+	v, err := m.TrustRecord("pz1", head, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Overall != review.Block {
+		t.Fatalf("two clean reports over a poisoned base must not pass: %q (%+v)", v.Overall, v.Findings)
+	}
+	if _, err := os.Stat(m.P.ApprovalFile("pz1")); err == nil {
+		t.Fatal("no approval may be minted over a poisoned base")
 	}
 }
