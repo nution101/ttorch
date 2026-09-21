@@ -239,7 +239,7 @@ func TestGateOnce_MissingReportNeverRecordsPass(t *testing.T) {
 	// Write clean reports for all dimensions EXCEPT security, then remove security's so it is
 	// genuinely missing (writeReviewReports always writes the full set).
 	writeReportsForPreppedInputs(t, m.P.ReviewInputsDir("mr1"), head, nil)
-	if err := os.Remove(filepath.Join(m.P.ReviewInputsDir("mr1"), review.DimensionSecurity+".json")); err != nil {
+	if err := os.Remove(filepath.Join(review.ReportsDir(m.P.ReviewInputsDir("mr1")), review.DimensionSecurity+".json")); err != nil {
 		t.Fatal(err)
 	}
 	out, err := m.GateOnce("mr1")

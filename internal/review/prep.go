@@ -125,6 +125,14 @@ func ValidateState(inputsDir, sha string) string {
 // with InputPath rather than joined by hand, so the name is always validated first.
 const ReportSuffix = ".json"
 
+// ReportsDirName is the subdirectory of the review inputs dir that holds the per-dimension
+// reports. Reports are named by a dimension and the control files are not, so keeping them
+// in separate namespaces is what stops the two from colliding: flat, a dimension called
+// "prep", "validate", "reviewers" or "gate-progress" names a control file, and the charset
+// check cannot tell those apart from any other legal name. Reserving the names that exist
+// today would be one more list to keep complete; a directory cannot go out of date.
+const ReportsDirName = "reports"
+
 // maxDimensionNameLen bounds a dimension name. Nothing legitimate comes close; the bound
 // keeps a name from producing an unusable filename.
 const maxDimensionNameLen = 32
@@ -233,7 +241,13 @@ func InputPath(inputsDir, dim, suffix string) (string, error) {
 	if !ValidDimensionName(dim) {
 		return "", fmt.Errorf("unusable review dimension name %q", dim)
 	}
-	return filepath.Join(inputsDir, dim+suffix), nil
+	return filepath.Join(inputsDir, ReportsDirName, dim+suffix), nil
+}
+
+// ReportsDir is where a task's per-dimension reports live. Prep creates it; the reviewers
+// write into it.
+func ReportsDir(inputsDir string) string {
+	return filepath.Join(inputsDir, ReportsDirName)
 }
 
 // prepState is the episode the reports in an inputs dir are folded against: the marker's

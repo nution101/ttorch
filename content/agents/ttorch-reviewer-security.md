@@ -77,7 +77,9 @@ test exercises. State why in the finding. The default is **no execution**.
 
 ## Output
 
-Write exactly `security.json` into the inputs dir:
+Write exactly `reports/security.json` — the `reports/` subdirectory of the inputs dir,
+which prep creates. Reports live there so a dimension name can never collide with one of
+the control files at the top of the inputs dir:
 
 ```json
 {

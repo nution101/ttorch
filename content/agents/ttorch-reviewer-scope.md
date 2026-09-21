@@ -63,7 +63,9 @@ execution**.
 
 ## Output
 
-Write exactly `scope.json` into the inputs dir:
+Write exactly `reports/scope.json` — the `reports/` subdirectory of the inputs dir,
+which prep creates. Reports live there so a dimension name can never collide with one of
+the control files at the top of the inputs dir:
 
 ```json
 {

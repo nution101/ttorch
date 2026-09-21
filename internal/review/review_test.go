@@ -24,7 +24,14 @@ func writeReport(t *testing.T, inputsDir, dim, sha string, findings []Finding) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(inputsDir, dim+".json"), b, 0o644); err != nil {
+	path, err := InputPath(inputsDir, dim, ReportSuffix)
+	if err != nil {
+		path = filepath.Join(inputsDir, dim+ReportSuffix) // a test writing a rejected name on purpose
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -101,7 +108,10 @@ func TestAggregate(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(dir, "security.json"), []byte("{not json"), 0o644); err != nil {
+		if err := os.MkdirAll(ReportsDir(dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(ReportsDir(dir), "security.json"), []byte("{not json"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		v, err := Aggregate(dir, sha, dims)

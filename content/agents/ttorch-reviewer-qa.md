@@ -87,7 +87,9 @@ execution**.
 
 ## Output
 
-Write exactly `qa.json` into the inputs dir:
+Write exactly `reports/qa.json` — the `reports/` subdirectory of the inputs dir,
+which prep creates. Reports live there so a dimension name can never collide with one of
+the control files at the top of the inputs dir:
 
 ```json
 {

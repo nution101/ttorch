@@ -75,7 +75,7 @@ func TestAggregate_ReportPredatingPrepIsAbsent(t *testing.T) {
 	// An earlier session's clean reports, pinned to the head the task still sits on.
 	for _, d := range dims {
 		writeReport(t, dir, d, sha, nil)
-		backdate(t, filepath.Join(dir, d+".json"), 24*24*time.Hour)
+		backdate(t, filepath.Join(ReportsDir(dir), d+ReportSuffix), 24*24*time.Hour)
 	}
 	// The gate re-preps now; the reviewers have not run yet.
 	stagePrep(t, dir, sha, greenValidate())

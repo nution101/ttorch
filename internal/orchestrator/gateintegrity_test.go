@@ -98,14 +98,14 @@ func TestTrustRecord_RePrepSupersedesEarlierReports(t *testing.T) {
 
 	// The superseded reports are archived, not destroyed: an adjudicated finding stays
 	// readable after a re-prep.
-	archived, err := filepath.Glob(filepath.Join(dir, supersededDirName, "*", review.DimensionCorrectness+".json"))
+	archived, err := filepath.Glob(filepath.Join(dir, supersededDirName, "*", review.ReportsDirName, review.DimensionCorrectness+".json"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(archived) == 0 {
 		t.Error("the previous episode's reports must be archived under superseded/, not deleted")
 	}
-	if _, err := os.Stat(filepath.Join(dir, review.DimensionCorrectness+".json")); err == nil {
+	if _, err := os.Stat(filepath.Join(review.ReportsDir(dir), review.DimensionCorrectness+".json")); err == nil {
 		t.Error("a superseded report must not be left where the current episode's report belongs")
 	}
 
@@ -116,7 +116,7 @@ func TestTrustRecord_RePrepSupersedesEarlierReports(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	restoredPath := filepath.Join(dir, review.DimensionCorrectness+".json")
+	restoredPath := filepath.Join(review.ReportsDir(dir), review.DimensionCorrectness+".json")
 	if err := os.WriteFile(restoredPath, restored, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -344,6 +344,9 @@ func writeDimensionReport(t *testing.T, dir, dim, sha string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(review.ReportsDir(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(path, b, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -370,10 +373,10 @@ func TestTrustPrep_ArchivesEveryPreparedDimension(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := os.Stat(filepath.Join(dir, extra+".json")); err == nil {
+	if _, err := os.Stat(filepath.Join(review.ReportsDir(dir), extra+".json")); err == nil {
 		t.Errorf("the %s report survived a re-prep, so a superseded review still sits where the current one belongs", extra)
 	}
-	archived, err := filepath.Glob(filepath.Join(dir, supersededDirName, "*", extra+".json"))
+	archived, err := filepath.Glob(filepath.Join(dir, supersededDirName, "*", review.ReportsDirName, extra+".json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -386,7 +389,7 @@ func TestTrustPrep_ArchivesEveryPreparedDimension(t *testing.T) {
 	// gap this test closes was the archive layer alone, not a dimension the gate would pass.
 	addPreparedDimension(t, dir, extra)
 	writeReportsForPreppedInputs(t, dir, head, nil)
-	restore := filepath.Join(dir, extra+review.ReportSuffix)
+	restore := filepath.Join(review.ReportsDir(dir), extra+review.ReportSuffix)
 	writeDimensionReport(t, dir, extra, head)
 	backdateFile(t, restore, time.Hour)
 	v, err := m.TrustRecord("ad1", "", time.Minute)
@@ -501,7 +504,7 @@ func TestTrustPrep_DimensionNameCannotMoveFilesOutsideTheReviewDir(t *testing.T)
 			t.Errorf("a file from outside the review dir was archived: %s", p)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(dir, "sentinel.json")); err == nil {
+	if _, err := os.Stat(filepath.Join(review.ReportsDir(dir), "sentinel.json")); err == nil {
 		t.Error("a file from outside the review dir was moved into the review dir")
 	}
 }

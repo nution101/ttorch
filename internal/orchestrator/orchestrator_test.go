@@ -1068,6 +1068,9 @@ func writeReportsForPreppedInputs(t *testing.T, dir, sha string, perDim map[stri
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(review.ReportsDir(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	for _, dim := range requiredReviewers {
 		b, err := json.Marshal(review.Report{Dimension: dim, ReviewedSHA: sha, Findings: perDim[dim]})
 		if err != nil {
@@ -3219,6 +3222,9 @@ func writeSecurityReport(t *testing.T, dir, sha string, findings []review.Findin
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(review.ReportsDir(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(path, b, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -3359,6 +3365,9 @@ func writeQAReport(t *testing.T, dir, sha string, findings []review.Finding) {
 	}
 	path, err := review.InputPath(dir, review.DimensionQA, review.ReportSuffix)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(review.ReportsDir(dir), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(path, b, 0o644); err != nil {

@@ -41,8 +41,8 @@ the security dimension:
 1. `ttorch security-review prep <id>` — materializes the same inputs dir as `trust prep`
    (committed `diff.patch`, `brief.md`, `validate.json`, `head.txt`); refuses a dirty worktree.
 2. Dispatch the **`ttorch-reviewer-security`** agent over that dir + the commit in `head.txt`.
-   It writes `security.json` following the findings contract below.
-3. `ttorch security-review record <id>` — folds `security.json` into a commit-pinned verdict
+   It writes `reports/security.json` following the findings contract below.
+3. `ttorch security-review record <id>` — folds `reports/security.json` into a commit-pinned verdict
    and prints it. `ttorch security-review show <id>` reprints the latest.
 
 This pass is **advisory and never blocks delivery**: it never mints an approval, never writes
@@ -71,8 +71,8 @@ gate, folding **only** the QA dimension:
 1. `ttorch qa-review prep <id>` — materializes the same inputs dir as `trust prep`
    (committed `diff.patch`, `brief.md`, `validate.json`, `head.txt`); refuses a dirty worktree.
 2. Dispatch the **`ttorch-reviewer-qa`** agent over that dir + the commit in `head.txt`.
-   It writes `qa.json` following the findings contract below.
-3. `ttorch qa-review record <id>` — folds `qa.json` into a commit-pinned advisory verdict and
+   It writes `reports/qa.json` following the findings contract below.
+3. `ttorch qa-review record <id>` — folds `reports/qa.json` into a commit-pinned advisory verdict and
    prints it. `ttorch qa-review show <id>` reprints the latest.
 
 This pass is **advisory and never blocks delivery**: it never mints an approval, never writes
@@ -107,7 +107,7 @@ an automatic block.
      scope is dropped — but it is still code, so **security is kept**.
 
    Give each the inputs dir path and the commit from `head.txt`. Each reads the inputs,
-   reviews **only** its dimension, and writes `<dimension>.json` into the inputs dir
+   reviews **only** its dimension, and writes `reports/<dimension>.json` into the inputs dir
    following the findings contract below. Reviewers never edit code, and they **trust the
    green `validate.json`** that prep staged rather than re-running the suite themselves —
    review is a static read of the diff (a green `validate.json` already proves the repo's
@@ -153,7 +153,9 @@ invalidates the verdict — re-prep, re-review, re-record.
 
 ## Findings contract
 
-Each reviewer writes exactly `<dimension>.json` in the inputs dir:
+Each reviewer writes exactly `reports/<dimension>.json` — the `reports/` subdirectory of the
+inputs dir, which prep creates. Reports are named by dimension and the control files are not,
+so they live in separate namespaces and a dimension can never name a control file:
 
 ```json
 {

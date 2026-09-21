@@ -302,6 +302,11 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
+	// The reports live in their own subdirectory so a dimension name can never name a
+	// control file (see review.ReportsDirName). Prep creates it; the reviewers write there.
+	if err := os.MkdirAll(review.ReportsDir(dir), 0o755); err != nil {
+		return "", err
+	}
 	// Open the new episode by moving the previous one's reports out of the way, so a report
 	// written for superseded inputs is simply not there to be folded. Best-effort: the
 	// episode stamp written below rejects a surviving report anyway, so failing to archive
@@ -415,8 +420,10 @@ func (m *Manager) archivePriorReports(taskID, dir string) {
 			continue
 		}
 		if archive == "" {
+			// The archive keeps the same shape as the inputs dir, reports under reports/, so
+			// a restored file goes back where it came from and the namespaces stay apart.
 			archive = filepath.Join(dir, supersededDirName, time.Now().UTC().Format("20060102T150405Z"))
-			if err := os.MkdirAll(archive, 0o755); err != nil {
+			if err := os.MkdirAll(review.ReportsDir(archive), 0o755); err != nil {
 				fmt.Fprintf(os.Stderr, "ttorch: could not archive the previous review reports in %s: %v\n", dir, err)
 				return
 			}
