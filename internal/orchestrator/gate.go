@@ -65,8 +65,24 @@ type scaledReviewers struct {
 //
 // It is NOT the authority on what a verdict must cover. The file lives in the review inputs
 // dir, so anything that can write there can rewrite it between the review and the record;
-// the authority is the set prep stamped into prep.json, and requiredDimensions reconciles
-// the two (the stamp is the floor, the file may only add).
+// the authority is the set prep stamped into prep.json unioned with the floor re-derived
+// from the diff, and requiredDimensions reconciles all three (the stamp decides, the file
+// may only add, the floor may only raise).
+//
+// HOW FAR THE "UNTRUSTED INPUTS" TREATMENT ACTUALLY GOES, stated here because this is where
+// the claim starts and it is easy to read as more than it is. All of that machinery stops the
+// recorded set LOWERING what a verdict must cover. It does not make the reports themselves
+// trustworthy. review.Aggregate authenticates a report on two things only: that the file is
+// present and that its reviewedSha equals the head under review. Neither is unforgeable by a
+// process running as the lead. Worse, the daemon's dispatch loop skips any dimension whose
+// report is already pinned to head, so a report that is simply THERE first leaves allReady
+// true and no reviewer is ever launched for it. Writing one clean file per required dimension
+// therefore produces a pass with nobody having reviewed anything.
+//
+// So the accurate claim is narrow: the review-inputs dir is treated as untrusted for the
+// QUESTION OF WHICH DIMENSIONS ARE REQUIRED, and is trusted for the content of the answers.
+// Closing the second half needs the reports to carry provenance the gate can check, which
+// nothing here does.
 func (m *Manager) ReviewersFor(taskID string) []string {
 	b, err := os.ReadFile(filepath.Join(m.P.ReviewInputsDir(taskID), reviewersFileName))
 	if err != nil {
@@ -1382,7 +1398,7 @@ var isolatedReviewDimensions = map[string]bool{review.DimensionSecurity: true}
 // directory under the task's review-workspace root, so two isolated reviewers never share a
 // mirror and the episode teardown can drop it wholesale. The root is paths.ReviewWorkspaceDir
 // and NOT the review-inputs dir, because a session's cwd ancestors are on its configuration
-// path and the inputs dir is the directory the gate treats as untrusted.
+// path, and the inputs dir is the directory whose CONTENT the gate cannot vouch for.
 func (m *Manager) reviewWorkspaceDir(taskID, dim string) string {
 	return filepath.Join(m.P.ReviewWorkspaceDir(taskID), dim)
 }

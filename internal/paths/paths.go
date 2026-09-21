@@ -84,11 +84,11 @@ func (p Paths) ValidateCacheDir() string {
 //
 // It is deliberately NOT under ReviewInputsDir. A Claude session walks up from its cwd
 // looking for CLAUDE.md, so every ancestor of a reviewer's working directory is on that
-// session's configuration path, and the review-inputs dir is precisely the directory the
-// trust gate treats as untrusted — it holds the diff, the verdicts and the reviewer set, all
-// of which the gate must assume an adversary can write. Putting the reviewer's cwd inside it
-// would have made the one directory the gate distrusts an ancestor of the session doing the
-// distrusting.
+// session's configuration path, and the review-inputs dir holds the diff, the verdicts and
+// the reviewer set, none of whose content the gate can vouch for — it authenticates a report
+// on presence and a sha match, both of which any process running as the lead can produce.
+// Putting the reviewer's cwd inside it would have made that directory an ancestor of the
+// session reading from it.
 //
 // This narrows the plausible path, not the capability: everything under Home is writable by
 // any process running as the same user, which is the process channel and is not closed by
