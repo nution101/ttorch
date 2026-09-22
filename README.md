@@ -477,11 +477,20 @@ success that never arrived. Scroll freely; just press `Escape` when you are done
 **Read-only is an accident guard, not a security boundary.** It stops a stray keystroke in a
 watcher tab. It does not contain anyone: anybody with a shell on the machine can run `tmux
 attach -t ttv-wk-<TASK>` (or attach to the `ttorch` session itself) and get a writable
-client. Two further limits worth knowing. `ttorch send` deliberately bypasses the read-only
-check — that is what keeps steering working — so read-only says nothing about a
-*programmatic* steer; in particular a send that lands on a worker sitting at a numbered menu
-is still consumed as a menu selection and still reports success. And `ttv-` sessions created
-by a pre-fix ttorch persist writable until the worker is respawned.
+client. Four further limits:
+
+- `ttorch send` deliberately bypasses the read-only check, because that is what keeps
+  steering working, so read-only says nothing about a *programmatic* steer. A send that lands
+  on a worker sitting at a numbered menu is still consumed as a menu selection and still
+  reports success.
+- A tmux below 3.2 has no read-only view client, so the tab opens writable, as above.
+- `ttv-` sessions created by a pre-fix ttorch persist writable until the worker is respawned.
+- If you have bound a key to `switch-client -r`, pressing it in a view tab clears the
+  read-only flag and the tab becomes writable, with nothing on screen to show it changed.
+  `switch-client` is one of the few command families tmux lets a read-only client run. No
+  stock binding reaches `-r` (the default bindings use `-p`, `-n`, `-l` and `-t`), so this
+  needs a binding of your own. There is no fix available to ttorch: tmux key tables are
+  server-global, so unbinding it in the view would unbind it for the worker session too.
 
 **iTerm2 is recommended** for the cleanest experience: it gives one window with a tab per
 worker. When iTerm2 is installed, running bare `ttorch` opens the **manager itself in a new

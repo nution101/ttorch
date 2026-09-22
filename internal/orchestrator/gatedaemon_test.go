@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -406,5 +407,65 @@ func TestGateOnce_ReviewerTimeoutBlocks(t *testing.T) {
 	}
 	if _, ok := m.TrustShow("to1"); ok {
 		t.Fatal("a reviewer timeout must not record a verdict")
+	}
+}
+
+// slowTmux puts a tmux on PATH whose list-windows never answers, so a window probe hits the
+// deadline instead of returning. Everything else it is asked succeeds, so the only thing the
+// test changes is whether spawnReviewer can tell if the reviewer window already exists.
+func slowTmux(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	script := "#!/bin/sh\ncase \"$1\" in\nlist-windows) sleep 30 ;;\nesac\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "tmux"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Cleanup(tmux.SetRunTimeoutForTest(300 * time.Millisecond))
+}
+
+// TestGateOnce_FailedLaunchBurnsNoAttempt is the other half of the chain: gateOnceAt's
+// contract that a dispatcher error costs no attempt, because nothing started. The test above
+// makes spawnReviewer report a timed-out probe as an error; this one shows that landing here.
+func TestGateOnce_FailedLaunchBurnsNoAttempt(t *testing.T) {
+	m, _ := trustedTaskWithSubstantialDiff(t, "gate-noburn", "nb1")
+	t.Cleanup(func() { _, _ = m.Teardown("nb1", true) })
+	prev := reviewerDispatcher
+	t.Cleanup(func() { reviewerDispatcher = prev })
+	reviewerDispatcher = func(m *Manager, taskID, dim, dir, head, repo, wt string) error {
+		return errors.New("probe timed out, nothing launched")
+	}
+
+	if _, err := m.GateOnce("nb1"); err != nil {
+		t.Fatalf("GateOnce: %v", err)
+	}
+	prog := m.readGateProgress(m.P.ReviewInputsDir("nb1"))
+	for _, d := range m.ReviewersFor("nb1") {
+		if prog.Attempts[d] != 0 {
+			t.Errorf("dimension %s burned %d attempt(s) for a reviewer that never launched, want 0", d, prog.Attempts[d])
+		}
+	}
+}
+
+// TestGateOnce_TimedOutProbeBurnsNoAttempt pins the retry budget against a wedged tmux.
+// spawnReviewer's idempotence probe used the bool WindowExists, which folds a timed-out probe
+// to "the window is already there" — so it returned nil having launched nothing, and
+// gateOnceAt counts an attempt for every nil. With maxReviewerAttempts at 2 that spent the
+// whole budget on two reviewers that never started, during the exact tmux hang the deadline
+// exists to survive. The probe now reports the timeout, which reaches gateOnceAt's
+// "does not burn an attempt (nothing started)" path.
+func TestGateOnce_TimedOutProbeBurnsNoAttempt(t *testing.T) {
+	skipIfShort(t)
+	m, head := trustedTaskWithSubstantialDiff(t, "gate-probe", "pt1")
+	dir := t.TempDir()
+	slowTmux(t)
+
+	// The production dispatcher, so the probe under test actually runs.
+	err := m.spawnReviewer("pt1", "correctness", dir, head, t.TempDir(), t.TempDir())
+	if err == nil {
+		t.Fatal("spawnReviewer err = nil on a timed-out probe; gateOnceAt would count an attempt for a reviewer that never started")
+	}
+	if !errors.Is(err, tmux.ErrTimeout) {
+		t.Errorf("spawnReviewer err = %v, want it to carry tmux.ErrTimeout", err)
 	}
 }

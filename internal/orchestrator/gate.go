@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -1278,6 +1279,20 @@ func (m *Manager) writeGateProgress(dir string, p gateProgress) {
 // source the diff touches; it never edits the tree (review is read-only). It is idempotent —
 // it no-ops when the dimension's window already exists — so a re-dispatch never doubles a
 // running reviewer.
+//
+// The idempotence probe uses WindowExistsErr, not the bool WindowExists, because this is the
+// one call site where the bool's timeout fold is wrong. WindowExists answers "present" for a
+// probe that timed out, which is right for the callers that would otherwise duplicate an
+// agent, but here it would make spawnReviewer return nil having launched nothing, and the
+// caller in gateOnceAt counts an attempt for every nil. With maxReviewerAttempts at 2 that
+// halves the retry budget during exactly the tmux hang the deadline exists to survive.
+// Reporting the timeout instead reaches the "does not burn an attempt (nothing started)"
+// path, and the next tick retries.
+//
+// Only a timeout is treated that way. Any other probe failure means the window is genuinely
+// not there, including the one that matters here: list-windows fails when the shared session
+// does not exist yet, and that case has to fall through to the EnsureSession below rather
+// than error out, or the first reviewer could never be dispatched.
 func (m *Manager) spawnReviewer(taskID, dim, inputsDir, head, repo, wt string) error {
 	// First, before tmux, the harness, or any file: the dimension name decides a file path
 	// written under inputsDir, the tmux window name, and the report path handed to the
@@ -1294,7 +1309,11 @@ func (m *Manager) spawnReviewer(taskID, dim, inputsDir, head, repo, wt string) e
 		return err
 	}
 	window := reviewerWindow(taskID, dim)
-	if tmux.WindowExists(m.Session, window) {
+	exists, err := tmux.WindowExistsErr(m.Session, window)
+	if errors.Is(err, tmux.ErrTimeout) {
+		return fmt.Errorf("could not tell whether reviewer window %q is already running: %w", window, err)
+	}
+	if exists {
 		return nil // already running — idempotent
 	}
 	if err := tmux.EnsureSession(m.Session); err != nil {

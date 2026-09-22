@@ -75,7 +75,7 @@ func Open(session, window string) error {
 // tmux.SupportsReadOnlyView), so there is no "unknown version" case to word.
 func warnWritableView(w io.Writer, window, banner string) {
 	fmt.Fprintf(w, "ttorch: the view tab for %s is WRITABLE — %s is below tmux %s, which is where read-only view clients arrive. Anything you type in that tab goes to the running worker. Upgrade tmux, or set TTORCH_WORKER_TABS=0 and watch with 'ttorch peek'.\n",
-		window, banner, tmux.ReadOnlyViewFloor)
+		window, banner, tmux.ReadOnlyViewFloor())
 }
 
 // Enabled reports whether native-terminal behavior (worker views and the

@@ -94,6 +94,15 @@ var ErrTimeout = errors.New("tmux did not answer in time")
 // no deadline at all. It only ever applies on the timeout path.
 var runWaitDelay = 2 * time.Second
 
+// SetRunTimeoutForTest shortens the command deadline and returns a restore func, so a
+// package above this one can exercise its own timeout handling without waiting out the
+// real 30s. Nothing in production calls it; the deadline is not configurable at runtime.
+func SetRunTimeoutForTest(d time.Duration) func() {
+	prevTimeout, prevWait := runTimeout, runWaitDelay
+	runTimeout, runWaitDelay = d, d
+	return func() { runTimeout, runWaitDelay = prevTimeout, prevWait }
+}
+
 func run(args ...string) (string, error) {
 	b, err := bin()
 	if err != nil {
@@ -343,10 +352,25 @@ func Version() string {
 	return strings.TrimSpace(out)
 }
 
-// ReadOnlyViewFloor is the tmux version that introduced `new-session -f read-only`,
-// which is what makes a worker view tab a view rather than a second keyboard.
-// 'ttorch doctor' reports a tmux below it.
-const ReadOnlyViewFloor = "3.2"
+// The tmux version that introduced `new-session -f read-only`, which is what makes
+// a worker view tab a view rather than a second keyboard. These two are the only
+// spelling of the floor: ReadOnlyViewFloor renders them for a message and
+// AtReadOnlyViewFloor compares against them, so nothing else writes 3 or 2.
+const (
+	readOnlyViewFloorMajor = 3
+	readOnlyViewFloorMinor = 2
+)
+
+// ReadOnlyViewFloor is the floor as it appears in a message ("3.2"). 'ttorch doctor'
+// reports a tmux below it.
+func ReadOnlyViewFloor() string {
+	return strconv.Itoa(readOnlyViewFloorMajor) + "." + strconv.Itoa(readOnlyViewFloorMinor)
+}
+
+// AtReadOnlyViewFloor reports whether a version banner is at or above the floor.
+func AtReadOnlyViewFloor(banner string) bool {
+	return BannerAtLeast(banner, readOnlyViewFloorMajor, readOnlyViewFloorMinor)
+}
 
 // BannerReadable reports whether a version banner is in a form ttorch can read a
 // version out of. It separates "older than the floor" from "no idea", which
@@ -419,7 +443,7 @@ func readOnlyViewSupported(banner string) bool {
 	if !BannerReadable(banner) {
 		return true
 	}
-	return BannerAtLeast(banner, 3, 2)
+	return AtReadOnlyViewFloor(banner)
 }
 
 // SupportsReadOnlyView reports whether to attach worker view tabs with

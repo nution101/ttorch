@@ -45,12 +45,12 @@ func reportTmuxVersion(out io.Writer, banner string) {
 	switch {
 	case strings.TrimSpace(banner) == "":
 		fmt.Fprintln(out, "  tmux version: could not be read")
-	case tmux.BannerAtLeast(banner, 3, 2):
+	case tmux.AtReadOnlyViewFloor(banner):
 		fmt.Fprintf(out, "  tmux version: %s\n", banner)
 	case tmux.BannerReadable(banner):
-		fmt.Fprintf(out, "  tmux version: %s — below %s, so worker view tabs open WRITABLE (typing in one goes to the worker); upgrade tmux, or set TTORCH_WORKER_TABS=0\n", banner, tmux.ReadOnlyViewFloor)
+		fmt.Fprintf(out, "  tmux version: %s — below %s, so worker view tabs open WRITABLE (typing in one goes to the worker); upgrade tmux, or set TTORCH_WORKER_TABS=0\n", banner, tmux.ReadOnlyViewFloor())
 	default:
-		fmt.Fprintf(out, "  tmux version: %s — unrecognized; ttorch assumes it is new enough for read-only worker view tabs (tmux %s+)\n", banner, tmux.ReadOnlyViewFloor)
+		fmt.Fprintf(out, "  tmux version: %s — unrecognized; ttorch assumes it is new enough for read-only worker view tabs (tmux %s+)\n", banner, tmux.ReadOnlyViewFloor())
 	}
 }
 

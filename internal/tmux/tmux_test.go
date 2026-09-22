@@ -364,13 +364,13 @@ func TestWindowExists(t *testing.T) {
 	}
 }
 
-// TestWindowExistsFoldsATimeoutToPresent pins the fold direction, and its limit.
+// TestWindowExists_TimeoutFoldsToPresent pins the fold direction, and its limit.
 // Resume reads this bool and rebuilds a worker when it is false, so a timeout
 // folding to false would put a second agent in a worktree that already has one.
 // A definite negative must keep answering false, because `list-windows` against a
 // session that does not exist yet fails — and folding that to "present" refuses the
 // first spawn on a machine with no tmux session.
-func TestWindowExistsFoldsATimeoutToPresent(t *testing.T) {
+func TestWindowExists_TimeoutFoldsToPresent(t *testing.T) {
 	installFakeTmux(t)
 
 	// A timeout: uncertainty, so assume present.
@@ -396,11 +396,11 @@ func TestWindowExistsFoldsATimeoutToPresent(t *testing.T) {
 	}
 }
 
-// TestRunTimeoutIsIdentifiable pins the sentinel. A timeout has to be
+// TestRun_TimeoutIsIdentifiable pins the sentinel. A timeout has to be
 // distinguishable from a negative answer anywhere a negative answer causes an
 // action, which is why WindowExists can fold it safely and why a caller that needs
 // to tell them apart can.
-func TestRunTimeoutIsIdentifiable(t *testing.T) {
+func TestRun_TimeoutIsIdentifiable(t *testing.T) {
 	installFakeTmux(t)
 	t.Setenv("FAKE_SLEEP", "5")
 	prevT, prevW := runTimeout, runWaitDelay
@@ -523,13 +523,13 @@ func TestSendKey(t *testing.T) {
 	}
 }
 
-// TestSendLineRefusesAPaneInCopyMode pins the second half of the copy-mode defect.
+// TestSendLine_RefusesPaneInCopyMode pins the second half of the copy-mode defect.
 // The deadline stops a steer hanging forever, but it does not make the steer land:
 // once the deadline has killed the blocked client the server is unwedged, so later
 // attempts return success in milliseconds while copy-mode swallows the keys. A
 // steer that reports success and never arrived is the worst of the three outcomes,
 // so SendLine refuses and names the key that clears the mode.
-func TestSendLineRefusesAPaneInCopyMode(t *testing.T) {
+func TestSendLine_RefusesPaneInCopyMode(t *testing.T) {
 	log := installFakeTmux(t)
 	t.Setenv("FAKE_DISPLAY", "1")
 	err := SendLine("s", "w", "continue")
@@ -546,9 +546,9 @@ func TestSendLineRefusesAPaneInCopyMode(t *testing.T) {
 	}
 }
 
-// TestSendLineProceedsWhenTheModeProbeFails keeps the guard from becoming a new
+// TestSendLine_ProceedsWhenModeProbeFails keeps the guard from becoming a new
 // way to lose the control channel: a broken diagnostic must not block steering.
-func TestSendLineProceedsWhenTheModeProbeFails(t *testing.T) {
+func TestSendLine_ProceedsWhenModeProbeFails(t *testing.T) {
 	log := installFakeTmux(t)
 	t.Setenv("FAKE_DISPLAY_EXIT", "1")
 	if err := SendLine("s", "w", "continue"); err != nil {
@@ -588,13 +588,13 @@ func TestBannerAtLeast(t *testing.T) {
 	}
 }
 
-// TestSendKeysIsNotAttributedToAClient pins the steer half of the read-only view
+// TestSendKeys_NotAttributedToAClient pins the steer half of the read-only view
 // fix. With no -c, tmux attributes send-keys to whichever client is *current* and
 // refuses with "client is read-only" when that is one of the read-only worker view
 // tabs — so a steer would fail whenever the lead's focus sat on a view tab, and
 // always once those tabs were the only clients. The empty -c resolves to no client
 // at all, which is what makes the pane the only thing addressed.
-func TestSendKeysIsNotAttributedToAClient(t *testing.T) {
+func TestSendKeys_NotAttributedToAClient(t *testing.T) {
 	pinReadOnlyView(t, true)
 	log := installFakeTmux(t)
 	if err := SendKey("s", "w", "Escape"); err != nil {
@@ -615,12 +615,12 @@ func TestSendKeysIsNotAttributedToAClient(t *testing.T) {
 	t.Fatalf("send-keys must pass an empty -c so no client is resolved, got %v", inv[0])
 }
 
-// TestSendKeysFallsBackWhenTmuxRejectsTheEmptyClient covers the tmux versions
+// TestSendKeys_FallsBackWhenEmptyClientRejected covers the tmux versions
 // before 3.1, which reject an unfound client instead of ignoring it. The steer
 // path must not depend on reading a version banner to get this right — a misread
 // banner would silently kill the control channel — so it reacts to what tmux
 // actually said and retries in the form that works there.
-func TestSendKeysFallsBackWhenTmuxRejectsTheEmptyClient(t *testing.T) {
+func TestSendKeys_FallsBackWhenEmptyClientRejected(t *testing.T) {
 	log := installFakeTmux(t)
 	t.Setenv("FAKE_REJECT_EMPTY_CLIENT", "1")
 	if err := SendKey("s", "w", "C-c"); err != nil {
@@ -635,9 +635,9 @@ func TestSendKeysFallsBackWhenTmuxRejectsTheEmptyClient(t *testing.T) {
 	}
 }
 
-// TestSendKeysDoesNotRetryOnOtherErrors keeps the fallback narrow: a send that
+// TestSendKeys_NoRetryOnOtherErrors keeps the fallback narrow: a send that
 // failed for any other reason must surface that failure, not be sent twice.
-func TestSendKeysDoesNotRetryOnOtherErrors(t *testing.T) {
+func TestSendKeys_NoRetryOnOtherErrors(t *testing.T) {
 	log := installFakeTmux(t)
 	t.Setenv("FAKE_GENERIC_EXIT", "1")
 	t.Setenv("FAKE_GENERIC_OUT", "can't find window: w")
@@ -673,12 +673,12 @@ func TestReadOnlyViewSupported(t *testing.T) {
 	}
 }
 
-// TestRunTimesOut pins the control-channel deadline. A tmux command can block
+// TestRun_TimesOut pins the control-channel deadline. A tmux command can block
 // forever rather than fail — a pane left in copy-mode does it — and run() had no
 // deadline, so ttorch send, the scheduler's stall recovery, the watcher, the gate
 // and a spawn would all park indefinitely. The caller must get an error it can
 // report instead.
-func TestRunTimesOut(t *testing.T) {
+func TestRun_TimesOut(t *testing.T) {
 	installFakeTmux(t)
 	t.Setenv("FAKE_SLEEP", "5")
 	prevT, prevW := runTimeout, runWaitDelay
@@ -702,9 +702,9 @@ func TestRunTimesOut(t *testing.T) {
 	}
 }
 
-// TestSupportsReadOnlyViewProbesVersion confirms the capability is decided by the
+// TestSupportsReadOnlyView_ProbesVersion confirms the capability is decided by the
 // tmux version banner, not assumed.
-func TestSupportsReadOnlyViewProbesVersion(t *testing.T) {
+func TestSupportsReadOnlyView_ProbesVersion(t *testing.T) {
 	log := installFakeTmux(t)
 	t.Setenv("FAKE_VERSION", "3.5a")
 	if !BannerAtLeast(Version(), 3, 2) {
