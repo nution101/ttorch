@@ -11,10 +11,13 @@
 // group is killed when ctx is done, and WaitDelay caps how long Wait will linger on pipes an
 // escaped process might still be holding.
 //
-// The guarantee lives in three fields of the returned *exec.Cmd, all of them public and
-// mutable, and every way of losing it is silent. So starting the command through this
-// package's Start, Run or CombinedOutput checks them first and refuses to run a command
-// whose enforcement has been taken away. Calling c.Start or c.Run directly skips that check.
+// The guarantee lives in four fields of the returned *exec.Cmd, all of them public and
+// mutable, and every way of losing it is silent. Three are settings Command makes:
+// SysProcAttr, Cancel and WaitDelay. The fourth is Process, which the kill reads when it
+// fires, so repointing it after Start aims the kill somewhere else. Starting the command
+// through this package's Start, Run or CombinedOutput checks the three settings first and
+// refuses a command whose enforcement has been taken away; Process cannot be checked, since
+// Start is what sets it. Calling c.Start or c.Run directly skips the check entirely.
 package proc
 
 import (
@@ -59,20 +62,14 @@ var ErrUnverifiable = errors.New("proc: timeout enforcement could not be verifie
 
 // Command is exec.CommandContext plus the three settings that make ctx an enforceable
 // bound. Set Dir, Env, Stdin, Stdout, Stderr and the rest as usual, then start it with this
-// package's Start, Run or CombinedOutput.
+// package's Start, Run or CombinedOutput. Check describes what each setting is for and what
+// losing it costs.
 //
-// SysProcAttr, Cancel and WaitDelay carry the guarantee, and Check describes what each one
-// is for and what losing it costs. It runs before every start this package performs, so a
-// command that has lost one fails loudly rather than running unbounded.
-//
-// FOUR fields decide where the kill lands, though, because Process is the one the kill
-// reads at the moment it fires. Repointing c.Process after Start silently redirects the
-// group kill at whatever process is there instead, and Check cannot see it: Check runs
-// before Start, and a command mutated afterwards was already outside os/exec's contract.
-// Measured, so it is recorded rather than implied: a command whose Process was repointed at
-// another live command killed that command's group at its own deadline. Nothing in this
-// repository does it, and Start overwrites Process, so a pre-Start assignment is harmless.
-// Do not mutate a Cmd after Start.
+// Do not mutate a Cmd after Start. Process is the fourth field the guarantee rests on and
+// the only one Check cannot vouch for, because Check runs before Start: a command whose
+// Process was repointed at another live command killed that command's group at its own
+// deadline. Mutating a Cmd after Start is already outside os/exec's contract and nothing
+// here does it, so this is recorded rather than defended against.
 func Command(ctx context.Context, name string, arg ...string) *exec.Cmd {
 	c := exec.CommandContext(ctx, name, arg...)
 	// A new process group, so one signal reaches everything the command forked.
@@ -87,14 +84,10 @@ func Command(ctx context.Context, name string, arg ...string) *exec.Cmd {
 // function is one of ours, and whether it belongs to the command being checked.
 //
 // The second question is the one that matters and the one an earlier version never asked.
-// `cp := *c` and `c.Cancel = other.Cancel` both leave a Cancel that closes over a DIFFERENT
-// command, and either way this command's own group is never signalled: its forked
-// grandchild outlives the deadline. What happens to the other command depends on its state.
-// Never started, its Process is nil and the kill returns without signalling. Running, the
-// deadline kills that command's whole process group instead, which is worse than doing
-// nothing, because the collateral is a live group this command does not own. Already
-// reaped, see cancel: the kill still fires, at a pid the OS has freed. Both shapes passed a
-// check that only compared code pointers.
+// `cp := *c` and `c.Cancel = other.Cancel` both leave a Cancel closed over a DIFFERENT
+// command, so this command's group is never signalled and its forked grandchild outlives the
+// deadline. Both shapes passed a check that only compared code pointers. Check's last bullet
+// says what becomes of the other command.
 type killer struct{ cmd *exec.Cmd }
 
 // cancel kills the command's process group. Process nil means the command never started,
@@ -102,17 +95,24 @@ type killer struct{ cmd *exec.Cmd }
 //
 // It does NOT mean the command is still running. os/exec never clears Process, so after Wait
 // this fires at a pid the OS has already freed, where os.Process.Kill would have refused
-// with "process already finished" (measured: the raw kill returns ESRCH there). On the real
-// path that happens when a deadline lands between Wait reaping the child and the cancel
-// handshake completing, which a reviewer hit in 82 of 4000 timed runs.
+// with "process already finished". Measured for that case alone: the raw kill returns ESRCH,
+// 500 runs of 500. On the real path it happens when a deadline lands between Wait reaping
+// the child and the cancel handshake completing.
 //
-// It stays that way deliberately. The guard that would close it is ProcessState, which Wait
-// writes on another goroutine while this one runs, and reading it here is a genuine data
-// race: with the guard in place, -race reports Wait writing ProcessState against this
-// function reading it. A race in the kill path is a worse defect than a signal to a pid
-// freed microseconds earlier, which is a window too narrow for the pid to have been reused.
-// That narrowness is the whole argument, and it is not available to a caller reaching for a
-// pid reaped seconds ago; see the SIGSTOP note in the tests.
+// A wider run of 4000 timed commands is where the interesting number is, and it does not
+// support a single-errno claim: the kill fired 3873 times, delivered 3775, and returned
+// EPERM 93 times against ESRCH 4. Every one of those EPERMs came from a firing where Wait
+// had not yet recorded the exit, so none of them is the after-reap case above. Why the
+// kernel answers EPERM there rather than delivering the signal is unexplained, and is left
+// unexplained rather than guessed at.
+//
+// The after-reap kill stays as it is. The guard that would close it is ProcessState, which
+// Wait writes on another goroutine while this one runs, so reading it here is a genuine data
+// race: with the guard in place, -race reports Wait writing it against this function reading
+// it. A race in the kill path is worse than a signal to a pid freed microseconds earlier, a
+// window too narrow for the pid to have been reused. That narrowness is the whole argument
+// and it is not available to a caller reaching for a pid reaped seconds ago; see the SIGSTOP
+// note in the tests.
 func (k *killer) cancel() error {
 	if k.cmd.Process == nil {
 		return nil
@@ -126,14 +126,11 @@ func (k *killer) cancel() error {
 // so this tells "a Cancel this package installed" from "some other function". It is checked
 // first, and only so that Check never invokes a function a caller supplied.
 //
-// A mismatch fails closed, which is a decision and not a default. At runtime a mismatch is
-// indistinguishable from a deliberate replacement, so there is nothing safer to do with one.
-// The risk that argues the other way is a toolchain change moving this wrapper's code
-// pointer: Check would then reject every command and leave the validate gate permanently
-// red. TestCancelIdentityIsStable is the guard, comparing a real command's Cancel to this
-// value, so such a change fails a build rather than a gate in the field. The closure this
-// replaced needed a go:noinline pragma to keep the property; a method value keeps it with no
-// pragma, under -l, -l=4, -N -l, -trimpath, -buildmode=pie, -race, -ldflags=-s -w and PGO.
+// A mismatch fails closed, which is a decision and not a default: at runtime it cannot be
+// told from a deliberate replacement. The risk the other way is a toolchain change moving
+// this wrapper's code pointer, which would reject every command and leave the validate gate
+// permanently red. TestCancelIdentityIsStable guards that by comparing a real command's
+// Cancel to this value, so such a change fails a build rather than a gate in the field.
 var cancelPC = reflect.ValueOf((&killer{}).cancel).Pointer()
 
 // methodValue mirrors the runtime layout of a method value: the code pointer, then the
@@ -147,11 +144,10 @@ type methodValue struct {
 // cancelOwner returns the command a Cancel installed by this package is bound to. It READS
 // the bound receiver and calls nothing.
 //
-// Calling was the obvious way to ask and it was wrong. A probe that invoked Cancel reached
-// the group kill of whatever command that Cancel actually belonged to, so asking "are you
-// bound to this command?" about a borrowed or copied Cancel killed the process group of the
-// command it was really bound to, from inside a function whose whole contract is to report.
-// Nothing here signals, so the question is free to ask, before or after Start.
+// Calling was the obvious way to ask and it was wrong: a probe that invoked a borrowed or
+// copied Cancel reached the group kill of the command it really belonged to, killing a live
+// process group from inside a function whose contract is to report. Nothing here signals, so
+// the question is free to ask, before or after Start.
 //
 // The caller must have established that f's code pointer is cancelPC, and layoutOK must
 // hold. Check establishes both before reaching this.
@@ -164,14 +160,12 @@ func cancelOwner(f func() error) *exec.Cmd {
 // method value, read the receiver back the way Check will, and require it to be the killer
 // we started from.
 //
-// That layout is not guaranteed by the language, and if a toolchain ever changes it this
-// self-test is the thing that notices. Which way it notices is worth being accurate about,
-// because the check proves the layout by performing the same read it is proving: reading a
-// wrong offset and dereferencing what is there is at least as likely to panic at init as to
-// return a mismatching pointer. So the two outcomes are a crash on startup, or layoutOK
-// false and Check reporting ErrUnverifiable for every command. Both are loud and the suite
-// catches either. What cannot happen is a binding being silently certified from a pointer
-// read out of the wrong place.
+// That layout is not guaranteed by the language, and this self-test is what notices if a
+// toolchain changes it. It notices one of two ways, because it proves the layout by
+// performing the read it is proving: an init panic from dereferencing a wrong offset, or
+// layoutOK false and Check reporting ErrUnverifiable for every command. Both are loud and
+// the suite catches either. What cannot happen is a binding certified from a pointer read
+// out of the wrong place.
 var layoutOK = verifyLayout()
 
 func verifyLayout() bool {
@@ -191,11 +185,9 @@ func verifyLayout() bool {
 // built with context.Background() passes. Check answers "when the deadline fires, does the
 // whole tree die", not "is there a deadline".
 //
-// Check never signals anything. The binding below is read out of the installed Cancel, not
-// exercised, so it is answerable before or after Start and costs the caller nothing. An
-// earlier version asked the question by CALLING Cancel, which reached the group kill of
-// whichever command that Cancel really belonged to: Check killed a live process group as a
-// side effect of reporting on it. Nothing here may acquire a side effect again.
+// Check never signals anything, and must not start to: the binding is READ out of the
+// installed Cancel rather than exercised, which is answerable before or after Start and
+// costs the caller nothing. See cancelOwner for what invoking it cost instead.
 //
 // Each of these fails silently rather than loudly, which is why this exists:
 //
