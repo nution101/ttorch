@@ -759,13 +759,16 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 	// record a pass and discard its findings; the two paths must fold the identical set. A
 	// task with no gate episode (the manual flow throughout) has no extras.
 	inputs := m.P.ReviewInputsDir(taskID)
+	// The manual path folds the same extras as the daemon, and it reads them the same way.
+	// A store failure here is NOT "no episode": read that way, a record the gate could not
+	// load would silently drop a dispatched dimension out of the fold, which is the defect
+	// this record was moved into the store to end.
+	prog, found, err := m.readGateProgress(taskID)
+	if err != nil {
+		return zero, fmt.Errorf("trust record %q: could not read the gate episode: %w", taskID, err)
+	}
 	var dispatched []string
-	switch prog, readable := m.readGateProgress(inputs); {
-	case m.lostEpisodeRecord(inputs, sha, readable):
-		// The episode's memory is gone. Fold as though every built-in reviewer had been
-		// dispatched, so a report from one the derived set no longer names still counts.
-		dispatched = requiredReviewers
-	case prog.Head == sha:
+	if found && prog.Head == sha {
 		dispatched = dispatchedDimensions(prog)
 	}
 	dims := m.foldDimensions(inputs, sha, required, dispatched)
@@ -1239,14 +1242,29 @@ const (
 	reviewerModel = ""
 )
 
-// gateProgressFile is the daemon gate's per-task, crash-safe progress record, kept beside the
-// review inputs (ReviewInputsDir) so a daemon restart re-derives exactly where the gate was:
-// which head's episode is in flight, which dimensions it requires, how many times each
-// reviewer has been dispatched, when the reviewers were first launched (the stall clock), and
-// whether the head reached a terminal outcome (recorded / blocked). Together with the reviewer
-// windows and the per-dimension report files it is the source of truth that makes the pass
-// idempotent — never double-dispatching a reviewer or double-recording a verdict across a
-// restart.
+// The daemon gate's per-episode state lives in the STORE, not beside the review inputs. It
+// records which head's episode is in flight, which dimensions it dispatched, how many launch
+// attempts each has cost, when the episode opened, and whether the head reached a terminal
+// outcome. With the reviewer windows and the report files it is what makes the pass idempotent
+// across a daemon restart: never double-dispatching a reviewer, never double-recording.
+//
+// It used to be gate-progress.json in ReviewInputsDir, and that was the root of a critical and
+// three highs at once. A worker can write that directory, and this record decides what the
+// episode must still wait for. A parseable record naming no dimensions erased the memory that
+// a security reviewer had been dispatched, so an already-pinned CRITICAL finding fell out of
+// the fold and trusted mode minted an approval over it, from one deliberate write. Zeroing the
+// start time held the stall bound open indefinitely. Making the file unwritable stopped the
+// bound accumulating at all, and needed no attacker.
+//
+// Each shape wanted its own validity check, and the checks kept arriving one finding at a
+// time. The reviewer's cwd had already been moved out of that directory on exactly this
+// reasoning; this is the same move for the state the decision rests on. See
+// db.GateEpisode.
+
+// gateProgressFile is where the episode record USED to live, beside the review inputs. Nothing
+// reads or writes it now: the record moved into the store because a worker can write that
+// directory (see db.GateEpisode). The name survives so the archive sweep still recognises a
+// leftover from an older build as a control file rather than mistaking it for a report.
 const gateProgressFile = "gate-progress.json"
 
 // gate-progress terminal outcomes (the Outcome field). An empty Outcome means the episode for
@@ -1256,21 +1274,22 @@ const (
 	gateOutcomeBlocked  = "blocked"  // a block/refusal/stall was surfaced for Head (manager owns it)
 )
 
-// gateProgress is the persisted per-task gate state for one head's gating episode.
+// gateProgress is one episode's state in the shape the gate reasons about. It is loaded from
+// and saved to db.GateEpisode, which holds the durable form.
 type gateProgress struct {
-	Head         string         `json:"head"`         // the reviewed commit this episode gates
-	Dims         []string       `json:"dims"`         // the prepared, size-scaled reviewer set
-	Attempts     map[string]int `json:"attempts"`     // per-dimension reviewer (re)dispatch count
-	DispatchedAt int64          `json:"dispatchedAt"` // unix nano of the first CHARGED dispatch; 0 until one
+	Head         string         // the reviewed commit this episode gates
+	Dims         []string       // the prepared, size-scaled reviewer set
+	Attempts     map[string]int // per-dimension reviewer (re)dispatch count
+	DispatchedAt int64          // unix nano of the first CHARGED dispatch; 0 until one
 	// StartedAt is when this episode opened, and it is what the stall clock runs from. It is
 	// deliberately NOT DispatchedAt: an episode can fail to dispatch anything at all, and
 	// that is the case most in need of a bound (see the stall check).
-	StartedAt int64  `json:"startedAt"`
-	Outcome   string `json:"outcome"` // "" in flight | gateOutcomeRecorded | gateOutcomeBlocked
+	StartedAt int64
+	Outcome   string // "" in flight | gateOutcomeRecorded | gateOutcomeBlocked
 	// LastDispatchError is the most recent CHARGED launch failure, carried so the block the
 	// attempt ceiling surfaces can say the reviewer never started rather than never reported.
 	// An unstarted failure does not set it: it costs no attempt, so it never reaches a block.
-	LastDispatchError string `json:"lastDispatchError,omitempty"`
+	LastDispatchError string
 }
 
 // errReviewerNotStarted marks a dispatch failure where NOTHING WAS LAUNCHED and a retry is
@@ -1348,8 +1367,13 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 	}
 
 	dir := m.P.ReviewInputsDir(taskID)
-	prog, progReadable := m.readGateProgress(dir)
-	lostRecord := m.lostEpisodeRecord(dir, head, progReadable)
+	// A store failure is not "no episode in flight". Surface it and leave the task where it
+	// is; the next tick retries. Recording anything over an episode the gate cannot read is
+	// exactly what moving this record out of the worker's directory was for.
+	prog, _, err := m.readGateProgress(taskID)
+	if err != nil {
+		return GateSkipped, err
+	}
 
 	// Episode boundary: a first-ever gate, or the worker advanced past a prior episode's head
 	// (a re-gate). Reset the episode for the new head — tear down the prior head's reviewer
@@ -1361,29 +1385,20 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 		m.teardownReviewers(taskID, dispatchedDimensions(prog))
 		if _, err := m.TrustPrep(taskID); err != nil {
 			m.surfaceGateBlocked(taskID, head, "gate prep refused: "+err.Error())
-			m.writeGateProgress(dir, gateProgress{Head: head, Outcome: gateOutcomeBlocked})
+			if werr := m.writeGateProgress(taskID, gateProgress{Head: head, StartedAt: now.UnixNano(), Outcome: gateOutcomeBlocked}); werr != nil {
+				return GateBlocked, werr
+			}
 			return GateBlocked, nil
 		}
 		episodeDims, _ := m.requiredDimensions(t, head)
-		if lostRecord {
-			// An episode covered this head and its dispatch record is gone, so the successor
-			// episode inherits the assumption that every built-in reviewer was outstanding.
-			// Without it the reset is where the forgotten dimension is lost for good: the new
-			// record names only the currently derived set, and every later tick reads that.
-			episodeDims = unionDimensions(episodeDims, requiredReviewers)
+		// The episode's start is stamped here and nowhere else. It used to be normalized on
+		// every tick from a zero value, which made the bound resettable by anything that
+		// could zero it; the record is manager-owned now, so the boundary is the one place
+		// that decides when an episode began.
+		prog = gateProgress{Head: head, Dims: episodeDims, Attempts: map[string]int{}, StartedAt: now.UnixNano()}
+		if werr := m.writeGateProgress(taskID, prog); werr != nil {
+			return GateSkipped, werr
 		}
-		prog = gateProgress{Head: head, Dims: episodeDims, Attempts: map[string]int{}}
-		m.writeGateProgress(dir, prog)
-	}
-
-	// Stamp the episode's start if it does not have one. This covers both cases in one line:
-	// an episode opened on the tick above, and an episode written by a build whose stall clock
-	// still ran from DispatchedAt and so persisted no start. The second is why it is a
-	// normalization rather than an assignment at the boundary; giving it now rather than the
-	// zero time means an upgrade grants a full timeout instead of escalating instantly.
-	if prog.StartedAt == 0 {
-		prog.StartedAt = now.UnixNano()
-		m.writeGateProgress(dir, prog)
 	}
 
 	// Terminal for this head: a block was already surfaced (manager owns it) or a verdict was
@@ -1427,7 +1442,7 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 	if err := review.ValidateDimensionSet(dims); err != nil {
 		m.surfaceGateBlocked(taskID, head, err.Error())
 		prog.Outcome = gateOutcomeBlocked
-		m.writeGateProgress(dir, prog)
+		m.writeGateProgress(taskID, prog)
 		m.teardownReviewers(taskID, dims)
 		return GateBlocked, nil
 	}
@@ -1436,7 +1451,7 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 		// how a blocking report gets hidden. The manager adjudicates that, not the daemon.
 		m.surfaceGateBlocked(taskID, head, droppedDimensionFinding(dropped).Summary)
 		prog.Outcome = gateOutcomeBlocked
-		m.writeGateProgress(dir, prog)
+		m.writeGateProgress(taskID, prog)
 		m.teardownReviewers(taskID, dims)
 		return GateBlocked, nil
 	}
@@ -1467,7 +1482,7 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 			}
 			m.surfaceGateBlocked(taskID, head, reason)
 			prog.Outcome = gateOutcomeBlocked
-			m.writeGateProgress(dir, prog)
+			m.writeGateProgress(taskID, prog)
 			m.teardownReviewers(taskID, unionDimensions(dims, dispatchedDimensions(prog)))
 			return GateBlocked, nil
 		}
@@ -1502,7 +1517,7 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 		}
 		m.surfaceGateBlocked(taskID, head, reason)
 		prog.Outcome = gateOutcomeBlocked
-		m.writeGateProgress(dir, prog)
+		m.writeGateProgress(taskID, prog)
 		m.teardownReviewers(taskID, unionDimensions(dims, dispatchedDimensions(prog)))
 		return GateBlocked, nil
 	}
@@ -1531,7 +1546,7 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 		if charged && prog.DispatchedAt == 0 {
 			prog.DispatchedAt = now.UnixNano()
 		}
-		m.writeGateProgress(dir, prog)
+		m.writeGateProgress(taskID, prog)
 		return GateDispatched, nil
 	}
 
@@ -1559,7 +1574,7 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 		// manager and mark the head terminal so the pass does not re-loop on the same reports.
 		m.surfaceGateBlocked(taskID, head, "adversarial review blocked: "+strings.Join(review.Describe(v), "; "))
 		prog.Outcome = gateOutcomeBlocked
-		m.writeGateProgress(dir, prog)
+		m.writeGateProgress(taskID, prog)
 		m.teardownReviewers(taskID, unionDimensions(fold, dispatchedDimensions(prog)))
 		return GateBlocked, nil
 	}
@@ -1576,7 +1591,7 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 		return GateWaiting, nil
 	}
 	prog.Outcome = gateOutcomeRecorded
-	m.writeGateProgress(dir, prog)
+	m.writeGateProgress(taskID, prog)
 	m.teardownReviewers(taskID, unionDimensions(fold, dispatchedDimensions(prog)))
 	m.audit(fmt.Sprintf("gate-record task=%s commit=%s verdict=pass actor=daemon", taskID, short(head)))
 	return GateRecorded, nil
@@ -1742,20 +1757,6 @@ func reviewerWindow(taskID, dim string) string {
 	return "rv-" + taskID + "-" + dim
 }
 
-// lostEpisodeRecord reports whether the gate's memory of an episode for head has gone missing:
-// the progress record could not be read, AND an episode covering head exists anyway, which the
-// prep stamp attests.
-//
-// Callers treat that as "we cannot prove nothing was outstanding" and fall back to the full
-// built-in reviewer set as the dispatched set. Blocking outright was the other option and is
-// worse: the same state is reached legitimately when a manager preps by hand and the daemon
-// gates afterwards, and refusing that is a false alarm on a normal workflow. Assuming every
-// built-in dimension was dispatched costs an over-review in that case and, in the case this
-// exists for, keeps a critical report from a forgotten reviewer inside the fold.
-func (m *Manager) lostEpisodeRecord(dir, head string, readable bool) bool {
-	return !readable && review.ValidateState(dir, head) != "unprepped"
-}
-
 // reviewerWindowAlive reports whether a dimension's reviewer window is still present. A
 // dimension with no usable window name has no window.
 func (m *Manager) reviewerWindowAlive(taskID, dim string) bool {
@@ -1813,54 +1814,59 @@ func (m *Manager) surfaceGateBlocked(taskID, head, reason string) {
 	m.audit(fmt.Sprintf("gate-blocked task=%s commit=%s actor=daemon reason=%q", taskID, short(head), reason))
 }
 
-// readGateProgress loads the per-task gate progress record. ok is false when the record was
-// absent or unparseable, which callers MUST NOT read as "nothing was dispatched".
-//
-// The zero value used to be returned silently as fail-safe, on the reasoning that a missing
-// record just re-preps and re-derives from the live windows and report files. That reasoning
-// was wrong in one direction that matters. The record is the episode's only memory of which
-// reviewers it dispatched, and the defence that keeps a dispatched dimension required reads
-// it, as does foldDimensions, the intended backstop. Losing it does not degrade that defence,
-// it removes it: a critical report from a dimension no longer in the derived set goes
-// unfolded and the verdict passes. The file sits in the review-inputs dir, whose contents
-// this branch does not vouch for, and writeGateProgress is best-effort, so a truncated write
-// reaches the same state as a delete without anyone trying.
-//
-// See lostEpisodeRecord for what callers do with ok=false.
-func (m *Manager) readGateProgress(dir string) (gateProgress, bool) {
-	var p gateProgress
-	b, err := os.ReadFile(filepath.Join(dir, gateProgressFile))
-	if err != nil {
-		return gateProgress{Attempts: map[string]int{}}, false
+// readGateProgress loads a task's episode from the store. err is a real store failure and
+// callers must NOT read it as "no episode in flight": that reading is what let a lost record
+// record a verdict. found=false means there is genuinely no row, which is a fresh task.
+func (m *Manager) readGateProgress(taskID string) (gateProgress, bool, error) {
+	row, found, err := m.Store.GetGateEpisode(context.Background(), taskID)
+	if err != nil || !found {
+		return gateProgress{Attempts: map[string]int{}}, found, err
 	}
-	if err := json.Unmarshal(b, &p); err != nil {
-		return gateProgress{Attempts: map[string]int{}}, false
+	p := gateProgress{
+		Head:              row.Head,
+		Attempts:          map[string]int{},
+		Outcome:           row.Outcome,
+		LastDispatchError: row.LastDispatchError,
+		StartedAt:         row.StartedAt.UnixNano(),
+	}
+	if !row.DispatchedAt.IsZero() {
+		p.DispatchedAt = row.DispatchedAt.UnixNano()
+	}
+	// A row whose JSON will not parse is a store-side corruption, not worker input. Report it
+	// rather than silently continuing with an empty set, which is the failure this move exists
+	// to remove.
+	if err := json.Unmarshal([]byte(row.Dims), &p.Dims); err != nil {
+		return gateProgress{Attempts: map[string]int{}}, true, fmt.Errorf("gate episode for %q has unreadable dims: %w", taskID, err)
+	}
+	if err := json.Unmarshal([]byte(row.Attempts), &p.Attempts); err != nil {
+		return gateProgress{Attempts: map[string]int{}}, true, fmt.Errorf("gate episode for %q has unreadable attempts: %w", taskID, err)
 	}
 	if p.Attempts == nil {
 		p.Attempts = map[string]int{}
 	}
-	return p, true
+	return p, true, nil
 }
 
-// writeGateProgress persists the gate progress record beside the review inputs. The write is
-// best-effort, and the cost of losing it is NOT "a lost attempt counter, never a
-// double-record", which is what this comment used to claim. The record is what the gate knows
-// about dimensions it dispatched that the derived set no longer names, so losing it can drop
-// a blocking finding out of the fold entirely. That is why the read fails closed rather than
-// the write being made stronger: a best-effort write whose loss is handled is safer than a
-// careful write whose loss is not. See readGateProgress and lostEpisodeRecord.
-func (m *Manager) writeGateProgress(dir string, p gateProgress) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "ttorch: could not create the gate progress dir for %s: %v\n", dir, err)
-		return
-	}
-	b, err := json.MarshalIndent(p, "", "  ")
+// writeGateProgress persists a task's episode. A failed write is reported rather than
+// swallowed: the record is manager-owned now, so losing it is a real fault in something the
+// gate controls, not a worker-reachable condition to be tolerated.
+func (m *Manager) writeGateProgress(taskID string, p gateProgress) error {
+	dims, err := json.Marshal(p.Dims)
 	if err != nil {
-		return
+		return err
 	}
-	if err := os.WriteFile(filepath.Join(dir, gateProgressFile), append(b, '\n'), 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "ttorch: could not write the gate progress for %s: %v\n", dir, err)
+	attempts, err := json.Marshal(p.Attempts)
+	if err != nil {
+		return err
 	}
+	row := db.GateEpisode{
+		TaskID: taskID, Head: p.Head, Dims: string(dims), Attempts: string(attempts),
+		StartedAt: time.Unix(0, p.StartedAt), Outcome: p.Outcome, LastDispatchError: p.LastDispatchError,
+	}
+	if p.DispatchedAt != 0 {
+		row.DispatchedAt = time.Unix(0, p.DispatchedAt)
+	}
+	return m.Store.SaveGateEpisode(context.Background(), row)
 }
 
 // spawnReviewer launches one dimension's adversarial reviewer as a Claude session in a tmux

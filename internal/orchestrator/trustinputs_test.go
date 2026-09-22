@@ -427,7 +427,7 @@ func TestGateOnce_HonoursADispatchedReviewerAfterTheSetShrinks(t *testing.T) {
 	}
 
 	// The prior tick failed closed to all three and dispatched a security reviewer.
-	m.writeGateProgress(dir, gateProgress{
+	mustWriteEpisode(t, m, "sh1", gateProgress{
 		Head:         head,
 		Dims:         []string{review.DimensionCorrectness, review.DimensionScope, review.DimensionSecurity},
 		Attempts:     map[string]int{review.DimensionCorrectness: 1, review.DimensionScope: 1, review.DimensionSecurity: 1},
@@ -569,7 +569,7 @@ func shrunkSetHarness(t *testing.T, id string) (*Manager, string, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m.writeGateProgress(dir, gateProgress{
+	mustWriteEpisode(t, m, id, gateProgress{
 		Head:         head,
 		Dims:         []string{review.DimensionCorrectness, review.DimensionScope, review.DimensionSecurity},
 		Attempts:     map[string]int{review.DimensionCorrectness: 1, review.DimensionScope: 1, review.DimensionSecurity: 1},
@@ -1063,7 +1063,7 @@ func TestGateOnce_APersistentlyFailingLaunchIsCharged(t *testing.T) {
 	if out, err := m.gateOnceAt("mf1", time.Minute, 1, time.Hour, now); err != nil || out != GateDispatched {
 		t.Fatalf("tick1 = (%q, %v), want dispatched", out, err)
 	}
-	prog, _ := m.readGateProgress(m.P.ReviewInputsDir("mf1"))
+	prog, _, _ := m.readGateProgress("mf1")
 	for _, d := range m.ReviewersFor("mf1") {
 		if prog.Attempts[d] == 0 {
 			t.Errorf("dimension %s burned no attempt for a launch that will keep failing", d)
@@ -1116,7 +1116,7 @@ func TestGateOnce_AnUnclassifiedLaunchFailureIsCharged(t *testing.T) {
 	if out, err := m.gateOnceAt("uk1", time.Minute, 1, time.Hour, now); err != nil || out != GateDispatched {
 		t.Fatalf("tick1 = (%q, %v), want dispatched", out, err)
 	}
-	prog, _ := m.readGateProgress(m.P.ReviewInputsDir("uk1"))
+	prog, _, _ := m.readGateProgress("uk1")
 	for _, d := range m.ReviewersFor("uk1") {
 		if prog.Attempts[d] == 0 {
 			t.Errorf("dimension %s: an unclassified failure must be charged, not retried forever", d)
@@ -1179,7 +1179,7 @@ func TestGateOnce_AWedgedTmuxStillEscalates(t *testing.T) {
 			t.Fatalf("tick %d blocked inside the stall window; a transient wedge must be survivable", i+1)
 		}
 	}
-	prog, _ := m.readGateProgress(m.P.ReviewInputsDir("wg1"))
+	prog, _, _ := m.readGateProgress("wg1")
 	for d, n := range prog.Attempts {
 		if n != 0 {
 			t.Errorf("dimension %s burned %d attempt(s) to a wedged probe; the retry budget must survive the hang", d, n)
@@ -1222,7 +1222,7 @@ func TestGateOnce_ALostProgressRecordFailsClosed(t *testing.T) {
 		lose func(t *testing.T, path string)
 	}{
 		{"deleted", func(t *testing.T, path string) {
-			if err := os.Remove(path); err != nil {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 				t.Fatal(err)
 			}
 		}},
@@ -1326,7 +1326,7 @@ func TestGateOnce_ARepeatingUnstartedLaunchStillEscalates(t *testing.T) {
 			t.Fatalf("tick %d blocked inside the stall window; a transient wedge must be survivable", i+1)
 		}
 	}
-	prog, _ := m.readGateProgress(m.P.ReviewInputsDir("cm1"))
+	prog, _, _ := m.readGateProgress("cm1")
 	for d, n := range prog.Attempts {
 		if n != 0 {
 			t.Errorf("dimension %s burned %d attempt(s) to an unstarted launch", d, n)
@@ -1384,8 +1384,178 @@ func TestAdvisoryPrep_DoesNotDisturbALiveGateEpisode(t *testing.T) {
 			t.Errorf("the advisory prep archived the gate's %s report; the gate must re-review it for nothing", dim)
 		}
 	}
-	prog, ok := m.readGateProgress(dir)
+	prog, ok, _ := m.readGateProgress("aq1")
 	if !ok || prog.Head != head {
 		t.Fatalf("the advisory prep lost the gate's episode record: ok=%v head=%q", ok, prog.Head)
+	}
+}
+
+// TestGateOnce_AForgedEpisodeRecordCannotErasePriorDispatch is the probe deletion and
+// truncation missed. Those two make the record UNREADABLE, which is the case the fail-closed
+// read handles. A well-formed record does not go near that path: it parses, so readable is
+// true, lostEpisodeRecord never fires, and if its head matches the current head the episode
+// reset is skipped too. Writing one with an empty dimension set therefore erases the memory
+// that security was dispatched, and the pinned critical report falls out of the fold.
+//
+// One deliberate write, no race and no corruption, which is why the answer is to move the
+// record rather than add a fourth check to it.
+func TestGateOnce_AForgedEpisodeRecordCannotErasePriorDispatch(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		forged func(head string) string
+	}{
+		{"emptied", func(head string) string {
+			return fmt.Sprintf(`{"head":%q,"dims":[],"attempts":{},"startedAt":1}`, head)
+		}},
+		{"substituted", func(head string) string {
+			return fmt.Sprintf(`{"head":%q}`, head)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := "forged-" + tc.name
+			m, dir, head := shrunkSetHarness(t, id)
+			t.Cleanup(func() { _, _ = m.Teardown(id, true) })
+			recordingReviewer(t, false)
+			writeCleanReport(t, dir, review.DimensionCorrectness, head)
+			writeCleanReport(t, dir, review.DimensionScope, head)
+			writeFindingReport(t, dir, review.DimensionSecurity, head, []review.Finding{{
+				Dimension: review.DimensionSecurity, Severity: review.SeverityCritical,
+				Reviewer: "ttorch-reviewer-security", Summary: "unauthenticated path traversal in the new handler",
+			}})
+
+			if err := os.WriteFile(filepath.Join(dir, gateProgressFile), []byte(tc.forged(head)), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			out, err := m.gateOnceAt(id, time.Minute, 2, time.Hour, time.Now())
+			if err != nil {
+				t.Fatalf("gateOnceAt: %v", err)
+			}
+			if out == GateRecorded {
+				t.Fatal("a verdict was recorded from a forged episode record")
+			}
+			if v, ok, _ := m.Store.GetVerdict(context.Background(), id); ok && v.Overall == review.Pass {
+				t.Fatalf("a PASS was recorded over a pinned critical report: %+v", v)
+			}
+			if _, err := os.Stat(m.P.ApprovalFile(id)); err == nil {
+				t.Fatal("an approval was minted over a pinned critical report")
+			}
+		})
+	}
+}
+
+// TestGateOnce_AResetEpisodeClockStillEscalates: the stall bound is only a bound if the thing
+// it counts from cannot be moved. StartedAt is re-stamped whenever it reads zero, so a worker
+// zeroing it on every tick keeps the episode permanently young and the gate never escalates.
+func TestGateOnce_AResetEpisodeClockStillEscalates(t *testing.T) {
+	m, _ := trustedTaskWithSubstantialDiff(t, "gate-clockreset", "cr1")
+	t.Cleanup(func() { _, _ = m.Teardown("cr1", true) })
+	prev := reviewerDispatcher
+	t.Cleanup(func() { reviewerDispatcher = prev })
+	reviewerDispatcher = func(m *Manager, taskID, dim, dir, head, repo, wt string) error {
+		return fmt.Errorf("tmux is wedged: %w", errReviewerNotStarted)
+	}
+	dir := m.P.ReviewInputsDir("cr1")
+	start := time.Unix(1_700_000_000, 0)
+	const stall = 10 * time.Minute
+
+	var out GateOutcome
+	for i := range 15 {
+		at := start.Add(time.Duration(i) * time.Hour)
+		var err error
+		if out, err = m.gateOnceAt("cr1", time.Minute, 2, stall, at); err != nil {
+			t.Fatalf("tick %d: %v", i+1, err)
+		}
+		if out == GateBlocked {
+			break
+		}
+		zeroEpisodeClock(t, dir)
+	}
+	if out != GateBlocked {
+		t.Fatalf("outcome = %q after 15 ticks over 15 simulated hours; a bound a worker can reset is not a bound", out)
+	}
+}
+
+// TestGateOnce_AnUnpersistableEpisodeClockStillEscalates is the mirror image. If the episode's
+// start cannot be written back — chmod 000, a read-only filesystem, a full disk — the bound
+// never accumulates, and the gate re-preps and relaunches every reviewer for as long as the
+// task sits there. The failure needs no attacker at all.
+func TestGateOnce_AnUnpersistableEpisodeClockStillEscalates(t *testing.T) {
+	m, _ := trustedTaskWithSubstantialDiff(t, "gate-nowrite", "nw1")
+	t.Cleanup(func() { _, _ = m.Teardown("nw1", true) })
+	prev := reviewerDispatcher
+	t.Cleanup(func() { reviewerDispatcher = prev })
+	reviewerDispatcher = func(m *Manager, taskID, dim, dir, head, repo, wt string) error {
+		return fmt.Errorf("tmux is wedged: %w", errReviewerNotStarted)
+	}
+	dir := m.P.ReviewInputsDir("nw1")
+	start := time.Unix(1_700_000_000, 0)
+	const stall = 10 * time.Minute
+
+	// One tick to open the episode, then make the record unwritable.
+	if _, err := m.gateOnceAt("nw1", time.Minute, 2, stall, start); err != nil {
+		t.Fatal(err)
+	}
+	// Make the legacy artifact unwritable. Before the record moved into the store this made
+	// the episode start unpersistable and the bound never accumulated; now it is an inert
+	// file and the bound is held somewhere the worker cannot reach at all.
+	path := filepath.Join(dir, gateProgressFile)
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		if err := os.WriteFile(path, []byte(`{"head":"","startedAt":0}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chmod(path, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+
+	var out GateOutcome
+	for i := 1; i < 24; i++ {
+		var err error
+		if out, err = m.gateOnceAt("nw1", time.Minute, 2, stall, start.Add(time.Duration(i)*time.Hour)); err != nil {
+			t.Fatalf("tick %d: %v", i+1, err)
+		}
+		if out == GateBlocked {
+			break
+		}
+	}
+	if out != GateBlocked {
+		t.Fatalf("outcome = %q after 24 ticks over 24 simulated hours; an unwritable record must not mean an unbounded episode", out)
+	}
+}
+
+// zeroEpisodeClock rewrites the on-disk episode record with its start time cleared, leaving
+// everything else intact — the single write a worker needs to keep the bound from accruing.
+func zeroEpisodeClock(t *testing.T, dir string) {
+	t.Helper()
+	path := filepath.Join(dir, gateProgressFile)
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return // nothing persisted to tamper with
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatal(err)
+	}
+	raw["startedAt"] = 0
+	out, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, out, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// mustWriteEpisode opens a gate episode in the store, giving it a start time so the stall
+// bound has something to count from, and failing the test if the store rejects it.
+func mustWriteEpisode(t *testing.T, m *Manager, taskID string, p gateProgress) {
+	t.Helper()
+	if p.StartedAt == 0 {
+		p.StartedAt = time.Now().UnixNano()
+	}
+	if err := m.writeGateProgress(taskID, p); err != nil {
+		t.Fatal(err)
 	}
 }

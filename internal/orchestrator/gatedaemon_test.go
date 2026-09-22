@@ -445,7 +445,7 @@ func TestGateOnce_FailedLaunchBurnsNoAttempt(t *testing.T) {
 	if _, err := m.GateOnce("nb1"); err != nil {
 		t.Fatalf("GateOnce: %v", err)
 	}
-	prog, _ := m.readGateProgress(m.P.ReviewInputsDir("nb1"))
+	prog, _, _ := m.readGateProgress("nb1")
 	for _, d := range m.ReviewersFor("nb1") {
 		if prog.Attempts[d] != 0 {
 			t.Errorf("dimension %s burned %d attempt(s) for a reviewer that never launched, want 0", d, prog.Attempts[d])
