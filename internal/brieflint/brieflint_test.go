@@ -229,6 +229,11 @@ func TestRuleFilePathsSatisfied(t *testing.T) {
 	repo, _ := fixture(t)
 	r := Lint(satisfying, Options{Repo: repo})
 	requireClean(t, r, RuleFilePaths)
+	// Not vacuous: the fixture's two paths were recognised and resolved, rather than the
+	// rule finding nothing to check.
+	if !hasNote(r, "cited paths resolved against") {
+		t.Fatalf("the fixture must cite paths for the rule to resolve, got %v", r.Notes)
+	}
 }
 
 func TestRuleFilePathsViolatedByMissingPath(t *testing.T) {
@@ -384,6 +389,11 @@ func TestRuleHardCountsSatisfiedByVariedWording(t *testing.T) {
 		brief := strings.Replace(satisfying, "Touch pkg/thing.go", h, 1)
 		r := Lint(brief, Options{Repo: repo})
 		requireClean(t, r, RuleHardCounts)
+		// Not vacuous: the count was recognised and judged hedged, rather than the rule
+		// finding no count in the wording at all.
+		if !hasNote(r, "hard count(s), each with hedge wording in reach") {
+			t.Fatalf("%q: the rule recognised no count, so clean proves nothing: %v", h, r.Notes)
+		}
 	}
 }
 
@@ -428,10 +438,23 @@ func TestRuleProhibitionViolatedByBlanketBan(t *testing.T) {
 	}
 }
 
+// A fixture has to trip the rule before "no findings" says anything about it. This one did
+// not. The satisfying brief's "No changes to any product branch and no PR" matches nothing
+// in prohibitionRe, which wants a banned VERB (push, merge, commit, land, open a PR), so
+// the test asserted that a rule finding no prohibition at all reported no finding. It said
+// nothing about the bounding and end-state logic it is named for.
 func TestRuleProhibitionSatisfied(t *testing.T) {
 	repo, _ := fixture(t)
-	r := Lint(satisfying, Options{Repo: repo})
+	brief := strings.Replace(satisfying,
+		"No changes to any product branch and no PR until I have reviewed the work.",
+		"Do not push to a product branch, and do not merge anything into main.", 1)
+	r := Lint(brief, Options{Repo: repo})
 	requireClean(t, r, RuleProhibition)
+	// Both bans were found, bounded, and paired with the end state satisfying already
+	// states ("Commit on your own branch ... report the sha").
+	if !hasNote(r, "prohibition: 2 prohibition(s), each with bounding wording") {
+		t.Fatalf("the fixture must carry prohibitions for the rule to judge, got %v", r.Notes)
+	}
 }
 
 // A prohibition that names its invariant but leaves the worker no way to finish is still a
