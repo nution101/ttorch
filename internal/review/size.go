@@ -14,7 +14,7 @@ const (
 	// SizeDocsOnly is a diff whose every changed file is inert prose (Markdown, plain
 	// text, a LICENSE-style file): no executable surface, so no security review. Agent
 	// configuration spelled as Markdown (CLAUDE.md, .claude/agents/*.md) is NOT inert and
-	// never qualifies — see isHarnessConfig.
+	// never qualifies -- see isAgentInstruction.
 	SizeDocsOnly Size = "docs-only"
 	// SizeTrivial is a small single-file code change: low scope-creep risk, so scope
 	// review is dropped — but it is still code, so security review is KEPT.
@@ -55,8 +55,9 @@ var fullReviewers = []string{DimensionCorrectness, DimensionScope, DimensionSecu
 // whenever the authoritative list could not be obtained. ok being false means git could
 // not produce a trustworthy stat (it too forces the full set). Security review is dropped
 // only for a diff with no code at all (docs-only); every code path keeps it, and so does
-// every path that configures an agent session (CLAUDE.md, AGENTS.md, .claude/**), which is
-// configuration rather than prose however it is spelled — see isHarnessConfig.
+// every path that instructs an agent session (CLAUDE.md, AGENTS.md, SKILL.md, .claude/**,
+// content/agents/**, content/skills/**), which is
+// configuration rather than prose however it is spelled -- see isAgentInstruction.
 func Classify(files []string, lines int, binary, ok bool) (Size, []string) {
 	switch {
 	case !ok || len(files) == 0 || hasEmpty(files):
@@ -85,56 +86,102 @@ var docBasenames = map[string]bool{
 	"COPYING": true, "README": true, "CHANGELOG": true, "CONTRIBUTING": true,
 }
 
-// harnessConfigBasenames are agent-instruction files: prose by extension, configuration by
-// effect. A session reads them from its working directory and follows what they say, so a
-// change to one changes how an agent behaves. Compared with strings.EqualFold, so it is a
-// slice rather than a map: a map lookup needs a normalized key, and the normalization that
-// looked right (strings.ToUpper) is not the folding that decides here.
-var harnessConfigBasenames = []string{"CLAUDE.md", "AGENTS.md"}
+// agentInstructionBasenames are agent-instruction files: prose by extension, configuration
+// by effect. A session reads them and follows what they say, so a change to one changes how
+// an agent behaves. SKILL.md is here because a skill body is executed as instructions the
+// moment the skill is invoked. Compared with strings.EqualFold, so it is a slice rather than
+// a map: a map lookup needs a normalized key, and the normalization that looked right
+// (strings.ToUpper) is not the folding that decides here.
+var agentInstructionBasenames = []string{"CLAUDE.md", "AGENTS.md", "SKILL.md"}
 
-// harnessConfigDir is the directory whose contents configure an agent session: settings,
-// hooks that run around the session, and subagent definitions that outrank the installed
-// ones. Matched as a whole PATH COMPONENT, so a prose file that merely mentions the word
-// (notes/claude-usage.md) is unaffected, and matched case-INSENSITIVELY, because the
-// filesystem this runs on is.
-const harnessConfigDir = ".claude"
+// agentInstructionDirs are directories whose contents configure an agent session wherever
+// they appear: settings, hooks that run around the session, and subagent definitions that
+// outrank the installed ones. Matched as whole PATH COMPONENTS at any depth, because a
+// nested package may carry its own.
+var agentInstructionDirs = []string{".claude", ".agents"}
 
-// isHarnessConfig reports whether p configures an agent session rather than documenting the
-// project. It exists because two of those paths — CLAUDE.md and .claude/agents/*.md — are
-// spelled with a prose extension, and treating them as inert prose let a diff of nothing but
-// .md files classify as docs-only and drop the security reviewer. Dropping that reviewer is
-// what a worker subverting the review would want, since it is the one that runs outside the
-// worker's worktree.
-// Both halves fold, and they have to fold the same way. The first version folded only the
-// basename and left the directory segment an exact byte compare, so `.Claude/agents/x.md`
-// classified as docs-only and dropped the security reviewer, which is the reviewer this whole
-// change exists to keep. Folding is strings.EqualFold (Unicode simple folding) rather than
-// upper- or lower-casing, so U+212A KELVIN SIGN and U+017F LATIN SMALL LETTER LONG S fold too.
-// macOS is case-insensitive, so a committed `.Claude/` is the same directory to the session
-// that reads it: the guard has to be at least as insensitive as the filesystem it defends.
-func isHarnessConfig(p string) bool {
-	base := path.Base(p)
-	for _, name := range harnessConfigBasenames {
+// agentInstructionRoots are repository-rooted directories holding instruction files that are
+// not yet in an agent directory and are not named for one: ttorch embeds these and the
+// installer writes them into ~/.claude and ~/.agents, so a change here changes what every
+// future session is told to do. Anchored at the repository root rather than matched at any
+// depth, which keeps an unrelated docs/skills/ or a vendored content/agents/ from dragging a
+// security reviewer into an ordinary docs diff.
+var agentInstructionRoots = [][]string{
+	{"content", "agents"},
+	{"content", "skills"},
+}
+
+// isAgentInstruction reports whether p instructs an agent rather than documenting the
+// project. It exists because these paths are spelled with a prose extension, and treating
+// them as inert prose let a diff of nothing but .md files classify as docs-only and drop the
+// security reviewer. Dropping that reviewer is what a worker subverting the review would
+// want, since it is the one that runs outside the worker's worktree, and the file it would
+// most want to edit is the definition of the security reviewer itself.
+//
+// Every half of every comparison folds, and they all have to fold the same way. An earlier
+// version folded only the basename and left the directory segment an exact byte compare, so
+// `.Claude/agents/x.md` classified as docs-only and dropped the reviewer this whole check
+// exists to keep. Folding is strings.EqualFold (Unicode simple folding) rather than upper- or
+// lower-casing, so U+212A KELVIN SIGN and U+017F LATIN SMALL LETTER LONG S fold too. macOS is
+// case-insensitive, so a committed `.Claude/` is the same directory to the session that reads
+// it: the guard has to be at least as insensitive as the filesystem it defends.
+func isAgentInstruction(p string) bool {
+	segs := strings.Split(path.Clean(p), "/")
+	base := segs[len(segs)-1]
+	for _, name := range agentInstructionBasenames {
 		if strings.EqualFold(base, name) {
 			return true
 		}
 	}
-	for _, seg := range strings.Split(path.Clean(p), "/") {
-		if strings.EqualFold(seg, harnessConfigDir) {
+	for _, seg := range segs {
+		for _, dir := range agentInstructionDirs {
+			if strings.EqualFold(seg, dir) {
+				return true
+			}
+		}
+	}
+	for _, root := range agentInstructionRoots {
+		if hasFoldedPrefix(segs, root) {
 			return true
 		}
 	}
 	return false
 }
 
+// hasFoldedPrefix reports whether segs begins with prefix, comparing each component with
+// strings.EqualFold. It exists because strings.HasPrefix on the joined path would be a byte
+// compare — the exact one-sided-fold mistake this file has already paid for — and because a
+// string prefix would also match a sibling whose name merely starts with the same letters
+// (contentious/agents-notes.md against "content/agents"). A prefix must cover at least one
+// directory and leave a file after it, so an exact match of the directory alone is not one.
+func hasFoldedPrefix(segs, prefix []string) bool {
+	if len(segs) <= len(prefix) {
+		return false
+	}
+	for i, want := range prefix {
+		if !strings.EqualFold(segs[i], want) {
+			return false
+		}
+	}
+	return true
+}
+
 // isDocFile reports whether p is an inert-prose documentation file. It is deliberately
 // conservative: only well-known prose extensions and basenames qualify, so anything that
-// could execute or carry configuration (.go, .sh, .yaml, .json, .html, .svg, …) is treated
-// as code and keeps the full reviewer set. Agent-instruction files are configuration
-// whatever they are spelled (see isHarnessConfig), so they are checked first and never
-// qualify — README.md and docs/*.md still do.
+// could execute or carry configuration (.go, .sh, .yaml, .json, .html, .svg, ...) is treated
+// as code and keeps the full reviewer set. Agent-instruction files are configuration whatever
+// they are spelled (see isAgentInstruction), so they are checked first and never qualify --
+// README.md and docs/*.md still do.
+//
+// WHAT THIS DOES NOT COVER: the check is by name and by location, so Markdown that is neither
+// named as an instruction file nor under an instruction directory, yet is read as instructions
+// by something, is still inert here. A brief a manager points a worker at, a runbook a prompt
+// tells an agent to follow, an instruction file under a directory layout this list does not
+// know: all classify docs-only and drop the security reviewer. The scaling rule's premise --
+// prose has no executable surface -- holds for ordinary prose and is enforced by name for the
+// instruction files above, not established for Markdown in general.
 func isDocFile(p string) bool {
-	if isHarnessConfig(p) {
+	if isAgentInstruction(p) {
 		return false
 	}
 	base := path.Base(p)

@@ -231,3 +231,76 @@ func TestClassify_RealProseIsStillDocsOnly(t *testing.T) {
 		t.Fatalf("ordinary prose must not require a security review: %v", dims)
 	}
 }
+
+// TestClassify_InstructionFilesOutsideDotClaudeAreNotInertProse covers the instruction files
+// that live outside a .claude directory. They are the SOURCE of the ones inside it: ttorch
+// embeds content/agents/*.md and content/skills/**/SKILL.md and the installer writes them into
+// ~/.claude, so a change to the committed copy changes what every future reviewer session is
+// told to do. Classified as prose, a diff whose only file is the security reviewer's own
+// definition gets no security review, which is the one file where that matters most.
+func TestClassify_InstructionFilesOutsideDotClaudeAreNotInertProse(t *testing.T) {
+	cases := []struct {
+		name  string
+		files []string
+	}{
+		{"the security reviewer's committed definition", []string{"content/agents/ttorch-reviewer-security.md"}},
+		{"a review skill", []string{"content/skills/ttorch-review/SKILL.md"}},
+		// A non-SKILL.md file under content/skills: the only case the content/skills root
+		// carries alone, since SKILL.md is already caught by basename.
+		{"a skill's reference file", []string{"content/skills/ttorch-review/reference.md"}},
+		{"a skill file anywhere", []string{"SKILL.md"}},
+		{"nested skill file", []string{"internal/x/SKILL.md"}},
+		{"the whole agent payload", []string{
+			"content/agents/ttorch-reviewer-correctness.md",
+			"content/agents/ttorch-reviewer-scope.md",
+		}},
+		// Folded spellings of each of the three predicates, because a one-sided fold in this
+		// file is the bug that has recurred across this wave.
+		{"folded content prefix", []string{"Content/Agents/ttorch-reviewer-security.md"}},
+		{"folded skills prefix", []string{"CONTENT/SKILLS/ttorch-review/skill.md"}},
+		{"folded skill basename", []string{"Skill.md"}},
+		{"folded agents dir", []string{".Agents/agents/x.md"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			size, dims := Classify(tc.files, 5, false, true)
+			if size == SizeDocsOnly {
+				t.Fatalf("agent instructions must not classify as inert prose: %v -> %s %v", tc.files, size, dims)
+			}
+			if !contains(dims, DimensionSecurity) {
+				t.Fatalf("agent instructions must keep the security reviewer: %v -> %s %v", tc.files, size, dims)
+			}
+		})
+	}
+}
+
+// TestClassify_OrdinaryProseStaysDocsOnly is the inverse, and it is the expensive direction to
+// get wrong: widening the instruction predicate until every docs change drags in a security
+// reviewer is how a scaling rule gets switched off. Each of these mentions agents, skills or
+// claude somewhere in its path and is still prose.
+func TestClassify_OrdinaryProseStaysDocsOnly(t *testing.T) {
+	cases := [][]string{
+		{"README.md"},
+		{"docs/design.md", "docs/architecture.md"},
+		{"CHANGELOG"},
+		{"LICENSE"},
+		{"docs/agents-guide.md"},    // about agents, not named as one
+		{"docs/skills/overview.md"}, // not content/skills
+		{"notes/claude-usage.md"},   // mentions the word
+		{"content/README.md"},       // under content, not content/agents
+		{"content/agent-notes.md"},  // under content, not content/agents
+		{"skills.md"},               // not SKILL.md
+		{"docs/design.md", "CHANGELOG", "LICENSE", "README.md"},
+	}
+	for _, files := range cases {
+		t.Run(files[0], func(t *testing.T) {
+			size, dims := Classify(files, 500, false, true)
+			if size != SizeDocsOnly {
+				t.Fatalf("ordinary prose must stay docs-only: %v -> %s %v", files, size, dims)
+			}
+			if contains(dims, DimensionSecurity) {
+				t.Fatalf("ordinary prose must not pull a security reviewer: %v -> %v", files, dims)
+			}
+		})
+	}
+}
