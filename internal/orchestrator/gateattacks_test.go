@@ -1704,3 +1704,89 @@ func TestGateScopeFailsClosed(t *testing.T) {
 		t.Fatal("resolveGateScope must fail CLOSED when it cannot read the repository")
 	}
 }
+
+// TestGateScope_GitattributesCannotUnScopeTheRepo is the round-13 critical.
+//
+// resolveGateScope read base with `git grep`, and `git grep <rev>` takes its attributes from
+// the WORKING TREE rather than from the rev. So landing a two-word .gitattributes saying
+// `content.go -diff` made git report "Binary file main:content.go matches" for a commit
+// whose bytes never changed, the directive scan found nothing, and TtorchSource went false.
+// The whole ttorch-source tier left the covered set on an unflagged merge: content/**, the
+// six internal/** prefixes, content.go, both published installers and the five deciding
+// orchestrator files.
+//
+// Reading base rather than rev was never the defect. The read MECHANISM was.
+func TestGateScope_GitattributesCannotUnScopeTheRepo(t *testing.T) {
+	repo := t.TempDir()
+	gitIn(t, repo, "init", "-q", "-b", "main")
+	gitIn(t, repo, "config", "user.email", "t@example.com")
+	gitIn(t, repo, "config", "user.name", "t")
+	if err := os.MkdirAll(filepath.Join(repo, "content"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "content", "x.md"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "content.go"),
+		[]byte("package p\n\nimport \"embed\"\n\n//go:embed all:content\nvar payload embed.FS\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "-A")
+	gitIn(t, repo, "commit", "-q", "-m", "init")
+
+	if sc := resolveGateScope(repo, "main"); !sc.TtorchSource {
+		t.Fatal("setup: the repo must scope in before the attack, or this proves nothing")
+	}
+
+	// Merge 1 of the attack: a file that matched nothing in the covered set.
+	if err := os.WriteFile(filepath.Join(repo, ".gitattributes"), []byte("content.go -diff\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "-A")
+	gitIn(t, repo, "commit", "-q", "-m", "normalize diffs")
+
+	if sc := resolveGateScope(repo, "main"); !sc.TtorchSource {
+		t.Fatal("a committed .gitattributes must not un-scope the repository. The scope is " +
+			"resolved from the raw blob via git cat-file, which no attribute reaches; a " +
+			"text-search tool reads attributes from the working tree and cannot be trusted " +
+			"with this question.")
+	}
+	// And .gitattributes is itself covered now, so the first merge would be flagged anyway.
+	if !matchesGateConfig(".gitattributes", ttorchScope) {
+		t.Error(".gitattributes must be in the covered set: it changes how git reports every " +
+			"other file, which is defence in depth behind the blob read")
+	}
+}
+
+// TestEmbedsContentRoot_GlobsAndQuotes pins the directive grammar rather than a list of
+// spellings. Two hand-rolled scanners shipped before and both were evaded by all:cont*,
+// which compiles and yields an FS with content at top level while reading as the literal
+// element "cont*". go:embed patterns are path.Match globs, so path.Match is the test.
+func TestEmbedsContentRoot_GlobsAndQuotes(t *testing.T) {
+	for _, tc := range []struct {
+		name, src string
+		want      bool
+	}{
+		{"plain", "package p\n//go:embed content\nvar f embed.FS\n", true},
+		{"all prefix", "package p\n//go:embed all:content\nvar f embed.FS\n", true},
+		{"glob, the evasion", "package p\n//go:embed all:cont*\nvar f embed.FS\n", true},
+		{"glob without all:", "package p\n//go:embed cont*\nvar f embed.FS\n", true},
+		{"quoted", "package p\n//go:embed \"content\"\nvar f embed.FS\n", true},
+		{"subpath", "package p\n//go:embed content/skills\nvar f embed.FS\n", true},
+		{"question glob", "package p\n//go:embed conten?\nvar f embed.FS\n", true},
+		{"character class", "package p\n//go:embed [c]ontent\nvar f embed.FS\n", true},
+		{"a different tree", "package p\n//go:embed migrations/*.sql\nvar f embed.FS\n", false},
+		{"a near name", "package p\n//go:embed contents\nvar f embed.FS\n", false},
+		{"no directive", "package p\n\nvar f int\n", false},
+		{"not a directive, just prose", "package p\n// discusses go:embed content generally\nvar f int\n", false},
+		// Unparseable source is reported as matching: a file whose payload cannot be ruled
+		// out must not silently un-cover the deciding code.
+		{"syntax error fails closed", "package p\n//go:embed content\nvar f embed.FS\n}}}{{{", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := embedsContentRoot([]byte(tc.src)); got != tc.want {
+				t.Errorf("embedsContentRoot = %v, want %v for:\n%s", got, tc.want, tc.src)
+			}
+		})
+	}
+}

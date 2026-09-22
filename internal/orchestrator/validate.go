@@ -1,12 +1,17 @@
 package orchestrator
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"go/parser"
+	"go/token"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -128,6 +133,13 @@ var gateConfigFiles = []string{
 	"go.mod",
 	"go.sum",
 	".mcp.json",
+	// .gitattributes changes how git REPORTS every other file. A committed
+	// `content.go -diff` made `git grep <rev>` print "Binary file ... matches" for a commit
+	// whose bytes never changed, which un-scoped the whole ttorch-source tier. The read is
+	// on raw blobs now and no attribute reaches it, so this entry is defence in depth: a
+	// file that can change what git says about other files belongs in the set whether or
+	// not a current mechanism depends on it.
+	".gitattributes",
 }
 
 // ttorchSourceFiles are covered ONLY in the repository that is ttorch's own source. They are
@@ -143,6 +155,25 @@ var ttorchSourceFiles = []string{
 	"internal/orchestrator/validate.go",
 	"internal/orchestrator/validatecache.go",
 	"internal/orchestrator/audit.go",
+	// The gate's own proofs. Without these, the backstop can be deleted in the same merge
+	// as the attack it would catch: TestTtorchRepoIsScopedIn goes red on a .gitattributes
+	// that un-scopes the repo, but a diff that adds the attribute AND deletes the test
+	// touched nothing covered and auto-merged.
+	//
+	// Why these two and not every _test.go tree-wide: these are the files that carry the
+	// guard's assertions, and tree-wide coverage would put every test change behind the
+	// flag for no gain, since a test elsewhere cannot weaken this guard. The boundary is
+	// enforced rather than trusted. TestOrchestratorFilesAreClassified derives proof-ness
+	// from whether a test file USES the guard's identifiers, so a new proof file cannot
+	// land outside this list unnoticed.
+	//
+	// The gate-config tests used to live in orchestrator_test.go too. Covering that file
+	// cost 43 of 196 commits and took the set to 110/196 = 56%, past the more-than-half
+	// line that is the stated reason internal/orchestrator/ is not covered wholesale, so
+	// the tests moved into a file that was already covered instead. Both files here cost 0
+	// commits: they exist only to hold these proofs.
+	"internal/orchestrator/gateattacks_test.go",
+	"internal/orchestrator/gateconfig_test.go",
 }
 
 // gateConfigPrefixes define the gate by path prefix, where the covered unit is a directory
@@ -343,11 +374,12 @@ var ttorchSourcePrefixes = []string{
 //	SimpleFold orbit alone    13,328 misses
 //
 // TestFSIdentityKeySweep keeps a bounded version of that sweep (2,367 pairs) in the suite.
-// It calls skipIfShort, so it does NOT run in the fast lane .ttorch/validate.sh uses; CI runs
-// the full suite and is where the sweep actually executes. TestFSIdentityKeyMatchesTheFilesystem
-// checks seven hand-picked pairs and does run in both lanes. An earlier version of this
-// comment cited that seven-pair test as the sweep, which answered "is the fold measured where
-// the gate runs" backwards.
+// It calls skipIfShort, so `go test -short` skips it, but .ttorch/validate.sh runs
+// `make test-gate` as well as `make test-fast` and test-gate is not -short. The sweep
+// therefore DOES execute in the lane that gates, measured at 7.80s. This comment has now
+// been wrong in both directions: it first cited the seven-pair
+// TestFSIdentityKeyMatchesTheFilesystem as the sweep, then said the sweep does not run in
+// the gate lane, which stopped being true when test-gate was added in the same wave.
 //
 // cases.Caser is documented as possibly stateful and not safe to share, so a Caser is built
 // per call rather than cached in a package var.
@@ -447,27 +479,92 @@ func (sc gateScope) prefixes() []string {
 // Fails CLOSED: a git error returns TtorchSource=true, because the expensive mistake is
 // leaving ttorch's own deciding code uncovered.
 func resolveGateScope(repo, base string) gateScope {
-	out, err := worktree.GrepTree(repo, base, "//go:embed", "*.go")
+	goFiles, err := worktree.TreeFiles(repo, base)
 	if err != nil {
 		return gateScope{TtorchSource: true}
 	}
-	for _, line := range strings.Split(out, "\n") {
-		_, rest, ok := strings.Cut(line, "//go:embed ")
-		if !ok {
+	var candidates []string
+	for _, f := range goFiles {
+		if strings.HasSuffix(f, ".go") {
+			candidates = append(candidates, f)
+		}
+	}
+	blobs, err := worktree.CatBlobs(repo, base, candidates)
+	if err != nil {
+		return gateScope{TtorchSource: true}
+	}
+	for _, body := range blobs {
+		// Cheap byte filter first, on bytes already in hand, so only the handful of files
+		// that mention a directive get parsed.
+		if !bytes.Contains(body, []byte("go:embed")) {
 			continue
 		}
-		for _, pat := range strings.Fields(rest) {
-			// Strip an "all:" style prefix, then take the first path element.
-			if _, after, found := strings.Cut(pat, ":"); found {
-				pat = after
-			}
-			pat = strings.Trim(pat, `"`)
-			if top, _, _ := strings.Cut(pat, "/"); top == "content" {
-				return gateScope{TtorchSource: true}
-			}
+		if embedsContentRoot(body) {
+			return gateScope{TtorchSource: true}
 		}
 	}
 	return gateScope{}
+}
+
+// embedsContentRoot reports whether Go source carries a //go:embed directive that selects a
+// top-level entry named "content".
+//
+// Parsed with go/parser rather than scanned for a prefix. Two hand-rolled versions of this
+// shipped before and both were evaded: //go:embed all:cont* compiles, produces an FS with
+// content at top level, and reads as the literal element "cont*" to a string scanner. The
+// answer is not a longer list of spellings, it is to implement the grammar the directive
+// actually has.
+//
+//   - the directive is a COMMENT immediately preceding a declaration, which go/ast gives us
+//     positionally rather than by guessing at line prefixes
+//   - a pattern may be a Go string literal, so strconv.Unquote is the right reader
+//   - a pattern is a path.Match GLOB, per the go:embed spec, so path.Match against the name
+//     is the right test. That is what catches cont* without knowing cont* exists.
+//
+// Syntax errors are reported as MATCHING. A file this cannot parse is a file whose payload
+// cannot be ruled out, and the expensive mistake is un-covering the deciding code.
+func embedsContentRoot(src []byte) bool {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
+	if err != nil {
+		return true
+	}
+	for _, cg := range f.Comments {
+		for _, c := range cg.List {
+			rest, ok := strings.CutPrefix(c.Text, "//go:embed ")
+			if !ok {
+				continue
+			}
+			for _, pat := range splitEmbedPatterns(rest) {
+				if after, found := strings.CutPrefix(pat, "all:"); found {
+					pat = after
+				}
+				first, _, _ := strings.Cut(pat, "/")
+				if ok, err := path.Match(first, embedRootName); err == nil && ok {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// embedRootName is the directory installer.apply walks in the embedded FS. It is the
+// installer's embedRoot constant; the gate has to agree with it, and a mismatch would mean
+// the guard scopes on one name while the installer installs from another.
+const embedRootName = "content"
+
+// splitEmbedPatterns splits a directive's arguments, honouring Go string literals so a
+// quoted pattern is read as one argument with its quotes removed.
+func splitEmbedPatterns(rest string) []string {
+	var out []string
+	for _, tok := range strings.Fields(rest) {
+		if unq, err := strconv.Unquote(tok); err == nil {
+			tok = unq
+		}
+		out = append(out, tok)
+	}
+	return out
 }
 
 // matchesGateConfig reports whether a repository path names a gate-definition file. Matching
@@ -861,6 +958,13 @@ func diffTouchesGateConfig(repo, base, rev string) (*gateConfigHit, error) {
 // CLAUDE.md is a committed symlink; refusing every changed link would refuse every commit
 // that touches it, with no flag to clear it, and repointing an existing link is already
 // flaggable through the name match.
+//
+// Left open deliberately: REPOINTING a pre-existing symlink that stands at covered ground is
+// flaggable rather than blocking. Closing it would mean refusing every commit that touches
+// CLAUDE.md outright, which is a real cost for a case that cannot arise here without first
+// landing a link at covered ground, and that first merge is blocking. If a repo ever
+// legitimately carries such a link, revisit this rather than discovering it during an
+// incident.
 //
 // Limit, stated rather than implied: a symlink at a path that shadows NOTHING covered is not
 // refused, even though any directory symlink can introduce files git never lists by path.

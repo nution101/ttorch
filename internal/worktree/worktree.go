@@ -8,6 +8,7 @@
 package worktree
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -715,23 +716,62 @@ func ChangedLinks(path, base, rev string) ([]ChangedLink, error) {
 	return links, nil
 }
 
-// GrepTree returns the lines in rev's committed tree matching a fixed string, restricted to
-// paths matching pathspec. It reads the TREE, not the working directory, so a worker's
-// uncommitted edits cannot influence the answer.
+// CatBlobs returns the RAW bytes of each path in rev's committed tree.
 //
-// Used to resolve which repository the gate is running in from the repository's own content
-// rather than from its name. A non-zero exit with no output means "no matches", which git
-// signals with exit code 1; that is not an error.
-func GrepTree(path, rev, fixed, pathspec string) (string, error) {
-	out, errOut, err := gitRaw("-C", path, "grep", "-h", "--no-color", "-F", "-e", fixed, rev, "--", pathspec)
-	if err != nil {
-		// git grep exits 1 for "no matches". Anything on stderr means a real failure.
-		if strings.TrimSpace(errOut) == "" && strings.TrimSpace(out) == "" {
-			return "", nil
-		}
-		return "", fmt.Errorf("git grep in %s: %v: %s", rev, err, strings.TrimSpace(errOut))
+// Raw is the whole point. `git grep <rev>` and `git diff` read gitattributes from the
+// WORKING TREE, not from the rev they are given, so a committed `.gitattributes` saying
+// `content.go -diff` makes `git grep` report "Binary file ... matches" for a commit whose
+// bytes never changed. Measured: same rev argument, output flips depending on what is on
+// disk. Anything that decides policy from a text-search tool inherits that.
+//
+// `git cat-file --batch` emits the stored object bytes. No attribute reaches it: -diff,
+// -text, a diff=<driver> textconv, a clean/smudge filter, ident and working-tree-encoding
+// were all set hostile against the same blob and cat-file returned the committed bytes
+// every time. Filters apply on checkout and on add, so the stored blob is already what it
+// is; there is no read-time transformation left to subvert.
+//
+// One subprocess for any number of paths. Missing paths are skipped rather than failing,
+// since a tree legitimately may not contain one.
+func CatBlobs(path, rev string, paths []string) (map[string][]byte, error) {
+	if len(paths) == 0 {
+		return map[string][]byte{}, nil
 	}
-	return out, nil
+	var in bytes.Buffer
+	for _, p := range paths {
+		fmt.Fprintf(&in, "%s:%s\n", rev, p)
+	}
+	cmd := exec.Command("git", "-C", path, "cat-file", "--batch")
+	cmd.Stdin = &in
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("git cat-file --batch in %s: %w", rev, err)
+	}
+	res := make(map[string][]byte, len(paths))
+	buf := out.Bytes()
+	for _, p := range paths {
+		// Each record is "<sha> blob <size>\n<contents>\n", or "<spec> missing\n".
+		nl := bytes.IndexByte(buf, '\n')
+		if nl < 0 {
+			break
+		}
+		header := string(buf[:nl])
+		buf = buf[nl+1:]
+		fields := strings.Fields(header)
+		if len(fields) < 3 || fields[1] != "blob" {
+			continue // missing, or not a blob (a tree or a gitlink)
+		}
+		size, err := strconv.Atoi(fields[2])
+		if err != nil || size > len(buf) {
+			return nil, fmt.Errorf("git cat-file --batch: unparseable record %q", header)
+		}
+		res[p] = buf[:size]
+		buf = buf[size:]
+		if len(buf) > 0 && buf[0] == '\n' {
+			buf = buf[1:]
+		}
+	}
+	return res, nil
 }
 
 // TreeFiles returns every path in rev's committed tree, NUL-separated and unquoted.
