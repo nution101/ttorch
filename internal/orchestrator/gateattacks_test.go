@@ -11,6 +11,7 @@ import (
 	"github.com/nution101/ttorch/internal/approval"
 	"github.com/nution101/ttorch/internal/learnings"
 	"github.com/nution101/ttorch/internal/projectinit"
+	"github.com/nution101/ttorch/internal/review"
 	"github.com/nution101/ttorch/internal/worktree"
 )
 
@@ -1009,5 +1010,238 @@ func TestGateGuard_PublishedInstallersNeedAllowGateChange(t *testing.T) {
 				t.Fatalf("--allow-gate-change should let %s merge: %v", path, err)
 			}
 		})
+	}
+}
+
+// TestGateGuard_RenameReportsBothSides is the fifth wrong-input-set defect on this guard, and
+// like the other four the comparison was fine and the SET was short.
+//
+// diff.renames has defaulted TRUE since git 2.9, so a detected rename is reported as its
+// DESTINATION only. The source path never reaches the matcher, so moving a covered file out of
+// coverage touched nothing covered. collidesInTree cannot backstop it — a rename produces no
+// colliding pair, since the source is gone from the tree.
+//
+// The first two cases are the live ones:
+//
+//   - renaming the security reviewer's definition needs no code change at all, because
+//     installer.desiredFiles walks the embedded tree rather than working from a list, so the
+//     file just leaves the install set.
+//   - internal/installer has exactly one non-test importer, internal/cli/cli.go, which is
+//     deliberately uncovered at 29% of commits. So a diff could move the whole package out of
+//     coverage, fix that one import, compile, merge unflagged — and every later change to the
+//     package would be unflagged too.
+func TestGateGuard_RenameReportsBothSides(t *testing.T) {
+	// seed is what the file holds before the rename. It matters for the two paths the harness
+	// itself depends on: .ttorch/validate.sh must stay a script that exits 0 or the gate goes
+	// red for the wrong reason, and AGENTS.md must keep the delivery-mode block projectinit
+	// wrote or the repo stops reading as trusted and the merge is never gated at all. An
+	// earlier version of this test overwrote both with placeholder text and "passed" and
+	// "failed" for reasons that had nothing to do with renames.
+	for _, tc := range []struct{ from, to, seed, why string }{
+		{"content/agents/ttorch-reviewer-security.md", "content/agents/security-review-guidance.md", "original\n",
+			"the security reviewer's own definition leaves the install set with no code change"},
+		{"internal/installer/installer.go", "internal/installerx/installer.go", "package installer\n",
+			"moves the whole package out of coverage; one import to fix, in an uncovered file"},
+		{".ttorch/validate.sh", "scripts/validate.sh", "exit 0\n",
+			"relocates the gate's validation authority"},
+		{"AGENTS.md", "docs/notes-about-agents.txt", "", // "" = leave the existing file alone
+			"relocates the delivery-mode config"},
+	} {
+		t.Run(tc.from, func(t *testing.T) {
+			m, repo := deliveryHarness(t, "rename")
+			commitGateScript(t, repo, "exit 0")
+			if _, err := projectinit.Init(repo, "trusted"); err != nil {
+				t.Fatal(err)
+			}
+			if tc.seed != "" {
+				if dir := filepath.Dir(filepath.FromSlash(tc.from)); dir != "." {
+					if err := os.MkdirAll(filepath.Join(repo, dir), 0o755); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := os.WriteFile(filepath.Join(repo, filepath.FromSlash(tc.from)), []byte(tc.seed), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			gitIn(t, repo, "add", "-A")
+			gitIn(t, repo, "commit", "-q", "-m", "add "+tc.from)
+			// The file really is on the default branch, so the rename below is a rename.
+			if _, err := os.Stat(filepath.Join(repo, filepath.FromSlash(tc.from))); err != nil {
+				t.Fatalf("setup: %s must exist on the default branch: %v", tc.from, err)
+			}
+
+			task, err := m.Spawn("rn1", repo, false, "sleep 60")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _, _ = m.Teardown("rn1", true) }()
+			wt := task.Worktree
+			if dir := filepath.Dir(filepath.FromSlash(tc.to)); dir != "." {
+				if err := os.MkdirAll(filepath.Join(wt, dir), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			gitIn(t, wt, "mv", tc.from, tc.to)
+			gitIn(t, wt, "commit", "-q", "-m", "tidy up file layout")
+			head := gitIn(t, wt, "rev-parse", "HEAD")
+			base := worktree.DefaultBranch(repo)
+
+			// Setup: git really does detect this as a rename, so the gap is reachable.
+			withRenames, err := gitOut(repo, "diff", "--name-only", "-z", base, head)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(withRenames, tc.from) {
+				t.Skipf("git did not detect a rename here, so the source is reported anyway: %q", withRenames)
+			}
+
+			// Both sides must now reach the guard.
+			changed, cerr := worktree.ChangedFiles(repo, base, head)
+			if cerr != nil {
+				t.Fatal(cerr)
+			}
+			var sawFrom, sawTo bool
+			for _, c := range changed {
+				if c == tc.from {
+					sawFrom = true
+				}
+				if c == tc.to {
+					sawTo = true
+				}
+			}
+			if !sawFrom || !sawTo {
+				t.Fatalf("ChangedFiles must report both sides of a rename; got %q (from=%v to=%v)", changed, sawFrom, sawTo)
+			}
+
+			hit, err := diffTouchesGateConfig(repo, base, head)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if hit == nil {
+				t.Fatalf("%s: renaming %s must trip the guard", tc.why, tc.from)
+			}
+			if hit.Path != tc.from {
+				t.Fatalf("the refusal should name the SOURCE (%s), got %s", tc.from, hit.Path)
+			}
+
+			writeReviewReports(t, m.P.ReviewInputsDir("rn1"), head, nil)
+			if _, err := m.TrustRecord("rn1", "", time.Minute); err != nil {
+				t.Fatal(err)
+			}
+			if approval.Valid(m.P.ApprovalFile("rn1")) {
+				t.Fatalf("%s: the rename must not auto-approve", tc.why)
+			}
+			if err := m.Approve("rn1", time.Minute, false); err != nil {
+				t.Fatal(err)
+			}
+			defHead := gitIn(t, repo, "rev-parse", "HEAD")
+			if _, err := m.MergeLocal("rn1", false); err == nil {
+				t.Fatalf("a plain approval must not authorize renaming %s", tc.from)
+			}
+			if gitIn(t, repo, "rev-parse", "HEAD") != defHead {
+				t.Fatal("the rename must not have merged")
+			}
+			if err := m.Approve("rn1", time.Minute, true); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := m.MergeLocal("rn1", false); err != nil {
+				t.Fatalf("--allow-gate-change should let the rename merge: %v", err)
+			}
+			if b, _ := os.ReadFile(m.P.AuditLog()); !strings.Contains(string(b), "gate-change="+tc.from) {
+				t.Fatalf("the merge audit line must name the source %s: %s", tc.from, b)
+			}
+		})
+	}
+}
+
+// TestGateGuard_OrdinaryRenameStillMerges is the control: --no-renames widens the input set, so
+// it could have turned every ordinary file move into a flagged change. A rename whose source
+// and destination are both uncovered still merges clean.
+func TestGateGuard_OrdinaryRenameStillMerges(t *testing.T) {
+	m, repo := deliveryHarness(t, "renok")
+	commitGateScript(t, repo, "exit 0")
+	if _, err := projectinit.Init(repo, "trusted"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(repo, "internal", "cli"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "internal", "cli", "old.go"), []byte("package cli\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "-A")
+	gitIn(t, repo, "commit", "-q", "-m", "add an uncovered file")
+	task, err := m.Spawn("ro1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = m.Teardown("ro1", true) }()
+	wt := task.Worktree
+	gitIn(t, wt, "mv", "internal/cli/old.go", "internal/cli/new.go")
+	gitIn(t, wt, "commit", "-q", "-m", "rename an uncovered file")
+	head := gitIn(t, wt, "rev-parse", "HEAD")
+	writeReviewReports(t, m.P.ReviewInputsDir("ro1"), head, nil)
+	if _, err := m.TrustRecord("ro1", "", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if !approval.Valid(m.P.ApprovalFile("ro1")) {
+		t.Fatal("renaming an uncovered file must still auto-approve; --no-renames must not flag every move")
+	}
+	if _, err := m.MergeLocal("ro1", false); err != nil {
+		t.Fatalf("an ordinary rename must merge with no flag: %v", err)
+	}
+	if b, _ := os.ReadFile(m.P.AuditLog()); strings.Contains(string(b), "gate-change=") {
+		t.Fatalf("an ordinary rename must not be recorded as a gate change: %s", b)
+	}
+}
+
+// TestDiffFiles_RenameKeepsTheCodeVisible: the reviewer-set classifier reads the same command,
+// and there the consequence is worse. With renames detected, moving a .go file to a .md one
+// reports only the .md destination, so review.Classify sees a docs-only diff and DROPS the
+// security reviewer. The source has to be in the list for the classifier to know there is code
+// in the change.
+func TestDiffFiles_RenameKeepsTheCodeVisible(t *testing.T) {
+	m, repo := deliveryHarness(t, "clsrn")
+	task, err := m.Spawn("cl1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = m.Teardown("cl1", true) }()
+	wt := task.Worktree
+	if err := os.WriteFile(filepath.Join(wt, "logic.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, wt, "add", "-A")
+	gitIn(t, wt, "commit", "-q", "-m", "add code")
+	baseSHA := gitIn(t, wt, "rev-parse", "HEAD")
+	gitIn(t, wt, "mv", "logic.go", "notes.md")
+	gitIn(t, wt, "commit", "-q", "-m", "move code into a markdown file")
+	head := gitIn(t, wt, "rev-parse", "HEAD")
+
+	files, ok := diffFiles(wt, baseSHA, head)
+	if !ok {
+		t.Fatal("diffFiles failed")
+	}
+	var sawGo bool
+	for _, f := range files {
+		if strings.HasSuffix(f, ".go") {
+			sawGo = true
+		}
+	}
+	if !sawGo {
+		t.Fatalf("the .go source must appear in the classifier's file list, or the diff reads as docs-only and the security reviewer is dropped; got %q", files)
+	}
+	size, dims := review.Classify(files, 10, false, true)
+	if size == review.SizeDocsOnly {
+		t.Fatalf("a diff that moves code into a .md file must not classify as docs-only; dims=%v", dims)
+	}
+	var sawSecurity bool
+	for _, d := range dims {
+		if d == review.DimensionSecurity {
+			sawSecurity = true
+		}
+	}
+	if !sawSecurity {
+		t.Fatalf("the security reviewer must not be dropped for a diff containing code; dims=%v", dims)
 	}
 }

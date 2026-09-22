@@ -612,6 +612,19 @@ func splitNUL(out string) []string {
 	return files
 }
 
+// THE INPUT SET IS THE PART THAT KEEPS BEING WRONG.
+//
+// Five separate defects in the gate-config guard have now been defects in the set of paths
+// handed to the comparison, not in the comparison itself: no case folding at all, then simple
+// lowercasing instead of folding, then single-rune folding instead of full folding, then blobs
+// without the directories they imply, and then this one — renames reporting only their
+// destination. Each time the matcher was doing exactly what it said and the SET was short.
+//
+// So: anyone auditing this guard should check what reaches it before checking what it does
+// with what reaches it. The questions that have each caught a real bypass are — is every path
+// present (renames, directories), is it spelled the way the matcher matches (quoting,
+// normalization, folding), and is it the committed tree rather than the working one.
+//
 // ChangedFiles returns the repo-relative paths changed between base and the COMMITTED
 // rev — committed objects, never the working tree. It is an input to the trust gate's
 // gate-config guard (orchestrator.diffTouchesGateConfig), so the list must be complete and
@@ -630,8 +643,19 @@ func splitNUL(out string) []string {
 // Removing the quoting removes an incidental defence: a quoted path could not carry a raw
 // newline or control byte into a caller. orchestrator.hostilePath now refuses those
 // explicitly, and the audit sink escapes them, rather than relying on git's display quoting.
+//
+// --no-renames because diff.renames has defaulted TRUE since git 2.9, and a detected rename is
+// reported as its DESTINATION only. The source path simply does not appear, so
+// `git mv content/agents/ttorch-reviewer-security.md content/agents/security-review-guidance.md`
+// produced a diff that touched no covered path and merged unflagged — while the reviewer
+// definition left the install set, because installer.desiredFiles walks the embedded tree
+// rather than working from a list, so no code change was needed either. The same move applied
+// to internal/installer/ relocates the whole package out of coverage with one import to fix in
+// internal/cli/, which is deliberately uncovered. The collision check cannot backstop this: a
+// rename produces no colliding pair. With --no-renames git reports both sides and the source
+// trips the guard.
 func ChangedFiles(path, base, rev string) ([]string, error) {
-	out, err := checkedGitRaw("-C", path, "diff", "--name-only", "-z", base, rev)
+	out, err := checkedGitRaw("-C", path, "diff", "--name-only", "-z", "--no-renames", base, rev)
 	if err != nil {
 		return nil, err
 	}

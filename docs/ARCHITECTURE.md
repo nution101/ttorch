@@ -333,6 +333,55 @@ non-deciding. That stays a review responsibility. An earlier version of this sec
 the anchor test "fails if any deciding function lands in a file `gateConfigFiles` does not
 name", which was not true of what the test does.
 
+### The input set is the part that keeps being wrong
+
+Five separate bypasses of this guard have now been defects in the **list of paths handed to the
+matcher**, not in the matcher:
+
+| defect | the set was short by |
+|---|---|
+| no case folding at all | every case variant |
+| `strings.ToLower` instead of folding | U+017F and friends |
+| `unicode.SimpleFold` instead of full folding | the multi-rune folds (`ﬁ` → `fi`) |
+| blobs only, from `ls-tree -r` | the directories those blobs imply |
+| rename detection on, the git default | a rename's **source** path |
+
+Each time the comparison did exactly what it said and the set was incomplete. So the standing
+instruction, recorded beside `worktree.ChangedFiles`: check what reaches the guard before
+checking what it does with what reaches it. The three questions that have each caught a real
+bypass are whether every path is present, whether it is spelled the way the matcher matches,
+and whether it is the committed tree rather than the working one.
+
+The rename case is the newest. `diff.renames` has defaulted **true** since git 2.9, so a
+detected rename is reported as its destination only and the source never reaches the matcher.
+That made four moves merge unflagged:
+
+```
+content/agents/ttorch-reviewer-security.md -> content/agents/security-review-guidance.md
+internal/installer/installer.go            -> internal/installerx/installer.go
+.ttorch/validate.sh                        -> scripts/validate.sh
+AGENTS.md                                  -> docs/notes-about-agents.txt
+```
+
+The first two are the live ones. Renaming the security reviewer's definition needs no code
+change at all, because `installer.desiredFiles` walks the embedded tree rather than working
+from a list, so the file simply leaves the install set. And `internal/installer` has exactly
+one non-test importer, `internal/cli/cli.go`, which is deliberately uncovered — so a diff
+could move the whole package out of coverage, fix that one import, compile, merge unflagged,
+and every later change to the package would be unflagged too. The collision check cannot
+backstop either: a rename produces no colliding pair, because the source is gone from the tree.
+
+`--no-renames` reports both sides, and the guard then trips on the source. It is also needed in
+`orchestrator.diffFiles`, which feeds the reviewer-set classifier off the same command, and
+there the consequence is sharper: moving a `.go` file to a `.md` one reported only the `.md`
+destination, so `review.Classify` read the diff as **docs-only** and dropped the security
+reviewer entirely.
+
+Widening the set could have made every ordinary file move a flagged change, so
+`TestGateGuard_OrdinaryRenameStillMerges` pins that a rename whose source and destination are
+both uncovered still auto-approves and merges clean. The historical cost figures are unaffected
+— re-measuring the whole corpus with `--no-renames` moves 0 of the 196 commits.
+
 ### Why name-matching is not the load-bearing control
 
 Both the matcher and the collision check compare under one function, `fsIdentityKey`: NFD,

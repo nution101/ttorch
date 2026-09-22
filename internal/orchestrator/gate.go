@@ -202,11 +202,17 @@ func reviewBase(repo string, fetch bool) (string, error) {
 // core.quotePath, so a path with tabs, control characters, quotes, backslashes, or
 // non-ASCII bytes — which the patch body would quote — still appears in full and is never
 // silently dropped. ok is false on any git error so the caller fails closed (full reviewer
-// set). This is the source of truth for size classification; the patch body is never
+// set).
+//
+// --no-renames for the same reason worktree.ChangedFiles needs it, with a sharper consequence
+// here: diff.renames defaults TRUE, so a detected rename reports only its DESTINATION, and
+// renaming a .go file to a .md one would present the diff to review.Classify as DOCS-ONLY —
+// which drops the security reviewer entirely. The source path has to be in the list for the
+// classifier to see there is code in the change. This is the source of truth for size classification; the patch body is never
 // scraped for filenames, because a dropped quoted path could hide a malicious code file
 // behind a docs-only edit and skip the security reviewer.
 func diffFiles(dir, base, rev string) (files []string, ok bool) {
-	out, err := gitOut(dir, "diff", "--name-only", "-z", base+"..."+rev)
+	out, err := gitOut(dir, "diff", "--name-only", "-z", "--no-renames", base+"..."+rev)
 	if err != nil {
 		return nil, false
 	}

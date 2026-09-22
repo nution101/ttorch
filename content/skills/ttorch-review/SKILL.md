@@ -166,6 +166,7 @@ invalidates the verdict — re-prep, re-review, re-record.
   | `internal/validate/**` | what counts as a passing check |
   | `internal/projectinit/**` | parses `AGENTS.md` into the delivery mode and the auto-mint staleness bound |
   | `internal/orchestrator/{gate,merge,validate,validatecache}.go` | the Go code that resolves, enforces and caches the decision |
+  | *(measured cost of every entry)* | see the table in `docs/ARCHITECTURE.md` — the numbers live there only, because keeping a second copy here is what let them diverge |
   | `.github/workflows/**` | the full suite: `.ttorch/validate.sh` runs only the fast lane and defers to CI by name |
   | `Makefile` | `.ttorch/validate.sh` does nothing but run `make lint` and `make test-fast` |
   | `go.work`, `go.work.sum` | auto-discovered via `GOWORK`; `replace` directives there override `go.mod`, so a committed one redirects what `go test` compiles |
@@ -213,18 +214,14 @@ invalidates the verdict — re-prep, re-review, re-record.
     overwrite them directly. No diff-channel guard can ever see that. Covering the repo copies
     under `content/` narrows the channel; it does not close it.
   - **The rest of `internal/orchestrator/`** — `spawn.go`, `landqueue.go`, `autostart.go`,
-    `overlap.go` and the others. This is a deliberate, measured exclusion, not an oversight.
-    Over the 196 non-merge commits reachable from `b642ba6`, covering the whole package would
-    put **54%** of all commits behind `--allow-gate-change` and the flag would stop being a
-    signal; the four named files cost **8** commits. `TestGateConfigCoversTheDecidingCode`
-    fails if a deciding function moves out of those four, so the narrower list cannot decay
-    into false coverage without someone noticing.
-  - `.ttorch/offload/*` and `.ttorch/junk-check.sh` — named in earlier reviews; neither exists
-    in this repo, and only `.ttorch/validate.sh` is matched, not the `.ttorch/` directory.
-  - `internal/cli/` wires the `--allow-gate-change` flag but is not covered: it is 29% of this
-    repo's commits on its own (56/196). `internal/db/` holds the verdict row the merge trusts
-    for `Overall == pass` and is likewise excluded at 12% (23/196, +16 over the shipped set).
-    Both are cost judgements, not oversights.
+    `overlap.go` and the others. A deliberate, measured exclusion: covering the whole package
+    would put most of this repo's commits behind `--allow-gate-change` and the flag would stop
+    being a signal, while the five named files cost a fraction of that.
+    `TestGateConfigCoversTheDecidingCode` fails if a deciding function moves out of those
+    five, so the narrower list cannot decay into false coverage unnoticed.
+  - `internal/cli/` wires the `--allow-gate-change` flag but is not covered, and
+    `internal/db/` holds the verdict row the merge trusts for `Overall == pass`. Both are cost
+    judgements rather than oversights, and both would roughly double the flag's frequency.
   - Filesystems whose folding rules differ from Unicode's. `fsIdentityKey` models APFS and
     NTFS, and `TestFSIdentityKeySweep` measures it against the real filesystem rather than
     against a reading of the tables. A filesystem that collapses something Unicode does not
@@ -242,8 +239,7 @@ invalidates the verdict — re-prep, re-review, re-record.
     refusal, not the control-character refusal. Same pre-existing hole as the first bullet.
   - **Coordination note for step 6:** `go.mod` and `go.sum` ARE now covered by this branch.
     Step 6's not-covered list still names them; that line should go when the two land
-    together, the same way the fold is coordinated. They cost 5/196 and 3/196 commits — the
-    same figure that justifies `.github/workflows/`.
+    together, the same way the fold is coordinated.
   - Git will not tell you. `git clone` warns about a collision; `git worktree add --detach` —
     what the gate uses to build the checkout it validates — exits 0 with nothing on stderr and
     silently drops the losing entry. The gate's own collision check is load-bearing, not a
@@ -260,11 +256,19 @@ invalidates the verdict — re-prep, re-review, re-record.
   - The covered set answers TWO questions, not one: what decides how a change is reviewed or
     validated, and what a merge publishes directly to users (the two installers, and only
     those). Anything outside both is not covered however alarming it looks.
-  - The flag is a boolean, so the cheapest way to defeat the guard is habit. 76 of this repo's
-    196 non-merge commits (39%) now trip it, and a lead who passes the flag without reading
-    has given exactly the same authorization as one who read. What survives that is the audit
-    line, which names the file either way. Making the flag take the expected paths, so a bare
-    `--allow-gate-change` stops working, is the obvious next step and is not done here.
+  - The flag is a boolean, so the cheapest way to defeat the guard is habit. It fires on
+    roughly two of every five commits in this repo, and a lead who passes the flag without
+    reading has given exactly the same authorization as one who read. What survives that is
+    the audit line, which names the file either way. Making the flag take the expected paths,
+    so a bare `--allow-gate-change` stops working, is the obvious next step and is not done
+    here.
+  - **The input set is the part that keeps being wrong.** Five separate bypasses here were
+    defects in the list of paths handed to the matcher, not in the matcher: no case folding,
+    then lowercasing instead of folding, then single-rune instead of full folding, then blobs
+    without the directories they imply, then renames reporting only their destination. If you
+    are auditing this guard, check what reaches it before checking what it does with what
+    reaches it — is every path present, is it spelled the way the matcher matches, and is it
+    the committed tree rather than the working one.
   - None of it is a barrier. Anything running as the lead can write the approval token with
     the `allow-gate-change` scope already in it. What the guard removes is the silent skip.
 
