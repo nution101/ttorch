@@ -736,6 +736,15 @@ func checkStandards(ctx context.Context, b *brief, opt Options) ([]Finding, []st
 		return []Finding{budgetFinding(RuleStandards)}, nil
 	}
 	cfg := opt.Config
+	if cfg.Oversize {
+		// The project may well declare a pointer; this run does not know, because it refused
+		// to read the file (see maxConfigBytes). Falling through to the generic signal would
+		// judge the brief against a fallback the project had opted out of.
+		return []Finding{{
+			Rule: RuleStandards, Status: StatusIndeterminate,
+			Detail: fmt.Sprintf("cannot evaluate: %s is %d bytes, over the %d byte cap, so the pointer this project declares (if any) was never read", cfg.Source, cfg.Size, maxConfigBytes),
+		}}, nil
+	}
 	if cfg.StandardsEmpty {
 		return []Finding{{
 			Rule: RuleStandards, Status: StatusIndeterminate,

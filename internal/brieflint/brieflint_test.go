@@ -504,6 +504,39 @@ func TestRuleStandardsWithEmptyDeclaredValue(t *testing.T) {
 	}
 }
 
+// A configuration file the run refused to read leaves rule 5 unevaluable, not passing on a
+// fallback the project had opted out of, and leaves the rules the file disables RUNNING.
+// A rule turned off by a file nobody read is a rule silently skipped.
+func TestOversizeConfigIsIndeterminateAndDisablesNothing(t *testing.T) {
+	repo, _ := fixture(t)
+	body := "- brief-standards: docs/standards/\n- brief-lint-disable: prohibition\n" +
+		strings.Repeat("filler line that declares nothing\n", (maxConfigBytes/34)+64)
+	writeAgents(t, repo, body)
+	cfg := LoadConfig(repo)
+	if !cfg.Oversize {
+		t.Fatalf("fixture did not exceed the cap: %+v", cfg)
+	}
+
+	r := Lint(satisfying, Options{Repo: repo, Config: cfg})
+	f := requireStatus(t, r, RuleStandards, StatusIndeterminate)
+	if !strings.Contains(f.Detail, "over the") || !strings.Contains(f.Detail, "never read") {
+		t.Errorf("rule 5 must name the refusal as the reason, got %q", f.Detail)
+	}
+	if fs := findingsFor(r, RuleConfig); len(fs) != 1 || fs[0].Status != StatusIndeterminate {
+		t.Errorf("want one indeterminate config finding, got %+v", fs)
+	}
+	// The file disabled rule 4. It was not read, so rule 4 ran.
+	if hasNote(r, "rule prohibition: DISABLED") {
+		t.Error("a disable inside a refused file must not be applied")
+	}
+	if r.Evaluated() != r.Total() {
+		t.Errorf("every rule must still run: %d of %d", r.Evaluated(), r.Total())
+	}
+	if r.Outcome() != OutcomeIndeterminate {
+		t.Errorf("outcome: want %s, got %s", OutcomeIndeterminate, r.Outcome())
+	}
+}
+
 // --- "could not evaluate" is distinct from a pass ---------------------------------------
 
 // failingGit stands in for a git that cannot answer: an unreachable remote, a missing

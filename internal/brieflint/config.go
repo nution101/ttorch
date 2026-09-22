@@ -1,6 +1,8 @@
 package brieflint
 
 import (
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -30,6 +32,17 @@ const (
 // configFile is the file the keys are read from, relative to the repository root.
 const configFile = "AGENTS.md"
 
+// maxConfigBytes caps the configuration file one run will read. AGENTS.md belongs to the
+// repository under review and anyone who can commit to it chooses its size, so it is
+// untrusted input like the brief and like a cited blob, and both of those are capped
+// (MaxBriefBytes, maxBlobBytes). This read was not: the whole file was pulled into memory
+// and split into lines, and a 400 MiB AGENTS.md took one `ttorch brief-lint` to 859 MB of
+// resident memory, measured with /usr/bin/time -l.
+//
+// A real AGENTS.md is a few KB. The cap matches MaxBriefBytes because both bound a
+// human-written file in the same repository, and one number is easier to remember than two.
+const maxConfigBytes = MaxBriefBytes
+
 // Config is a project's brief-lint configuration.
 type Config struct {
 	// Standards holds the pointers a brief may cite to satisfy RuleStandards. Nil means the
@@ -51,6 +64,15 @@ type Config struct {
 	// Source is the file the configuration was read from, for the report. Empty when no
 	// configuration file was found.
 	Source string
+	// Oversize records a configuration file past maxConfigBytes. Nothing in it was read, so
+	// what the project declares is unknown, and that is NOT the same as declaring nothing:
+	// the zero Config is a pass-shaped state, and a file the linter refused to read must not
+	// resolve to one. RuleStandards reports unevaluable instead of falling back to its
+	// generic signal, no disable is applied (a rule turned off by a file nobody read is a
+	// rule silently skipped), and Lint reports the refusal against RuleConfig.
+	Oversize bool
+	// Size is the configuration file's size on disk when Oversize is set, for the report.
+	Size int64
 }
 
 // LoadConfig reads the brief-lint configuration for the repository at dir. A missing or
@@ -62,11 +84,25 @@ func LoadConfig(dir string) Config {
 		return c
 	}
 	path := filepath.Join(dir, configFile)
-	b, err := os.ReadFile(path)
+	// Read one byte past the cap, the way the CLI reads a brief: the extra byte is what
+	// distinguishes a file exactly at the cap from one over it, without trusting a stat that
+	// a special file can lie about.
+	b, err := readCapped(path, maxConfigBytes+1)
 	if err != nil {
 		return c
 	}
 	c.Source = path
+	if len(b) > maxConfigBytes {
+		// Refused, not truncated. Parsing the first megabyte would report a configuration
+		// the project did not write, and the disable list is exactly the part a truncated
+		// read would get wrong in the permissive direction.
+		c.Oversize = true
+		c.Size = int64(len(b))
+		if fi, statErr := os.Stat(path); statErr == nil {
+			c.Size = fi.Size()
+		}
+		return c
+	}
 	for _, line := range strings.Split(string(b), "\n") {
 		line = strings.TrimSpace(line)
 		if rest, ok := strings.CutPrefix(line, standardsKey); ok {
@@ -124,9 +160,23 @@ func splitList(s string) []string {
 	return out
 }
 
+// readCapped reads at most limit bytes of a file. The limit is the point of it: this is a
+// file from the repository under review, so its size is not ours to choose.
+func readCapped(path string, limit int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(io.LimitReader(f, limit))
+}
+
 // describe renders the configuration for the report header, so the reader can see which
 // expectation a rule was judged against.
 func (c Config) describe() string {
+	if c.Oversize {
+		return fmt.Sprintf("not read: %d bytes, over the %d byte cap", c.Size, maxConfigBytes)
+	}
 	var parts []string
 	switch {
 	case len(c.Standards) > 0:

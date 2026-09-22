@@ -282,7 +282,11 @@ Some details that matter in practice:
 - **A brief is untrusted input**, pasted from issues and written by agents, and two rules query git
   once per item they find in it. So one run is bounded on both sides. The brief itself is capped at
   **1 MiB** and a longer one is refused rather than truncated, because reading part of a brief says
-  nothing about the whole of it. The git work has an aggregate budget (45s), the remote check
+  nothing about the whole of it. The project's `AGENTS.md` is capped at the same 1 MiB, and is
+  likewise refused rather than truncated: it belongs to the repository under review, and a
+  configuration read in part would report declarations the project did not make. A refused one
+  leaves the standards rule unevaluable and every rule running, because a disable this run could
+  not see must not turn a rule off. The git work has an aggregate budget (45s), the remote check
   verifies at most 3 distinct targets, and at most 64 distinct cited paths are resolved. Whatever a
   bound excludes is reported as unevaluable and named, never passed over. The budget is enforced
   rather than merely set: each git call runs in its own process group, which is killed when the

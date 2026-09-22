@@ -323,6 +323,17 @@ func Lint(text string, opt Options) Report {
 	} else {
 		rep.Notes = append(rep.Notes, "config: none found ("+opt.Config.describe()+")")
 	}
+	// A configuration file past the cap was not read at all, so every declaration in it is
+	// unknown: the pointer RuleStandards would be judged against, and the disable list. It
+	// is reported here rather than swallowed, for the same reason an unreachable remote is:
+	// a check that could not run must never look like one that ran and passed.
+	if opt.Config.Oversize {
+		rep.Findings = append(rep.Findings, Finding{
+			Rule:   RuleConfig,
+			Status: StatusIndeterminate,
+			Detail: fmt.Sprintf("%s is %d bytes, over the %d byte cap, so no project configuration was read; every rule ran, since a disable this run could not see must not turn a rule off", opt.Config.Source, opt.Config.Size, maxConfigBytes),
+		})
+	}
 	// A project naming an unknown rule in its disable list is a configuration defect, not a
 	// no-op: the rule it meant to disable is still running, or the one it meant to keep is
 	// misspelled. Report it as unevaluable so it cannot pass unnoticed.

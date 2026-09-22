@@ -94,3 +94,52 @@ func TestConfigDescribe(t *testing.T) {
 		}
 	}
 }
+
+// An AGENTS.md past the cap is refused, not truncated and not read. It belongs to the
+// repository under review, so its size is chosen by whoever committed it, and a 400 MiB one
+// took a single run to 859 MB of resident memory.
+//
+// What makes this a correctness question rather than a memory one: the zero Config is a
+// valid "this project declares nothing" state, which is pass-shaped. A file the linter
+// refused to read must never resolve to it.
+func TestLoadConfigRefusesAnOversizeFile(t *testing.T) {
+	declared := "- brief-standards: docs/STANDARDS.md\n- brief-lint-disable: prohibition\n"
+	body := declared + strings.Repeat("filler line that declares nothing\n", (maxConfigBytes/34)+64)
+	if len(body) <= maxConfigBytes {
+		t.Fatalf("the fixture must exceed the cap: %d bytes vs %d", len(body), maxConfigBytes)
+	}
+	c := loadWith(t, body)
+	if !c.Oversize {
+		t.Fatalf("a %d byte %s must be refused, got %+v", len(body), configFile, c)
+	}
+	if c.Size != int64(len(body)) {
+		t.Errorf("the report needs the file's real size: got %d, want %d", c.Size, len(body))
+	}
+	// The declarations are on the FIRST two lines, so a truncating read would have found
+	// them. Neither may be applied.
+	if c.Standards != nil || c.StandardsEmpty {
+		t.Errorf("a refused file declares no pointer: %+v", c)
+	}
+	if len(c.Disabled) != 0 || len(c.UnknownDisabled) != 0 {
+		t.Errorf("a refused file disables nothing: %+v", c)
+	}
+	if !strings.Contains(c.describe(), "not read") {
+		t.Errorf("the report header must say the file was not read, got %q", c.describe())
+	}
+}
+
+// A file exactly at the cap is read. The cap is a limit, not a margin.
+func TestLoadConfigReadsAFileAtTheCap(t *testing.T) {
+	declared := "- brief-standards: docs/STANDARDS.md\n"
+	body := declared + strings.Repeat("x", maxConfigBytes-len(declared))
+	if len(body) != maxConfigBytes {
+		t.Fatalf("fixture is %d bytes, want exactly %d", len(body), maxConfigBytes)
+	}
+	c := loadWith(t, body)
+	if c.Oversize {
+		t.Fatalf("a file exactly at the cap must be read, got %+v", c)
+	}
+	if len(c.Standards) != 1 || c.Standards[0] != "docs/STANDARDS.md" {
+		t.Fatalf("want the declared pointer, got %+v", c.Standards)
+	}
+}
