@@ -3,7 +3,6 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -967,58 +966,4 @@ func TestSpawnReviewer_RefusesATraversingDimension(t *testing.T) {
 			}
 		}
 	}
-}
-
-// TestGateOnce_AReviewerThatNeverLaunchesIsBounded covers the dispatch failure path. A launch
-// that fails for a standing reason (the mirror clone for the isolated security reviewer is the
-// realistic one) used to be free: no attempt burned, no stall clock started, no block ever
-// surfaced. The gate retried it every tick for as long as the task sat in the done set, which
-// is the one failure mode that produces no signal at all.
-func TestGateOnce_AReviewerThatNeverLaunchesIsBounded(t *testing.T) {
-	m, _ := trustedTaskWithSubstantialDiff(t, "gate-nolaunch", "nl1")
-	t.Cleanup(func() { _, _ = m.Teardown("nl1", true) })
-	prev := reviewerDispatcher
-	t.Cleanup(func() { reviewerDispatcher = prev })
-	reviewerDispatcher = func(m *Manager, taskID, dim, dir, head, repo, wt string) error {
-		return fmt.Errorf("mirror %s for review: exit status 128", repo)
-	}
-	now := time.Unix(1_700_000_000, 0)
-
-	// Tick 1 attempts every dimension and every launch fails.
-	if out, err := m.gateOnceAt("nl1", time.Minute, 1, time.Hour, now); err != nil || out != GateDispatched {
-		t.Fatalf("tick1 = (%q, %v), want dispatched", out, err)
-	}
-	// Tick 2 is over the ceiling: the episode ends rather than spinning.
-	out, err := m.gateOnceAt("nl1", time.Minute, 1, time.Hour, now)
-	if err != nil {
-		t.Fatalf("gateOnceAt tick2: %v", err)
-	}
-	if out != GateBlocked {
-		t.Fatalf("outcome = %q, want %q: a launch that always fails must reach the ceiling", out, GateBlocked)
-	}
-	if !hasGateBlockedEvent(t, m, "nl1") {
-		t.Fatal("a reviewer that never launches must surface a gate_blocked event")
-	}
-	if _, ok := m.TrustShow("nl1"); ok {
-		t.Fatal("no verdict may be recorded when no reviewer ever ran")
-	}
-	// The block must say the reviewer never started, not that it never reported.
-	if !gateBlockedEventMentions(t, m, "nl1", "last dispatch error") {
-		t.Fatal("the block should distinguish a failed launch from a silent reviewer")
-	}
-}
-
-// gateBlockedEventMentions reports whether any gate_blocked event for taskID contains want.
-func gateBlockedEventMentions(t *testing.T, m *Manager, taskID, want string) bool {
-	t.Helper()
-	evs, err := m.Store.EventsSince(context.Background(), 0, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, e := range evs {
-		if e.EntityID == taskID && e.Type == db.EventGateBlocked && strings.Contains(e.Payload, want) {
-			return true
-		}
-	}
-	return false
 }

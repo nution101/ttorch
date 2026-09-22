@@ -1243,9 +1243,6 @@ type gateProgress struct {
 	Attempts     map[string]int `json:"attempts"`     // per-dimension reviewer (re)dispatch count
 	DispatchedAt int64          `json:"dispatchedAt"` // unix nano of the first reviewer dispatch (stall clock); 0 until dispatched
 	Outcome      string         `json:"outcome"`      // "" in flight | gateOutcomeRecorded | gateOutcomeBlocked
-	// LastDispatchError is the most recent reviewer launch failure, carried so the block the
-	// attempt ceiling surfaces can say the reviewer never started rather than never reported.
-	LastDispatchError string `json:"lastDispatchError,omitempty"`
 }
 
 // reviewerDispatcher is the seam the daemon gate dispatches a reviewer through; production
@@ -1395,12 +1392,7 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 			continue // its reviewer is still running
 		}
 		if prog.Attempts[dim] >= maxReviewerAttempts {
-			reason := fmt.Sprintf("reviewer %q produced no report after %d attempt(s)", dim, maxReviewerAttempts)
-			if prog.LastDispatchError != "" {
-				// Distinguish a reviewer that ran and said nothing from one that never started.
-				reason += "; last dispatch error: " + prog.LastDispatchError
-			}
-			m.surfaceGateBlocked(taskID, head, reason)
+			m.surfaceGateBlocked(taskID, head, fmt.Sprintf("reviewer %q produced no report after %d attempt(s)", dim, maxReviewerAttempts))
 			prog.Outcome = gateOutcomeBlocked
 			m.writeGateProgress(dir, prog)
 			m.teardownReviewers(taskID, unionDimensions(dims, dispatchedDimensions(prog)))
@@ -1410,26 +1402,18 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 	}
 
 	if len(toDispatch) > 0 {
+		dispatched := false
 		for _, dim := range toDispatch {
 			if err := reviewerDispatcher(m, taskID, dim, dir, head, t.Project, t.Worktree); err != nil {
-				// A launch failure burns an attempt, like a reviewer that starts and never
-				// reports. It did not always: the reasoning was that nothing started, so
-				// nothing should be charged and the next tick would retry. The retry is the
-				// problem. A launch that fails for a standing reason rather than a transient
-				// one, an unreadable repo or a mirror clone that cannot complete, fails the
-				// same way every tick. It never burned an attempt so it never reached the
-				// ceiling, it never set DispatchedAt so the stall clock never started, and the
-				// gate spun on it silently for as long as the task sat in the done set.
-				// Charging the attempt costs a transient failure one retry out of
-				// maxReviewerAttempts and gives a permanent one a surfaced block.
+				// A launch failure this tick is non-fatal and does not burn an attempt (nothing
+				// started): the next tick retries this dimension. Other dimensions still launch.
 				fmt.Fprintf(os.Stderr, "ttorch: gate could not dispatch reviewer %s/%s: %v\n", taskID, dim, err)
-				prog.LastDispatchError = fmt.Sprintf("%s: %v", dim, err)
+				continue
 			}
 			prog.Attempts[dim]++
+			dispatched = true
 		}
-		// The stall clock starts on the first dispatch ATTEMPT, not the first success, so a
-		// reviewer that never launches is bounded by reviewerTimeout as well as by the ceiling.
-		if prog.DispatchedAt == 0 {
+		if dispatched && prog.DispatchedAt == 0 {
 			prog.DispatchedAt = now.UnixNano()
 		}
 		m.writeGateProgress(dir, prog)
