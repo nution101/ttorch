@@ -1272,33 +1272,64 @@ func TestTextRulesStopWhenTheBudgetIsSpent(t *testing.T) {
 	}
 }
 
-// The hostile brief that took 69 seconds must now finish well inside a generous budget. This
-// asserts the complexity rather than a wall-clock number: quadratic behaviour hits the
-// budget and reports that it stopped, where linear behaviour reports the bans.
+// Every text rule must be linear in the brief, and the guard has to feed every shape. The
+// first version of it fed bans only, so it covered rule 4 alone: rule 3 acquired the same
+// quadratic in the commit after rule 4 lost it, and this test stayed green throughout.
 //
-// 4000 bans rather than the 8000 that were measured, because the number only has to be big
-// enough for a quadratic regression to blow the budget (4000 measured 17s against this 10s
-// budget, 8000 measured 69s), and a regression should fail the suite quickly.
-func TestAHostileBriefFinishesInsideItsBudget(t *testing.T) {
+// The assertion is complexity, not a wall-clock number. Each input is sized so that the
+// quadratic form cannot finish inside the budget while the linear form finishes in a
+// fraction of it, so a regression reports a spent budget where a healthy rule reports its
+// findings.
+func TestEveryTextRuleIsLinearInTheBrief(t *testing.T) {
 	repo, _ := fixture(t)
-	hostile := "Base is origin/main in this repository.\n\n" + strings.Repeat("do not push ", 4000) + "\n"
-	r := Lint(hostile, Options{Repo: repo, Budget: 10 * time.Second})
-	for _, f := range r.Findings {
-		if strings.Contains(f.Detail, "the run budget expired") {
-			t.Fatalf("4000 bans exhausted a 10s budget, which is the quadratic returning: %q", f.Detail)
+	cases := map[string]struct {
+		rule   RuleID
+		body   string
+		budget time.Duration
+		was    string // measured at 0e5f11b, the sha that carried the defect
+	}{
+		"rule 4, bans": {
+			RuleProhibition, strings.Repeat("do not push ", 4000), 10 * time.Second,
+			"17s at 4000 before cf73928",
+		},
+		"rule 3, counts": {
+			RuleHardCounts, strings.Repeat("there are 21 occurrences. ", 16000), 5 * time.Second,
+			"8.5s at 16000 before this round",
+		},
+		"rule 2, citations": {
+			RuleFilePaths, strings.Repeat("see internal/pkg/file.go and internal/pkg/other.go ", 4000), 10 * time.Second,
+			"44s at 8000 tokens before this round",
+		},
+	}
+	for name, tc := range cases {
+		brief := "Base is origin/main in this repository.\n\n" + tc.body + "\n"
+		r := Lint(brief, Options{Repo: repo, Budget: tc.budget})
+		for _, f := range r.Findings {
+			if f.Rule == tc.rule && strings.Contains(f.Detail, "the run budget expired") {
+				t.Errorf("%s: exhausted a %s budget, which is the quadratic returning (%s)", name, tc.budget, tc.was)
+			}
 		}
 	}
-	var blanket, quote string
+}
+
+// A brief is untrusted input, so what a finding prints from it is bounded. A 60 KB token
+// produced 121 KB of terminal output.
+func TestOneAbsurdTokenCannotFillAReport(t *testing.T) {
+	repo, _ := fixture(t)
+	token := "internal/" + strings.Repeat("a", 60000) + ".go"
+	brief := strings.Replace(satisfying, "Touch pkg/thing.go and docs/guide.md.", "Fix the finding at "+token+" first.", 1)
+	r := Lint(brief, Options{Repo: repo})
 	for _, f := range r.Findings {
-		if f.Rule == RuleProhibition && strings.Contains(f.Detail, "blanket prohibition") {
-			blanket, quote = f.Detail, f.Quote
+		if len(f.Quote) > maxTokenBytes+3 {
+			t.Errorf("a %d byte quote reached the report", len(f.Quote))
+		}
+		if len(f.Detail) > 1000 {
+			t.Errorf("a %d byte detail reached the report", len(f.Detail))
 		}
 	}
-	if blanket == "" {
-		t.Fatalf("want the bans reported, got %v", r.Findings)
-	}
-	// And the finding must not print the whole brief back: this sentence is 93 KB.
-	if len(quote) > maxQuoteBytes+3 {
-		t.Errorf("the quote is %d bytes; a hostile sentence must be capped", len(quote))
+	for _, n := range r.Notes {
+		if len(n) > 1000 {
+			t.Errorf("a %d byte note reached the report", len(n))
+		}
 	}
 }

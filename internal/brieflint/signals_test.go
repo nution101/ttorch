@@ -156,7 +156,7 @@ func TestHedgedAtRequiresAttachment(t *testing.T) {
 	}
 	for name, tc := range cases {
 		sents := sentences(tc.brief)
-		counts := hardCounts(sents)
+		counts, _ := hardCounts(context.Background(), sents)
 		if len(counts) != 1 {
 			t.Errorf("%s: fixture must state exactly one hard count, got %d", name, len(counts))
 			continue
@@ -216,7 +216,7 @@ func TestGovernedByCreate(t *testing.T) {
 	}
 	for name, tc := range cases {
 		at := indexOfPath(t, tc.sent, tc.path)
-		if got := governedByCreate(tc.sent, at); got != tc.want {
+		if got := governedByCreate(tc.sent, createVerbs(tc.sent), at); got != tc.want {
 			t.Fatalf("%s: governedByCreate = %v, want %v", name, got, tc.want)
 		}
 	}
@@ -280,7 +280,7 @@ func TestCreateExemptionNeedsAnActiveVerbGoverningThePath(t *testing.T) {
 		if i < 0 {
 			t.Fatalf("%s: fixture does not contain %q", name, tc.path)
 		}
-		if got := governedByCreate(tc.sent, i); got != tc.want {
+		if got := governedByCreate(tc.sent, createVerbs(tc.sent), i); got != tc.want {
 			t.Errorf("%s: governedByCreate = %v, want %v for %q", name, got, tc.want, tc.sent)
 		}
 	}
@@ -306,7 +306,7 @@ func TestSplitterHoldsBothDirections(t *testing.T) {
 	}
 	list := "1. There are 21 occurrences of the old helper. Note: I grepped for the bare\n   name.\n2. Verify the count yourself before you start."
 	sents := sentences(list)
-	counts := hardCounts(sents)
+	counts, _ := hardCounts(context.Background(), sents)
 	if len(counts) != 1 {
 		t.Fatalf("want one hard count, got %d", len(counts))
 	}
@@ -322,7 +322,7 @@ func firstCitationExempt(t *testing.T, text string) (string, bool) {
 	for _, s := range sentences(text) {
 		for _, m := range candidateRe.FindAllStringIndex(s.text, -1) {
 			if c, ok := citationOf(s.text[m[0]:m[1]]); ok && strings.Contains(c.path, "/") {
-				return c.raw, governedByCreate(s.text, m[0])
+				return c.raw, governedByCreate(s.text, createVerbs(s.text), m[0])
 			}
 		}
 	}
@@ -403,7 +403,7 @@ func TestWithinSentenceScopesRespectAMergedStop(t *testing.T) {
 
 	t.Run("a hedge still reaches across a stop, by block scope", func(t *testing.T) {
 		sents := sentences("there are 21 occurrences. that figure may be wrong.")
-		counts := hardCounts(sents)
+		counts, _ := hardCounts(context.Background(), sents)
 		if len(counts) != 1 {
 			t.Fatalf("want one hard count, got %d", len(counts))
 		}
@@ -417,7 +417,7 @@ func TestWithinSentenceScopesRespectAMergedStop(t *testing.T) {
 func bareBans(text string) int {
 	n := 0
 	for _, s := range sentences(text) {
-		hits, _ := prohibitionHits(context.Background(), s.text)
+		hits, _ := prohibitionHits(context.Background(), s)
 		for _, hit := range hits {
 			if !hit.bounded {
 				n++

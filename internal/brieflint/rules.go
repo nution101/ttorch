@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // --- Rule 1: a target branch must be declared, and must exist on the remote -------------
@@ -212,7 +213,31 @@ var bareFileExts = map[string]bool{
 // file extension. This is deliberately conservative: prose like "and/or" or "n/a", a glob
 // like "./..." or "*.go", and a bare directory written without a trailing slash are all
 // rejected rather than reported as missing files.
+// maxPathBytes is the longest token treated as a path. No filesystem accepts more, so a
+// longer one is prose that happens to contain slashes, and resolving it would spend git
+// work on text that cannot name a file.
+const maxPathBytes = 4096
+
+// maxTokenBytes caps a cited token on its way into a finding. A 60 KB token produced 121 KB
+// of terminal output, and every other rule already quotes something bounded.
+const maxTokenBytes = 120
+
+// clipToken renders a cited token for the terminal, capped.
+func clipToken(tok string) string {
+	if len(tok) <= maxTokenBytes {
+		return tok
+	}
+	cut := maxTokenBytes
+	for cut > 0 && !utf8.RuneStart(tok[cut]) {
+		cut--
+	}
+	return tok[:cut] + "..."
+}
+
 func citationOf(tok string) (citation, bool) {
+	if len(tok) > maxPathBytes {
+		return citation{}, false
+	}
 	tok = strings.Trim(tok, "`\"'()[]{}<>,;")
 	// A trailing dot or colon is punctuation: "see dev/report.md: the rule set" cites
 	// dev/report.md. A colon that introduces a LINE keeps its digits, so :40 survives this
@@ -252,13 +277,20 @@ func citationOf(tok string) (citation, bool) {
 
 // citations returns every distinct path the brief cites, in order of first mention. A
 // reference to the remote itself ("origin/main") is a ref, not a path, and is excluded.
-func (b *brief) citations(remote string) []citation {
+func (b *brief) citations(ctx context.Context, remote string) ([]citation, bool) {
 	var out []citation
 	seen := map[string]int{} // raw citation -> index in out
 	text := urlRe.ReplaceAllStringFunc(b.raw, func(s string) string { return strings.Repeat(" ", len(s)) })
 	refPrefix := strings.ToLower(remote) + "/"
+	scanned := 0
 	for _, sent := range sentences(text) {
+		// Once per sentence, not once per candidate in it.
+		verbs := createVerbs(sent.text)
 		for _, m := range candidateRe.FindAllStringIndex(sent.text, -1) {
+			if scanned%budgetCheckEvery == 0 && ctx.Err() != nil {
+				return out, false
+			}
+			scanned++
 			tok := sent.text[m[0]:m[1]]
 			if strings.HasPrefix(strings.ToLower(tok), refPrefix) {
 				continue
@@ -267,11 +299,11 @@ func (b *brief) citations(remote string) []citation {
 			if !ok {
 				continue
 			}
-			c.quote = c.raw
+			c.quote = clipToken(c.raw)
 			c.src = b.lineAt(sent.off + m[0])
 			// The exemption is earned by THIS mention, from a create verb governing this
 			// path here, not by the sentence and not by the path.
-			c.create = governedByCreate(sent.text, m[0])
+			c.create = governedByCreate(sent.text, verbs, m[0])
 			if i, ok := seen[c.raw]; ok {
 				// A later mention that earned no exemption puts the path back under the
 				// check. Otherwise one "Add internal/x/y.go" near the top would exempt
@@ -285,7 +317,7 @@ func (b *brief) citations(remote string) []citation {
 			out = append(out, c)
 		}
 	}
-	return out
+	return out, true
 }
 
 // maxCitations caps how many distinct cited paths one brief has resolved. Each costs local
@@ -294,7 +326,10 @@ func (b *brief) citations(remote string) []citation {
 const maxCitations = 64
 
 func checkFilePaths(ctx context.Context, b *brief, opt Options) ([]Finding, []string) {
-	cites := b.citations(opt.remote())
+	cites, complete := b.citations(ctx, opt.remote())
+	if !complete {
+		return []Finding{budgetFinding(RuleFilePaths)}, nil
+	}
 	if len(cites) == 0 {
 		return nil, []string{"file-paths: no file path was recognised in the brief (a path is recognised by its shape: a slash, or a bare name with a known extension)"}
 	}
@@ -345,7 +380,7 @@ func checkFilePaths(ctx context.Context, b *brief, opt Options) ([]Finding, []st
 		findings = append(findings, Finding{
 			Rule: RuleFilePaths, Status: StatusIndeterminate, Quote: surplus[0].quote, Line: surplus[0].src,
 			Detail: fmt.Sprintf("%d cited path(s) past the first %d were not checked (from %s on); a brief citing this many paths is doing too much, so split it or disable this rule",
-				len(surplus), maxCitations, surplus[0].raw),
+				len(surplus), maxCitations, clipToken(surplus[0].raw)),
 		})
 	}
 	var withLine, created []citation
@@ -369,12 +404,12 @@ func checkFilePaths(ctx context.Context, b *brief, opt Options) ([]Finding, []st
 		case err != nil:
 			findings = append(findings, Finding{
 				Rule: RuleFilePaths, Status: StatusIndeterminate, Quote: c.quote, Line: c.src,
-				Detail: fmt.Sprintf("cannot check %s at %s: %v", c.path, ref, err),
+				Detail: fmt.Sprintf("cannot check %s at %s: %v", clipToken(c.path), ref, err),
 			})
 		case !ok:
 			findings = append(findings, Finding{
 				Rule: RuleFilePaths, Status: StatusFail, Quote: c.quote, Line: c.src,
-				Detail: fmt.Sprintf("cited path %s does not exist at %s", c.path, ref),
+				Detail: fmt.Sprintf("cited path %s does not exist at %s", clipToken(c.path), ref),
 			})
 		}
 	}
@@ -412,7 +447,7 @@ func refSource(named bool) string {
 func rawPaths(cites []citation) []string {
 	out := make([]string, len(cites))
 	for i, c := range cites {
-		out[i] = c.raw
+		out[i] = clipToken(c.raw)
 	}
 	return out
 }
@@ -454,7 +489,7 @@ func (o Options) checkLineCitations(ctx context.Context, cites []citation, ref s
 		case err != nil:
 			findings = append(findings, Finding{
 				Rule: RuleFilePaths, Status: StatusIndeterminate, Quote: c.quote, Line: c.src,
-				Detail: fmt.Sprintf("cannot check %s at %s: %v", c.path, ref, err),
+				Detail: fmt.Sprintf("cannot check %s at %s: %v", clipToken(c.path), ref, err),
 			})
 			continue
 		case !ok:
@@ -464,7 +499,7 @@ func (o Options) checkLineCitations(ctx context.Context, cites []citation, ref s
 			}
 			findings = append(findings, Finding{
 				Rule: RuleFilePaths, Status: miss, Quote: c.quote, Line: c.src,
-				Detail: fmt.Sprintf("cited path %s does not exist at %s%s", c.path, ref, remedy),
+				Detail: fmt.Sprintf("cited path %s does not exist at %s%s", clipToken(c.path), ref, remedy),
 			})
 			continue
 		case typ != "blob":
@@ -478,7 +513,7 @@ func (o Options) checkLineCitations(ctx context.Context, cites []citation, ref s
 			if err != nil {
 				findings = append(findings, Finding{
 					Rule: RuleFilePaths, Status: StatusIndeterminate, Quote: c.quote, Line: c.src,
-					Detail: fmt.Sprintf("cannot count the lines of %s at %s: %v", c.path, ref, err),
+					Detail: fmt.Sprintf("cannot count the lines of %s at %s: %v", clipToken(c.path), ref, err),
 				})
 				continue
 			}
@@ -487,7 +522,7 @@ func (o Options) checkLineCitations(ctx context.Context, cites []citation, ref s
 		if c.line > n {
 			findings = append(findings, Finding{
 				Rule: RuleFilePaths, Status: miss, Quote: c.quote, Line: c.src,
-				Detail: fmt.Sprintf("cites line %d but %s has %d line(s) at %s%s", c.line, c.path, n, ref, remedy),
+				Detail: fmt.Sprintf("cites line %d but %s has %d line(s) at %s%s", c.line, clipToken(c.path), n, ref, remedy),
 			})
 		}
 	}
@@ -535,9 +570,14 @@ type countHit struct {
 // A span holds more than one sentence whenever the splitter merged them, and counting spans
 // meant "there are 21 occurrences. there are 19 files." certified one hard count in
 // lowercase and two capitalised.
-func hardCounts(sents []span) []countHit {
+func hardCounts(ctx context.Context, sents []span) ([]countHit, bool) {
 	var out []countHit
+	scanned := 0
 	for i, s := range sents {
+		if scanned%budgetCheckEvery == 0 && ctx.Err() != nil {
+			return out, false
+		}
+		scanned++
 		seen := map[int]bool{} // the number's offset: both patterns can match one count
 		for _, re := range []*regexp.Regexp{countNounRe, countPhraseRe} {
 			for _, m := range re.FindAllStringSubmatchIndex(s.text, -1) {
@@ -549,7 +589,8 @@ func hardCounts(sents []span) []countHit {
 					continue
 				}
 				seen[m[2]] = true
-				out = append(out, countHit{sent: i, unit: unitAround(s.text, m[2]), loc: [2]int{m[2], m[3]}})
+				scanned++
+				out = append(out, countHit{sent: i, unit: s.unitAround(m[2]), loc: [2]int{m[2], m[3]}})
 			}
 		}
 	}
@@ -559,12 +600,15 @@ func hardCounts(sents []span) []countHit {
 		}
 		return out[a].loc[0] < out[b].loc[0]
 	})
-	return out
+	return out, true
 }
 
 func checkHardCounts(ctx context.Context, b *brief, _ Options) ([]Finding, []string) {
 	sents := sentences(b.raw)
-	counts := hardCounts(sents)
+	counts, complete := hardCounts(ctx, sents)
+	if !complete {
+		return []Finding{budgetFinding(RuleHardCounts)}, nil
+	}
 	if len(counts) == 0 {
 		return nil, []string{"hard-counts: no hard count was recognised in the brief"}
 	}
@@ -633,7 +677,7 @@ func checkProhibition(ctx context.Context, b *brief, _ Options) ([]Finding, []st
 	banCount := 0
 	var first span // the sentence carrying the first ban, for the end-state finding
 	for _, s := range spans {
-		hits, complete := prohibitionHits(ctx, s.text)
+		hits, complete := prohibitionHits(ctx, s)
 		if !complete {
 			return append(findings, budgetFinding(RuleProhibition)), nil
 		}
