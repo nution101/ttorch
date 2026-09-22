@@ -239,6 +239,7 @@ invalidates the verdict — re-prep, re-review, re-record.
   internal/projectinit/
   internal/installer/
   internal/skills/
+  internal/worktree/
   internal/orchestrator/gate.go
   internal/orchestrator/merge.go
   internal/orchestrator/validate.go
@@ -263,7 +264,6 @@ invalidates the verdict — re-prep, re-review, re-record.
   cmd/ttorch/
   internal/cli/
   internal/db/
-  internal/worktree/
   internal/scheduler/
   internal/harness/
   internal/selfupdate/
@@ -278,9 +278,9 @@ invalidates the verdict — re-prep, re-review, re-record.
   The two that cost the most to leave out, with the measured reason:
   `internal/cli/` is +32 commits, which would take the covered set to 116/196 = 59.2%, past
   the more-than-half line that is the stated reason `internal/orchestrator/` is not covered
-  wholesale. `internal/db/` is +15, to 99/196 = 50.5%. `internal/worktree/` holds
-  `ChangedFiles`, the only input to the guard, and is the one whose absence should worry a
-  reviewer most: an incomplete list there makes the guard match nothing at all.
+  wholesale. `internal/db/` is +15, to 99/196 = 50.5%. `internal/worktree/` used to be here and is now COVERED: it holds `ChangedFiles`, the only
+  input to the guard, plus the raw blob read the scope resolves from, so an incomplete list
+  or a desynced read there makes the guard match nothing at all.
 
 - **What that claim does NOT cover**, stated so nobody reads it as wider than it is:
   - Gated means trusted mode or `--require-verdict`. A `local`/`validated` merge without

@@ -325,6 +325,15 @@ var ttorchSourcePrefixes = []string{
 	"internal/projectinit/",
 	"internal/installer/",
 	"internal/skills/",
+	// internal/worktree/ holds the guard's EVIDENCE layer: ChangedFiles and ChangedLinks are
+	// its entire input, TreeFiles is what the collision check keys, and CatBlobs is the raw
+	// read the scope resolves from. A one-line change to CatBlobs's record framing
+	// reproduces the .gitattributes critical, and it sat outside the covered set while
+	// internal/review/ and internal/validate/ were inside it on a thinner dependency.
+	// Whole package rather than the one file: all 18 of its commits touch worktree.go, so
+	// file-granularity buys nothing and decays. +11 commits, taking the set to 95/196 =
+	// 48.5%, which stays under the more-than-half line.
+	"internal/worktree/",
 }
 
 // fsIdentityKey is the key under which two repository paths are THE SAME FILE on a

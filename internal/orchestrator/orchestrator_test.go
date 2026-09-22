@@ -1831,10 +1831,10 @@ func TestApprovalPayloadScope(t *testing.T) {
 		{"empty", "", "", "", false},
 		{"unknown trailing scope", "human " + sha + " something-else", "human", sha, false},
 	} {
-		by, gotSHA, gateScope := splitApprovalPayload(tc.data)
-		if by != tc.wantBy || gotSHA != tc.wantSHA || gateScope != tc.wantGateScope {
+		by, gotSHA, allowScope := splitApprovalPayload(tc.data)
+		if by != tc.wantBy || gotSHA != tc.wantSHA || allowScope != tc.wantGateScope {
 			t.Errorf("%s: splitApprovalPayload(%q) = (%q, %q, %v), want (%q, %q, %v)",
-				tc.name, tc.data, by, gotSHA, gateScope, tc.wantBy, tc.wantSHA, tc.wantGateScope)
+				tc.name, tc.data, by, gotSHA, allowScope, tc.wantBy, tc.wantSHA, tc.wantGateScope)
 		}
 	}
 }

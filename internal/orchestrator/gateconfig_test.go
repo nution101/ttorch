@@ -156,6 +156,10 @@ func TestGateConfigCoversTheDecidingCode(t *testing.T) {
 	// Asks the resolved scope rather than gateConfigFiles alone. The deciding orchestrator
 	// files are ttorch-source tier, covered only in this repository, so reading one list
 	// would report them uncovered and read as a hole that is not there.
+	proofs := map[string]bool{}
+	for _, n := range proofTestFiles(t) {
+		proofs[n] = true
+	}
 	covered := map[string]bool{}
 	for _, f := range ttorchScope.files() {
 		covered[f] = true
@@ -172,43 +176,118 @@ func TestGateConfigCoversTheDecidingCode(t *testing.T) {
 	}
 }
 
-// usesGuardIdentifier reports whether a test file REFERENCES any of the guard's symbols in
-// its code. Comments do not count: a file that merely discusses the guard is not a proof of
-// it, and treating prose as a reference is expensive in exactly the wrong place.
-func usesGuardIdentifier(file string) (bool, error) {
-	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, file, nil, 0) // no ParseComments: comments are not uses
-	if err != nil {
-		return false, err
-	}
-	want := make(map[string]bool, len(guardIdentifiers))
-	for _, id := range guardIdentifiers {
-		want[id] = true
-	}
-	var found bool
-	ast.Inspect(f, func(n ast.Node) bool {
-		if id, ok := n.(*ast.Ident); ok && want[id.Name] {
-			found = true
-		}
-		return !found
-	})
-	return found, nil
-}
-
-// guardIdentifiers are the symbols that make a test file one of the gate's own proofs. A
-// test that references any of them is asserting something about the guard, so deleting it
-// weakens the guard.
+// guardSymbols returns the identifiers the gate-config guard is MADE OF, derived from the
+// call graph rather than listed.
 //
-// Derived rather than enumerated, for the reason an enumerated content/ subtree list failed
-// three times: a hand list of proof files decays the moment someone adds a proof. This scans
-// for references, so a NEW test that touches the guard must be covered or the check fails.
-var guardIdentifiers = []string{
-	"matchesGateConfig", "diffTouchesGateConfig", "resolveGateScope", "embedsContentRoot",
-	"gateConfigFiles", "ttorchSourceFiles", "gateConfigPrefixes", "ttorchSourcePrefixes",
-	"collidesInTree", "linksOverGateConfig", "fsIdentityKey",
+// It starts at diffTouchesGateConfig and matchesGateConfig and takes the transitive closure
+// over validate.go's package-level declarations. The enumerated version listed eleven names
+// and omitted six real ones, including hostilePath, which is the only thing standing
+// between a newline in a committed path and a desynced blob read. A hand list of things
+// that must not be deleted is a list that drifts, the same lesson that removed the "24
+// deciding functions" count two rounds ago.
+//
+// Scoped to the guard, not to all of validate.go. That file also holds the gate RUNNER
+// (runGate, stagedGreen, validateCommitted), and pulling its tests in would mark
+// orchestrator_test.go a proof file at 43 of 196 commits, the boundary this branch has
+// repeatedly refused to cross.
+//
+// Limit worth stating: matching is by identifier NAME, not by resolved symbol, so a local
+// that shadows a guard name marks its file a proof. One did, a `gateScope` local in a
+// splitApprovalPayload test, and it was renamed rather than special-cased. A false positive
+// is expensive rather than safe here, since it pulls a costly file into the covered set, so
+// TestGateCostFiguresMatchTheDoc is what surfaces one.
+func guardSymbols(t *testing.T) map[string]bool {
+	t.Helper()
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "validate.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parsing validate.go: %v", err)
+	}
+	decls := map[string]ast.Node{}
+	for _, d := range f.Decls {
+		switch n := d.(type) {
+		case *ast.FuncDecl:
+			if n.Recv == nil {
+				decls[n.Name.Name] = n
+			}
+		case *ast.GenDecl:
+			for _, sp := range n.Specs {
+				switch v := sp.(type) {
+				case *ast.ValueSpec:
+					for _, id := range v.Names {
+						decls[id.Name] = v
+					}
+				case *ast.TypeSpec:
+					decls[v.Name.Name] = v
+				}
+			}
+		}
+	}
+	seen := map[string]bool{}
+	var walk func(string)
+	walk = func(name string) {
+		n, ok := decls[name]
+		if !ok || seen[name] {
+			return
+		}
+		seen[name] = true
+		ast.Inspect(n, func(nd ast.Node) bool {
+			if id, ok := nd.(*ast.Ident); ok {
+				if _, isDecl := decls[id.Name]; isDecl {
+					walk(id.Name)
+				}
+			}
+			return true
+		})
+	}
+	for _, entry := range []string{"diffTouchesGateConfig", "matchesGateConfig"} {
+		if _, ok := decls[entry]; !ok {
+			t.Fatalf("%s is not declared in validate.go; the guard's entry points moved and "+
+				"this derivation measures nothing", entry)
+		}
+		walk(entry)
+	}
+	if len(seen) < 10 {
+		t.Fatalf("the guard closure came back with %d symbols, too few to be real; the "+
+			"derivation is broken and every proof file would read as ordinary", len(seen))
+	}
+	return seen
 }
 
-// absentByDesign are covered entries that do NOT exist in this repo and are not expected to.// absentByDesign are covered entries that do NOT exist in this repo and are not expected to.
+// proofTestFiles returns the _test.go files in this package that reference the guard.
+func proofTestFiles(t *testing.T) []string {
+	t.Helper()
+	syms := guardSymbols(t)
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	var out []string
+	for _, e := range entries {
+		n := e.Name()
+		if e.IsDir() || !strings.HasSuffix(n, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, n, nil, 0) // no ParseComments: prose is not a use
+		if err != nil {
+			t.Fatalf("parsing %s: %v", n, err)
+		}
+		var hit bool
+		ast.Inspect(f, func(nd ast.Node) bool {
+			if id, ok := nd.(*ast.Ident); ok && syms[id.Name] {
+				hit = true
+			}
+			return !hit
+		})
+		if hit {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// absentByDesign are covered entries that do NOT exist in this repo and are not expected to.
 // Each is exempt from the dead-coverage check below for a stated reason, so the exemption is
 // a decision on the record rather than a quiet hole in it.
 //
@@ -310,6 +389,10 @@ func TestGateConfigFilesAreRealPaths(t *testing.T) {
 	// Asks the resolved scope rather than gateConfigFiles alone. The deciding orchestrator
 	// files are ttorch-source tier, covered only in this repository, so reading one list
 	// would report them uncovered and read as a hole that is not there.
+	proofs := map[string]bool{}
+	for _, n := range proofTestFiles(t) {
+		proofs[n] = true
+	}
 	covered := map[string]bool{}
 	for _, f := range ttorchScope.files() {
 		covered[f] = true
@@ -480,6 +563,10 @@ func TestOrchestratorFilesAreClassified(t *testing.T) {
 	// Asks the resolved scope rather than gateConfigFiles alone. The deciding orchestrator
 	// files are ttorch-source tier, covered only in this repository, so reading one list
 	// would report them uncovered and read as a hole that is not there.
+	proofs := map[string]bool{}
+	for _, n := range proofTestFiles(t) {
+		proofs[n] = true
+	}
 	covered := map[string]bool{}
 	for _, f := range ttorchScope.files() {
 		covered[f] = true
@@ -494,15 +581,12 @@ func TestOrchestratorFilesAreClassified(t *testing.T) {
 			// Parsed, not grepped. A substring scan counts a guard name MENTIONED in a
 			// comment, which would have marked orchestrator_test.go a proof file for two
 			// passing references in prose and cost 43 of 196 commits to cover.
-			isProof, err := usesGuardIdentifier(n)
-			if err != nil {
-				t.Fatalf("parsing %s: %v", n, err)
-			}
+			isProof := proofs[n]
 			if isProof && !covered[rel] {
-				t.Errorf("%s references the guard (%v) but is not covered. A diff can then "+
+				t.Errorf("%s references the guard but is not covered. A diff can then "+
 					"delete the proof in the SAME unflagged merge as the attack it catches, "+
 					"which is how TestTtorchRepoIsScopedIn was removable. Add it to "+
-					"ttorchSourceFiles.", rel, guardIdentifiers)
+					"ttorchSourceFiles.", rel)
 			}
 			if !isProof && covered[rel] {
 				t.Errorf("%s is covered but references none of the guard's symbols, so it is "+
@@ -1377,9 +1461,13 @@ func TestGateTestsSelectorCoversTheProofs(t *testing.T) {
 		t.Errorf("GATE_TESTS must be anchored at both ends, got %q", raw)
 	}
 
+	// Derived from the proof files that EXIST, not from a fixed list of three. The previous
+	// version scanned a hardcoded file list, so a proof added in a NEW file was required to
+	// appear nowhere and ran in neither gating lane: verified both ways, the same proof
+	// inside gateconfig_test.go went red and in a new file it passed.
 	decl := regexp.MustCompile(`(?m)^func (Test\w+)`)
 	var proofs []string
-	for _, f := range []string{"gateattacks_test.go", "gateconfig_test.go"} {
+	for _, f := range proofTestFiles(t) {
 		b, err := os.ReadFile(f)
 		if err != nil {
 			t.Fatalf("reading %s: %v", f, err)
@@ -1388,18 +1476,6 @@ func TestGateTestsSelectorCoversTheProofs(t *testing.T) {
 			proofs = append(proofs, mm[1])
 		}
 	}
-	// The gate-config tests that live in orchestrator_test.go alongside unrelated ones.
-	b, err := os.ReadFile("orchestrator_test.go")
-	if err != nil {
-		t.Fatalf("reading orchestrator_test.go: %v", err)
-	}
-	onTopic := regexp.MustCompile(`GateConfig|AllowGateChange|GateInstruction|MatchesGateConfig|GateGuard`)
-	for _, mm := range decl.FindAllStringSubmatch(string(b), -1) {
-		if onTopic.MatchString(mm[1]) {
-			proofs = append(proofs, mm[1])
-		}
-	}
-
 	if len(proofs) == 0 {
 		t.Fatal("found no proof tests; this check is asserting nothing")
 	}

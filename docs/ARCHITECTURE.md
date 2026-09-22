@@ -293,7 +293,7 @@ rather than by what sounds prudent. Measured over the **196 non-merge commits re
 | `go.mod`, `go.sum` | 5 | +2 |
 | `.github/workflows/**` | 9 | +5 |
 | `docs/install.sh`, `docs/install.ps1` | 7 | +3 |
-| **the whole set** | **84 / 196 = 43%** | |
+| **the whole set** | **95 / 196 = 48%** | |
 
 Two columns because one number cannot carry it. "Commits touching it" is that group in
 isolation; "marginal" is what it adds *given everything else already covered*, which is the
@@ -306,15 +306,15 @@ Rejected, measured against that same set:
 
 | Rejected | commits | share |
 |---|---|---|
-| + `internal/db/` | 99 | 50.5% |
-| + `internal/orchestrator/**` and `internal/review/**` wholesale | 130 | 66.3% |
+| + `internal/db/` | 110 | 56.1% |
+| + `internal/orchestrator/**` and `internal/review/**` wholesale | 134 | 68.4% |
 
 (An earlier count of this corpus reported 9 and 43 for the first two groups; the difference is
 the root commit, which `git diff-tree` skips without `--root`. It changes no conclusion.)
 
 The second rejected row is the answer to "why not just cover the packages".
 `internal/orchestrator/` alone is 78 of the 196 commits — spawn, the land queue, the scheduler
-wiring, the overlap planner — and covering it wholesale puts **66.3% of every change** behind
+wiring, the overlap planner — and covering it wholesale puts **68.4% of every change** behind
 the flag. A flag that fires on most commits is not a signal; it is a formality, and it
 launders a real gate change through a habit. The five files that actually resolve, enforce,
 cache and record the decision are +5 marginal instead.
@@ -465,7 +465,7 @@ The set is now two tiers.
 | Tier | Entries | Applies |
 |---|---|---|
 | universal | `.ttorch/**`, `AGENTS.md`, `CLAUDE.md` (and both by basename), `.claude/**`, `.mcp.json`, `Makefile`, `go.mod`, `go.sum`, `go.work`, `go.work.sum`, `vendor/**`, `.github/workflows/**` | every ttorch-gated repo |
-| ttorch source | `content/**`, `content.go`, `docs/install.sh`, `docs/install.ps1`, `internal/{review,approval,validate,projectinit,installer,skills}/**`, the five deciding `internal/orchestrator/*.go` | only ttorch's own repository |
+| ttorch source | `content/**`, `content.go`, `docs/install.sh`, `docs/install.ps1`, `internal/{review,approval,validate,projectinit,installer,skills,worktree}/**`, the five deciding `internal/orchestrator/*.go`, the two proof test files | only ttorch's own repository |
 
 `resolveGateScope` decides which applies, from the repository rather than from its name or
 remote URL. The signal is a Go `//go:embed` directive rooted at `content`, which is the
@@ -791,10 +791,10 @@ Two genuine cost judgements are left out, and both are recorded here and in the 
 read as decisions rather than omissions.
 
 `internal/db/` holds `Store.GetVerdict`, the row the merge trusts for `Overall == pass`;
-covering it costs 15 more commits (23/196 on its own, taking the set to 99/196 = 50.5%).
+covering it costs 15 more commits (23/196 on its own, taking the set to 110/196 = 56.1%).
 
 `internal/cli/` wires the `--allow-gate-change` flag and is the larger of the two: 56/196 on
-its own, +32 marginal, which would take the set to 116/196 = **59.2%**. That is past the
+its own, +32 marginal, which would take the set to 127/196 = **64.8%**. That is past the
 more-than-half line that is the stated reason `internal/orchestrator/` is not covered
 wholesale, so covering it would mean applying the rule to one package and breaking it for
 another. It was also the caller that chose the tree `installer.Apply` walked, which made the
