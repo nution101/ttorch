@@ -361,3 +361,19 @@ func TestBoundMustGovernTheBanItBounds(t *testing.T) {
 		}
 	}
 }
+
+// A create verb must not reach across a full stop, including one the splitter deliberately
+// merged because a lowercase word followed it.
+func TestCreateVerbDoesNotReachAcrossAFullStop(t *testing.T) {
+	cases := map[string]bool{
+		"I already created the shim. e.g. internal/x/ghost.go is the one to change.": false,
+		"Add e.g. internal/new/thing.go as a new config file.":                       true,
+		"There are approx. 21 of them. Write dev/notes/out.md when you are done.":    true,
+		"Write dev/report/EVIDENCE.md: the rule set as implemented.":                 true,
+	}
+	for text, want := range cases {
+		if _, got := firstCitationExempt(t, text); got != want {
+			t.Errorf("exempt = %v, want %v for %q", got, want, text)
+		}
+	}
+}

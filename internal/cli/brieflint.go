@@ -194,7 +194,10 @@ func lintBriefForAdd(text, repo, citationsRef string, offline bool) error {
 	if errors.As(err, &le) && le.code == exitLintPartial {
 		// Reduced coverage is reported, not refused: see exitLintPartial for why the add
 		// path and the standalone exit status part company here.
-		fmt.Fprintf(os.Stderr, "note: %s. The add proceeds; the rules the project disabled were not checked.\n", coverage(rep))
+		// coverage() names the real reason; this sentence must not re-assert a different
+		// one. It said "the rules the project disabled" even under --brief-lint-offline,
+		// which points the reader at an AGENTS.md that never mentions the rule.
+		fmt.Fprintf(os.Stderr, "note: %s. The add proceeds; the rules that did not run were not checked.\n", coverage(rep))
 		return nil
 	}
 	switch {
