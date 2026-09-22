@@ -154,6 +154,7 @@ invalidates the verdict — re-prep, re-review, re-record.
   |---|---|
   | `.ttorch/validate.sh` | what "green" means for this repo |
   | `AGENTS.md` | whether the gate runs at all (`projectinit.ReadMode`) |
+  | `CLAUDE.md` | a **symlink** to `AGENTS.md`; replacing it with a real file reports only `CLAUDE.md`, and it is the instruction file every session loads, manager included |
   | `content/skills/**` | the ttorch-review, ttorch-manager and ttorch-validate procedures — **including this file** |
   | `content/agents/ttorch-reviewer-*` | the adversarial reviewers' own definitions |
   | `internal/review/**` | the findings contract, the severity-to-block rule, and the classifier that picks which reviewers run |
@@ -226,7 +227,12 @@ invalidates the verdict — re-prep, re-review, re-record.
     would still be missed.
   - Substitutions that never produce two entries in one tree. The collision check detects two
     entries resolving to one path; that is a narrower claim than "any substitution is
-    observable", which this document wrongly made for two rounds.
+    observable", which this document wrongly made for two rounds. Replacing the `CLAUDE.md`
+    symlink with a real file is one such case — same path, new blob and mode, no pair to
+    collide — so the covered-set entry is the only thing standing there, not a second line.
+  - A symlink is matched by its OWN path, never by what it resolves to. `CLAUDE.md` is the
+    only one in this repo and it is covered; `TestTreeHasNoUncoveredSymlinks` fails if another
+    appears outside the set, because each would be the same trick.
   - Everything here is inside the `gated` branch of the merge, so a `local`/`validated` merge
     without `--require-verdict` gets none of it — not the name match, not the collision
     refusal, not the control-character refusal. Same pre-existing hole as the first bullet.

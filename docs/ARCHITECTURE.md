@@ -237,8 +237,9 @@ passing commit-pinned verdict plus a fresh green validate auto-mints the approva
   own gate), and a repo with **no checks detected is a hard block**, never a pass. Without
   the script, the trusted auto-merge is refused and a human `ttorch approve` is required.
 - A trusted auto-merge **cannot change a gate-definition file**; such a diff is refused. The
-  covered set is `.ttorch/validate.sh` and `AGENTS.md` (the repo-local gate config, present in
-  every managed repo), `content/skills/**` and `content/agents/ttorch-reviewer-*` (which
+  covered set is `.ttorch/validate.sh`, `AGENTS.md` and `CLAUDE.md` (the repo-local gate
+  config, present in every managed repo), `content/skills/**` and
+  `content/agents/ttorch-reviewer-*` (which
   `content.go` embeds and the installer lays down under `~/.claude`, so they are the gate's
   live reviewer and manager instructions, not documentation about the gate), `internal/review/**`,
   `internal/approval/**`, `internal/validate/**`, `internal/projectinit/**` (which parses
@@ -458,6 +459,22 @@ itself: covering `content/agents/ttorch-reviewer-*` while leaving the mapping op
 deliberately excluded file such as `content/agents/ttorch-worker.md` be installed as a reviewer
 instead. `audit.go` holds the only `writeAudit`, and `MergeLocal` refuses to merge when it
 fails, so one line there strips the record from every trusted merge.
+
+`CLAUDE.md` is covered because the guard matches a symlink by its OWN path, never by what it
+resolves to. In a managed repo `CLAUDE.md` is a symlink whose blob is the string `AGENTS.md`,
+so a commit that deletes the link and writes a real `CLAUDE.md` reports the changed path
+`CLAUDE.md` — which is not `AGENTS.md`, and matched nothing. It is the agent-instruction file
+every Claude Code session in the repo loads, the manager session that adjudicates gates
+included, which is the rationale that already covers all of `content/`; unlike `content/` it
+needs no rebuild and no install, so it takes effect on the merge. `projectinit.ensureSymlink`
+also refuses to clobber a real file, so `ttorch init` never undoes the swap.
+
+The collision check does **not** back that up. The swap changes the blob and the file mode but
+not the path, so the tree gains no entry and there is no pair to collide;
+`TestGateGuard_SymlinkSwapNeedsAllowGateChange` asserts that the collision check stays silent,
+so the covered-set entry is known to be the only thing standing rather than assumed to be
+belt-and-braces. `CLAUDE.md` is the only symlink in this repo, and
+`TestTreeHasNoUncoveredSymlinks` fails if another appears outside the covered set.
 
 `go.work` and `vendor/` are covered although neither exists in this repo, and that is the
 reason rather than an exception to it. `.ttorch/validate.sh` runs `make lint` and

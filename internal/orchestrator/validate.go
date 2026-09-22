@@ -47,9 +47,24 @@ func (m *Manager) Validate(taskID string) ([]validate.Result, error) {
 
 // gateConfigFiles define the trust gate itself by exact path. Two kinds of file are here.
 //
-// The repo-local gate config — ".ttorch/validate.sh" (what green means) and "AGENTS.md"
-// (whether the gate runs at all) — exists in every ttorch-managed repo and takes effect on
-// the very next gate run.
+// The repo-local gate config — ".ttorch/validate.sh" (what green means), "AGENTS.md"
+// (whether the gate runs at all) and "CLAUDE.md" — exists in every ttorch-managed repo and
+// takes effect on the very next gate run.
+//
+// CLAUDE.md is here because in a managed repo it is a SYMLINK to AGENTS.md, and the guard
+// matches the LINK's own path, not what it resolves to. A commit that deletes the symlink and
+// writes a real CLAUDE.md reports the changed path "CLAUDE.md", which is not "AGENTS.md" and
+// matched nothing. It is the agent-instruction file every Claude Code session in the repo
+// loads — the manager session that adjudicates gates included — which is the same rationale
+// that covers all of content/; unlike content/ it needs no rebuild and no install, so it
+// takes effect on the merge. projectinit.ensureSymlink also refuses to clobber a real file
+// ("already exists as a real file; left it"), so `ttorch init` never undoes the swap.
+//
+// The collision check does NOT back this up, and TestGateGuard_SymlinkSwapNeedsAllowGateChange
+// asserts that rather than leaving it to be assumed: the swap changes the blob and the mode
+// but not the path, so the tree gains no entry and there is no pair to collide. This entry is
+// the only thing standing there. TestTreeHasNoUncoveredSymlinks fails if any OTHER symlink
+// appears outside the covered set, since every one of them is the same trick.
 //
 // The rest is ttorch's own DECIDING CODE: the four files in this package that resolve,
 // enforce and cache the gate's decision. They exist only in this repo, and a change to them
@@ -91,6 +106,7 @@ func (m *Manager) Validate(taskID string) ([]validate.Result, error) {
 var gateConfigFiles = []string{
 	".ttorch/validate.sh",
 	"AGENTS.md",
+	"CLAUDE.md",
 	"internal/orchestrator/gate.go",
 	"internal/orchestrator/merge.go",
 	"internal/orchestrator/validate.go",

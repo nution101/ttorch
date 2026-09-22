@@ -1901,6 +1901,7 @@ func TestMatchesGateConfig(t *testing.T) {
 	}{
 		{"the validate script", ".ttorch/validate.sh", true},
 		{"the delivery-mode config", "AGENTS.md", true},
+		{"the symlink to it that every session loads", "CLAUDE.md", true},
 		{"the gate procedure skill", "content/skills/ttorch-review/SKILL.md", true},
 		{"the manager skill", "content/skills/ttorch-manager/SKILL.md", true},
 		{"the validate skill", "content/skills/ttorch-validate/SKILL.md", true},
@@ -1943,6 +1944,7 @@ func TestMatchesGateConfig(t *testing.T) {
 		{"the worker agent definition", "content/agents/ttorch-worker.md", false},
 		{"an embedded command", "content/commands/ttorch.md", false},
 		{"a docs copy of the mode config", "docs/AGENTS.md", false},
+		{"a docs copy of the instruction file", "docs/CLAUDE.md", false},
 		{"a validate script somewhere else", "sub/.ttorch/validate.sh", false},
 		{"a directory that merely starts the same", "contents/skills/x.md", false},
 		{"ordinary orchestrator source", "internal/orchestrator/spawn.go", false},
