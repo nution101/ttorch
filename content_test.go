@@ -1,6 +1,7 @@
 package ttorch
 
 import (
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,7 +15,7 @@ import (
 // can be executed as the real shipped script (not a copy that could drift).
 func writeHook(t *testing.T) string {
 	t.Helper()
-	b, err := Content.ReadFile("content/hooks/prompt-reminders.sh")
+	b, err := fs.ReadFile(Content(), "content/hooks/prompt-reminders.sh")
 	if err != nil {
 		t.Fatalf("read embedded hook: %v", err)
 	}
@@ -262,7 +263,7 @@ func jsonPrompt(prompt string) string {
 func TestManagerProtocolContent(t *testing.T) {
 	read := func(name string) string {
 		t.Helper()
-		b, err := Content.ReadFile(name)
+		b, err := fs.ReadFile(Content(), name)
 		if err != nil {
 			t.Fatalf("read %s: %v", name, err)
 		}

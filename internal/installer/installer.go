@@ -46,7 +46,7 @@ type Result struct {
 // changed by editing content/ or content.go (covered), or this package (covered).
 // TestInstallerExposesNoFSChoice fails if an exported function takes an fs.FS again.
 func ApplyEmbedded(p paths.Paths, version string) (*Result, error) {
-	return apply(ttorchembed.Content, p, version)
+	return apply(ttorchembed.Content(), p, version)
 }
 
 // apply installs (or updates) the managed content. It is idempotent and never

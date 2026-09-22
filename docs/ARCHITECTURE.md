@@ -359,9 +359,13 @@ left 35 open:
 This was the third time an enumerated subset of this tree missed installed files, so the fix
 is the same inversion already applied to `.ttorch/`: cover the tree. `content/` is a superset
 of everything `desiredFiles` can install, and it is a superset *by construction* rather than
-by coincidence — `content.go` embeds `all:content` and nothing else, so the installer has no
-file outside `content/` to install. `TestContentPrefixCoversWhatDesiredFilesInstalls` fails if
-a second embed directive appears.
+by coincidence. `content.go` embeds `all:content` and nothing else, and the embedded FS is
+unexported behind an accessor, so there is no exported variable for another package to point
+at a different tree. `TestEmbeddedPayloadIsNotAssignable` fails if an exported var comes
+back. An earlier version of this paragraph cited
+`TestContentPrefixCoversWhatDesiredFilesInstalls`, which had already been deleted, and which
+scanned `//go:embed` spellings by hand: `all:cont*` and `"content"` both produce a usable FS
+and both got past it. Assignability is the bound worth holding; directive spellings are not.
 
 Deriving the list from `desiredFiles` at runtime was considered and rejected. It would couple
 the guard to installer internals in the wrong direction: editing `desiredFiles` would then

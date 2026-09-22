@@ -69,12 +69,17 @@ var nonDecidingFiles = map[string]string{
 // TestGateConfigCoversTheDecidingCode is the anchor for the file-granular half of
 // gateConfigFiles.
 //
-// gateConfigPrefixes can name whole directories because content/skills/, internal/review/,
+// gateConfigPrefixes can name whole directories because content/, internal/review/,
 // internal/approval/ and internal/validate/ are each small and single-purpose. This package
-// is not: it is 39% of the repo's commits, so covering "internal/orchestrator/" wholesale
-// would put 54% of all commits behind --allow-gate-change (measured over the 196 non-merge
-// commits reachable from b642ba6) and turn the flag into a formality. gateConfigFiles
-// therefore names four files instead.
+// is not, so covering "internal/orchestrator/" wholesale would put most of the repo's
+// commits behind --allow-gate-change and turn the flag into a formality. gateConfigFiles
+// therefore names five files instead.
+//
+// The figures are in docs/ARCHITECTURE.md and only there. This comment used to restate them
+// and drifted twice; the second time it said 54% where the measurement was 66.3%, which
+// understated the cost in the direction that made the boundary look better than it is.
+// TestGateCostFiguresMatchTheDoc measures the doc, so a figure that lives only there cannot
+// go stale unnoticed, and one restated here can.
 //
 // A file list over a package that gets refactored decays silently — this package has already
 // been re-split once (140d2b91, "split god-file into focused single-responsibility files"),
@@ -788,7 +793,7 @@ func TestTtorchRuntimeFileIsIgnored(t *testing.T) {
 // point) and hooks/prompt-reminders.sh (runs on every prompt).
 func TestEveryInstalledContentFileIsCovered(t *testing.T) {
 	var files []string
-	if err := fs.WalkDir(ttorchembed.Content, "content", func(p string, d fs.DirEntry, err error) error {
+	if err := fs.WalkDir(ttorchembed.Content(), "content", func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -910,6 +915,55 @@ func TestNoEmbedRootOutsideContent(t *testing.T) {
 	}
 	if scanned == 0 {
 		t.Fatal("scanned no Go files; this test is asserting nothing")
+	}
+}
+
+// TestEmbeddedPayloadIsNotAssignable fails if the root package exports a variable again.
+//
+// installer.ApplyEmbedded reads ttorch.Content at call time. While that was
+// `var Content embed.FS` it was exported and assignable, so an init() in any package linked
+// into the binary could point it at another tree: five lines and one markdown file, none of
+// it on a path the guard covers. Unexporting the variable behind an accessor closes it at
+// the language level, which is why this test checks for an exported VAR rather than for
+// embed directives. Directive spellings are unbounded; assignability is not.
+func TestEmbeddedPayloadIsNotAssignable(t *testing.T) {
+	root := repoRootForGateConfig(t)
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, root, func(fi os.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatalf("parsing the root package: %v", err)
+	}
+	var checked int
+	for _, pkg := range pkgs {
+		for name, f := range pkg.Files {
+			for _, d := range f.Decls {
+				gd, ok := d.(*ast.GenDecl)
+				if !ok || gd.Tok != token.VAR {
+					continue
+				}
+				checked++
+				for _, spec := range gd.Specs {
+					vs, ok := spec.(*ast.ValueSpec)
+					if !ok {
+						continue
+					}
+					for _, id := range vs.Names {
+						if id.IsExported() {
+							t.Errorf("%s declares exported var %s. An exported package-level var is "+
+								"assignable from any package linked into the binary, and the embedded "+
+								"payload is read at call time by installer.ApplyEmbedded, so an exported "+
+								"one can be redirected to another tree with nothing in the diff the gate "+
+								"guard matches. Expose a read accessor instead.", filepath.Base(name), id.Name)
+						}
+					}
+				}
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("found no package-level var declarations in the root package; this test is asserting nothing")
 	}
 }
 
