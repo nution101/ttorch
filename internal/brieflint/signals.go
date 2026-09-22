@@ -179,14 +179,19 @@ type span struct {
 // scanner can start after it.
 var blockMarker = regexp.MustCompile("^[ \t]*(?:```|\\||(?:[-*+>]+|#{1,6}|[0-9]{1,3}[.)]|[A-Za-z][.)])[ \t]+)")
 
-// abbrevs are words whose trailing dot is not a sentence end. Dotted initialisms (e.g., i.e.,
-// U.S.) are recognised by shape instead, so this list only needs the ones that end in a
-// single dot.
-var abbrevs = map[string]bool{
-	"etc": true, "cf": true, "vs": true, "approx": true, "resp": true, "al": true,
-	"fig": true, "incl": true, "excl": true, "viz": true, "dr": true, "mr": true,
-	"mrs": true, "ms": true, "prof": true, "jr": true, "sr": true, "eg": true, "ie": true,
+// operandAbbrevs are words whose trailing dot never ends a sentence, because what follows is
+// the abbreviation's operand and may be capitalised or a digit: "approx. 21 occurrences",
+// "Fig. 3", "e.g. Foo". Dotted initialisms (e.g., i.e., U.S.) are recognised by shape and
+// treated the same way.
+var operandAbbrevs = map[string]bool{
+	"approx": true, "cf": true, "vs": true, "resp": true, "fig": true, "incl": true,
+	"excl": true, "eg": true, "ie": true,
 }
+
+// clauseAbbrevs are words whose trailing dot MAY end a sentence. "etc. See the note" is two
+// sentences; "etc. and then fix it" is one. The lookahead decides, exactly as it does for an
+// ordinary period.
+var clauseAbbrevs = map[string]bool{"etc": true, "al": true, "viz": true}
 
 // blockRange is one Markdown block: a paragraph, a list item, a heading. Soft-wrapped lines
 // belong to the block they continue.
@@ -262,11 +267,13 @@ func sentences(text string) []span {
 			if c := bt[i]; c != '.' && c != '!' && c != '?' {
 				continue
 			}
-			if !endsSentence(bt, i) {
+			next, ok := endsSentence(bt, i)
+			if !ok {
 				continue
 			}
 			emit(bt[pos:i], b.start+pos, bi)
-			pos = i + 1
+			pos = next
+			i = next - 1
 		}
 		emit(bt[pos:], b.start+pos, bi)
 	}
@@ -274,22 +281,56 @@ func sentences(text string) []span {
 }
 
 // endsSentence reports whether the terminator at i closes a sentence rather than sitting
-// inside a path, an abbreviation or a decimal.
-func endsSentence(s string, i int) bool {
-	if i+1 < len(s) && !isSpace(s[i+1]) {
-		return false
-	}
-	if s[i] != '.' {
-		return true
-	}
-	if isAbbrev(s, i) {
-		return false
-	}
+// inside a path, an abbreviation or a decimal. It also returns the index the next sentence
+// starts from, which is past any closing punctuation belonging to this one.
+//
+// One rule, applied on every path: after any closing quote or bracket, whitespace or the end
+// of the block must follow, and the next thing along must be able to begin a sentence. An
+// earlier version skipped that lookahead on two branches and both MERGED sentences that
+// should have split. "Add the fix, etc. See <path>" and `the note "done." See <path>` each
+// became one sentence, which handed the create verb in the first sentence an exemption over
+// a citation in the second. Over-splitting cost false positives in round 2; skipping the
+// lookahead to cure that cost a false negative on the very rule the splitting protects.
+func endsSentence(s string, i int) (int, bool) {
 	j := i + 1
-	for j < len(s) && isSpace(s[j]) {
-		j++
+	for j < len(s) {
+		n := closerLen(s, j)
+		if n == 0 {
+			break
+		}
+		j += n
 	}
-	return j >= len(s) || startsSentence(s[j])
+	if j < len(s) && !isSpace(s[j]) {
+		return 0, false
+	}
+	// An operand abbreviation is never a boundary, whatever follows it.
+	if s[i] == '.' && abbrevKind(s, i) == abbrevOperand {
+		return 0, false
+	}
+	k := j
+	for k < len(s) && isSpace(s[k]) {
+		k++
+	}
+	if k >= len(s) {
+		return j, true
+	}
+	return j, startsSentence(s[k])
+}
+
+// closerLen returns the width of the closing punctuation at j, or 0. A terminator can sit
+// inside a quotation or a parenthesis, and the mark that closes it belongs to the sentence
+// being closed.
+func closerLen(s string, j int) int {
+	switch s[j] {
+	case '"', '\'', ')', ']', '}', '`':
+		return 1
+	}
+	for _, q := range []string{"\u201d", "\u2019", "\u00bb"} {
+		if strings.HasPrefix(s[j:], q) {
+			return len(q)
+		}
+	}
+	return 0
 }
 
 // startsSentence reports whether c can open a sentence: a capital, a digit, or the opening
@@ -302,22 +343,38 @@ func startsSentence(c byte) bool {
 	return strings.IndexByte("\"'(*_[`", c) >= 0
 }
 
-// isAbbrev reports whether the dot at position dot ends an abbreviation: either a word in
-// abbrevs, or a single letter already preceded by a dot, which is the shape of e.g., i.e.
-// and U.S.
-func isAbbrev(s string, dot int) bool {
+type abbrevClass int
+
+const (
+	abbrevNone abbrevClass = iota
+	// abbrevOperand: the dot is always internal, because the operand follows it.
+	abbrevOperand
+	// abbrevClause: the dot may end a sentence, so the lookahead decides.
+	abbrevClause
+)
+
+// abbrevKind classifies the dot at position dot by the word in front of it.
+func abbrevKind(s string, dot int) abbrevClass {
 	j := dot
 	for j > 0 && isLetter(s[j-1]) {
 		j--
 	}
 	w := strings.ToLower(s[j:dot])
-	if w == "" {
-		return false
+	switch {
+	case w == "":
+		return abbrevNone
+	case len(w) == 1:
+		// A single letter already preceded by a dot is a dotted initialism: e.g., i.e., U.S.
+		if j > 0 && s[j-1] == '.' {
+			return abbrevOperand
+		}
+		return abbrevNone
+	case operandAbbrevs[w]:
+		return abbrevOperand
+	case clauseAbbrevs[w]:
+		return abbrevClause
 	}
-	if len(w) == 1 {
-		return j > 0 && s[j-1] == '.'
-	}
-	return abbrevs[w]
+	return abbrevNone
 }
 
 func isLetter(c byte) bool {

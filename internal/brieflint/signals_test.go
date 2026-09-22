@@ -73,6 +73,38 @@ func TestSentencesSplitsRealProse(t *testing.T) {
 			"See internal/cli/cli.go:40. Then stop.",
 			[]string{"See internal/cli/cli.go:40", "Then stop"},
 		},
+		"an abbreviation before a new clause splits": {
+			"Add the fix, etc. See internal/ghost/nonexistent.go:9999 for context.",
+			[]string{"Add the fix, etc", "See internal/ghost/nonexistent.go:9999 for context"},
+		},
+		"a quote-terminated sentence splits": {
+			"Write the note \"done.\" See internal/ghost/nonexistent.go:9999 for context.",
+			[]string{"Write the note \"done", "See internal/ghost/nonexistent.go:9999 for context"},
+		},
+		"a parenthesis-terminated sentence splits": {
+			"Add the helper (see round 3.) See internal/ghost/nonexistent.go:9999 too.",
+			[]string{"Add the helper (see round 3", "See internal/ghost/nonexistent.go:9999 too"},
+		},
+		"an operand abbreviation before a digit does not split": {
+			"There are approx. 21 occurrences left.",
+			[]string{"There are approx. 21 occurrences left"},
+		},
+		"a decimal is not a boundary": {
+			"The budget is 45.5 seconds in practice.",
+			[]string{"The budget is 45.5 seconds in practice"},
+		},
+		"a version string is not a boundary": {
+			"Upgrade to go1.26.5 before you start.",
+			[]string{"Upgrade to go1.26.5 before you start"},
+		},
+		"an ellipsis mid-sentence is not a boundary": {
+			"Wait for the gate... then land it.",
+			[]string{"Wait for the gate... then land it"},
+		},
+		"a parenthetical is not a boundary": {
+			"Fix it (the second one) before you push.",
+			[]string{"Fix it (the second one) before you push"},
+		},
 		"a heading is its own span": {
 			"## Rule 3\n\nThere are 21 occurrences.",
 			[]string{"Rule 3", "There are 21 occurrences"},
@@ -251,4 +283,48 @@ func TestCreateExemptionNeedsAnActiveVerbGoverningThePath(t *testing.T) {
 			t.Errorf("%s: governedByCreate = %v, want %v for %q", name, got, tc.want, tc.sent)
 		}
 	}
+}
+
+// The splitter has now been wrong in both directions on this branch: it over-split ordinary
+// prose, and the cure made it merge sentences that a create verb then reached across. Both
+// directions are pinned here, together, because each earlier round was tested only against
+// its own finding.
+func TestSplitterHoldsBothDirections(t *testing.T) {
+	// Merging: a create verb must not reach a citation in a following sentence.
+	for _, tc := range []string{
+		"Add the fix, etc. See internal/ghost/nonexistent.go:9999 for context.",
+		"Write the note \"done.\" See internal/ghost/nonexistent.go:9999 for context.",
+	} {
+		if _, exempt := firstCitationExempt(t, tc); exempt {
+			t.Errorf("a create verb reached across a sentence boundary in %q", tc)
+		}
+	}
+	// Over-splitting: the round-2 false positives must stay fixed.
+	if _, exempt := firstCitationExempt(t, "Add e.g. internal/new/thing.go as a new config file."); !exempt {
+		t.Error("an abbreviation must not cut a create verb off the path it governs")
+	}
+	list := "1. There are 21 occurrences of the old helper. Note: I grepped for the bare\n   name.\n2. Verify the count yourself before you start."
+	sents := sentences(list)
+	counts := hardCounts(sents)
+	if len(counts) != 1 {
+		t.Fatalf("want one hard count, got %d", len(counts))
+	}
+	if !hedgedAt(sents, counts[0]) {
+		t.Error("a hedge in the next list item must still reach the count")
+	}
+}
+
+// firstCitationExempt reports the first cited path in text and whether it earned the create
+// exemption, the way citations() asks.
+func firstCitationExempt(t *testing.T, text string) (string, bool) {
+	t.Helper()
+	for _, s := range sentences(text) {
+		for _, m := range candidateRe.FindAllStringIndex(s.text, -1) {
+			if c, ok := citationOf(s.text[m[0]:m[1]]); ok && strings.Contains(c.path, "/") {
+				return c.raw, governedByCreate(s.text, m[0])
+			}
+		}
+	}
+	t.Fatalf("no citation found in %q", text)
+	return "", false
 }
