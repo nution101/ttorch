@@ -22,8 +22,14 @@ func (m *Manager) audit(line string) { _ = m.writeAudit(line) }
 // The guard also refuses a changed path carrying a control character before a merge can
 // reach this point (orchestrator.hostilePath). That closes the known route; this closes the
 // class, for the call sites nobody has audited yet.
+//
+// C1 (U+0080–U+009F) is escaped alongside C0 and DEL: U+0085 NEL is a line break, and U+009B
+// is CSI, the single-character form of "ESC [" that several terminals accept — so a log a
+// human greps or pipes to a terminal must not carry them raw either.
+func isAuditControl(r rune) bool { return r < 0x20 || (r >= 0x7f && r <= 0x9f) }
+
 func sanitizeAuditLine(line string) string {
-	if strings.IndexFunc(line, func(r rune) bool { return r < 0x20 || r == 0x7f }) < 0 {
+	if strings.IndexFunc(line, isAuditControl) < 0 {
 		return line
 	}
 	var b strings.Builder
@@ -36,7 +42,7 @@ func sanitizeAuditLine(line string) string {
 			b.WriteString(`\r`)
 		case r == '\t':
 			b.WriteString(`\t`)
-		case r < 0x20 || r == 0x7f:
+		case isAuditControl(r):
 			fmt.Fprintf(&b, `\x%02x`, r)
 		default:
 			b.WriteRune(r)

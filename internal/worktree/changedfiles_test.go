@@ -266,3 +266,54 @@ func TestCheckedGitRaw_EscapesStderrItSurfaces(t *testing.T) {
 		t.Errorf("the ESC bytes must be shown as an escape, got: %q", got)
 	}
 }
+
+// TestGit_EscapesItsErrorText: git() is the most-used wrapper in this file, and its error
+// text is built from CombinedOutput — git's stderr, which echoes back committed filenames and
+// .gitattributes lines. checkedGitRaw and warnf were escaped first; leaving this one raw rests
+// on every caller remembering which wrapper they used, and the reason for fixing at a sink is
+// that they will not.
+//
+// No worker-controlled route into a git() argument is known today, so this closes an
+// asymmetry rather than a demonstrated exploit. The returned VALUE stays verbatim on success —
+// callers parse it, and escaping would corrupt the data.
+func TestGit_EscapesItsErrorText(t *testing.T) {
+	repo := makeRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, ".gitattributes"), []byte("* \x1b[31mPWNED\x1b[0m=bad\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A failing command, so the error path runs and carries git's stderr.
+	_, err := git("-C", repo, "checkout", "no-such-branch-\x1b[31m")
+	if err == nil {
+		t.Fatal("expected the command to fail")
+	}
+	if strings.ContainsAny(err.Error(), "\x1b\r") {
+		t.Errorf("git() error text carries raw control bytes to the terminal: %q", err.Error())
+	}
+
+	// Success still returns the value verbatim, or callers that parse it break.
+	head := gitT(t, repo, "rev-parse", "HEAD")
+	got, gerr := git("-C", repo, "rev-parse", "HEAD")
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if got != head {
+		t.Errorf("git() must return parsed output verbatim: got %q, want %q", got, head)
+	}
+}
+
+// TestEscapeForTerminal_C1: U+009B is CSI, the single-character form of "ESC [" that several
+// terminals accept, so escaping ESC alone leaves a second door into the same sequences.
+// U+0085 NEL is a line break in its own right.
+func TestEscapeForTerminal_C1(t *testing.T) {
+	for _, r := range []rune{0x0085, 0x009b, 0x0080, 0x009f} {
+		in := "a" + string(r) + "b"
+		got := escapeForTerminal(in)
+		if strings.ContainsRune(got, r) {
+			t.Errorf("escapeForTerminal left U+%04X raw: %q", r, got)
+		}
+	}
+	// A printable non-ASCII rune must survive untouched.
+	if got := escapeForTerminal("café ſ"); got != "café ſ" {
+		t.Errorf("escapeForTerminal mangled printable text: %q", got)
+	}
+}

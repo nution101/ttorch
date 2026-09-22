@@ -178,16 +178,22 @@ invalidates the verdict — re-prep, re-review, re-record.
   that changed.
 
   **Matching on the name alone is not enough, so the guard does not rely on it.** Paths are
-  compared under `fsIdentityKey` — NFD, Unicode FULL case folding, NFD again — which is what
-  a case-insensitive normalizing filesystem compares under. Two weaker versions of this were
-  exploitable: `strings.ToLower` missed U+017F (`agentſ.md` → `AGENTS.md`), and
-  `unicode.SimpleFold` missed the multi-rune full folds (`Makeﬁle` → `Makefile`, which is the
-  Makefile `.ttorch/validate.sh` executes). Beyond the name, the guard **refuses outright**
-  any changed path that collides with a different path in the resulting tree, whether or not
-  either is in the table above, and any changed path containing a control character. Those
-  two refusals are blocking: `--allow-gate-change` does not clear them, because a diff with
-  two index entries resolving to one file has no single well-defined checkout and there is
-  nothing for an approval to be an approval of.
+  compared under `fsIdentityKey` — NFD, Unicode FULL case folding, then SimpleFold
+  orbit-minimum — which is the relation APFS implements, verified by creating the files and
+  reading them back. Three weaker versions were exploitable: `strings.ToLower` missed U+017F
+  (`agentſ.md` → `AGENTS.md`), `unicode.SimpleFold` missed the multi-rune full folds
+  (`Makeﬁle` → `Makefile`, the Makefile `.ttorch/validate.sh` executes), and NFD+fold+NFD
+  missed the 172 Cherokee runes where `cases.Fold` swaps the two cases instead of picking one.
+
+  Beyond the name, the guard **refuses outright** any newly introduced tree entry that
+  collides with a different entry in the same tree, and any changed path containing a control
+  character. Entry means blob **or directory**: a blob named `.github/workflowſ` deletes the
+  whole `.github/workflows/` directory from the checkout, and because that breaks no build
+  the validate would otherwise go green against a checkout that is not the tree. Both
+  refusals are blocking — `--allow-gate-change` does not clear them, because a diff with two
+  entries resolving to one path has no single well-defined checkout and there is nothing for
+  an approval to be an approval of. Only collisions the diff *introduces* are reported, so a
+  repo that already contains a colliding pair can still land the rename that fixes it.
 
 - **What that claim does NOT cover**, stated so nobody reads it as wider than it is:
   - Gated means trusted mode or `--require-verdict`. A `local`/`validated` merge without
@@ -213,10 +219,18 @@ invalidates the verdict — re-prep, re-review, re-record.
     for `Overall == pass` and is likewise excluded at 12% (23/196, +16 over the shipped set).
     Both are cost judgements, not oversights.
   - Filesystems whose folding rules differ from Unicode's. `fsIdentityKey` models APFS and
-    NTFS; `TestFSIdentityKeyMatchesTheFilesystem` creates each known colliding pair on the
-    real filesystem and fails if the key disagrees, so the guard is measured against the
-    machine rather than against a reading of the Unicode tables. A filesystem that collapses
-    something Unicode does not would still be missed.
+    NTFS, and `TestFSIdentityKeySweep` measures it against the real filesystem rather than
+    against a reading of the tables. A filesystem that collapses something Unicode does not
+    would still be missed.
+  - Substitutions that never produce two entries in one tree. The collision check detects two
+    entries resolving to one path; that is a narrower claim than "any substitution is
+    observable", which this document wrongly made for two rounds.
+  - Everything here is inside the `gated` branch of the merge, so a `local`/`validated` merge
+    without `--require-verdict` gets none of it — not the name match, not the collision
+    refusal, not the control-character refusal. Same pre-existing hole as the first bullet.
+  - `go.mod` and `go.sum` are not in the covered set on this branch or on step 6, and a
+    `replace` or `toolchain` directive changes what `go test` compiles. Named here so it is
+    not mistaken for coverage; adding it belongs to whoever owns that decision.
   - Git will not tell you. `git clone` warns about a collision; `git worktree add --detach` —
     what the gate uses to build the checkout it validates — exits 0 with nothing on stderr and
     silently drops the losing entry. The gate's own collision check is load-bearing, not a

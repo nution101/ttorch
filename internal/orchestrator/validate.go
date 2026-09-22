@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode"
 
 	"golang.org/x/text/cases"
 	"golang.org/x/text/unicode/norm"
@@ -142,27 +143,63 @@ var gateConfigPrefixes = []string{
 // fsIdentityKey is the key under which two repository paths are THE SAME FILE on a
 // case-insensitive, normalizing filesystem. It is the only path comparison in this guard.
 //
-// It must model what the filesystem does, not what Go's string package makes convenient, and
-// the two are not the same. Two earlier versions of this comparison were exploitable:
+// It must model what the filesystem does, not what a plausible reading of the Unicode tables
+// suggests, and each previous attempt got that wrong in a way that was exploitable:
 //
-//	strings.ToLower   simple LOWERCASING. Missed U+017F (ſ), which folds with 's' but
-//	                  lowercases to itself: "agentſ.md" evaded the guard and overwrote
-//	                  AGENTS.md on checkout.
-//	unicode.SimpleFold single-rune folding. Missed the MULTI-RUNE full folds, which are the
-//	                  ones that reach an ASCII target: U+FB01 (ﬁ) folds to "fi", so "Makeﬁle"
-//	                  evaded the guard and substituted the Makefile the gate itself executes.
-//	                  U+FB06 (ﬆ) → "st" and U+00DF (ß) → "ss" reach internal/inﬆaller/ and
-//	                  any covered path containing a double s the same way.
+//	strings.ToLower    simple LOWERCASING. Missed U+017F (ſ), which folds with 's' but
+//	                   lowercases to itself: "agentſ.md" evaded the guard and overwrote
+//	                   AGENTS.md on checkout.
+//	unicode.SimpleFold single-rune folding. Missed the MULTI-RUNE full folds: U+FB01 (ﬁ)
+//	                   folds to "fi", so "Makeﬁle" substituted the Makefile the gate runs.
+//	NFD+fold+NFD       missed the 172 Cherokee runes, where cases.Fold is an INVOLUTION
+//	                   rather than a canonicalisation — fold(U+13A0)=U+AB70 and
+//	                   fold(U+AB70)=U+13A0, so the two spellings swap and never meet.
 //
-// So: NFD-normalize, apply Unicode FULL case folding, normalize again — the canonical
-// caseless match, which is what APFS compares under. TestFSIdentityKeyMatchesTheFilesystem
-// checks this against the real filesystem by creating both files and seeing whether they
-// collide, rather than against anybody's reading of the tables.
+// The pipeline is NFD, full case folding, then SimpleFold orbit-minimum. The orbit pass runs
+// LAST and is what settles Cherokee: it maps every rune to the lowest code point in its fold
+// orbit, so an involution's two endpoints land on the same one. Running it first instead
+// misses 33 pairs, and folding twice does not help at all — fold(fold(x)) == x is precisely
+// the problem.
+//
+// There is deliberately NO trailing NFD. It was in an earlier version justified as insurance
+// against "folding producing characters that themselves decompose", which is not true of the
+// fold output; and once the orbit pass exists it stops being a no-op and starts being wrong,
+// collapsing 4 measured pairs the filesystem keeps apart. Measured, not reasoned.
+//
+// Measurements behind those claims, all against real APFS by creating both files and reading
+// one back — 16,304 single-rune pairs covering the lower/upper/title/SimpleFold-orbit/NFC/NFD
+// /fold image of every printable rune:
+//
+//	NFD,fold,orbit  (this)    0 misses   0 false positives
+//	NFD,fold,NFD              172 misses (all Cherokee)
+//	fold,NFD,fold             172 misses (the involution cancels)
+//	orbit,NFD,fold,NFD        33 misses
+//	SimpleFold orbit alone    13,328 misses
+//
+// TestFSIdentityKeyMatchesTheFilesystem keeps a bounded version of that sweep in the suite.
 //
 // cases.Caser is documented as possibly stateful and not safe to share, so a Caser is built
 // per call rather than cached in a package var.
 func fsIdentityKey(p string) string {
-	return norm.NFD.String(cases.Fold().String(norm.NFD.String(p)))
+	return orbitMin(cases.Fold().String(norm.NFD.String(p)))
+}
+
+// orbitMin maps every rune to the lowest code point in its Unicode simple-case-folding orbit.
+// It is a canonicalisation, which full folding alone is not: cases.Fold swaps the two Cherokee
+// cases instead of picking one, and walking the orbit to its minimum picks one.
+func orbitMin(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		lowest := r
+		for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+			if f < lowest {
+				lowest = f
+			}
+		}
+		b.WriteRune(lowest)
+	}
+	return b.String()
 }
 
 // matchesGateConfig reports whether a repository path names a gate-definition file. Matching
@@ -204,7 +241,9 @@ func matchesGateConfig(name string) bool {
 // hostilePath reports whether a repo path carries a byte that has no business in a filename
 // and that downstream consumers render verbatim.
 //
-// A C0 control character or DEL is the marker. The audit log is newline-delimited
+// A C0 control character, DEL or a C1 control is the marker. C1 is in because U+0085 NEL is
+// itself a line break and U+009B is CSI, the single-character "ESC [" several terminals
+// accept; no legitimate path carries either. The audit log is newline-delimited
 // (audit.go's "%s %s\n") and the merge record interpolates the matched path into it, so a
 // path containing a literal newline writes a second, well-formed, entirely fabricated
 // trusted-merge line. git's C-quoting used to make that unreachable; reading the file list
@@ -213,7 +252,7 @@ func matchesGateConfig(name string) bool {
 // from reaching a merge at all, that one is the half that protects every other call site.
 func hostilePath(name string) bool {
 	for _, r := range name {
-		if r < 0x20 || r == 0x7f {
+		if isAuditControl(r) {
 			return true
 		}
 	}
@@ -461,12 +500,16 @@ type gateConfigHit struct {
 //     of what either is called. It fires whether or not either path matches the gate set,
 //     because the guard cannot know which entry wins the checkout.
 //
-//     The comparison is against the WHOLE tree, not just the changed list: in the attack only
-//     the new entry is in the diff, so pairwise comparison within the diff sees nothing. It
-//     is keyed on fsIdentityKey, which models the filesystem (full folding + NFD) rather than
-//     mirroring matchesGateConfig — keying the backstop on the same relation as the matcher
-//     would make it blind to exactly what the matcher is blind to, which is what an earlier
-//     version of this function did while its comment claimed otherwise.
+//     The comparison is over the WHOLE tree, and over DIRECTORIES as well as blobs, because a
+//     blob can collide with a covered directory and erase it. It is keyed on fsIdentityKey,
+//     which models the filesystem, rather than mirroring matchesGateConfig — keying the
+//     backstop on the same relation as the matcher makes it blind to exactly what the matcher
+//     is blind to, which an earlier version did while claiming otherwise.
+//
+//     What this is NOT: it is not a guarantee that any substitution is observable. It catches
+//     the case where two entries in ONE tree resolve to one path. It cannot see a substitution
+//     that never produces two entries — and an earlier version of this comment claimed it
+//     could, which was wrong twice over, since it was also blind to directories at the time.
 //
 //  3. A changed path that matches the gate set (matchesGateConfig).
 //
@@ -486,7 +529,7 @@ func diffTouchesGateConfig(repo, base, rev string) (*gateConfigHit, error) {
 			}, nil
 		}
 	}
-	if hit, err := collidesInTree(repo, rev, changed); err != nil || hit != nil {
+	if hit, err := collidesInTree(repo, base, rev); err != nil || hit != nil {
 		return hit, err
 	}
 	for _, n := range changed {
@@ -497,42 +540,98 @@ func diffTouchesGateConfig(repo, base, rev string) (*gateConfigHit, error) {
 	return nil, nil
 }
 
-// collidesInTree reports the first changed path that shares a fold key with a DIFFERENT path
-// in rev's tree. Pairs are reported deterministically (the tree list is sorted before the
-// partner is chosen) so the same diff always produces the same refusal and the same audit
-// line, which matters for a record a human is meant to compare across runs.
+// collidesInTree reports the first NEWLY INTRODUCED filesystem entry in rev's tree that
+// shares an fsIdentityKey with a DIFFERENT entry in the same tree.
 //
-// A pre-existing collision between two paths the diff does not touch is NOT reported: it
-// would block every unrelated merge in the repo forever with no way to land the fix. The
-// attack always introduces its own entry, so it always appears in the changed list.
-func collidesInTree(repo, rev string, changed []string) (*gateConfigHit, error) {
-	if len(changed) == 0 {
-		return nil, nil
-	}
-	tree, err := worktree.TreeFiles(repo, rev)
+// "Entry" means blob OR DIRECTORY, and the directories are the whole point. An earlier
+// version keyed only the blob list from `git ls-tree -r`, where a directory is never an
+// entry, so a blob that collides with a covered DIRECTORY was invisible:
+//
+//	tree:     .github/workflows/ci.yml   .github/workflowſ   main.go
+//	guard:    nil — the blob matches no covered path and no other BLOB
+//	checkout: .github/workflowſ is a 7-byte file; .github/workflows/ is GONE
+//
+// The whole covered directory vanishes from the bytes the gate validates, git warns about
+// nothing, and because a missing .github/workflows/ breaks no Go build the validate then goes
+// green against a checkout that is not the tree — which is the exact outcome running this
+// guard before the validate exists to prevent. content/skills/ and content/agents/ go the
+// same way. The spelling has to sort after the directory's entries for the blob to win, which
+// plain ASCII cannot do ('/' sorts low) but a non-ASCII spelling does for free.
+//
+// So the keyed set is every blob plus every ancestor directory those blobs imply. Git stores
+// no empty trees in a commit, so the implied set is exactly what `ls-tree -r -t` would list;
+// deriving it here rather than asking git keeps the decision inside a covered file.
+//
+// Only entries ABSENT FROM BASE are reported. A repository that already contains a colliding
+// pair would otherwise be unmergeable forever with no flag to clear it and no way to land the
+// rename that fixes it. Restricting to new entries means the guard fires on the diff that
+// INTRODUCES the collision, which is both the attack and the thing a human can act on.
+//
+// Pairs are reported deterministically — entries are sorted before a partner is chosen — so
+// the same diff always yields the same refusal and the same audit line.
+func collidesInTree(repo, base, rev string) (*gateConfigHit, error) {
+	revBlobs, err := worktree.TreeFiles(repo, rev)
 	if err != nil {
 		return nil, err
 	}
-	sort.Strings(tree)
-	byKey := make(map[string][]string, len(tree))
-	for _, p := range tree {
-		k := fsIdentityKey(p)
-		byKey[k] = append(byKey[k], p)
+	if len(revBlobs) == 0 {
+		return nil, nil
 	}
-	for _, n := range changed {
-		for _, other := range byKey[fsIdentityKey(n)] {
-			if other == n {
+	baseBlobs, err := worktree.TreeFiles(repo, base)
+	if err != nil {
+		return nil, err
+	}
+	existing := make(map[string]bool, len(baseBlobs)*2)
+	for _, e := range entriesWithDirs(baseBlobs) {
+		existing[e] = true
+	}
+	entries := entriesWithDirs(revBlobs)
+	sort.Strings(entries)
+	byKey := make(map[string][]string, len(entries))
+	for _, e := range entries {
+		k := fsIdentityKey(e)
+		byKey[k] = append(byKey[k], e)
+	}
+	for _, e := range entries {
+		if existing[e] {
+			continue // already on the default branch; this diff did not introduce it
+		}
+		for _, other := range byKey[fsIdentityKey(e)] {
+			if other == e {
 				continue
 			}
 			return &gateConfigHit{
-				Path: n,
+				Path: e,
 				Reason: fmt.Sprintf("adds %q, which resolves to the same file as %q on a case-insensitive or normalizing filesystem; a checkout writes one over the other and the guard cannot tell which wins",
-					sanitizePathForMessage(n), sanitizePathForMessage(other)),
+					sanitizePathForMessage(e), sanitizePathForMessage(other)),
 				Blocking: true,
 			}, nil
 		}
 	}
 	return nil, nil
+}
+
+// entriesWithDirs expands a blob list into every filesystem entry the tree materializes: the
+// blobs themselves plus every ancestor directory. Deduplicated; order is not meaningful and
+// callers that need determinism sort it.
+func entriesWithDirs(blobs []string) []string {
+	seen := make(map[string]bool, len(blobs)*2)
+	out := make([]string, 0, len(blobs)*2)
+	for _, b := range blobs {
+		if !seen[b] {
+			seen[b] = true
+			out = append(out, b)
+		}
+		for i := strings.LastIndexByte(b, '/'); i > 0; i = strings.LastIndexByte(b, '/') {
+			b = b[:i]
+			if seen[b] {
+				break // this ancestor and all of its own are already recorded
+			}
+			seen[b] = true
+			out = append(out, b)
+		}
+	}
+	return out
 }
 
 // sanitizePathForMessage renders a path safely inside a one-line refusal or audit record,
@@ -548,7 +647,7 @@ func sanitizePathForMessage(name string) string {
 			b.WriteString(`\r`)
 		case r == '\t':
 			b.WriteString(`\t`)
-		case r < 0x20 || r == 0x7f:
+		case isAuditControl(r):
 			fmt.Fprintf(&b, `\x%02x`, r)
 		default:
 			b.WriteRune(r)

@@ -317,13 +317,14 @@ name", which was not true of what the test does.
 ### Why name-matching is not the load-bearing control
 
 Both the matcher and the collision check compare under one function, `fsIdentityKey`: NFD,
-Unicode **full** case folding, NFD again — the canonical caseless match, which is what APFS
-compares under. Two weaker versions of this shipped first, and each was exploitable:
+Unicode **full** case folding, then SimpleFold **orbit-minimum**. Three weaker versions
+shipped first, and each was exploitable:
 
 | version | missed | attack |
 |---|---|---|
 | `strings.ToLower` | simple lowercasing | U+017F `ſ` folds with `s` but lowercases to itself: `agentſ.md` overwrites `AGENTS.md`, which sets delivery-mode |
 | `unicode.SimpleFold` | multi-rune FULL folds | U+FB01 `ﬁ` folds to `fi`: `Makeﬁle` substitutes the `Makefile` that `.ttorch/validate.sh` executes |
+| NFD + fold + NFD | the 172 Cherokee runes | `cases.Fold` is an **involution** there — `fold(U+13A0)=U+AB70` and `fold(U+AB70)=U+13A0` — so the two spellings swap and never meet |
 
 The second is worse than the first. `Makefile` is in the covered set *because* the validate
 script does nothing but run `make lint` and `make test-fast`, so an attacker who substitutes
@@ -333,23 +334,65 @@ reaches `internal/inﬆaller/` and `internal/orcheﬆrator/gate.go` the same way
 
 Folding correctly fixes those spellings. It does not fix the class, because the attacker picks
 the spelling and the guard would otherwise have to anticipate every collapse rule of every
-filesystem. So the guard also refuses **any changed path that collides with a different path
-in the resulting tree**, whether or not either one is in the covered set. The attack always
-needs two index entries resolving to one file, and that is observable without recognising
-either name — provided the collision key models the filesystem rather than mirroring the
-matcher. An earlier version keyed it on the same relation the matcher used, which made the
-backstop blind to exactly what the matcher was blind to while its comment claimed the
-opposite.
+filesystem. So the guard also refuses **any newly introduced tree entry that collides with a
+different entry in the same tree**, whether or not either one is in the covered set. An
+earlier version keyed that on the same relation the matcher used, which made the backstop
+blind to exactly what the matcher was blind to while its comment claimed the opposite.
+
+"Entry" means blob **or directory**, and the directories are load-bearing. `git ls-tree -r`
+lists blobs; a directory is never an entry, so an earlier version could not see this:
+
+```
+tree:     .github/workflows/ci.yml   .github/workflowſ   main.go
+guard:    nil — matches no covered path, and no other BLOB
+checkout: .github/workflowſ is a 7-byte file; .github/workflows/ is GONE
+```
+
+The whole covered directory vanishes from the bytes the gate validates, git warns about
+nothing, and since a missing `.github/workflows/` breaks no Go build the validate then goes
+green against a checkout that is not the tree — the exact outcome that running the guard
+before the validate exists to prevent. `content/skills/`, `content/agents/` and
+`internal/installer/` go the same way. The hostile spelling has to sort after the directory's
+own entries to win the checkout, which plain ASCII cannot do (`/` sorts below every letter)
+but a non-ASCII spelling does for free. The keyed set is therefore every blob plus every
+ancestor directory those blobs imply.
+
+Two limits, stated because an earlier version of this paragraph overstated it. It claimed
+"the attack always needs two entries landing on one file, and that is observable regardless of
+what either is called". The second half was false while the check was blind to directories,
+and the general claim is still too strong: what the check detects is two entries in ONE tree
+resolving to one path, and a substitution that never produces two entries is invisible to it.
 
 A collision, and a control character in a path, are **blocking**: no approval clears them,
 `--allow-gate-change` included. A gate change is a legitimate act that needs naming; a diff
 whose checkout is not well-defined is not a change to anything, and offering a flag for it
 would turn the attack into a formality a lead can wave through.
 
-This is measured, not reasoned. `TestFSIdentityKeyMatchesTheFilesystem` creates each known
-colliding pair on the real filesystem, reads one back to see whether they became one file, and
-fails if `fsIdentityKey` disagrees. Both previous rounds were lost to reasoning about Unicode
-tables instead of asking the machine.
+The ordering was settled by measurement, not by reading the tables. Every printable rune was
+turned into pairs with its lower/upper/title/SimpleFold-orbit/NFC/NFD/fold images, and each
+pair was created on real APFS and read back:
+
+| pipeline | misses | false positives |
+|---|---|---|
+| **NFD, fold, orbit** (shipped) | **0** | **0** |
+| NFD, fold, NFD | 172 (all Cherokee) | 0 |
+| fold, NFD, fold | 172 (the involution cancels) | 0 |
+| orbit, NFD, fold, NFD | 33 | 0 |
+| SimpleFold orbit alone | 13,328 | 0 |
+
+16,304 pairs. The orbit pass must run **last**: it is what settles an involution, by walking
+to the orbit's lowest code point so both endpoints land on one key. Folding twice does not
+help, because `fold(fold(x)) == x` is the problem itself.
+
+There is deliberately **no trailing NFD**. An earlier version had one, justified as insurance
+against folding producing characters that themselves decompose — which is not true of the fold
+output, and once the orbit pass exists the trailing NFD stops being a no-op and starts being
+wrong: it collapses 4 measured pairs the filesystem keeps apart and catches nothing extra.
+
+`TestFSIdentityKeySweep` keeps a bounded version of that sweep in the suite (~2,400 pairs,
+including the whole Cherokee block) and `TestFSIdentityKeyMatchesTheFilesystem` keeps the hand
+table. Three rounds of this work were lost to reasoning about Unicode instead of asking the
+machine, so the tests ask the machine.
 
 The full folding and normalization come from `golang.org/x/text` (`cases.Fold`, `unicode/norm`),
 a new direct dependency. It is a real cost — a `golang.org/x` module in the gate's own path,
@@ -358,11 +401,17 @@ hand-rolling the CaseFolding full mappings, which is a bounded table, plus NFD, 
 and a hand-rolled Unicode table in a security control going quietly stale against a new
 Unicode revision is the exact failure this section already documents twice.
 
-The comparison is against the whole tree rather than the changed list, because in the attack
-only the new entry is in the diff — `AGENTS.md` is untouched, so comparing changed paths
-against each other sees one path and nothing to pair it with. A collision between two paths
-the diff does not touch is deliberately not reported: it would block every unrelated merge in
-the repo with no way to land the fix.
+The comparison is over the whole tree rather than the changed list, because in the attack only
+the new entry is in the diff — `AGENTS.md` is untouched, so comparing changed paths against
+each other sees one path and nothing to pair it with. Only entries **absent from the base
+tree** are reported: a repository that already contains a colliding pair would otherwise be
+unmergeable forever, with no flag to clear it and no way to land the rename that fixes it. So
+the guard fires on the diff that INTRODUCES the collision, which is both the attack and the
+thing a human can act on. That is also the answer to the false-positive worry on a
+case-sensitive filesystem, where `AUTHORS` and `authors` really are two files: an existing
+pair never blocks, and a diff that newly introduces one is producing a tree that cannot be
+checked out correctly on macOS or Windows at all. There is deliberately no `runtime.GOOS`
+gate.
 
 Git will not do this for you. `git clone` prints "the following paths have collided";
 `git worktree add --detach`, which is what the gate uses to materialize the checkout it
@@ -385,7 +434,12 @@ echo it back, ANSI escapes included, while exiting 0 — so `worktree.warnf` esc
 bytes before printing, and the escaped form is what goes into `ErrPathCollision` too.
 
 Both sinks were chosen over per-call-site escaping for the same reason: every caller shares the
-exposure and no caller can be relied on to remember.
+exposure and no caller can be relied on to remember. `worktree.git`, the most-used wrapper in
+that file, escapes its error text on the same argument — no worker-controlled route into a
+`git()` argument is known, so what that closes is the asymmetry rather than a demonstrated
+exploit. All three escapers cover C1 (U+0080–U+009F) as well as C0 and DEL, because U+009B is
+CSI, the single-character form of `ESC [` that several terminals accept, and U+0085 NEL is a
+line break in its own right.
 
 An earlier `TestGateConfigPathsAreASCII` claimed the covered set was safe because "ASCII has no
 decomposed form and no multi-character fold". That is true in one direction only — an ASCII

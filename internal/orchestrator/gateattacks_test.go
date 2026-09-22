@@ -347,3 +347,131 @@ func TestGateGuard_FullFoldMakefileSubstitution(t *testing.T) {
 		t.Log("the clean-worktree check refused first on this filesystem; the guard's blocking refusal is covered by the diffTouchesGateConfig assertions above")
 	}
 }
+
+// TestGateGuard_BlobErasesCoveredDirectory is the round-4 attack: a blob that fold-collides
+// with a covered DIRECTORY deletes the whole directory from the checkout.
+//
+// `git ls-tree -r` lists blobs; a directory is never an entry. So a collision check keyed on
+// that list could not see ".github/workflowſ" colliding with ".github/workflows/", the guard
+// returned nil, and the checkout contained a 7-byte file where the directory had been. git
+// warned about nothing.
+//
+// .github/workflows/ is the cleanest payload of the three because its absence breaks no Go
+// build: `go build ./... && go test ./...` still passes, so the validate goes GREEN against a
+// checkout that is not the tree. Running the guard before the validate only helps if the
+// guard can see the substitution.
+//
+// The spelling has to sort after the directory's own entries for the blob to win the
+// checkout. Plain ASCII cannot do that ('/' sorts below every letter, so "internal/revieW"
+// loses); a non-ASCII spelling does it for free, which is why these are the live ones.
+func TestGateGuard_BlobErasesCoveredDirectory(t *testing.T) {
+	for _, tc := range []struct{ dir, blob, why string }{
+		{".github/workflows", ".github/workflowſ", "the CI workflows: absent, the Go build still passes and validate goes green"},
+		{"content/skills", "content/skillſ", "the gate's own reviewer and manager instructions"},
+		{"internal/installer", "internal/inﬆaller", "the mapping that decides which embedded file becomes which installed reviewer"},
+		{"content/agents", "content/agentſ", "the directory holding the reviewer definitions"},
+	} {
+		t.Run(tc.dir, func(t *testing.T) {
+			m, repo := deliveryHarness(t, "direras")
+			commitGateScript(t, repo, "exit 0")
+			if _, err := projectinit.Init(repo, "trusted"); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Join(repo, filepath.FromSlash(tc.dir)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(repo, filepath.FromSlash(tc.dir), "real.yml"), []byte("name: ci\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			gitIn(t, repo, "add", "-A")
+			gitIn(t, repo, "commit", "-q", "-m", "add "+tc.dir)
+
+			task, err := m.Spawn("de1", repo, false, "sleep 60")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _, _ = m.Teardown("de1", true) }()
+			wt := task.Worktree
+			if err := os.WriteFile(filepath.Join(wt, "h.tmp"), []byte("HOSTILE"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			blob := gitIn(t, wt, "hash-object", "-w", "h.tmp")
+			if err := os.Remove(filepath.Join(wt, "h.tmp")); err != nil {
+				t.Fatal(err)
+			}
+			gitIn(t, wt, "update-index", "--add", "--cacheinfo", "100644,"+blob+","+tc.blob)
+			gitIn(t, wt, "commit", "-q", "-m", "unrelated tweak")
+			head := gitIn(t, wt, "rev-parse", "HEAD")
+
+			// Setup assertions, because getting these wrong LOOKS like a security hole. The
+			// blob must actually fold onto the directory — not every name is reachable, since
+			// a long-s spells 's' and "internal/review" contains no 's' — and it must not
+			// match the covered set by its own name, or this proves nothing about directories.
+			if fsIdentityKey(tc.blob) != fsIdentityKey(tc.dir) {
+				t.Fatalf("setup: %q does not fold onto %q, so it is not this attack", tc.blob, tc.dir)
+			}
+			if matchesGateConfig(tc.blob) {
+				t.Fatalf("setup: %q must not match the covered set by name", tc.blob)
+			}
+
+			hit, err := diffTouchesGateConfig(repo, worktree.DefaultBranch(repo), head)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if hit == nil {
+				t.Fatalf("%s: a blob erasing the %s directory must not pass the guard", tc.why, tc.dir)
+			}
+			if !hit.Blocking {
+				t.Fatal("erasing a directory must be BLOCKING; no flag can make the checkout well-defined")
+			}
+			if !strings.Contains(hit.Reason, tc.dir) {
+				t.Fatalf("the refusal must name the directory being erased, got: %s", hit.Reason)
+			}
+		})
+	}
+}
+
+// TestGateGuard_PreExistingCollisionDoesNotBlock is the false-positive bound on all of the
+// above, and it is what keeps "blocking, no flag clears it" from being a trap.
+//
+// The guard reports only entries the diff INTRODUCES. A repository that already contains a
+// colliding pair — which on a case-sensitive filesystem is legal, if unwise, and which no
+// flag could clear — would otherwise be unmergeable forever, including for the rename that
+// fixes it. Here the pair exists on the default branch already and an ordinary change on top
+// still merges.
+func TestGateGuard_PreExistingCollisionDoesNotBlock(t *testing.T) {
+	m, repo := deliveryHarness(t, "preexist")
+	commitGateScript(t, repo, "exit 0")
+	if _, err := projectinit.Init(repo, "trusted"); err != nil {
+		t.Fatal(err)
+	}
+	// Both halves of a colliding pair land on the DEFAULT branch first.
+	if err := os.WriteFile(filepath.Join(repo, "notes.txt"), []byte("real\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "-A")
+	blob := gitIn(t, repo, "hash-object", "-w", "notes.txt")
+	gitIn(t, repo, "update-index", "--add", "--cacheinfo", "100644,"+blob+",NOTES.txt")
+	gitIn(t, repo, "commit", "-q", "-m", "a repo that already collides")
+
+	task, err := m.Spawn("pe1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = m.Teardown("pe1", true) }()
+	wt := task.Worktree
+	if err := os.WriteFile(filepath.Join(wt, "feature.txt"), []byte("ordinary work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, wt, "add", "feature.txt")
+	gitIn(t, wt, "commit", "-q", "-m", "ordinary change")
+	head := gitIn(t, wt, "rev-parse", "HEAD")
+
+	hit, err := diffTouchesGateConfig(repo, worktree.DefaultBranch(repo), head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hit != nil {
+		t.Fatalf("a collision already on the default branch must not block unrelated work, or the repo can never land the rename that fixes it; got: %s", hit.Reason)
+	}
+}

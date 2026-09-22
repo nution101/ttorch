@@ -21,11 +21,24 @@ import (
 	"encoding/hex"
 )
 
+// git runs a git command and returns its combined output, trimmed. The ERROR text is escaped
+// because it ends up in a CLI message on the lead's terminal and carries git's own stderr,
+// which echoes back committed filenames and .gitattributes lines — attacker-controlled bytes,
+// ANSI escape sequences included, which a terminal executes. checkedGitRaw and warnf were
+// fixed for this first; leaving the most-used wrapper in the file unescaped would rest on
+// every caller remembering which one they used, and the reason for fixing at a sink is that
+// they will not. No worker-controlled route into a git() argument is known today; this closes
+// the asymmetry rather than a demonstrated exploit.
+//
+// The returned VALUE is left verbatim: callers parse it, and escaping would corrupt the data.
 func git(args ...string) (string, error) {
 	out, err := exec.Command("git", args...).CombinedOutput()
 	s := strings.TrimSpace(string(out))
 	if err != nil {
-		return s, fmt.Errorf("git %s: %v: %s", strings.Join(args, " "), err, s)
+		// The ARGS are escaped as well as the output. git sanitizes its own stderr, but the
+		// command line is echoed back verbatim, so a ref or path with an escape sequence in
+		// it reaches the terminal through the args half instead.
+		return s, fmt.Errorf("git %s: %v: %s", escapeForTerminal(strings.Join(args, " ")), err, escapeForTerminal(s))
 	}
 	return s, nil
 }
@@ -45,11 +58,16 @@ var warnf = func(format string, args ...any) {
 	fmt.Fprintln(os.Stderr, "ttorch: "+escapeForTerminal(fmt.Sprintf(format, args...)))
 }
 
-// escapeForTerminal renders untrusted text safe to print: every C0 control character and DEL
-// becomes a visible escape, so ESC (the lead byte of every ANSI sequence), CR (which rewrites
-// the current line) and LF (which fabricates a second line) are shown rather than obeyed.
+// escapeForTerminal renders untrusted text safe to print: every C0 control character, DEL and
+// C1 control becomes a visible escape, so ESC (the lead byte of every ANSI sequence), CR
+// (which rewrites the current line) and LF (which fabricates a second line) are shown rather
+// than obeyed.
+//
+// C1 (U+0080–U+009F) is included because U+009B is CSI — the single-character form of "ESC [",
+// which several terminals accept, so escaping ESC alone leaves a second door into the same
+// sequences. U+0085 NEL is a line break in its own right.
 func escapeForTerminal(s string) string {
-	if strings.IndexFunc(s, func(r rune) bool { return r < 0x20 || r == 0x7f }) < 0 {
+	if strings.IndexFunc(s, isControl) < 0 {
 		return s
 	}
 	var b strings.Builder
@@ -64,13 +82,19 @@ func escapeForTerminal(s string) string {
 			b.WriteString(`\t`)
 		case r == 0x1b:
 			b.WriteString(`\e`)
-		case r < 0x20 || r == 0x7f:
+		case isControl(r):
 			fmt.Fprintf(&b, `\x%02x`, r)
 		default:
 			b.WriteRune(r)
 		}
 	}
 	return b.String()
+}
+
+// isControl reports whether r is a C0 control, DEL, or a C1 control — the code points that
+// a terminal acts on rather than displays, and that a line-delimited log cannot carry.
+func isControl(r rune) bool {
+	return r < 0x20 || (r >= 0x7f && r <= 0x9f)
 }
 
 // RepoRoot returns the top-level directory of the git repo containing dir.
@@ -551,10 +575,10 @@ func gitRaw(args ...string) (stdout, stderr string, err error) {
 	stderr = errBuf.String()
 	if err != nil {
 		if msg := strings.TrimSpace(stderr); msg != "" {
-			// Escaped: this text ends up in a CLI error the lead reads on a terminal.
-			return "", stderr, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, escapeForTerminal(msg))
+			// Escaped, args included: this text ends up in a CLI error on a terminal.
+			return "", stderr, fmt.Errorf("git %s: %w: %s", escapeForTerminal(strings.Join(args, " ")), err, escapeForTerminal(msg))
 		}
-		return "", stderr, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+		return "", stderr, fmt.Errorf("git %s: %w", escapeForTerminal(strings.Join(args, " ")), err)
 	}
 	return string(out), stderr, nil
 }
@@ -569,7 +593,7 @@ func checkedGitRaw(args ...string) (string, error) {
 	}
 	if msg := strings.TrimSpace(stderr); msg != "" {
 		if collisionWarning(msg) {
-			return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), ErrPathCollision, escapeForTerminal(msg))
+			return "", fmt.Errorf("git %s: %w: %s", escapeForTerminal(strings.Join(args, " ")), ErrPathCollision, escapeForTerminal(msg))
 		}
 		warnf("git %s: %s", strings.Join(args, " "), msg)
 	}

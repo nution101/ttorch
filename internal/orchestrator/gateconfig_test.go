@@ -6,9 +6,14 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
+	"unicode"
+
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/nution101/ttorch/internal/approval"
 	"github.com/nution101/ttorch/internal/projectinit"
@@ -38,7 +43,8 @@ var decidingFunctions = []string{
 	// the audit record a trusted merge refuses to proceed without
 	"writeAudit", "sanitizeAuditLine",
 	// the path-spelling and collision controls the guard rests on
-	"fsIdentityKey", "hostilePath", "collidesInTree", "sanitizePathForMessage",
+	"fsIdentityKey", "orbitMin", "hostilePath", "collidesInTree", "entriesWithDirs",
+	"sanitizePathForMessage", "isAuditControl",
 }
 
 // nonDecidingFiles are the files in this package that have been LOOKED AT and judged not to
@@ -343,6 +349,7 @@ var collidingPairs = []struct {
 	{"installer.txt", "in\ufb06aller.txt", "U+FB06 st ligature: full fold to \"st\""},
 	{"ass.txt", "a\u00df.txt", "U+00DF sharp s: full fold to \"ss\""},
 	{"cafe\u0301.md", "caf\u00e9.md", "NFD vs NFC of the same name"},
+	{"\u13a0.txt", "\uab70.txt", "U+13A0/U+AB70 Cherokee: cases.Fold SWAPS these rather than canonicalising, so folding alone never makes them meet"},
 }
 
 // distinctPairs must NOT share a key. Folding and normalizing widen the relation, and a key
@@ -387,6 +394,102 @@ func TestFSIdentityKeyMatchesTheFilesystem(t *testing.T) {
 		if fsIdentityKey(p[0]) == fsIdentityKey(p[1]) {
 			t.Errorf("fsIdentityKey collapses %q and %q, which are different files; the key is too wide and would refuse ordinary merges", p[0], p[1])
 		}
+	}
+}
+
+// TestFSIdentityKeySweep is a bounded version of the sweep that settled the pipeline order: a
+// sample of runes, each turned into a pair with its lower/upper/title/fold/NFC/NFD/orbit image
+// and checked against the filesystem. The full version covered every printable rune —
+// 16,304 pairs, 0 misses, 0 false positives — and is what the ordering in fsIdentityKey's
+// comment is based on. This keeps a representative slice of it in the suite, including the
+// Cherokee block, at a cost of a few thousand file creations rather than sixteen.
+func TestFSIdentityKeySweep(t *testing.T) {
+	skipIfShort(t)
+	dir := t.TempDir()
+	if !caseFoldingDir(t, dir) {
+		t.Skip("case-sensitive filesystem: nothing folds, so there is nothing to agree with")
+	}
+	// Every 7th printable rune through the BMP, plus the whole Cherokee range, which is
+	// where cases.Fold stops being a canonicalisation and where the last regression lived.
+	var runes []rune
+	for r := rune(0x20); r <= 0xFFFF; r += 7 {
+		runes = append(runes, r)
+	}
+	for r := rune(0x13A0); r <= 0x13F5; r++ {
+		runes = append(runes, r)
+	}
+	for r := rune(0xAB70); r <= 0xABBF; r++ {
+		runes = append(runes, r)
+	}
+	for _, r := range []rune{0x017F, 0x212A, 0xFB01, 0xFB06, 0x00DF, 0x0130, 0x1E9E} {
+		runes = append(runes, r)
+	}
+	var pairs, misses, falsePos int
+	for _, r := range runes {
+		if !unicode.IsPrint(r) || (r >= 0xD800 && r <= 0xDFFF) {
+			continue
+		}
+		base := string(r)
+		for _, c := range foldImages(base) {
+			if c == base || c == "" || strings.ContainsAny(c, "/\x00") {
+				continue
+			}
+			a, b := "x"+base+".t", "x"+c+".t"
+			pairs++
+			fs := filesCollide(t, dir, a, b)
+			same := fsIdentityKey(a) == fsIdentityKey(b)
+			switch {
+			case fs && !same:
+				misses++
+				t.Errorf("MISS U+%04X: the filesystem resolves %q and %q to one file, fsIdentityKey does not", r, a, b)
+			case !fs && same:
+				falsePos++
+				t.Errorf("FALSE POSITIVE U+%04X: fsIdentityKey collapses %q and %q, the filesystem keeps them apart", r, a, b)
+			}
+		}
+	}
+	if pairs < 1500 {
+		t.Fatalf("the sweep only produced %d pairs; it is not covering anything", pairs)
+	}
+	t.Logf("%d pairs created and stat'd: %d misses, %d false positives", pairs, misses, falsePos)
+}
+
+// foldImages returns the spellings a filesystem might consider equal to s.
+func foldImages(s string) []string {
+	out := map[string]bool{
+		strings.ToLower(s): true, strings.ToUpper(s): true, strings.ToTitle(s): true,
+		norm.NFC.String(s): true, norm.NFD.String(s): true,
+		cases.Fold().String(s): true,
+	}
+	for _, r := range s {
+		for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+			out[string(f)] = true
+		}
+	}
+	keys := make([]string, 0, len(out))
+	for k := range out {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// TestEntriesWithDirs pins the expansion the directory-collision check depends on.
+func TestEntriesWithDirs(t *testing.T) {
+	got := entriesWithDirs([]string{".github/workflows/ci.yml", "main.go", "a/b/c/d.txt", "a/b/e.txt"})
+	sort.Strings(got)
+	want := []string{".github", ".github/workflows", ".github/workflows/ci.yml",
+		"a", "a/b", "a/b/c", "a/b/c/d.txt", "a/b/e.txt", "main.go"}
+	if len(got) != len(want) {
+		t.Fatalf("entriesWithDirs = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("entriesWithDirs = %q, want %q", got, want)
+		}
+	}
+	if n := len(entriesWithDirs(nil)); n != 0 {
+		t.Errorf("entriesWithDirs(nil) returned %d entries", n)
 	}
 }
 
