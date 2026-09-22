@@ -38,7 +38,11 @@ const (
 	childFlag = "-proc-test-child"
 	binEnv    = "TTORCH_PROC_TEST_BIN"  // this test binary, for the shell to fork
 	stopEnv   = "TTORCH_PROC_TEST_STOP" // the stop file every fixture process watches
-	lockEnv   = "TTORCH_PROC_TEST_LOCK" // the child holds a lock on this for its whole life
+	// escapedEnv is where a child that leaves the process group says so. The escape test
+	// needs the child to have setsid'd BEFORE the kill fires, and the lock says only that
+	// the child started: it is created before setsid, not after.
+	escapedEnv = "TTORCH_PROC_TEST_ESCAPED"
+	lockEnv    = "TTORCH_PROC_TEST_LOCK" // the child holds a lock on this for its whole life
 )
 
 // childPoll is how often a fixture process checks for the stop file.
@@ -75,6 +79,11 @@ func runChild(v string) int {
 		if _, err := syscall.Setsid(); err != nil {
 			return 4
 		}
+		if p := os.Getenv(escapedEnv); p != "" {
+			if err := os.WriteFile(p, []byte("escaped\n"), 0o644); err != nil {
+				return 7
+			}
+		}
 		v = rest
 	}
 	parts := strings.SplitN(v, " ", 2)
@@ -103,7 +112,7 @@ func runChild(v string) int {
 // The shell blocks in a loop over the stop file rather than in sleep(1), so cleanup can end
 // it without signalling anything; the loop is bounded so that a test binary killed before
 // its cleanup runs still leaves nothing behind for longer than the old sleep did.
-func hangingCommand(t *testing.T, ctx context.Context, marker string, wait time.Duration, opts ...string) (*bytes.Buffer, func() error) {
+func hangingCommand(t *testing.T, ctx context.Context, marker string, wait time.Duration, opts ...string) (*bytes.Buffer, string, func() error) {
 	t.Helper()
 	self, err := os.Executable()
 	if err != nil {
@@ -112,6 +121,7 @@ func hangingCommand(t *testing.T, ctx context.Context, marker string, wait time.
 	dir := t.TempDir()
 	stop := filepath.Join(dir, "stop")
 	lock := filepath.Join(dir, "child.lock")
+	escaped := filepath.Join(dir, "escaped")
 
 	// The binary path reaches the shell through the environment, never interpolated into
 	// the script: sh expands $ and backtick inside double quotes, and %q does not escape
@@ -128,12 +138,13 @@ done`
 		binEnv+"="+self,
 		stopEnv+"="+stop,
 		lockEnv+"="+lock,
+		escapedEnv+"="+escaped,
 	)
 	var out bytes.Buffer
 	c.Stdout = &out
 	c.Stderr = &out
 	t.Cleanup(func() { reapFixture(t, stop, lock) })
-	return &out, func() error { return Run(c) }
+	return &out, escaped, func() error { return Run(c) }
 }
 
 // specEnv carries the child's spec to the shell, which passes it on as the childFlag
@@ -198,7 +209,7 @@ func TestCommandKillsTheWholeGroupOnDeadline(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "child-survived")
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	_, run := hangingCommand(t, ctx, marker, time.Second)
+	_, _, run := hangingCommand(t, ctx, marker, time.Second)
 
 	done := make(chan error, 1)
 	start := time.Now()
@@ -239,35 +250,56 @@ func TestCommandKillsTheWholeGroupOnDeadline(t *testing.T) {
 // caller, which is all WaitDelay promises; cleanup is what ends the child, and it proves it.
 func TestWaitDelayReleasesTheCallerWhenAChildEscapesTheGroup(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "child-survived")
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	// Cancelled by hand rather than by a short deadline, once the child has confirmed it
+	// left the group. os/exec treats the two identically, and the confirmation is the
+	// point: with a 300ms deadline the child had to re-exec this binary and call setsid
+	// inside 300ms, which a -race build does not always manage, and the kill then caught
+	// it in the group and the test asserted nothing.
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	// The escaped child must hold the pipe for far longer than WaitDelay. An earlier
 	// version had it wait 3s, so with WaitDelay removed Run still returned when the child
 	// finished of its own accord, and the test passed against the mutant it exists to catch.
 	const holdsPipeFor = 30 * time.Second
-	_, run := hangingCommand(t, ctx, marker, holdsPipeFor, "setsid ")
+	_, escaped, run := hangingCommand(t, ctx, marker, holdsPipeFor, "setsid ")
 
 	done := make(chan error, 1)
-	start := time.Now()
 	go func() { done <- run() }()
+	waitForFile(t, escaped, 20*time.Second, "the child never left the process group, so this would assert nothing")
+
+	start := time.Now()
+	cancel()
 	select {
 	case err := <-done:
 		if err == nil {
-			t.Fatal("want an error when the deadline fires")
+			t.Fatal("want an error when the context is cancelled")
 		}
 		if errors.Is(err, ErrDisarmed) {
 			t.Fatalf("the fixture never ran, so this asserted nothing: %v", err)
 		}
 		el := time.Since(start)
 		if el > WaitDelay+5*time.Second {
-			t.Fatalf("Run took %s to return on a 300ms deadline with a %s wait delay", el, WaitDelay)
+			t.Fatalf("Run took %s to return after cancellation with a %s wait delay", el, WaitDelay)
 		}
 		if el < WaitDelay {
 			t.Fatalf("Run returned in %s, before the %s wait delay: the child was reaped after all, so this is no longer testing the backstop", el, WaitDelay)
 		}
 	case <-time.After(20 * time.Second):
-		t.Fatalf("Run did not return 20s after a 300ms deadline: a child that left the process group holds the pipe, and nothing capped the wait on it")
+		t.Fatalf("Run did not return 20s after cancellation: a child that left the process group holds the pipe, and nothing capped the wait on it")
 	}
+}
+
+// waitForFile blocks until path exists, and fails the test with why it mattered if it never
+// does.
+func waitForFile(t *testing.T, path string, within time.Duration, why string) {
+	t.Helper()
+	for deadline := time.Now().Add(within); time.Now().Before(deadline); {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("%s did not appear within %s: %s", filepath.Base(path), within, why)
 }
 
 // The ordinary path must be untouched: output is captured and the exit status is the
