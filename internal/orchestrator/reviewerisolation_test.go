@@ -182,31 +182,52 @@ func TestReviewWorkspace_BareMirrorServesTheSource(t *testing.T) {
 	}
 }
 
-// TestReviewerCwd_UnpilotedDimensionsStayInTheWorktree records that this is a pilot on ONE
-// dimension. Correctness and scope still run in the worker's worktree and are still exposed to
-// committed harness config; the evidence says so in those words, and this test stops the scope
-// of the pilot drifting silently in either direction.
-func TestReviewerCwd_UnpilotedDimensionsStayInTheWorktree(t *testing.T) {
+// TestReviewerCwd_EveryDimensionRunsOutsideTheWorktree replaces the test that recorded the
+// pilot's scope. That test asserted correctness and scope still ran inside the worker's tree,
+// which was true and was the hole: a committed Stop hook executes as the lead in any session
+// launched there with permissions skipped, and from those two sessions it can write the
+// security report and kill the isolated reviewer's window. A report already pinned to head
+// makes the dispatch loop skip that dimension forever after, so isolating one dimension while
+// two others can forge its report isolates nothing.
+//
+// Every dispatched dimension now runs in its own scratch workspace against a bare mirror.
+func TestReviewerCwd_EveryDimensionRunsOutsideTheWorktree(t *testing.T) {
 	m, repo, wt := trustHarness(t, "iso3", "trusted", "exit 0")
 	inputsDir := m.P.ReviewInputsDir("iso3")
 	head := plantHostileHarnessConfig(t, wt, inputsDir)
 	if _, err := m.TrustPrep("iso3"); err != nil {
 		t.Fatal(err)
 	}
-	for _, dim := range []string{review.DimensionCorrectness, review.DimensionScope} {
+	seen := map[string]bool{}
+	for _, dim := range []string{review.DimensionCorrectness, review.DimensionScope, review.DimensionSecurity} {
 		cwd, bare, err := m.reviewerCwd("iso3", dim, inputsDir, repo, wt, head)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if cwd != wt || bare != "" {
-			t.Fatalf("%s is not part of the pilot: cwd = %q bare = %q, want the worktree and no mirror", dim, cwd, bare)
+		if cwd == wt || bare == "" {
+			t.Fatalf("%s still runs in the worker's tree: cwd = %q bare = %q", dim, cwd, bare)
+		}
+		if rel, err := filepath.Rel(wt, cwd); err == nil && !strings.HasPrefix(rel, "..") {
+			t.Fatalf("%s runs under the worker's tree at %q, so the tree's config is still on its path", dim, cwd)
+		}
+		// One workspace per dimension, or two reviewers share a mirror and the episode
+		// teardown of one pulls the ground from under the other.
+		if seen[cwd] {
+			t.Fatalf("%s shares a workspace with another dimension: %q", dim, cwd)
+		}
+		seen[cwd] = true
+		// No checkout of the worker's harness config may exist anywhere under the cwd.
+		if _, err := os.Stat(filepath.Join(cwd, ".claude")); !os.IsNotExist(err) {
+			t.Fatalf("%s: a checkout of the worker's .claude/ exists under its cwd: %v", dim, err)
 		}
 		rp, err := review.InputPath(inputsDir, dim, review.ReportSuffix)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := reviewerBrief("iso3", dim, inputsDir, head, rp, bare); strings.Contains(got, "no working tree here") {
-			t.Fatalf("%s runs in a worktree, so its brief must not teach the bare-mirror read path", dim)
+		// Having taken the working tree away, the brief has to replace it for every
+		// dimension, not just the one that was piloted.
+		if got := reviewerBrief("iso3", dim, inputsDir, head, rp, bare); !strings.Contains(got, "no working tree here") {
+			t.Fatalf("%s has no working tree, so its brief must teach the bare-mirror read path", dim)
 		}
 	}
 }

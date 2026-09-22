@@ -1574,33 +1574,36 @@ func (m *Manager) Gateable(repo string) bool {
 	return projectinit.ReadMode(repo) == "trusted"
 }
 
-// isolatedReviewDimensions names the review dimensions whose reviewer session runs OUTSIDE the
-// worker's worktree, in a scratch workspace holding the staged diff and a BARE mirror of the
-// repo.
+// EVERY dispatched reviewer runs OUTSIDE the worker's worktree, in a scratch workspace holding
+// the staged diff and a BARE mirror of the repo. reviewerCwd is where that happens; this note
+// is why it applies to all of them rather than to a list.
 //
 // Everything a Claude session resolves from its cwd is content the worker can commit: project
 // .claude/settings.json hooks, project .claude/agents/ definitions that outrank the installed
-// ones, CLAUDE.md. Guarding those paths in the diff is the move that has not converged across
-// four review rounds, because each round found a resolver the previous list did not know
-// about. Moving the session's cwd out of the tree stops the enumeration instead of extending
-// it: it no longer matters what config a worker commits, because no reviewer session is ever
-// inside the tree that defines it.
+// ones, CLAUDE.md. Guarding those paths in the diff is the move that never converged, because
+// each review round found a resolver the previous list did not know about. Moving the cwd out
+// of the tree stops the enumeration instead of extending it.
 //
-// This is a PILOT on one dimension rather than the whole set, because it has a real cost: the
-// reviewer loses ripgrep over a working tree and reads surrounding source through
-// `git -C <bare> show` and `git grep <tree-ish>` instead, which the brief spells out. Security
-// is the dimension piloted, for two reasons. A forged empty report damages it most, since its
-// absence lets a vulnerability through rather than a style slip. And it is the one the attack
-// was demonstrated against: a committed .claude/settings.json Stop hook fires for a session
-// launched with permissions skipped whose cwd is the repo, and overwrites the report the
-// reviewer just wrote; run from a scratch directory outside the tree, the same hook does not
-// fire. Correctness and scope keep running in the worktree until the pilot's review quality
-// has been measured.
+// This was a pilot on security alone, on the reasoning that a forged empty report damages that
+// dimension most and the cost of losing ripgrep over a working tree should be measured on one
+// dimension first. The pilot's scope was the hole. Correctness and scope still launched with
+// cwd = the worktree under `claude --dangerously-skip-permissions`, so a committed Stop hook
+// executed as the lead inside those two sessions, and from there could write the security
+// report and kill the isolated reviewer's window. A report already pinned to head makes the
+// dispatch loop skip that dimension on every later tick, so the isolated reviewer never runs
+// again. The worker's own session is usually gone by gate time, which means the GATE is what
+// re-executes the worker's committed configuration. Isolating one dimension while two others
+// can write its report is not isolation.
 //
-// It does not cover the skill-driven path, where the manager dispatches ttorch-reviewer-*
+// The measured cost is the one the pilot was there to find, and it is per reviewer rather than
+// per gate: a `git clone --mirror` of a local repo hardlinks its objects, and the workspace is
+// torn down with the episode, so it is three short-lived mirrors instead of one. The review
+// experience is unchanged from the pilot: `git -C <bare> show` and `git grep <tree-ish>`, which
+// the brief teaches.
+//
+// It still does not cover the skill-driven path, where the manager dispatches ttorch-reviewer-*
 // subagents from its own cwd. That path's exposure is the DEFAULT BRANCH's CLAUDE.md and
-// .claude/, which is a different problem.
-var isolatedReviewDimensions = map[string]bool{review.DimensionSecurity: true}
+// .claude/, which is a different problem and not closed here.
 
 // reviewWorkspaceDir is the scratch cwd for an isolated dimension's reviewer: a per-dimension
 // directory under the task's review-workspace root, so two isolated reviewers never share a
@@ -1640,9 +1643,6 @@ func safePathComponent(s string) bool {
 // materialized scratch workspace (see prepareReviewWorkspace); every other dimension still runs
 // in the worker's worktree at the reviewed commit.
 func (m *Manager) reviewerCwd(taskID, dim, inputsDir, repo, wt, head string) (cwd, bare string, err error) {
-	if !isolatedReviewDimensions[dim] {
-		return wt, "", nil
-	}
 	ws := m.reviewWorkspaceDir(taskID, dim)
 	if ws == "" {
 		return "", "", fmt.Errorf("refusing to build a review workspace for task %q dimension %q: not a single safe path component", taskID, dim)
@@ -1764,13 +1764,11 @@ func (m *Manager) reviewReportPinned(dir, dim, head string) bool {
 // window is idle and holds no pool slot). Called when the episode reaches a terminal outcome.
 func (m *Manager) teardownReviewers(taskID string, dims []string) {
 	for _, dim := range dims {
-		// An isolated reviewer's scratch workspace holds a bare mirror of the repo. It is
-		// rebuilt from scratch on the next dispatch, so dropping it here keeps one mirror per
-		// in-flight reviewer rather than one per task per episode.
-		if isolatedReviewDimensions[dim] {
-			if ws := m.reviewWorkspaceDir(taskID, dim); ws != "" {
-				_ = os.RemoveAll(ws)
-			}
+		// A reviewer's scratch workspace holds a bare mirror of the repo. It is rebuilt from
+		// scratch on the next dispatch, so dropping it here keeps one mirror per in-flight
+		// reviewer rather than one per task per episode.
+		if ws := m.reviewWorkspaceDir(taskID, dim); ws != "" {
+			_ = os.RemoveAll(ws)
 		}
 		window := reviewerWindow(taskID, dim)
 		if window == "" || !tmux.WindowExists(m.Session, window) {
@@ -1857,10 +1855,8 @@ func (m *Manager) writeGateProgress(dir string, p gateProgress) {
 // dimension, and writes the same commit-pinned <dim>.json report — so the daemon orchestrates
 // the real adversarial reviewers, it does not replace them with a rubber stamp.
 //
-// Where it runs depends on the dimension (see isolatedReviewDimensions and reviewerCwd): an
-// isolated dimension runs in a scratch workspace outside the worker's tree, reading source
-// from a bare mirror; the rest still run in the worker's worktree (wt) at the reviewed commit.
-// Either way it never edits anything, review is read-only. It is idempotent: it no-ops when
+// It runs in a scratch workspace outside the worker's tree (see reviewerCwd), reading source
+// from a bare mirror rather than a checkout. It never edits anything, review is read-only. It is idempotent: it no-ops when
 // the dimension's window already exists, so a re-dispatch never doubles a running reviewer.
 //
 // The idempotence probe uses WindowExistsErr, not the bool WindowExists, because this is the
