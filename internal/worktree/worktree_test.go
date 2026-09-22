@@ -914,3 +914,70 @@ func TestCatBlobs_ShortReadIsAnError(t *testing.T) {
 			"caller reads absence as 'no embed directive' and un-scopes the repository")
 	}
 }
+
+// The batch parser's framing checks, exercised directly.
+//
+// CatBlobs reads by object id precisely so that no tree can produce a desynced stream, and
+// that is the point of the design — but it also means a test driving CatBlobs through a
+// repository cannot reach the checks that catch a desync, and a check no test can reach is
+// a check the next person deletes. Feeding the parser a stream by hand is the only way to
+// hold it up.
+
+const (
+	oidA = "1111111111111111111111111111111111111111"
+	oidB = "2222222222222222222222222222222222222222"
+	oidC = "3333333333333333333333333333333333333333"
+)
+
+func TestParseBatchRecords_OutOfFrameIsAnError(t *testing.T) {
+	wanted := []blobRequest{
+		{path: "a.go", entry: treeEntry{Type: "blob", OID: oidA}},
+		{path: "b.go", entry: treeEntry{Type: "blob", OID: oidB}},
+	}
+	// The second record answers some other object. Without the id check this returns
+	// b.go's entry holding a.go's bytes, with a nil error.
+	stream := []byte(oidA + " blob 3\nxxx\n" + oidC + " blob 3\nyyy\n")
+	got, err := parseBatchRecords("main", stream, wanted)
+	if err == nil {
+		t.Fatalf("a record that does not echo the id it answers must be an error; got %q", got)
+	}
+	if !strings.Contains(err.Error(), "out of frame") {
+		t.Errorf("the error should say the stream is out of frame, got: %v", err)
+	}
+}
+
+func TestParseBatchRecords_TruncatedRecordIsAnError(t *testing.T) {
+	wanted := []blobRequest{{path: "a.go", entry: treeEntry{Type: "blob", OID: oidA}}}
+	stream := []byte(oidA + " blob 99\nshort\n")
+	if _, err := parseBatchRecords("main", stream, wanted); err == nil {
+		t.Fatal("a record claiming more bytes than remain must be an error, not a short map")
+	} else if !strings.Contains(err.Error(), "truncated") {
+		t.Errorf("the error should say the stream is truncated, got: %v", err)
+	}
+}
+
+func TestParseBatchRecords_MissingBlobIsAnErrorButMissingGitlinkIsNot(t *testing.T) {
+	// A submodule commit this repository does not have is normal, and dropping it keeps
+	// the stream in frame for everything after it.
+	ok := []blobRequest{
+		{path: "sub", entry: treeEntry{Type: "commit", OID: oidC}},
+		{path: "a.go", entry: treeEntry{Type: "blob", OID: oidA}},
+	}
+	got, err := parseBatchRecords("main", []byte(oidC+" missing\n"+oidA+" blob 3\nhi!\n"), ok)
+	if err != nil {
+		t.Fatalf("an absent submodule commit must not fail the read: %v", err)
+	}
+	if string(got["a.go"]) != "hi!" {
+		t.Errorf("the record after the missing one was read at the wrong offset: %q", got["a.go"])
+	}
+	if _, present := got["sub"]; present {
+		t.Error("a gitlink is not content and must not be returned")
+	}
+
+	// A blob the tree just named cannot be missing. That is a broken read, not absence,
+	// and the caller un-scopes the repository if it is told absence.
+	bad := []blobRequest{{path: "a.go", entry: treeEntry{Type: "blob", OID: oidA}}}
+	if _, err := parseBatchRecords("main", []byte(oidA+" missing\n"), bad); err == nil {
+		t.Fatal("a blob the tree names but the object store lacks must be an error")
+	}
+}

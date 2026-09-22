@@ -728,70 +728,117 @@ func ChangedLinks(path, base, rev string) ([]ChangedLink, error) {
 // The framing is the part that has to be right, because three ways of getting it wrong all
 // fail OPEN, handing a caller a short map with a nil error:
 //
-//   - Input is NUL-delimited (`--batch -z`). Newline-delimited input splits on a committed
-//     path that CONTAINS a newline, desyncing every later record. Requires git 2.44 or
-//     newer; tested on 2.50.1, and checkGitSupportsBatchZ makes a refusal explicit rather
-//     than letting an older git silently read "-z" as a pathspec.
-//   - Every record's content is consumed EXACTLY, whatever its type. Skipping a record
-//     without consuming its bytes misaligns the rest of the batch: one gitlink at a path
-//     sorting before content.go was enough to make the next blob unreadable and flip the
-//     gate's scope.
-//   - A short batch, a missing object or anything on stderr is an ERROR. Absence and
+//   - Nothing derived from a PATH is written into the batch input. Paths came from the
+//     tree, and a committed path may contain a newline; written into newline-delimited
+//     batch input it split into two object specs and desynced every later record. So the
+//     paths are resolved to object ids by `ls-tree -r -z` first, and the ids are what the
+//     batch reads. An id is forty hex characters and cannot carry a delimiter, which is a
+//     stronger guarantee than escaping or than `--batch -z`: it does not depend on a git
+//     version, and there is no input a tree can hold that changes the framing.
+//   - Every record's content is consumed EXACTLY, whatever its type, and each record's
+//     echoed id is checked against the id that was asked for. Skipping a record without
+//     consuming its bytes misaligns the rest of the batch: one gitlink at a path sorting
+//     before content.go was enough to make the next blob unreadable and flip the gate's
+//     scope. The id check is what makes a misalignment loud instead of silent — a
+//     desynced stream cannot echo the id that was requested.
+//   - A short batch, a missing blob or anything on stderr is an ERROR. Absence and
 //     failure are not the same answer, and the caller documents itself as failing closed,
 //     which it can only do if it is told.
 //
 // Missing paths are reported as an error rather than omitted. Callers ask for paths they
 // read out of the same tree, so a miss means the read is wrong, not that the file is
-// absent.
+// absent. Entries that are not blobs — a gitlink, a submodule whose commit this repository
+// does not have — are read to keep the stream in frame and then dropped, because they are
+// not content a caller can use.
 func CatBlobs(path, rev string, paths []string) (map[string][]byte, error) {
 	if len(paths) == 0 {
 		return map[string][]byte{}, nil
 	}
-	if err := checkGitSupportsBatchZ(path); err != nil {
+	entries, err := treeEntries(path, rev)
+	if err != nil {
 		return nil, err
 	}
-	var in bytes.Buffer
+	wanted := make([]blobRequest, 0, len(paths))
 	for _, p := range paths {
-		in.WriteString(rev + ":" + p)
-		in.WriteByte(0)
+		e, ok := entries[p]
+		if !ok {
+			return nil, fmt.Errorf("git cat-file: %s:%s is not in the tree; the caller reads "+
+				"its paths out of this same tree, so a miss is a failed read, not an absent file",
+				rev, p)
+		}
+		wanted = append(wanted, blobRequest{path: p, entry: e})
 	}
-	cmd := exec.Command("git", "-C", path, "cat-file", "--batch", "-z")
+
+	var in bytes.Buffer
+	for _, w := range wanted {
+		in.WriteString(w.entry.OID)
+		in.WriteByte('\n')
+	}
+	cmd := exec.Command("git", "-C", path, "cat-file", "--batch")
 	cmd.Stdin = &in
 	var out, errOut bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errOut
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("git cat-file --batch -z in %s: %w: %s", rev, err, strings.TrimSpace(errOut.String()))
+		return nil, fmt.Errorf("git cat-file --batch in %s: %w: %s", rev, err, strings.TrimSpace(errOut.String()))
 	}
 	if msg := strings.TrimSpace(errOut.String()); msg != "" {
-		return nil, fmt.Errorf("git cat-file --batch -z in %s wrote to stderr: %s", rev, msg)
+		return nil, fmt.Errorf("git cat-file --batch in %s wrote to stderr: %s", rev, msg)
 	}
 
-	res := make(map[string][]byte, len(paths))
-	buf := out.Bytes()
-	for _, p := range paths {
+	return parseBatchRecords(rev, out.Bytes(), wanted)
+}
+
+// blobRequest pairs a path the caller asked for with the tree entry it resolved to.
+type blobRequest struct {
+	path  string
+	entry treeEntry
+}
+
+// parseBatchRecords walks `git cat-file --batch` output against the ids that were fed to
+// it, in order, and returns the blob contents keyed by path.
+//
+// It is separate from the process call so the framing can be tested on a stream that no
+// repository could be made to produce. The checks it carries are the ones that make a
+// desync loud: a record that does not echo the id it answers, a record that claims more
+// bytes than remain, and a batch that ends early are all errors, because every one of them
+// otherwise yields a short map with a nil error and reads to the caller as absence.
+func parseBatchRecords(rev string, out []byte, wanted []blobRequest) (map[string][]byte, error) {
+	res := make(map[string][]byte, len(wanted))
+	buf := out
+	for _, w := range wanted {
 		nl := bytes.IndexByte(buf, '\n')
 		if nl < 0 {
-			return nil, fmt.Errorf("git cat-file --batch -z: output ended before %s:%s; "+
-				"a short batch is a failed read, not an absent file", rev, p)
+			return nil, fmt.Errorf("git cat-file --batch: output ended before %s:%s; "+
+				"a short batch is a failed read, not an absent file", rev, w.path)
 		}
 		header := string(buf[:nl])
 		buf = buf[nl+1:]
 		fields := strings.Fields(header)
-		// "<spec> missing" has no content to consume.
-		if len(fields) >= 2 && fields[len(fields)-1] == "missing" {
-			return nil, fmt.Errorf("git cat-file --batch -z: %s:%s is missing from the tree", rev, p)
+		if len(fields) == 0 || fields[0] != w.entry.OID {
+			return nil, fmt.Errorf("git cat-file --batch: record %q does not answer %s (%s:%s); "+
+				"the stream is out of frame", header, w.entry.OID, rev, w.path)
+		}
+		// "<id> missing" carries no content, so there is nothing to consume. A blob the
+		// tree just named cannot be missing; a gitlink pointing into a submodule this
+		// repository does not have routinely is.
+		if len(fields) == 2 && fields[1] == "missing" {
+			if w.entry.Type == "blob" {
+				return nil, fmt.Errorf("git cat-file --batch: %s:%s is a blob the tree names "+
+					"but the object store does not have", rev, w.path)
+			}
+			continue
 		}
 		if len(fields) < 3 {
-			return nil, fmt.Errorf("git cat-file --batch -z: unparseable record %q", header)
+			return nil, fmt.Errorf("git cat-file --batch: unparseable record %q", header)
 		}
 		size, err := strconv.Atoi(fields[2])
 		if err != nil {
-			return nil, fmt.Errorf("git cat-file --batch -z: unparseable size in %q", header)
+			return nil, fmt.Errorf("git cat-file --batch: unparseable size in %q", header)
 		}
 		if size > len(buf) {
-			return nil, fmt.Errorf("git cat-file --batch -z: record for %s:%s claims %d bytes "+
-				"but only %d remain; the stream is truncated", rev, p, size, len(buf))
+			return nil, fmt.Errorf("git cat-file --batch: record for %s:%s claims %d bytes "+
+				"but only %d remain; the stream is truncated", rev, w.path, size, len(buf))
 		}
 		content := buf[:size]
 		buf = buf[size:]
@@ -802,22 +849,45 @@ func CatBlobs(path, rev string, paths []string) (map[string][]byte, error) {
 		// path is not content the caller can use, but its bytes still have to leave the
 		// stream or every later record is read at the wrong offset.
 		if fields[1] == "blob" {
-			res[p] = content
+			res[w.path] = content
 		}
 	}
 	return res, nil
 }
 
-// checkGitSupportsBatchZ fails loudly on a git too old for NUL-delimited batch input.
-// Without it, `-z` is taken as a pathspec-ish argument and the read silently reverts to the
-// newline framing this function exists to avoid.
-func checkGitSupportsBatchZ(path string) error {
-	out, errOut, err := gitRaw("-C", path, "cat-file", "--batch-check", "-z")
-	if err != nil && strings.Contains(errOut+out, "unknown option") {
-		return fmt.Errorf("git cat-file --batch -z is unsupported by this git (2.44+ required): %s",
-			strings.TrimSpace(errOut))
+// treeEntry is one record of a recursive tree listing: what the object is, and its id.
+type treeEntry struct {
+	Type string
+	OID  string
+}
+
+// treeEntries lists rev's tree recursively as path -> entry.
+//
+// `-z` here is on the OUTPUT, where it has been supported for as long as ls-tree has, and
+// it is what keeps a path containing a newline from splitting a record. It also hands back
+// each object's id, which is what lets CatBlobs read by id rather than by path.
+func treeEntries(path, rev string) (map[string]treeEntry, error) {
+	out, errOut, err := gitRaw("-C", path, "ls-tree", "-r", "-z", rev)
+	if err != nil {
+		return nil, fmt.Errorf("git ls-tree -r -z %s in %s: %w: %s", rev, path, err, strings.TrimSpace(errOut))
 	}
-	return nil
+	entries := make(map[string]treeEntry)
+	for _, rec := range strings.Split(out, "\x00") {
+		if rec == "" {
+			continue
+		}
+		// "<mode> SP <type> SP <oid> TAB <path>", and with -z the path is never quoted.
+		tab := strings.IndexByte(rec, '\t')
+		if tab < 0 {
+			return nil, fmt.Errorf("unparseable `git ls-tree` record %q", rec)
+		}
+		meta := strings.Fields(rec[:tab])
+		if len(meta) != 3 {
+			return nil, fmt.Errorf("unparseable `git ls-tree` record %q", rec)
+		}
+		entries[rec[tab+1:]] = treeEntry{Type: meta[1], OID: meta[2]}
+	}
+	return entries, nil
 }
 
 // TreeFiles returns every path in rev's committed tree, NUL-separated and unquoted.
