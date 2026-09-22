@@ -716,62 +716,108 @@ func ChangedLinks(path, base, rev string) ([]ChangedLink, error) {
 	return links, nil
 }
 
-// CatBlobs returns the RAW bytes of each path in rev's committed tree.
+// CatBlobs returns the RAW bytes of each path in rev's committed tree, keyed by path.
 //
 // Raw is the whole point. `git grep <rev>` and `git diff` read gitattributes from the
-// WORKING TREE, not from the rev they are given, so a committed `.gitattributes` saying
-// `content.go -diff` makes `git grep` report "Binary file ... matches" for a commit whose
-// bytes never changed. Measured: same rev argument, output flips depending on what is on
-// disk. Anything that decides policy from a text-search tool inherits that.
+// WORKING TREE rather than from the rev they are given, so a committed `.gitattributes`
+// saying `content.go -diff` made `git grep` report "Binary file ... matches" for a commit
+// whose bytes never changed. Anything that decides policy from a text-search tool inherits
+// that. `git cat-file` emits the stored object bytes; twelve hostile attribute spellings
+// were set against the same blob and every one returned the committed bytes.
 //
-// `git cat-file --batch` emits the stored object bytes. No attribute reaches it: -diff,
-// -text, a diff=<driver> textconv, a clean/smudge filter, ident and working-tree-encoding
-// were all set hostile against the same blob and cat-file returned the committed bytes
-// every time. Filters apply on checkout and on add, so the stored blob is already what it
-// is; there is no read-time transformation left to subvert.
+// The framing is the part that has to be right, because three ways of getting it wrong all
+// fail OPEN, handing a caller a short map with a nil error:
 //
-// One subprocess for any number of paths. Missing paths are skipped rather than failing,
-// since a tree legitimately may not contain one.
+//   - Input is NUL-delimited (`--batch -z`). Newline-delimited input splits on a committed
+//     path that CONTAINS a newline, desyncing every later record. Requires git 2.44 or
+//     newer; tested on 2.50.1, and checkGitSupportsBatchZ makes a refusal explicit rather
+//     than letting an older git silently read "-z" as a pathspec.
+//   - Every record's content is consumed EXACTLY, whatever its type. Skipping a record
+//     without consuming its bytes misaligns the rest of the batch: one gitlink at a path
+//     sorting before content.go was enough to make the next blob unreadable and flip the
+//     gate's scope.
+//   - A short batch, a missing object or anything on stderr is an ERROR. Absence and
+//     failure are not the same answer, and the caller documents itself as failing closed,
+//     which it can only do if it is told.
+//
+// Missing paths are reported as an error rather than omitted. Callers ask for paths they
+// read out of the same tree, so a miss means the read is wrong, not that the file is
+// absent.
 func CatBlobs(path, rev string, paths []string) (map[string][]byte, error) {
 	if len(paths) == 0 {
 		return map[string][]byte{}, nil
 	}
+	if err := checkGitSupportsBatchZ(path); err != nil {
+		return nil, err
+	}
 	var in bytes.Buffer
 	for _, p := range paths {
-		fmt.Fprintf(&in, "%s:%s\n", rev, p)
+		in.WriteString(rev + ":" + p)
+		in.WriteByte(0)
 	}
-	cmd := exec.Command("git", "-C", path, "cat-file", "--batch")
+	cmd := exec.Command("git", "-C", path, "cat-file", "--batch", "-z")
 	cmd.Stdin = &in
-	var out bytes.Buffer
+	var out, errOut bytes.Buffer
 	cmd.Stdout = &out
+	cmd.Stderr = &errOut
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("git cat-file --batch in %s: %w", rev, err)
+		return nil, fmt.Errorf("git cat-file --batch -z in %s: %w: %s", rev, err, strings.TrimSpace(errOut.String()))
 	}
+	if msg := strings.TrimSpace(errOut.String()); msg != "" {
+		return nil, fmt.Errorf("git cat-file --batch -z in %s wrote to stderr: %s", rev, msg)
+	}
+
 	res := make(map[string][]byte, len(paths))
 	buf := out.Bytes()
 	for _, p := range paths {
-		// Each record is "<sha> blob <size>\n<contents>\n", or "<spec> missing\n".
 		nl := bytes.IndexByte(buf, '\n')
 		if nl < 0 {
-			break
+			return nil, fmt.Errorf("git cat-file --batch -z: output ended before %s:%s; "+
+				"a short batch is a failed read, not an absent file", rev, p)
 		}
 		header := string(buf[:nl])
 		buf = buf[nl+1:]
 		fields := strings.Fields(header)
-		if len(fields) < 3 || fields[1] != "blob" {
-			continue // missing, or not a blob (a tree or a gitlink)
+		// "<spec> missing" has no content to consume.
+		if len(fields) >= 2 && fields[len(fields)-1] == "missing" {
+			return nil, fmt.Errorf("git cat-file --batch -z: %s:%s is missing from the tree", rev, p)
+		}
+		if len(fields) < 3 {
+			return nil, fmt.Errorf("git cat-file --batch -z: unparseable record %q", header)
 		}
 		size, err := strconv.Atoi(fields[2])
-		if err != nil || size > len(buf) {
-			return nil, fmt.Errorf("git cat-file --batch: unparseable record %q", header)
+		if err != nil {
+			return nil, fmt.Errorf("git cat-file --batch -z: unparseable size in %q", header)
 		}
-		res[p] = buf[:size]
+		if size > len(buf) {
+			return nil, fmt.Errorf("git cat-file --batch -z: record for %s:%s claims %d bytes "+
+				"but only %d remain; the stream is truncated", rev, p, size, len(buf))
+		}
+		content := buf[:size]
 		buf = buf[size:]
 		if len(buf) > 0 && buf[0] == '\n' {
 			buf = buf[1:]
 		}
+		// Consumed for every type, then kept only for blobs. A tree or a commit at this
+		// path is not content the caller can use, but its bytes still have to leave the
+		// stream or every later record is read at the wrong offset.
+		if fields[1] == "blob" {
+			res[p] = content
+		}
 	}
 	return res, nil
+}
+
+// checkGitSupportsBatchZ fails loudly on a git too old for NUL-delimited batch input.
+// Without it, `-z` is taken as a pathspec-ish argument and the read silently reverts to the
+// newline framing this function exists to avoid.
+func checkGitSupportsBatchZ(path string) error {
+	out, errOut, err := gitRaw("-C", path, "cat-file", "--batch-check", "-z")
+	if err != nil && strings.Contains(errOut+out, "unknown option") {
+		return fmt.Errorf("git cat-file --batch -z is unsupported by this git (2.44+ required): %s",
+			strings.TrimSpace(errOut))
+	}
+	return nil
 }
 
 // TreeFiles returns every path in rev's committed tree, NUL-separated and unquoted.

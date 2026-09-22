@@ -1,6 +1,7 @@
 package worktree
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -819,5 +820,97 @@ func TestPoolFreeSlots(t *testing.T) {
 		if got := p.FreeSlots(c.inUse); got != c.want {
 			t.Errorf("%s: FreeSlots(%v) with Max=%d = %d, want %d", c.name, c.inUse, p.Max, got, c.want)
 		}
+	}
+}
+
+func catBlobsFixture(t *testing.T) string {
+	t.Helper()
+	repo := t.TempDir()
+	gitT(t, repo, "init", "-q", "-b", "main")
+	gitT(t, repo, "config", "user.email", "t@example.com")
+	gitT(t, repo, "config", "user.name", "t")
+	if err := os.WriteFile(filepath.Join(repo, "content.go"),
+		[]byte("package p\n\n//go:embed all:content\nvar payload embed.FS\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, repo, "add", "-A")
+	gitT(t, repo, "commit", "-q", "-m", "init")
+	return repo
+}
+
+// TestCatBlobs_NewlineInAPathCannotDesync is finding 1(a).
+//
+// The batch input was newline-delimited, so a committed path CONTAINING a newline split
+// into two object specs. Every later record then read at the wrong offset, content.go's
+// blob was never returned, and the caller got a short map with a nil error, which
+// resolveGateScope reads as "not ttorch source".
+//
+// It was closed only because hostilePath runs first in the one caller, and hostilePath sees
+// base..rev CHANGED paths, never a path already sitting in base. One exported call away
+// from live.
+func TestCatBlobs_NewlineInAPathCannotDesync(t *testing.T) {
+	repo := catBlobsFixture(t)
+	// A tracked path with a newline in it, sorting before content.go.
+	hostile := "a\nb.go"
+	tmp := filepath.Join(t.TempDir(), "x")
+	if err := os.WriteFile(tmp, []byte("package a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sha := gitT(t, repo, "hash-object", "-w", tmp)
+	gitT(t, repo, "update-index", "--add", "--cacheinfo", "100644,"+sha+","+hostile)
+	gitT(t, repo, "commit", "-q", "-m", "add a path with a newline")
+
+	got, err := CatBlobs(repo, "main", []string{hostile, "content.go"})
+	if err != nil {
+		t.Fatalf("CatBlobs must read a tree containing a newline path, got: %v", err)
+	}
+	body, ok := got["content.go"]
+	if !ok {
+		t.Fatal("content.go was not returned: the newline path desynced the batch, and a " +
+			"short map with a nil error reads as 'no embed directive', which un-scopes the repo")
+	}
+	if !bytes.Contains(body, []byte("go:embed")) {
+		t.Fatalf("content.go came back as the wrong record: %q", body)
+	}
+}
+
+// TestCatBlobs_GitlinkCannotDesync is finding 1(b), and it is the easier of the two.
+//
+// A non-blob record was skipped with `continue` WITHOUT consuming its content bytes, so
+// every later record in the batch was misaligned. One gitlink at a path sorting before
+// content.go, pointing at any reachable commit, was enough to make the next blob unreadable
+// and flip the gate's scope in a single commit. No .gitattributes required.
+func TestCatBlobs_GitlinkCannotDesync(t *testing.T) {
+	repo := catBlobsFixture(t)
+	head := gitT(t, repo, "rev-parse", "HEAD")
+	// A gitlink sorts before content.go and points at a commit already reachable.
+	gitT(t, repo, "update-index", "--add", "--cacheinfo", "160000,"+head+",aaa-sub")
+	gitT(t, repo, "commit", "-q", "-m", "add a submodule pointer")
+
+	got, err := CatBlobs(repo, "main", []string{"aaa-sub", "content.go"})
+	if err != nil {
+		t.Fatalf("CatBlobs must stay in frame across a non-blob record, got: %v", err)
+	}
+	if _, isBlob := got["aaa-sub"]; isBlob {
+		t.Error("a gitlink is not a blob and must not be returned as content")
+	}
+	body, ok := got["content.go"]
+	if !ok {
+		t.Fatal("content.go was not returned: the gitlink's record was skipped without " +
+			"consuming its bytes, so the next record was read at the wrong offset")
+	}
+	if !bytes.Contains(body, []byte("go:embed")) {
+		t.Fatalf("content.go came back as the wrong record: %q", body)
+	}
+}
+
+// TestCatBlobs_ShortReadIsAnError is finding 1(c). Absence and failure are different
+// answers, and a caller that documents itself as failing closed can only do so if it is
+// told the read failed.
+func TestCatBlobs_ShortReadIsAnError(t *testing.T) {
+	repo := catBlobsFixture(t)
+	if _, err := CatBlobs(repo, "main", []string{"content.go", "does-not-exist.go"}); err == nil {
+		t.Fatal("a missing object must be an error, not a silently absent map entry: the " +
+			"caller reads absence as 'no embed directive' and un-scopes the repository")
 	}
 }
