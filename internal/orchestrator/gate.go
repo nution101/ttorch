@@ -19,6 +19,7 @@ import (
 	"github.com/nution101/ttorch/internal/projectinit"
 	"github.com/nution101/ttorch/internal/review"
 	"github.com/nution101/ttorch/internal/tmux"
+	"github.com/nution101/ttorch/internal/validate"
 	"github.com/nution101/ttorch/internal/worktree"
 )
 
@@ -274,9 +275,12 @@ func dispatchedDimensions(prog gateProgress) []string {
 // add findings, never drop a requirement.
 //
 // The extras come from the episode's own dispatch record and never from "whatever report files
-// happen to exist". The advisory audits write qa.json and security.json into this same
-// directory (QAReview, SecurityAudit), and those are advisory by design: neither may ever gate
-// a merge, so neither may be picked up here.
+// happen to exist". That bounds which dimensions may be folded; it does not by itself keep an
+// advisory report out, and this comment used to claim it did. The advisory audits dispatch the
+// same reviewer agents over the same inputs, so their reports have the same filenames, and the
+// gate would have folded one for any dimension it had also dispatched. They are kept out by
+// living in a different directory (AdvisoryInputsDir): the gate aggregates the inputs dir and
+// the audits aggregate the subdirectory, so neither can read the other's artifact.
 func (m *Manager) foldDimensions(dir, head string, required, dispatched []string) []string {
 	out := append([]string(nil), required...)
 	have := make(map[string]bool, len(required))
@@ -915,6 +919,101 @@ func fromDBVerdict(dv db.Verdict) (review.Verdict, error) {
 	}, nil
 }
 
+// AdvisoryInputsDir is the advisory audits' own review episode: a subdirectory of the task's
+// review-inputs dir with the same shape as its parent, holding a prep stamp, the staged
+// validate it was cross-checked against, and a reports/ dir the advisory reviewers write into.
+//
+// Both channels dispatch the same reviewer agents over the same diff, so their reports have
+// the same filenames. While they shared a directory, the advisory security audit and the trust
+// gate's security dimension were the same file. The audit is the standing practice in this
+// repo and normally runs FIRST, so the gate's dispatch loop would find a report already pinned
+// to head, skip launching its own reviewer, and fold the audit's in its place. That is not a
+// degraded gate; it is the specific thing step 2 exists to prevent, because the advisory
+// reviewer runs inside the worker's worktree, under whatever CLAUDE.md, settings hooks and
+// agent definitions that tree carries. The gate's own security reviewer runs in a scratch
+// workspace against a bare mirror for exactly that reason.
+//
+// Separation is by PATH rather than by a provenance field in the report, because a field has
+// to be trusted absent as well as present: a report written without it needs a default, and
+// either default is wrong (fail closed and every existing report is rejected, fail open and
+// the substitution it was added to stop still works). A path cannot be defaulted.
+//
+// It is a whole episode rather than just a reports directory because review.Aggregate folds
+// reports against the prep stamp in the directory it is given. Pointing it at a bare
+// subdirectory would leave it with no episode covering the commit, which fails the fold closed
+// and takes the advisory audit out of service. So the advisory side gets its own stamp, and
+// prepareAdvisoryEpisode writes it LAST for the same reason prep does.
+//
+// This says which artifact satisfies which channel. It does NOT authenticate either
+// directory's contents: a process that can write one path can write the other, and report
+// authentication remains open work (see ReviewersFor).
+func (m *Manager) AdvisoryInputsDir(taskID string) string {
+	return filepath.Join(m.P.ReviewInputsDir(taskID), "advisory")
+}
+
+// AdvisoryPrep materializes the shared review inputs and opens the advisory audit's own
+// episode over them, returning the inputs dir and the advisory dir the reviewer writes into.
+// It is the entry point `ttorch security-review prep` and `ttorch qa-review prep` share; dims
+// is the single dimension that channel folds.
+func (m *Manager) AdvisoryPrep(taskID string, dims []string) (inputsDir, advisoryDir string, err error) {
+	t, ok, err := m.Store.GetTask(context.Background(), taskID)
+	if err != nil || !ok {
+		return "", "", fmt.Errorf("unknown task %q", taskID)
+	}
+	// The reviewer reads exactly the inputs trust prep materializes (diff.patch / brief.md /
+	// validate.json / head.txt), so reuse it rather than duplicate the materialization.
+	inputsDir, err = m.TrustPrep(taskID)
+	if err != nil {
+		return "", "", err
+	}
+	head, err := worktree.Head(t.Worktree)
+	if err != nil {
+		return "", "", err
+	}
+	advisoryDir, err = m.prepareAdvisoryEpisode(taskID, head, dims)
+	if err != nil {
+		return "", "", err
+	}
+	return inputsDir, advisoryDir, nil
+}
+
+// prepareAdvisoryEpisode opens the advisory review episode for taskID at head, over the inputs
+// TrustPrep has just materialized, and returns its directory.
+//
+// It copies the staged validate rather than re-running one: review.Aggregate cross-checks a
+// stamp's validateGreen against the staged results beside it and reports "disputed" when they
+// disagree, so the two must come from the same measurement. Copying is also what keeps the
+// advisory verdict describing the same suite run the gate saw.
+//
+// ORDER MATTERS, and it is the freshness rule that makes it matter. Aggregate treats a report
+// older than the episode's stamp as predating the prep, so the stamp must be written before
+// any report and after everything else. Writing it last means a re-prep moves its mtime and
+// correctly invalidates the previous episode's reports; writing it first would let a report
+// left over from an earlier audit read as fresh for this one, which is the substitution this
+// whole split exists to stop, arriving by another route.
+func (m *Manager) prepareAdvisoryEpisode(taskID, head string, dims []string) (string, error) {
+	inputs := m.P.ReviewInputsDir(taskID)
+	adv := m.AdvisoryInputsDir(taskID)
+	if err := os.MkdirAll(review.ReportsDir(adv), 0o755); err != nil {
+		return "", err
+	}
+	raw, err := os.ReadFile(filepath.Join(inputs, review.StagedValidateFile))
+	if err != nil {
+		return "", fmt.Errorf("advisory prep for %q: the staged validate is missing: %w", taskID, err)
+	}
+	var results []validate.Result
+	if err := json.Unmarshal(raw, &results); err != nil {
+		return "", fmt.Errorf("advisory prep for %q: the staged validate is unreadable: %w", taskID, err)
+	}
+	if err := os.WriteFile(filepath.Join(adv, review.StagedValidateFile), raw, 0o644); err != nil {
+		return "", err
+	}
+	if _, err := review.WritePrepStamp(adv, head, results, dims); err != nil {
+		return "", err
+	}
+	return adv, nil
+}
+
 // securityVerdictPath is where the standalone, advisory security-everywhere verdict
 // lives — beside the review inputs the security reviewer reads, and DISTINCT from the
 // trust gate's durable DB verdict so the two never interfere: the advisory pass can
@@ -957,7 +1056,7 @@ func (m *Manager) SecurityReview(taskID, sha string, ttl time.Duration) (review.
 	if sha != head {
 		return zero, fmt.Errorf("security review covers %s but the worker HEAD is now %s; re-run 'ttorch security-review prep %s' and review again", short(sha), short(head), taskID)
 	}
-	verdict, err := review.Aggregate(m.P.ReviewInputsDir(taskID), sha, []string{review.DimensionSecurity})
+	verdict, err := review.Aggregate(m.AdvisoryInputsDir(taskID), sha, []string{review.DimensionSecurity})
 	if err != nil {
 		return zero, err
 	}
@@ -1026,7 +1125,7 @@ func (m *Manager) QAReview(taskID, sha string, ttl time.Duration) (review.Verdic
 	if sha != head {
 		return zero, fmt.Errorf("qa review covers %s but the worker HEAD is now %s; re-run 'ttorch qa-review prep %s' and review again", short(sha), short(head), taskID)
 	}
-	verdict, err := review.Aggregate(m.P.ReviewInputsDir(taskID), sha, []string{review.DimensionQA})
+	verdict, err := review.Aggregate(m.AdvisoryInputsDir(taskID), sha, []string{review.DimensionQA})
 	if err != nil {
 		return zero, err
 	}

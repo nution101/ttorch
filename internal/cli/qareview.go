@@ -14,8 +14,8 @@ import (
 // but folding only the QA dimension:
 //
 //	ttorch qa-review prep <id>     materialize the reviewer's inputs (reuses trust prep)
-//	  → manager runs the ttorch-reviewer-qa agent, which writes qa.json
-//	ttorch qa-review record <id>   fold qa.json into an advisory verdict
+//	  → manager runs the ttorch-reviewer-qa agent, which writes advisory/qa.json
+//	ttorch qa-review record <id>   fold advisory/qa.json into an advisory verdict
 //	ttorch qa-review show <id>     show the latest advisory verdict
 //
 // The verdict is ADVISORY: it surfaces findings to the manager but never mints an approval,
@@ -36,12 +36,16 @@ func cmdQAReview(args []string) error {
 		// The QA reviewer reads exactly the inputs trust prep materializes (diff.patch /
 		// brief.md / validate.json / head.txt), so reuse it rather than duplicate the
 		// materialization.
-		dir, err := m.TrustPrep(id)
+		dir, out, err := m.AdvisoryPrep(id, []string{review.DimensionQA})
+		if err != nil {
+			return err
+		}
+		reportPath, err := review.InputPath(out, review.DimensionQA, review.ReportSuffix)
 		if err != nil {
 			return err
 		}
 		fmt.Printf("prepared qa-review inputs for %s in %s\n", id, dir)
-		fmt.Printf("  run the QA reviewer (ttorch-reviewer-qa) over that dir, then: ttorch qa-review record %s\n", id)
+		fmt.Printf("  the QA reviewer writes its report to %s\n", reportPath)
 		return nil
 	case "record":
 		fs := flag.NewFlagSet("qa-review record", flag.ContinueOnError)

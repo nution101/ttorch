@@ -707,3 +707,142 @@ func TestRequiredDimensions_PoisonedOriginCannotLowerTheFloor(t *testing.T) {
 		t.Fatal("no approval may be minted over a poisoned base")
 	}
 }
+
+// TestGateOnce_AnAdvisoryAuditDoesNotSatisfyTheGate covers the collision between the two
+// channels that dispatch the same reviewer agents.
+//
+// review.Aggregate resolves a dimension to "<dimension>.json" in the directory it is handed,
+// so while both channels read the same directory an advisory security audit and the gate's
+// security dimension were the same file. The advisory audit is the standing practice here and
+// normally runs first, so the gate's dispatch loop would find a report already pinned to head,
+// skip launching its own reviewer, and fold the advisory one. The advisory reviewer runs inside
+// the worker's worktree; the gate's runs in a scratch workspace against a bare mirror, which is
+// the whole point of it. Folding the first in place of the second is not a weaker gate, it is
+// the gate reading a report produced under the worker's own configuration.
+//
+// This asserts the separation end to end: an advisory audit that passes at this head leaves
+// nothing the gate will accept, and the gate still dispatches its own reviewer.
+func TestGateOnce_AnAdvisoryAuditDoesNotSatisfyTheGate(t *testing.T) {
+	m, _ := trustedTaskWithSubstantialDiff(t, "gate-advisory", "adv1")
+	t.Cleanup(func() { _, _ = m.Teardown("adv1", true) })
+	head := gitIn(t, mustTask(t, m, "adv1").Worktree, "rev-parse", "HEAD")
+	if _, err := m.TrustPrep("adv1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The advisory audit runs and passes, exactly as the manager runs it before a merge.
+	writeSecurityReport(t, m.AdvisoryInputsDir("adv1"), head, nil)
+	v, err := m.SecurityReview("adv1", head, time.Minute)
+	if err != nil {
+		t.Fatalf("SecurityReview: %v", err)
+	}
+	if v.Overall != review.Pass {
+		t.Fatalf("the advisory audit should pass over a clean report, got %q", v.Overall)
+	}
+
+	// The gate must not treat that as its security dimension.
+	if _, err := os.Stat(filepath.Join(m.P.ReviewInputsDir("adv1"), review.DimensionSecurity+".json")); !os.IsNotExist(err) {
+		t.Fatalf("the advisory audit left a report where the gate reads one: stat err = %v", err)
+	}
+	rec := recordingReviewer(t, false)
+	if out, err := m.gateOnceAt("adv1", time.Minute, 2, time.Hour, time.Now()); err != nil {
+		t.Fatalf("gateOnceAt: %v", err)
+	} else if out != GateDispatched {
+		t.Fatalf("outcome = %q, want %q: the gate must run its own reviewers", out, GateDispatched)
+	}
+	if rec.calls[review.DimensionSecurity] == 0 {
+		t.Fatal("the gate folded the advisory audit instead of dispatching its own isolated security reviewer")
+	}
+}
+
+// mustTask fetches a task or fails the test.
+func mustTask(t *testing.T, m *Manager, id string) db.Task {
+	t.Helper()
+	task, ok, err := m.Store.GetTask(context.Background(), id)
+	if err != nil || !ok {
+		t.Fatalf("GetTask(%s): ok=%v err=%v", id, ok, err)
+	}
+	return task
+}
+
+// TestAdvisoryEpisode_StampIsWrittenLastSoReportsReadAsFresh checks the ordering rule the
+// advisory episode inherits from prep. review.Aggregate treats a report older than the
+// episode's stamp as predating it, so a stamp written after the reports would invalidate
+// every one of them, and a stamp left over from an earlier audit would let a stale report
+// read as fresh for this episode. Neither failure is visible from the verdict alone, so the
+// ordering is asserted directly against the filesystem.
+func TestAdvisoryEpisode_StampIsWrittenLastSoReportsReadAsFresh(t *testing.T) {
+	m, _, wt := trustHarness(t, "adv-fresh", "trusted", "exit 0")
+	if err := os.WriteFile(filepath.Join(wt, "feature.go"), []byte("package x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, wt, "add", "-A")
+	gitIn(t, wt, "commit", "-q", "-m", "work")
+	head := gitIn(t, wt, "rev-parse", "HEAD")
+
+	_, adv, err := m.AdvisoryPrep("adv-fresh", []string{review.DimensionSecurity})
+	if err != nil {
+		t.Fatalf("AdvisoryPrep: %v", err)
+	}
+
+	// The stamp is the newest thing in the episode when prep returns.
+	stamp := mtimeOf(t, filepath.Join(adv, review.PrepStampFile))
+	staged := mtimeOf(t, filepath.Join(adv, review.StagedValidateFile))
+	if stamp.Before(staged) {
+		t.Fatalf("the stamp must be written after the staged validate: stamp %v, staged %v", stamp, staged)
+	}
+
+	// A report written after prep reads as fresh, so the audit can actually fold it.
+	writeSecurityReportOnly(t, adv, head, nil)
+	v, err := m.SecurityReview("adv-fresh", head, time.Minute)
+	if err != nil {
+		t.Fatalf("SecurityReview: %v", err)
+	}
+	if v.Overall != review.Pass {
+		t.Fatalf("a report written after the advisory prep must fold as fresh, got %q: %+v", v.Overall, v.Findings)
+	}
+
+	// A report written BEFORE the stamp is the stale case, and must not fold.
+	backdateFile(t, advisoryReportPath(t, adv, review.DimensionSecurity), time.Hour)
+	v, err = m.SecurityReview("adv-fresh", head, time.Minute)
+	if err != nil {
+		t.Fatalf("SecurityReview over a stale report: %v", err)
+	}
+	if v.Overall == review.Pass {
+		t.Fatal("a report predating the advisory prep must not fold as a pass")
+	}
+}
+
+// mtimeOf returns a file's modification time, failing the test if it is not there.
+func mtimeOf(t *testing.T, path string) time.Time {
+	t.Helper()
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st.ModTime()
+}
+
+// advisoryReportPath is the path a dimension's advisory report occupies.
+func advisoryReportPath(t *testing.T, adv, dim string) string {
+	t.Helper()
+	p, err := review.InputPath(adv, dim, review.ReportSuffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// writeSecurityReportOnly drops a security report into an advisory episode prep has already
+// opened, WITHOUT restamping it — writeSecurityReport stages its own episode, which would
+// move the stamp's mtime and defeat the ordering this test is about.
+func writeSecurityReportOnly(t *testing.T, adv, sha string, findings []review.Finding) {
+	t.Helper()
+	b, err := json.Marshal(review.Report{Dimension: review.DimensionSecurity, ReviewedSHA: sha, Findings: findings})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(advisoryReportPath(t, adv, review.DimensionSecurity), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

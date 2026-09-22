@@ -77,9 +77,16 @@ test exercises. State why in the finding. The default is **no execution**.
 
 ## Output
 
-Write exactly `reports/security.json` — the `reports/` subdirectory of the inputs dir,
-which prep creates. Reports live there so a dimension name can never collide with one of
-the control files at the top of the inputs dir:
+Write your report to the EXACT path your dispatcher gave you, and to no other. Two channels
+dispatch this agent over the same diff, and each folds its own `reports/` directory: the
+trusted gate reads `reports/security.json` under the inputs dir, and the advisory
+`ttorch security-review` audit reads `advisory/reports/security.json` under it. Writing to the
+other channel's path is not a filing error. A report sitting at the gate's path makes the gate
+skip launching its own reviewer, which runs isolated from the worker's tree, and fold yours
+instead. If no path was named, write `advisory/reports/security.json`, which gates nothing.
+
+Reports live in a `reports/` subdirectory, which prep creates, so a dimension name can never
+collide with one of the control files at the top of an inputs dir:
 
 ```json
 {

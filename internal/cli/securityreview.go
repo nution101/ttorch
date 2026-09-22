@@ -15,9 +15,15 @@ import (
 // but folding only the security dimension:
 //
 //	ttorch security-review prep <id>     materialize the reviewer's inputs (reuses trust prep)
-//	  → manager runs the ttorch-reviewer-security agent, which writes security.json
-//	ttorch security-review record <id>   fold security.json into an advisory verdict
+//	  → manager runs the ttorch-reviewer-security agent, which writes advisory/security.json
+//	ttorch security-review record <id>   fold advisory/security.json into an advisory verdict
 //	ttorch security-review show <id>     show the latest advisory verdict
+//
+// The report goes in the advisory SUBDIRECTORY of the inputs dir, which is what keeps this
+// pass out of the trusted gate. Both channels dispatch the same agent and so produce the same
+// filename; the gate aggregates the inputs dir and this aggregates advisory/, so an audit run
+// before a gate can never stand in for the gate's own isolated reviewer (see
+// Manager.AdvisoryInputsDir).
 //
 // The verdict is ADVISORY: it surfaces findings to the manager but never mints an
 // approval, never touches the trust gate, and never blocks a merge. The trusted-mode
@@ -37,12 +43,18 @@ func cmdSecurityReview(args []string) error {
 		// The security reviewer reads exactly the inputs trust prep materializes
 		// (diff.patch / brief.md / validate.json / head.txt), so reuse it rather than
 		// duplicate the materialization.
-		dir, err := m.TrustPrep(id)
+		dir, out, err := m.AdvisoryPrep(id, []string{review.DimensionSecurity})
+		if err != nil {
+			return err
+		}
+		reportPath, err := review.InputPath(out, review.DimensionSecurity, review.ReportSuffix)
 		if err != nil {
 			return err
 		}
 		fmt.Printf("prepared security-review inputs for %s in %s\n", id, dir)
-		fmt.Printf("  run the security reviewer (ttorch-reviewer-security) over that dir, then: ttorch security-review record %s\n", id)
+		fmt.Printf("  run the security reviewer (ttorch-reviewer-security) over that dir, writing its report to\n")
+		fmt.Printf("  %s\n", reportPath)
+		fmt.Printf("  then: ttorch security-review record %s\n", id)
 		return nil
 	case "record":
 		fs := flag.NewFlagSet("security-review record", flag.ContinueOnError)

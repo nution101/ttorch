@@ -3203,7 +3203,7 @@ func worktreeIsDirty(t *testing.T, path string) (bool, error) {
 // reviewer, not the full three-dimension gate — as the security-everywhere pass expects.
 func writeSecurityReport(t *testing.T, dir, sha string, findings []review.Finding) {
 	t.Helper()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(review.ReportsDir(dir), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	stageGreenPrep(t, dir, sha)
@@ -3236,7 +3236,7 @@ func TestSecurityReview_AdvisoryAndIndependentOfTrustGate(t *testing.T) {
 	}
 	head := commitFeature(t, task.Worktree, "feature.txt", "new\n")
 
-	writeSecurityReport(t, m.P.ReviewInputsDir("sv1"), head, nil) // clean
+	writeSecurityReport(t, m.AdvisoryInputsDir("sv1"), head, nil) // clean
 	v, err := m.SecurityReview("sv1", "", time.Minute)
 	if err != nil {
 		t.Fatal(err)
@@ -3276,7 +3276,7 @@ func TestSecurityReview_BlockingFindingStaysAdvisory(t *testing.T) {
 	}
 	head := commitFeature(t, task.Worktree, "feature.txt", "new\n")
 
-	writeSecurityReport(t, m.P.ReviewInputsDir("sb1"), head, []review.Finding{
+	writeSecurityReport(t, m.AdvisoryInputsDir("sb1"), head, []review.Finding{
 		{Severity: review.SeverityHigh, Reviewer: "ttorch-reviewer-security", Summary: "leaked key in fixture"},
 	})
 	v, err := m.SecurityReview("sb1", "", time.Minute)
@@ -3348,7 +3348,7 @@ func TestSecurityReview_RefusesStaleSha(t *testing.T) {
 // the full three-dimension gate — as the qa-review pass expects.
 func writeQAReport(t *testing.T, dir, sha string, findings []review.Finding) {
 	t.Helper()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(review.ReportsDir(dir), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	stageGreenPrep(t, dir, sha)
@@ -3380,7 +3380,7 @@ func TestQAReview_AdvisoryAndIndependentOfReviewPaths(t *testing.T) {
 	}
 	head := commitFeature(t, task.Worktree, "feature.txt", "new\n")
 
-	writeQAReport(t, m.P.ReviewInputsDir("qv1"), head, nil) // clean
+	writeQAReport(t, m.AdvisoryInputsDir("qv1"), head, nil) // clean
 	v, err := m.QAReview("qv1", "", time.Minute)
 	if err != nil {
 		t.Fatal(err)
@@ -3423,7 +3423,7 @@ func TestQAReview_BlockingFindingStaysAdvisory(t *testing.T) {
 	}
 	head := commitFeature(t, task.Worktree, "feature.txt", "new\n")
 
-	writeQAReport(t, m.P.ReviewInputsDir("qb1"), head, []review.Finding{
+	writeQAReport(t, m.AdvisoryInputsDir("qb1"), head, []review.Finding{
 		{Severity: review.SeverityHigh, Reviewer: "ttorch-reviewer-qa", Summary: "new failure path has no test"},
 	})
 	v, err := m.QAReview("qb1", "", time.Minute)

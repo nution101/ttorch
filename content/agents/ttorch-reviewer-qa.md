@@ -87,9 +87,13 @@ execution**.
 
 ## Output
 
-Write exactly `reports/qa.json` — the `reports/` subdirectory of the inputs dir,
-which prep creates. Reports live there so a dimension name can never collide with one of
-the control files at the top of the inputs dir:
+Write your report to the EXACT path your dispatcher gave you. If none was named, write
+`advisory/reports/qa.json` under the inputs dir. The QA audit is advisory and folds that
+subdirectory; the trusted gate folds `reports/` at the top of the inputs dir and must never
+find a report it did not dispatch a reviewer to produce.
+
+Reports live in a `reports/` subdirectory, which prep creates, so a dimension name can never
+collide with one of the control files at the top of an inputs dir:
 
 ```json
 {

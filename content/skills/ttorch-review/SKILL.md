@@ -41,12 +41,17 @@ the security dimension:
 1. `ttorch security-review prep <id>` — materializes the same inputs dir as `trust prep`
    (committed `diff.patch`, `brief.md`, `validate.json`, `head.txt`); refuses a dirty worktree.
 2. Dispatch the **`ttorch-reviewer-security`** agent over that dir + the commit in `head.txt`.
-   It writes `reports/security.json` following the findings contract below.
-3. `ttorch security-review record <id>` — folds `reports/security.json` into a commit-pinned verdict
+   Give it the report path `prep` printed: `advisory/reports/security.json` under the inputs
+   dir. It follows the findings contract below.
+3. `ttorch security-review record <id>` — folds `advisory/reports/security.json` into a commit-pinned verdict
    and prints it. `ttorch security-review show <id>` reprints the latest.
 
 This pass is **advisory and never blocks delivery**: it never mints an approval, never writes
-the trust gate's verdict, and never gates a merge. It mirrors how a recorded verdict is
+the trust gate's verdict, and never gates a merge. The `advisory/` episode is what makes
+that structural rather than a convention: both channels dispatch the same agent and produce the
+same filename, so if an audit report landed in the gate's reports dir the gate would find it
+already pinned to head, skip dispatching its own isolated reviewer, and fold the audit's in its
+place. The audit runs inside the worker's worktree, which is what the gate's reviewer does not. It mirrors how a recorded verdict is
 advisory in every non-trusted mode — the lead's `ttorch approve` still governs those merges.
 **Surface its findings to the lead;** a `high`/`critical` (or "no review recorded", which
 fails closed) is a reason to pause and decide, not an automatic block. The trusted-mode gate
@@ -71,8 +76,9 @@ gate, folding **only** the QA dimension:
 1. `ttorch qa-review prep <id>` — materializes the same inputs dir as `trust prep`
    (committed `diff.patch`, `brief.md`, `validate.json`, `head.txt`); refuses a dirty worktree.
 2. Dispatch the **`ttorch-reviewer-qa`** agent over that dir + the commit in `head.txt`.
-   It writes `reports/qa.json` following the findings contract below.
-3. `ttorch qa-review record <id>` — folds `reports/qa.json` into a commit-pinned advisory verdict and
+   Give it the report path `prep` printed: `advisory/reports/qa.json` under the inputs dir. It
+   follows the findings contract below.
+3. `ttorch qa-review record <id>` — folds `advisory/reports/qa.json` into a commit-pinned advisory verdict and
    prints it. `ttorch qa-review show <id>` reprints the latest.
 
 This pass is **advisory and never blocks delivery**: it never mints an approval, never writes
