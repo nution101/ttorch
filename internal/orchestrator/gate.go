@@ -230,8 +230,14 @@ func diffFiles(dir, base, rev string) (files []string, ok bool) {
 // irrelevant here. A binary file reports added/removed as "-"; that sets binary and is not
 // counted. ok is false on a git error or any unparseable record, so the caller fails
 // closed to the full reviewer set rather than under-counting a large change as trivial.
+//
+// --no-renames for consistency with diffFiles and worktree.ChangedFiles, not because the
+// undercount was reachable here: with renames detected a rename reports one record instead
+// of two, but review.Classify's trivial branch needs len(files) == 1 and --no-renames
+// always reports both paths, so the file count gets there first. Two commands answering the
+// same question differently is how the last five input-set defects started.
 func diffLineStat(dir, base, rev string) (lines int, binary, ok bool) {
-	out, err := gitOut(dir, "diff", "--numstat", base+"..."+rev)
+	out, err := gitOut(dir, "diff", "--numstat", "--no-renames", base+"..."+rev)
 	if err != nil {
 		return 0, false, false
 	}
