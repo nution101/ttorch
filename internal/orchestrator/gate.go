@@ -1459,6 +1459,39 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 		toDispatch = append(toDispatch, dim)
 	}
 
+	// Bound the episode BEFORE deciding what to do about it, so every route out of an
+	// unfinished episode passes through this check. It used to live inside the waiting branch,
+	// which two different wedges walk straight past: a dispatch whose launches all come back
+	// unstarted returns from the dispatch branch below, and reaches nothing.
+	//
+	// The clock runs from the EPISODE rather than from the first dispatch. Keying it on
+	// DispatchedAt tied both of the gate's bounds to the same fact: the attempt ceiling counts
+	// launches, so an episode that never launches anything was invisible to both and ran
+	// forever. That is reachable with no attacker. reviewerWindowAlive uses the bool
+	// tmux.WindowExists, which folds a timed-out probe to "present" so a wedged server cannot
+	// make the gate double-launch into an occupied worktree, so a server wedged from the
+	// episode's first tick makes every dimension read as already-running.
+	//
+	// Running it from the episode leaves the charging split alone, which is the point: a
+	// transient wedge still burns no retries, because the fix is not to start charging for it.
+	if !allReady && reviewerTimeout > 0 && prog.StartedAt != 0 && now.Sub(time.Unix(0, prog.StartedAt)) > reviewerTimeout {
+		// DispatchedAt still earns its place here: it separates "reviewers ran and went
+		// quiet" from "nothing ever got off the ground", which are different problems for
+		// whoever picks this up.
+		reason := fmt.Sprintf("reviewers did not all report within %s", reviewerTimeout)
+		if prog.DispatchedAt == 0 {
+			reason = fmt.Sprintf("no reviewer was dispatched within %s; the episode made no progress", reviewerTimeout)
+			if prog.LastDispatchError != "" {
+				reason += "; last dispatch error: " + prog.LastDispatchError
+			}
+		}
+		m.surfaceGateBlocked(taskID, head, reason)
+		prog.Outcome = gateOutcomeBlocked
+		m.writeGateProgress(dir, prog)
+		m.teardownReviewers(taskID, unionDimensions(dims, dispatchedDimensions(prog)))
+		return GateBlocked, nil
+	}
+
 	if len(toDispatch) > 0 {
 		charged := false
 		for _, dim := range toDispatch {
@@ -1488,37 +1521,6 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 	}
 
 	if !allReady {
-		// Not all reports are in. Bound the wait from the EPISODE, not from the first dispatch.
-		//
-		// Keying this on DispatchedAt tied both of the gate's bounds to the same fact. The
-		// attempt ceiling counts launches and the stall clock counted the first launch, so an
-		// episode where nothing ever launches was invisible to both and ran forever. That is
-		// reachable without anything exotic: reviewerWindowAlive uses the bool
-		// tmux.WindowExists, which folds a timed-out probe to "present" so a wedged server
-		// cannot make the gate double-launch a reviewer into an occupied worktree. With tmux
-		// wedged from an episode's first tick every dimension reads as already-running,
-		// nothing is dispatched, nothing is charged, and DispatchedAt stays zero.
-		//
-		// Running the clock from the episode makes lack of progress itself the thing that
-		// escalates, which is the property actually wanted, and it leaves the charging split
-		// alone: a transient wedge still burns no retries because nothing is charged for it.
-		if reviewerTimeout > 0 && prog.StartedAt != 0 && now.Sub(time.Unix(0, prog.StartedAt)) > reviewerTimeout {
-			// DispatchedAt still earns its place here: it separates "reviewers ran and went
-			// quiet" from "nothing ever got off the ground", which are different problems for
-			// whoever picks this up.
-			reason := fmt.Sprintf("reviewers did not all report within %s", reviewerTimeout)
-			if prog.DispatchedAt == 0 {
-				reason = fmt.Sprintf("no reviewer was dispatched within %s; the episode made no progress", reviewerTimeout)
-				if prog.LastDispatchError != "" {
-					reason += "; last dispatch error: " + prog.LastDispatchError
-				}
-			}
-			m.surfaceGateBlocked(taskID, head, reason)
-			prog.Outcome = gateOutcomeBlocked
-			m.writeGateProgress(dir, prog)
-			m.teardownReviewers(taskID, unionDimensions(dims, dispatchedDimensions(prog)))
-			return GateBlocked, nil
-		}
 		return GateWaiting, nil
 	}
 

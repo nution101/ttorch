@@ -1291,3 +1291,56 @@ func writeFindingReport(t *testing.T, dir, dim, sha string, findings []review.Fi
 		t.Fatal(err)
 	}
 }
+
+// TestGateOnce_ARepeatingUnstartedLaunchStillEscalates is the other wedge, and it takes a
+// different route through the loop than the tmux-probe one.
+//
+// tmux.ErrTimeout is the only uncharged bucket, and the worker shares the tmux server, so a
+// pane left in copy-mode can make every probe time out for as long as it sits there. Here the
+// dispatch IS attempted, unlike the case where reviewerWindowAlive short-circuits: every
+// launch comes back unstarted, nothing is charged, and the loop returns GateDispatched from
+// inside the dispatch branch, which is BEFORE the stall check the other wedge reaches. So
+// moving the clock to the episode did not by itself close this one; the check also has to sit
+// where both routes pass through it.
+//
+// Not charging is still right. An unstarted launch must not consume a retry, or the budget
+// that exists to outlast a wedge is spent by the wedge. What has to be bounded is the
+// EPISODE, which is a different question from what has to be charged.
+func TestGateOnce_ARepeatingUnstartedLaunchStillEscalates(t *testing.T) {
+	m, _ := trustedTaskWithSubstantialDiff(t, "gate-copymode", "cm1")
+	t.Cleanup(func() { _, _ = m.Teardown("cm1", true) })
+	prev := reviewerDispatcher
+	t.Cleanup(func() { reviewerDispatcher = prev })
+	reviewerDispatcher = func(m *Manager, taskID, dim, dir, head, repo, wt string) error {
+		return fmt.Errorf("tmux pane is in copy-mode: %w", errReviewerNotStarted)
+	}
+	start := time.Unix(1_700_000_000, 0)
+	const stall = 10 * time.Minute
+
+	for i, at := range []time.Time{start, start.Add(time.Minute), start.Add(5 * time.Minute)} {
+		out, err := m.gateOnceAt("cm1", time.Minute, 2, stall, at)
+		if err != nil {
+			t.Fatalf("tick %d: %v", i+1, err)
+		}
+		if out == GateBlocked {
+			t.Fatalf("tick %d blocked inside the stall window; a transient wedge must be survivable", i+1)
+		}
+	}
+	prog, _ := m.readGateProgress(m.P.ReviewInputsDir("cm1"))
+	for d, n := range prog.Attempts {
+		if n != 0 {
+			t.Errorf("dimension %s burned %d attempt(s) to an unstarted launch", d, n)
+		}
+	}
+
+	out, err := m.gateOnceAt("cm1", time.Minute, 2, stall, start.Add(11*time.Minute))
+	if err != nil {
+		t.Fatalf("gateOnceAt past the stall window: %v", err)
+	}
+	if out != GateBlocked {
+		t.Fatalf("outcome = %q, want %q: a launch that never starts must still bound the episode", out, GateBlocked)
+	}
+	if !hasGateBlockedEvent(t, m, "cm1") {
+		t.Fatal("a repeating unstarted launch must surface gate_blocked, not spin on daemon stderr")
+	}
+}
