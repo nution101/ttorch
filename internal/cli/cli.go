@@ -2332,7 +2332,8 @@ Briefs:
                           is the commit a file:line citation was read at (a worker HEAD
                           or reviewed sha). Without it, line citations resolve against
                           the base, where an unresolved one is unevaluable rather than
-                          failed. Per-project config lives in AGENTS.md, as the lines
+                          failed. A brief over 1 MiB is refused, not truncated.
+                          Per-project config lives in AGENTS.md, as the lines
                           "- brief-standards: <pointer>" and
                           "- brief-lint-disable: <rule,...>".
 

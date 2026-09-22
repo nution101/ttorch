@@ -153,11 +153,16 @@ func (r Report) Skipped() int { return r.skipped }
 // Refused reports a run that stopped before any rule could run, for a reason of its own.
 func (r Report) Refused() bool { return r.refused }
 
-// MaxBriefBytes caps the text one run will read. A brief is untrusted input and the text
-// rules are linear in its size, so this is a bound on the work rather than a judgement about
-// writing: 1 MiB is several times the largest brief this project has produced (the biggest
-// measured is 193 KB), and a file past it is refused rather than truncated, because linting
-// half a brief and reporting a pass is the failure this package exists to prevent.
+// MaxBriefBytes caps the text one run will read. A brief is untrusted input, so this bounds
+// the work rather than judging the writing: 1 MiB is several times the largest brief this
+// project has produced (the biggest measured is 193 KB), and a file past it is refused
+// rather than truncated, because linting half a brief and reporting a pass is the failure
+// this package exists to prevent.
+//
+// The cap is what makes the text phase bounded in the first place. Being linear in the
+// brief's size is a property each text rule has had to be given and has twice lost: a
+// per-item call that rescans the brief turns a rule quadratic without changing a line of
+// its logic. TestEveryTextRuleIsLinearInTheBrief is what holds it, per rule.
 const MaxBriefBytes = 1 << 20
 
 // budgetCheckEvery is how often a text rule looks at the clock while walking a brief. Often
@@ -216,12 +221,16 @@ type Options struct {
 	// means defaultBudget. Whatever the budget does not cover is reported as unevaluable,
 	// naming what went unchecked — never passed over in silence.
 	//
-	// The budget covers the git work and the text rules both, and it is worth being exact
-	// about how: git calls derive their deadline from it, and the three text rules check it
-	// as they walk the brief and stop rather than run to completion. Those rules are linear
-	// in the brief's size and the size is capped, so the budget is a backstop there rather
-	// than the primary bound. It was git-only once, and a pathological brief then spent 69s
-	// inside a text rule with the budget looking on.
+	// The budget covers the git work and the text phase both, and it is worth being exact
+	// about how, because this claim has been wrong twice. Git calls derive their deadline
+	// from it. Rules 2, 3 and 4 check it inside the loops that walk the brief, including
+	// the phase that collects the items before the rule reports on them, which is where
+	// rule 3 once overran a 45s budget by 11.9s: the loop that checked the clock ran after
+	// the expensive one. Rules 1 and 5 do work proportional to the brief and check it once.
+	//
+	// Every text rule is measured linear in the brief's size, and the size is capped, so
+	// the budget is a backstop there rather than the primary bound. It was git-only once,
+	// and a pathological brief then spent 69s inside a text rule with the budget watching.
 	//
 	// The deadline is enforced, not merely declared: see gitCommand, which kills the child's
 	// whole process group and caps the wait on pipes a fork might still hold. Killing git

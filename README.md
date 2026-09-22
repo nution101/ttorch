@@ -280,13 +280,21 @@ Some details that matter in practice:
   five rules instead of one. The separate status is for the caller who wants to insist on full
   coverage.
 - **A brief is untrusted input**, pasted from issues and written by agents, and two rules query git
-  once per item they find in it. So one run has an aggregate git budget (45s), the remote check
+  once per item they find in it. So one run is bounded on both sides. The brief itself is capped at
+  **1 MiB** and a longer one is refused rather than truncated, because reading part of a brief says
+  nothing about the whole of it. The git work has an aggregate budget (45s), the remote check
   verifies at most 3 distinct targets, and at most 64 distinct cited paths are resolved. Whatever a
   bound excludes is reported as unevaluable and named, never passed over. The budget is enforced
   rather than merely set: each git call runs in its own process group, which is killed when the
   budget is spent, and the wait on any pipe an escaped fork still holds is capped at 2s. Killing
   git alone is not enough, because the ssh or credential helper it forked keeps the output pipe
   open.
+
+  The text rules are bounded too, and that took three rounds to get right. Each is linear in the
+  brief's size and checks the budget as it walks, including while collecting what it will report
+  on. Twice a rule was made quadratic by a per-item call that rescanned the brief, and a 416 KB
+  brief of nothing but counts took 9.8s where its parent took 0.07s. A per-rule complexity test
+  holds that now.
 
 Per-project configuration lives in the repo's `AGENTS.md`, beside the delivery-mode line:
 
