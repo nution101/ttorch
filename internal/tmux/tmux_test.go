@@ -375,17 +375,18 @@ func TestWindowExists_TimeoutFoldsToPresent(t *testing.T) {
 
 	// A timeout: uncertainty, so assume present.
 	t.Setenv("FAKE_SLEEP", "5")
-	prevT, prevW := runTimeout, runWaitDelay
-	runTimeout, runWaitDelay = 250*time.Millisecond, 250*time.Millisecond
-	t.Cleanup(func() { runTimeout, runWaitDelay = prevT, prevW })
-	if !WindowExists("s", "anything") {
-		t.Error("WindowExists = false on a timeout, want true so Resume skips rather than rebuilds")
-	}
-	if _, err := WindowExistsErr("s", "anything"); !errors.Is(err, ErrTimeout) {
-		t.Errorf("WindowExistsErr should surface the timeout sentinel, got %v", err)
-	}
+	underShortDeadline(t, 250*time.Millisecond, func() {
+		if !WindowExists("s", "anything") {
+			t.Error("WindowExists = false on a timeout, want true so Resume skips rather than rebuilds")
+		}
+		if _, err := WindowExistsErr("s", "anything"); !errors.Is(err, ErrTimeout) {
+			t.Errorf("WindowExistsErr should surface the timeout sentinel, got %v", err)
+		}
+	})
 
-	// A plain failure (no such session): a definite negative, so keep answering false.
+	// A plain failure (no such session): a definite negative, so keep answering false. Run
+	// under the production deadline: a short budget here would let a slow fork/exec become
+	// a timeout, which WindowExists folds to present, failing this for the wrong reason.
 	t.Setenv("FAKE_SLEEP", "")
 	t.Setenv("FAKE_LIST_WINDOWS_EXIT", "1")
 	if WindowExists("s", "anything") {
@@ -400,21 +401,41 @@ func TestWindowExists_TimeoutFoldsToPresent(t *testing.T) {
 // distinguishable from a negative answer anywhere a negative answer causes an
 // action, which is why WindowExists can fold it safely and why a caller that needs
 // to tell them apart can.
+// underShortDeadline runs fn with a short tmux command deadline and restores the real one
+// afterwards.
+//
+// Only a phase that is SUPPOSED to hit the deadline belongs inside it. A call that is meant
+// to fail fast, left under a short budget, is decided by how long a fork/exec happens to
+// take rather than by the property under test: run() classifies anything past the budget as
+// a timeout, so a legitimate fast failure gets reported as one. That is what made the two
+// tests below intermittently red inside a full parallel suite. The margin was never large
+// enough to rely on: with the real fake-tmux binary the negative path measured a 25ms mean
+// and a 134ms max against the 250ms budget that used to span the whole test.
+func underShortDeadline(t *testing.T, d time.Duration, fn func()) {
+	t.Helper()
+	defer SetRunTimeoutForTest(d)()
+	fn()
+}
+
 func TestRun_TimeoutIsIdentifiable(t *testing.T) {
 	installFakeTmux(t)
-	t.Setenv("FAKE_SLEEP", "5")
-	prevT, prevW := runTimeout, runWaitDelay
-	runTimeout, runWaitDelay = 250*time.Millisecond, 250*time.Millisecond
-	t.Cleanup(func() { runTimeout, runWaitDelay = prevT, prevW })
 
-	_, err := run("list-windows", "-t", "s")
-	if err == nil {
-		t.Fatal("run err = nil, want a timeout")
-	}
-	if !errors.Is(err, ErrTimeout) {
-		t.Errorf("timeout must be identifiable with errors.Is, got %v", err)
-	}
-	// A real negative answer must not look like a timeout.
+	// A command that never answers. The budget only has to be shorter than the fake's
+	// sleep, so a short one keeps the test quick.
+	t.Setenv("FAKE_SLEEP", "5")
+	underShortDeadline(t, 250*time.Millisecond, func() {
+		_, err := run("list-windows", "-t", "s")
+		if err == nil {
+			t.Fatal("run err = nil, want a timeout")
+		}
+		if !errors.Is(err, ErrTimeout) {
+			t.Errorf("timeout must be identifiable with errors.Is, got %v", err)
+		}
+	})
+
+	// A real negative answer must not look like a timeout. This phase runs under the
+	// production deadline on purpose: under a short one the assertion would be decided by
+	// how long the fork/exec took, not by how run() classifies a failure.
 	t.Setenv("FAKE_SLEEP", "")
 	t.Setenv("FAKE_LIST_WINDOWS_EXIT", "1")
 	if _, err := run("list-windows", "-t", "s"); err == nil || errors.Is(err, ErrTimeout) {
@@ -680,14 +701,20 @@ func TestReadOnlyViewSupported(t *testing.T) {
 // report instead.
 func TestRun_TimesOut(t *testing.T) {
 	installFakeTmux(t)
-	t.Setenv("FAKE_SLEEP", "5")
-	prevT, prevW := runTimeout, runWaitDelay
-	runTimeout, runWaitDelay = 250*time.Millisecond, 250*time.Millisecond
-	t.Cleanup(func() { runTimeout, runWaitDelay = prevT, prevW })
+	// 30s, not 5s. Every assertion here is on the timeout path, so this test does not have
+	// the flake shape the two above did, but it still ends on a wall-clock upper bound. The
+	// bound separates "gave up at the deadline" from "waited the command out", so the gap
+	// between the ceiling and the command's own duration is the whole margin: 3s against a
+	// 5s sleep left only 1.7x, while 10s against 30s leaves 3x, on an expected ~0.5s.
+	t.Setenv("FAKE_SLEEP", "30")
 
-	start := time.Now()
-	_, err := run("send-keys", "-t", "s:w", "x")
-	elapsed := time.Since(start)
+	var elapsed time.Duration
+	var err error
+	underShortDeadline(t, 250*time.Millisecond, func() {
+		start := time.Now()
+		_, err = run("send-keys", "-t", "s:w", "x")
+		elapsed = time.Since(start)
+	})
 	if err == nil {
 		t.Fatal("run err = nil, want a timeout")
 	}
@@ -697,8 +724,8 @@ func TestRun_TimesOut(t *testing.T) {
 	if !strings.Contains(err.Error(), "copy-mode") {
 		t.Errorf("error should name the reachable cause so it is actionable, got %v", err)
 	}
-	if elapsed > 3*time.Second {
-		t.Errorf("run blocked %v, want it to give up near the deadline", elapsed)
+	if elapsed > 10*time.Second {
+		t.Errorf("run blocked %v, want it to give up at the deadline rather than wait the command out", elapsed)
 	}
 }
 
