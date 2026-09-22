@@ -425,3 +425,17 @@ func TestCmdBriefLintRefusesAnOversizeBrief(t *testing.T) {
 		t.Errorf("a size refusal must not be reported as a project disable: %v", err)
 	}
 }
+
+// spawn stores a brief exactly as task add does, and for a while only task add checked one.
+func TestSpawnLintsTheBriefItStores(t *testing.T) {
+	repo := lintRepo(t)
+	if err := lintBriefBeforeStore("spawn", "spawned", defectiveBrief, repo, "", false); err == nil {
+		t.Fatal("spawn must refuse a brief that violates a rule")
+	}
+	out, err := captureStdout(t, func() error {
+		return lintBriefBeforeStore("spawn", "spawned", cleanBrief, repo, "", false)
+	})
+	if err != nil {
+		t.Fatalf("spawn must accept a clean brief, got %v\n%s", err, out)
+	}
+}

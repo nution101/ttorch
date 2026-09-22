@@ -415,7 +415,7 @@ func cmdSpawn(args []string) error {
 	// Task id and repo are the first two positionals; flags follow (the stdlib
 	// flag parser stops at the first positional, so parse the remainder).
 	if len(args) < 2 {
-		return errors.New(`usage: ttorch spawn <task-id> <repo-path> [--scout] [--init] [--touches "a,b"] [--brief-file <path> | --brief "..."] [--effort <level>] [--model <m>] [--force-overlap] [--cmd "..."]`)
+		return errors.New(`usage: ttorch spawn <task-id> <repo-path> [--scout] [--init] [--touches "a,b"] [--brief-file <path> | --brief "..."] [--effort <level>] [--model <m>] [--force-overlap] [--cmd "..."] [--no-brief-lint]`)
 	}
 	id, repo := args[0], args[1]
 	fs := flag.NewFlagSet("spawn", flag.ContinueOnError)
@@ -428,6 +428,9 @@ func cmdSpawn(args []string) error {
 	brief := fs.String("brief", "", "inline brief text used as the worker's initial prompt, instead of the generic stub")
 	forceOverlap := fs.Bool("force-overlap", false, "dispatch even if the footprint overlaps a live worker (override the conflict refusal)")
 	raw := fs.String("cmd", "", "raw command to run instead of the default harness launch")
+	citationsRef := fs.String("citations-ref", "", "ref the brief's file:line citations were read at (a worker HEAD or reviewed sha) - passed to the brief lint")
+	lintOffline := fs.Bool("brief-lint-offline", false, "lint the brief without reaching the network: the target-branch rule is skipped and the rest still run")
+	noLint := fs.Bool("no-brief-lint", false, "spawn without linting the brief (see 'ttorch brief-lint'); prefer disabling a specific rule in the project's AGENTS.md")
 	if err := fs.Parse(args[2:]); err != nil {
 		return err
 	}
@@ -446,6 +449,18 @@ func cmdSpawn(args []string) error {
 	briefContent, err := resolveBrief("spawn", *brief, *briefFile)
 	if err != nil {
 		return err
+	}
+	if *noLint && briefContent == "" {
+		return errNoBriefLintWithoutBrief
+	}
+	// Lint before any side effect, for the reason task add does: this writes the brief to
+	// the task and the worker starts on it, so this is the last moment a defect is free to
+	// fix. A manager standing over the command can still override, which is why the escape
+	// flags are here rather than a decision to skip the check.
+	if !*noLint && briefContent != "" {
+		if err := lintBriefBeforeStore("spawn", "spawned", briefContent, repo, *citationsRef, *lintOffline); err != nil {
+			return err
+		}
 	}
 	m, err := mgr()
 	if err != nil {
@@ -2270,6 +2285,10 @@ Team:
     --brief-file <path>     launch the worker with this file's contents as its
                             initial prompt (the full brief) instead of the stub
     --brief "..."           launch the worker with this inline text as its brief
+    --no-brief-lint         store the brief without linting it; --brief-lint-offline
+                            skips only the rule that reaches the network, and
+                            --citations-ref names the commit file:line citations
+                            were read at
     --effort <level>        reasoning effort: low|medium|high|xhigh|max|ultracode|off
                             (default: $TTORCH_EFFORT, else ultracode for ship / high
                             for scout); persisted so a resume restores it
@@ -2316,8 +2335,9 @@ Backlog & planning (read the DB; includes pending backlog tasks):
   phase set-status <id> <status>          planned|in_progress|blocked|done|cancelled
   task add <id> --project <id> [--epic id] [--phase id] [--title "…"] [--touches "a,b"]
                           create a pending backlog task (does not spawn); a supplied
-                          brief is lint-checked first (--brief-lint-offline to skip
-                          only the network rule, --no-brief-lint to skip all five)
+                          brief is lint-checked first, as it is on spawn
+                          (--brief-lint-offline to skip only the network rule,
+                          --no-brief-lint to skip all five)
 
 Briefs:
   brief-lint <file>       check a brief before it is stored on a task: target branch

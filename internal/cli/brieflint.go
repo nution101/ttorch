@@ -190,11 +190,18 @@ func coverage(rep brieflint.Report) string {
 	return s
 }
 
-// lintBriefForAdd runs the same rules in front of `ttorch task add`, where the cost of a
-// defective brief is actually paid: the brief is copied into the task at add time, so this
-// is the last moment a fix reaches the worker. Both a violation and an unevaluable check
-// stop the add — an unevaluable check is not a pass — and both name the escape hatches.
+// lintBriefForAdd runs the lint in front of `ttorch task add`.
 func lintBriefForAdd(text, repo, citationsRef string, offline bool) error {
+	return lintBriefBeforeStore("task add", "added", text, repo, citationsRef, offline)
+}
+
+// lintBriefBeforeStore runs the rules in front of whichever command is about to STORE a
+// brief, which is where the cost of a defective one is actually paid: the brief is copied
+// into the task, so this is the last moment a fix reaches the worker. Both a violation and
+// an unevaluable check stop the command — an unevaluable check is not a pass — and both
+// name the escape hatches. `task add` and `spawn` both store one, and for a while only the
+// first of them checked.
+func lintBriefBeforeStore(who, stored, text, repo, citationsRef string, offline bool) error {
 	if strings.TrimSpace(text) == "" {
 		return nil
 	}
@@ -205,7 +212,7 @@ func lintBriefForAdd(text, repo, citationsRef string, offline bool) error {
 		Config:       brieflint.LoadConfig(repo),
 	})
 	printBriefLint(os.Stdout, "the supplied brief", rep)
-	err := briefLintOutcome(rep, "task add")
+	err := briefLintOutcome(rep, who)
 	var le lintError
 	if errors.As(err, &le) && le.code == exitLintPartial {
 		// Reduced coverage is reported, not refused: see exitLintPartial for why the add
@@ -213,7 +220,7 @@ func lintBriefForAdd(text, repo, citationsRef string, offline bool) error {
 		// coverage() names the real reason; this sentence must not re-assert a different
 		// one. It said "the rules the project disabled" even under --brief-lint-offline,
 		// which points the reader at an AGENTS.md that never mentions the rule.
-		fmt.Fprintf(os.Stderr, "note: %s. The add proceeds; the rules that did not run were not checked.\n", coverage(rep))
+		fmt.Fprintf(os.Stderr, "note: %s. The %s proceeds; the rules that did not run were not checked.\n", coverage(rep), who)
 		return nil
 	}
 	switch {
@@ -222,9 +229,9 @@ func lintBriefForAdd(text, repo, citationsRef string, offline bool) error {
 		// Say plainly that this is not a verdict on the brief. The lint reaches the network
 		// for the target-branch check, so an unreachable remote lands here, and a worker
 		// whose add was refused should not go looking for a defect in the text.
-		fmt.Fprintf(os.Stderr, "note: nothing was added, and this is NOT a verdict on the brief: the lint could not finish. An unreachable remote, a ref that does not resolve, or a citation it could not settle all land here. Resolve it, or re-run with --no-brief-lint to add the brief as written.\n")
+		fmt.Fprintf(os.Stderr, "note: nothing was %s, and this is NOT a verdict on the brief: the lint could not finish. An unreachable remote, a ref that does not resolve, or a citation it could not settle all land here. Resolve it, or re-run with --no-brief-lint to store the brief as written.\n", stored)
 	default:
-		fmt.Fprintf(os.Stderr, "note: nothing was added. Fix the brief, or re-run with --no-brief-lint to add it as written.\n")
+		fmt.Fprintf(os.Stderr, "note: nothing was %s. Fix the brief, or re-run with --no-brief-lint to store it as written.\n", stored)
 	}
 	return err
 }
