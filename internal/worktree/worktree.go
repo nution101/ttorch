@@ -836,6 +836,14 @@ func parseBatchRecords(rev string, out []byte, wanted []blobRequest) (map[string
 		if err != nil {
 			return nil, fmt.Errorf("git cat-file --batch: unparseable size in %q", header)
 		}
+		// A negative size slips past the bounds check below, because a negative is not
+		// greater than a length, and then buf[:size] panics. Nothing in this process
+		// recovers, so one malformed header would take down ttorch rather than fail one
+		// gate closed. Real git never emits one; this function's contract is to survive a
+		// stream no repository could produce, so it has to hold anyway.
+		if size < 0 {
+			return nil, fmt.Errorf("git cat-file --batch: negative size in %q", header)
+		}
 		if size > len(buf) {
 			return nil, fmt.Errorf("git cat-file --batch: record for %s:%s claims %d bytes "+
 				"but only %d remain; the stream is truncated", rev, w.path, size, len(buf))
@@ -867,9 +875,9 @@ type treeEntry struct {
 // it is what keeps a path containing a newline from splitting a record. It also hands back
 // each object's id, which is what lets CatBlobs read by id rather than by path.
 func treeEntries(path, rev string) (map[string]treeEntry, error) {
-	out, errOut, err := gitRaw("-C", path, "ls-tree", "-r", "-z", rev)
+	out, err := checkedGitRaw("-C", path, "ls-tree", "-r", "-z", rev)
 	if err != nil {
-		return nil, fmt.Errorf("git ls-tree -r -z %s in %s: %w: %s", rev, path, err, strings.TrimSpace(errOut))
+		return nil, fmt.Errorf("git ls-tree -r -z %s in %s: %w", rev, path, err)
 	}
 	entries := make(map[string]treeEntry)
 	for _, rec := range strings.Split(out, "\x00") {

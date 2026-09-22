@@ -981,3 +981,29 @@ func TestParseBatchRecords_MissingBlobIsAnErrorButMissingGitlinkIsNot(t *testing
 		t.Fatal("a blob the tree names but the object store lacks must be an error")
 	}
 }
+
+// TestParseBatchRecords_MalformedSizeIsAnError covers the headers a stream could carry that
+// are not a usable size.
+//
+// The negative case is the one that mattered: strconv.Atoi accepts "-5", a negative is not
+// greater than a length so the bounds check below it never fired, and buf[:size] then
+// panicked with slice-bounds-out-of-range. Nothing in internal/orchestrator,
+// internal/scheduler or cmd/ttorch recovers, so that took down the whole process instead of
+// failing one gate closed. Real git never emits one, but this function's contract is to
+// survive a stream no repository could produce.
+func TestParseBatchRecords_MalformedSizeIsAnError(t *testing.T) {
+	for _, tc := range []struct{ name, header string }{
+		{"negative", oidA + " blob -5"},
+		{"not a number", oidA + " blob eight"},
+		{"empty", oidA + " blob "},
+		{"overflowing an int", oidA + " blob 99999999999999999999999"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wanted := []blobRequest{{path: "a.go", entry: treeEntry{Type: "blob", OID: oidA}}}
+			got, err := parseBatchRecords("main", []byte(tc.header+"\nhi!\n"), wanted)
+			if err == nil {
+				t.Fatalf("a %s size must be an error, got %q", tc.name, got)
+			}
+		})
+	}
+}
