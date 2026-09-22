@@ -1141,3 +1141,63 @@ func gateBlockedEventMentions(t *testing.T, m *Manager, taskID, want string) boo
 	}
 	return false
 }
+
+// TestGateOnce_AWedgedTmuxStillEscalates closes the gap between the two bounds. An episode
+// that makes no progress at all must end, and before this it could run forever.
+//
+// The charging split's one "nothing started" case is the window-probe timeout inside
+// spawnReviewer, and that is only reachable once reviewerWindowAlive has said the window is
+// NOT already up. reviewerWindowAlive calls the bool tmux.WindowExists, which folds a
+// timed-out probe to "present" on purpose, so that a wedged server cannot make the gate
+// double-launch a reviewer into an occupied worktree. The consequence is that when tmux is
+// wedged from the first tick of an episode, every dimension reads as already-running: nothing
+// is dispatched, nothing is charged, and the stall check never fires because it was gated on
+// DispatchedAt, which only a charged attempt sets.
+//
+// So both bounds were keyed on the same fact. The attempt ceiling counts launches, the stall
+// clock counted the first launch, and an episode where nothing ever launches is invisible to
+// both. The clock now runs from the EPISODE, so making no progress is itself the thing that
+// escalates, and neither of the two properties the charging split protects has to change: a
+// transient wedge still burns no retries, and a total wedge still surfaces gate_blocked on a
+// bounded schedule.
+func TestGateOnce_AWedgedTmuxStillEscalates(t *testing.T) {
+	skipIfShort(t)
+	m, _ := trustedTaskWithSubstantialDiff(t, "gate-wedged", "wg1")
+	t.Cleanup(func() { _, _ = m.Teardown("wg1", true) })
+	slowTmux(t)
+	start := time.Unix(1_700_000_000, 0)
+	const stall = 10 * time.Minute
+
+	// Ticks inside the stall window: nothing launches, and nothing is charged, which is the
+	// behaviour ttv-mirror's property requires and which must not change.
+	for i, at := range []time.Time{start, start.Add(time.Minute), start.Add(5 * time.Minute)} {
+		out, err := m.gateOnceAt("wg1", time.Minute, 2, stall, at)
+		if err != nil {
+			t.Fatalf("tick %d: %v", i+1, err)
+		}
+		if out == GateBlocked {
+			t.Fatalf("tick %d blocked inside the stall window; a transient wedge must be survivable", i+1)
+		}
+	}
+	prog := m.readGateProgress(m.P.ReviewInputsDir("wg1"))
+	for d, n := range prog.Attempts {
+		if n != 0 {
+			t.Errorf("dimension %s burned %d attempt(s) to a wedged probe; the retry budget must survive the hang", d, n)
+		}
+	}
+
+	// Past the stall window the episode has made no progress whatsoever, so it must end.
+	out, err := m.gateOnceAt("wg1", time.Minute, 2, stall, start.Add(11*time.Minute))
+	if err != nil {
+		t.Fatalf("gateOnceAt past the stall window: %v", err)
+	}
+	if out != GateBlocked {
+		t.Fatalf("outcome = %q, want %q: an episode that never dispatched anything must still escalate", out, GateBlocked)
+	}
+	if !hasGateBlockedEvent(t, m, "wg1") {
+		t.Fatal("a wedged episode must surface gate_blocked for the manager, not wait silently")
+	}
+	if _, ok := m.TrustShow("wg1"); ok {
+		t.Fatal("no verdict may be recorded from an episode where no reviewer ever ran")
+	}
+}

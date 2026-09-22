@@ -1241,8 +1241,12 @@ type gateProgress struct {
 	Head         string         `json:"head"`         // the reviewed commit this episode gates
 	Dims         []string       `json:"dims"`         // the prepared, size-scaled reviewer set
 	Attempts     map[string]int `json:"attempts"`     // per-dimension reviewer (re)dispatch count
-	DispatchedAt int64          `json:"dispatchedAt"` // unix nano of the first reviewer dispatch (stall clock); 0 until dispatched
-	Outcome      string         `json:"outcome"`      // "" in flight | gateOutcomeRecorded | gateOutcomeBlocked
+	DispatchedAt int64          `json:"dispatchedAt"` // unix nano of the first CHARGED dispatch; 0 until one
+	// StartedAt is when this episode opened, and it is what the stall clock runs from. It is
+	// deliberately NOT DispatchedAt: an episode can fail to dispatch anything at all, and
+	// that is the case most in need of a bound (see the stall check).
+	StartedAt int64  `json:"startedAt"`
+	Outcome   string `json:"outcome"` // "" in flight | gateOutcomeRecorded | gateOutcomeBlocked
 	// LastDispatchError is the most recent CHARGED launch failure, carried so the block the
 	// attempt ceiling surfaces can say the reviewer never started rather than never reported.
 	// An unstarted failure does not set it: it costs no attempt, so it never reaches a block.
@@ -1341,6 +1345,16 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 		}
 		episodeDims, _ := m.requiredDimensions(t, head)
 		prog = gateProgress{Head: head, Dims: episodeDims, Attempts: map[string]int{}}
+		m.writeGateProgress(dir, prog)
+	}
+
+	// Stamp the episode's start if it does not have one. This covers both cases in one line:
+	// an episode opened on the tick above, and an episode written by a build whose stall clock
+	// still ran from DispatchedAt and so persisted no start. The second is why it is a
+	// normalization rather than an assignment at the boundary; giving it now rather than the
+	// zero time means an upgrade grants a full timeout instead of escalating instantly.
+	if prog.StartedAt == 0 {
+		prog.StartedAt = now.UnixNano()
 		m.writeGateProgress(dir, prog)
 	}
 
@@ -1461,11 +1475,32 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 	}
 
 	if !allReady {
-		// Reviewers are running but not all reports are in. Bound the wait: a reviewer wedged
-		// past reviewerTimeout (alive but never reporting) is surfaced as a stall rather than
-		// leaving the done task in a silent forever-wait.
-		if prog.DispatchedAt != 0 && reviewerTimeout > 0 && now.Sub(time.Unix(0, prog.DispatchedAt)) > reviewerTimeout {
-			m.surfaceGateBlocked(taskID, head, fmt.Sprintf("reviewers did not all report within %s", reviewerTimeout))
+		// Not all reports are in. Bound the wait from the EPISODE, not from the first dispatch.
+		//
+		// Keying this on DispatchedAt tied both of the gate's bounds to the same fact. The
+		// attempt ceiling counts launches and the stall clock counted the first launch, so an
+		// episode where nothing ever launches was invisible to both and ran forever. That is
+		// reachable without anything exotic: reviewerWindowAlive uses the bool
+		// tmux.WindowExists, which folds a timed-out probe to "present" so a wedged server
+		// cannot make the gate double-launch a reviewer into an occupied worktree. With tmux
+		// wedged from an episode's first tick every dimension reads as already-running,
+		// nothing is dispatched, nothing is charged, and DispatchedAt stays zero.
+		//
+		// Running the clock from the episode makes lack of progress itself the thing that
+		// escalates, which is the property actually wanted, and it leaves the charging split
+		// alone: a transient wedge still burns no retries because nothing is charged for it.
+		if reviewerTimeout > 0 && prog.StartedAt != 0 && now.Sub(time.Unix(0, prog.StartedAt)) > reviewerTimeout {
+			// DispatchedAt still earns its place here: it separates "reviewers ran and went
+			// quiet" from "nothing ever got off the ground", which are different problems for
+			// whoever picks this up.
+			reason := fmt.Sprintf("reviewers did not all report within %s", reviewerTimeout)
+			if prog.DispatchedAt == 0 {
+				reason = fmt.Sprintf("no reviewer was dispatched within %s; the episode made no progress", reviewerTimeout)
+				if prog.LastDispatchError != "" {
+					reason += "; last dispatch error: " + prog.LastDispatchError
+				}
+			}
+			m.surfaceGateBlocked(taskID, head, reason)
 			prog.Outcome = gateOutcomeBlocked
 			m.writeGateProgress(dir, prog)
 			m.teardownReviewers(taskID, unionDimensions(dims, dispatchedDimensions(prog)))
