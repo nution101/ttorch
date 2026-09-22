@@ -988,7 +988,20 @@ func (m *Manager) AdvisoryPrep(taskID string, dims []string) (inputsDir, advisor
 	// that case, which costs nothing here: the inputs under review are the committed diff, and
 	// they are the ones the gate is already reviewing.
 	inputsDir = m.P.ReviewInputsDir(taskID)
-	if review.ValidateState(inputsDir, head) == "unprepped" {
+	// Prep only when NOTHING says an episode already covers this commit.
+	//
+	// Keying that on review.ValidateState alone was the same root as the episode record: the
+	// stamp it reads is prep.json, in the review-inputs dir, so removing one file turned the
+	// guard off and an advisory prep archived a healthy gate's reports and drove it to
+	// gate_blocked. The store episode is checked first because the worker cannot write it; the
+	// stamp is still consulted for the manual flow, which has no gate episode but can equally
+	// have a review in progress.
+	prog, found, perr := m.readGateProgress(taskID)
+	if perr != nil {
+		return "", "", fmt.Errorf("advisory prep for %q: could not read the gate episode: %w", taskID, perr)
+	}
+	gated := found && prog.Head == head
+	if !gated && review.ValidateState(inputsDir, head) == "unprepped" {
 		if inputsDir, err = m.TrustPrep(taskID); err != nil {
 			return "", "", err
 		}
