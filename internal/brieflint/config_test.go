@@ -1,6 +1,7 @@
 package brieflint
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -83,10 +84,10 @@ func TestLoadConfigDisable(t *testing.T) {
 // The configuration the reader sees must say what the rules were judged against.
 func TestConfigDescribe(t *testing.T) {
 	cases := map[string]Config{
-		"brief-standards: none declared":       {},
-		"brief-standards: declared but EMPTY":  {StandardsEmpty: true},
-		`brief-standards: "docs/x.md"`:         {Standards: []string{"docs/x.md"}},
-		"disabled: target-branch, hard-counts": {Disabled: map[RuleID]bool{RuleHardCounts: true, RuleTargetBranch: true}},
+		"brief-standards: none declared":            {},
+		"brief-standards: declared but EMPTY":       {StandardsEmpty: true},
+		`brief-standards: 1 declared ("docs/x.md")`: {Standards: []string{"docs/x.md"}},
+		"disabled: target-branch, hard-counts":      {Disabled: map[RuleID]bool{RuleHardCounts: true, RuleTargetBranch: true}},
 	}
 	for want, c := range cases {
 		if got := c.describe(); !strings.Contains(got, want) {
@@ -141,5 +142,36 @@ func TestLoadConfigReadsAFileAtTheCap(t *testing.T) {
 	}
 	if len(c.Standards) != 1 || c.Standards[0] != "docs/STANDARDS.md" {
 		t.Fatalf("want the declared pointer, got %+v", c.Standards)
+	}
+}
+
+// The pointer list comes out of the repository's AGENTS.md, so the project chooses its
+// length. The report header renders it on every run, a clean pass included, and 16,000
+// pointers came to 896 KB of header.
+func TestConfigDescribeCapsThePointerList(t *testing.T) {
+	var c Config
+	for i := 0; i < 16_000; i++ {
+		c.Standards = append(c.Standards, fmt.Sprintf("docs/standard-%d.md", i))
+	}
+	got := c.describe()
+	if len(got) > 1_000 {
+		t.Fatalf("the header is %d bytes for %d pointers; it must be bounded", len(got), len(c.Standards))
+	}
+	if !strings.Contains(got, "16000 declared") {
+		t.Errorf("the header must still say how many were declared, got %q", got)
+	}
+	if !strings.Contains(got, fmt.Sprintf("and %d more", 16_000-maxShownPointers)) {
+		t.Errorf("the header must count what it did not print, got %q", got)
+	}
+	if strings.Contains(got, "docs/standard-15999.md") {
+		t.Errorf("the header must not render the whole list, got %d bytes", len(got))
+	}
+}
+
+// A single pointer is untrusted text too: a project can declare one a megabyte long.
+func TestConfigDescribeClipsALongPointer(t *testing.T) {
+	c := Config{Standards: []string{strings.Repeat("a", 50_000)}}
+	if got := c.describe(); len(got) > 1_000 {
+		t.Fatalf("a %d byte pointer rendered %d bytes of header", 50_000, len(got))
 	}
 }

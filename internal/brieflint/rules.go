@@ -222,6 +222,19 @@ const maxPathBytes = 4096
 // of terminal output, and every other rule already quotes something bounded.
 const maxTokenBytes = 120
 
+// maxRuleFindings caps how many findings one rule reports about one brief. Rules 1 and 2
+// bound the items they process (maxRemoteTargets, maxCitations) so that the brief does not
+// decide how much work its reader does; rules 3 and 4 bounded the SIZE of each finding and
+// not the NUMBER of them, which is the same question. A 1,048,542-byte brief just under
+// MaxBriefBytes produced 63,551 findings and 15,877,010 bytes of stdout, a 15x
+// amplification into whatever reads `ttorch task add`, which in practice is a terminal
+// pane. The number is maxCitations again: one cap is easier to hold in mind than three.
+//
+// Past the cap the surplus is counted and summarised rather than dropped in silence. It is
+// summarised as a violation, not as unevaluable: those sentences were checked and they do
+// carry the defect, they are simply not each printed.
+const maxRuleFindings = maxCitations
+
 // clipToken renders a cited token for the terminal, capped.
 func clipToken(tok string) string {
 	if len(tok) <= maxTokenBytes {
@@ -615,6 +628,7 @@ func checkHardCounts(ctx context.Context, b *brief, _ Options) ([]Finding, []str
 	hedged := hedgedBlocks(sents)
 	asksForTheNumber := reportsTheNumber(b)
 	var findings []Finding
+	suppressed := 0
 	reported := map[[2]int]bool{} // one finding per sentence, not per count inside it
 	for n, c := range counts {
 		if n%budgetCheckEvery == 0 && ctx.Err() != nil {
@@ -635,10 +649,20 @@ func checkHardCounts(ctx context.Context, b *brief, _ Options) ([]Finding, []str
 			continue
 		}
 		reported[key] = true
+		if len(findings) >= maxRuleFindings {
+			suppressed++
+			continue
+		}
 		unit := span{text: s.text[c.unit[0]:c.unit[1]], off: s.off + c.unit[0]}
 		findings = append(findings, Finding{
 			Rule: RuleHardCounts, Status: StatusFail, Quote: unit.trim(), Line: b.lineAt(unit.off),
 			Detail: detail,
+		})
+	}
+	if suppressed > 0 {
+		findings = append(findings, Finding{
+			Rule: RuleHardCounts, Status: StatusFail,
+			Detail: fmt.Sprintf("%d further sentence(s) state a hard count with the same defect and are not listed; the first %d are above. A brief stating this many counts is doing too much, so split it or disable this rule", suppressed, maxRuleFindings),
 		})
 	}
 	if len(findings) == 0 {
@@ -674,7 +698,7 @@ func checkProhibition(ctx context.Context, b *brief, _ Options) ([]Finding, []st
 		return nil, []string{"prohibition: no prohibition on push/merge/commit/PR was recognised in the brief"}
 	}
 	var findings []Finding
-	banCount := 0
+	banCount, suppressed := 0, 0
 	var first span // the sentence carrying the first ban, for the end-state finding
 	for _, s := range spans {
 		hits, complete := prohibitionHits(ctx, s)
@@ -692,11 +716,23 @@ func checkProhibition(ctx context.Context, b *brief, _ Options) ([]Finding, []st
 				continue
 			}
 			reported[hit.unit[0]] = true
+			// The loop runs on past the cap rather than breaking: banCount and first feed
+			// the note and the end-state finding below, and both must count every ban.
+			if len(findings) >= maxRuleFindings {
+				suppressed++
+				continue
+			}
 			findings = append(findings, Finding{
 				Rule: RuleProhibition, Status: StatusFail, Quote: unit.trim(), Line: b.lineAt(unit.off),
 				Detail: fmt.Sprintf("blanket prohibition %q: state the invariant it protects (for example: no changes to a product branch, no PR) rather than banning the machinery outright", strings.TrimSpace(s.text[hit.loc[0]:hit.loc[1]])),
 			})
 		}
+	}
+	if suppressed > 0 {
+		findings = append(findings, Finding{
+			Rule: RuleProhibition, Status: StatusFail,
+			Detail: fmt.Sprintf("%d further sentence(s) carry an unbounded prohibition and are not listed; the first %d are above. A brief banning this much is doing too much, so split it or disable this rule", suppressed, maxRuleFindings),
+		})
 	}
 	if !endStateSignal.MatchString(b.raw) {
 		findings = append(findings, Finding{
@@ -762,12 +798,12 @@ func checkStandards(ctx context.Context, b *brief, opt Options) ([]Finding, []st
 				return []Finding{budgetFinding(RuleStandards)}, nil
 			}
 			if strings.Contains(b.lower, strings.ToLower(p)) {
-				return nil, []string{fmt.Sprintf("standards: the brief mentions the project's declared pointer %q (wording only: a mention, which the check cannot tell from one telling the worker to ignore it)", p)}
+				return nil, []string{fmt.Sprintf("standards: the brief mentions the project's declared pointer %q (wording only: a mention, which the check cannot tell from one telling the worker to ignore it)", clipToken(p))}
 			}
 		}
 		return []Finding{{
 			Rule: RuleStandards, Status: StatusFail,
-			Detail: fmt.Sprintf("the brief cites none of the standards pointer(s) this project declares (%s, from %s %s); point the worker at them", strings.Join(quoteAll(cfg.Standards), ", "), cfg.Source, standardsKey),
+			Detail: fmt.Sprintf("the brief cites none of the %d standards pointer(s) this project declares (%s, from %s %s); point the worker at them", len(cfg.Standards), showPointers(cfg.Standards), cfg.Source, standardsKey),
 		}}, nil
 	}
 	notes := []string{fmt.Sprintf("standards: no project pointer declared (%s), so any explicit standards reference is accepted (wording only: a standards-shaped phrase, which the check cannot tell from one telling the worker to ignore the conventions)", standardsKey)}

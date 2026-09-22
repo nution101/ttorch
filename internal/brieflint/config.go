@@ -148,6 +148,31 @@ func quoteAll(vals []string) []string {
 	return out
 }
 
+// maxShownPointers caps how many declared pointers one report line renders. The list comes
+// out of the repository's AGENTS.md, so its length is the project's choice and not the
+// report's: 16,000 pointers rendered 896 KB of header on every run, including a clean pass.
+// Rules 1 and 2 bound what they print for the same reason.
+const maxShownPointers = 8
+
+// showPointers renders a declared pointer list for the terminal: quoted, each value clipped
+// to a token's length, and the list itself cut to maxShownPointers with the rest counted.
+// Both places that print the list use it, the report header and rule 5's finding.
+func showPointers(vals []string) string {
+	shown := vals
+	if len(shown) > maxShownPointers {
+		shown = shown[:maxShownPointers]
+	}
+	clipped := make([]string, len(shown))
+	for i, v := range shown {
+		clipped[i] = clipToken(v)
+	}
+	s := strings.Join(quoteAll(clipped), ", ")
+	if n := len(vals) - len(shown); n > 0 {
+		s += fmt.Sprintf(", and %d more", n)
+	}
+	return s
+}
+
 // splitList parses a comma-separated value, dropping blank entries so `a,,b` and a trailing
 // comma are not mistaken for empty pointers.
 func splitList(s string) []string {
@@ -180,7 +205,7 @@ func (c Config) describe() string {
 	var parts []string
 	switch {
 	case len(c.Standards) > 0:
-		parts = append(parts, "brief-standards: "+strings.Join(quoteAll(c.Standards), ", "))
+		parts = append(parts, fmt.Sprintf("brief-standards: %d declared (%s)", len(c.Standards), showPointers(c.Standards)))
 	case c.StandardsEmpty:
 		parts = append(parts, "brief-standards: declared but EMPTY")
 	default:

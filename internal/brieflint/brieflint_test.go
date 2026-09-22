@@ -1408,3 +1408,48 @@ func TestOneAbsurdTokenCannotFillAReport(t *testing.T) {
 		}
 	}
 }
+
+// The companion to TestOneAbsurdTokenCannotFillAReport, which bounds the size of each
+// finding and says nothing about how many there are. A 1,048,542-byte brief of nothing but
+// defective sentences produced 63,551 findings and 15,877,010 bytes of stdout, into
+// whatever reads `ttorch task add`.
+func TestNoRuleReportsAnUnboundedNumberOfFindings(t *testing.T) {
+	// Each line trips one rule: the first a hard count with no hedge, the second an
+	// unbounded prohibition. No end state anywhere, so rule 4 also reports that once.
+	unit := "there are 21 files.\ndo not push.\n"
+	body := strings.Repeat(unit, (MaxBriefBytes-2)/len(unit))
+	if len(body) > MaxBriefBytes {
+		t.Fatalf("fixture is %d bytes, over the %d byte cap", len(body), MaxBriefBytes)
+	}
+	r := Lint(body, Options{})
+
+	for _, id := range []RuleID{RuleHardCounts, RuleProhibition} {
+		fs := findingsFor(r, id)
+		// The listed findings, plus the summary of what was not listed, plus rule 4's
+		// separate end-state finding.
+		if len(fs) > maxRuleFindings+2 {
+			t.Errorf("rule %s reported %d findings from one brief; the cap is %d", id, len(fs), maxRuleFindings)
+		}
+		var summarised bool
+		for _, f := range fs {
+			if strings.Contains(f.Detail, "are not listed") {
+				summarised = true
+			}
+		}
+		if !summarised {
+			t.Errorf("rule %s dropped the surplus without saying so: %d findings", id, len(fs))
+		}
+	}
+
+	// What the caller's terminal actually receives.
+	total := 0
+	for _, f := range r.Findings {
+		total += len(f.Detail) + len(f.Quote)
+	}
+	for _, n := range r.Notes {
+		total += len(n)
+	}
+	if total > 100_000 {
+		t.Errorf("a %d byte brief produced %d bytes of report; the whole point of the caps is that it cannot", len(body), total)
+	}
+}
