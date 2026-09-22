@@ -11,6 +11,8 @@ import (
 	"testing"
 
 	"github.com/nution101/ttorch/internal/brieflint"
+	"github.com/nution101/ttorch/internal/paths"
+	"github.com/nution101/ttorch/internal/worktree"
 )
 
 // lintRepo builds a neutral fixture repository: one commit on a base branch pushed to a
@@ -426,8 +428,10 @@ func TestCmdBriefLintRefusesAnOversizeBrief(t *testing.T) {
 	}
 }
 
-// spawn stores a brief exactly as task add does, and for a while only task add checked one.
-func TestSpawnLintsTheBriefItStores(t *testing.T) {
+// The helper spawn shares with task add, over a real repository, so the online rules run.
+// It says nothing about whether cmdSpawn calls it: see TestCmdSpawnLintsTheBriefItStores,
+// which is the one that fails when the gate is unwired.
+func TestSpawnsLintHelperJudgesABrief(t *testing.T) {
 	repo := lintRepo(t)
 	if err := lintBriefBeforeStore("spawn", "spawned", defectiveBrief, repo, "", false); err == nil {
 		t.Fatal("spawn must refuse a brief that violates a rule")
@@ -437,5 +441,79 @@ func TestSpawnLintsTheBriefItStores(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("spawn must accept a clean brief, got %v\n%s", err, out)
+	}
+}
+
+// spawnBrief is cleanBrief with its one cited path removed. Everything else is unchanged:
+// it declares its base, points at conventions, bounds its prohibition and states an end
+// state. The path has to go because the fixture repository below is deliberately not a
+// repository, and a citation would send rule 2 to git there.
+var spawnBrief = strings.Replace(cleanBrief,
+	"match the shape of pkg/thing.go", "match the surrounding code", 1)
+
+// The gate has to be WIRED INTO cmdSpawn, not merely available to it. Deleting the gate
+// block from cmdSpawn left `go test ./internal/cli/...` fully green: every spawn test
+// either stopped at flag validation or called the helper directly, so nothing went through
+// cmdSpawn at all. task add had end-to-end coverage of the same gate and spawn had none.
+//
+// The spawn itself is not exercised. The fixture repo is not a git repository, so
+// SpawnWithEffort refuses once the brief has been stored, and what this test asserts is
+// everything up to and including the store. That is where the gate sits, and storing the
+// brief is the side effect a defective one has to be stopped before: the brief is a
+// snapshot the worker starts on.
+func TestCmdSpawnLintsTheBriefItStores(t *testing.T) {
+	withSeedDB(t, nil)
+	// A spawn installs the recommended agent skills before launch, which shells out to npx.
+	t.Setenv("TTORCH_SKIP_SKILL_INSTALL", "1")
+	repo := t.TempDir()
+	// Asserted, not assumed: if this directory were inside a repository, the cases below
+	// that are meant to fail after the store would instead launch a real worker.
+	if root, err := worktree.RepoRoot(repo); err == nil {
+		t.Fatalf("the fixture directory must not be inside a git repository, got root %s", root)
+	}
+	// errors.As on lintError is what separates a refusal by the gate from the spawn's own
+	// later failure. Exit status cannot: exitLintViolation is 1 and so is every other error.
+	var le lintError
+
+	// A defective brief stops the spawn before any side effect: no stored brief.
+	out, err := captureStdout(t, func() error {
+		return cmdSpawn([]string{"spawn-bad", repo, "--brief", defectiveBrief, "--brief-lint-offline"})
+	})
+	if !errors.As(err, &le) || le.code != exitLintViolation {
+		t.Fatalf("a defective brief must fail the spawn with a lint violation (exit %d), got %v\n%s", exitLintViolation, err, out)
+	}
+	if _, statErr := os.Stat(paths.Default().BriefPath("spawn-bad")); !os.IsNotExist(statErr) {
+		t.Fatalf("a refused spawn must store no brief; stat err = %v", statErr)
+	}
+
+	// A clean brief reaches the store. The spawn fails after that for its own reason, which
+	// must not be a lint outcome.
+	out, err = captureStdout(t, func() error {
+		return cmdSpawn([]string{"spawn-good", repo, "--brief", spawnBrief, "--brief-lint-offline"})
+	})
+	if err == nil {
+		t.Fatalf("the fixture spawn cannot succeed: a worker was launched\n%s", out)
+	}
+	if errors.As(err, &le) {
+		t.Fatalf("a clean brief must pass the gate, got a lint outcome: %v\n%s", err, out)
+	}
+	if got := mustReadFile(t, paths.Default().BriefPath("spawn-good")); got != spawnBrief {
+		t.Fatalf("stored brief = %q, want the brief as written", got)
+	}
+
+	// The escape hatch stores the brief as written.
+	out, err = captureStdout(t, func() error {
+		return cmdSpawn([]string{"spawn-skipped", repo, "--brief", defectiveBrief, "--no-brief-lint"})
+	})
+	if errors.As(err, &le) {
+		t.Fatalf("--no-brief-lint must not lint, got a lint outcome: %v\n%s", err, out)
+	}
+	if got := mustReadFile(t, paths.Default().BriefPath("spawn-skipped")); got != defectiveBrief {
+		t.Fatalf("stored brief = %q, want the brief as written", got)
+	}
+
+	// --no-brief-lint with nothing to lint is a loud error rather than a silent no-op.
+	if err := cmdSpawn([]string{"spawn-nobrief", repo, "--no-brief-lint"}); !errors.Is(err, errNoBriefLintWithoutBrief) {
+		t.Fatalf("want errNoBriefLintWithoutBrief, got %v", err)
 	}
 }
