@@ -389,6 +389,62 @@ func TestCheckRejectsAMisboundCancel(t *testing.T) {
 		c.Cancel = other.Cancel
 		assertMisbound(t, c)
 	})
+
+	// The same two shapes with the OTHER command running. Check used to answer the binding
+	// question by invoking the Cancel, which reached the group kill of whichever command
+	// that Cancel really belonged to: a report that killed a live process group. Both
+	// commands here are deliberately alive, and the verdict must be identical to the dead
+	// cases above while the process survives.
+	t.Run("crossbound from a live command", func(t *testing.T) {
+		victim := startLive(t, Command(context.Background(), "sleep", "60"))
+		c := Command(context.Background(), "sh", "-c", "exit 0")
+		c.Cancel = victim.cmd.Cancel
+		assertMisbound(t, c)
+		victim.assertStillRunning(t, "the command whose Cancel was borrowed")
+	})
+	t.Run("copy of a live command", func(t *testing.T) {
+		c := Command(context.Background(), "sleep", "60")
+		cp := *c // an ordinary struct copy, taken before Start
+		original := startLive(t, c)
+		assertMisbound(t, &cp)
+		original.assertStillRunning(t, "the command that was copied")
+	})
+}
+
+// live is a started command with ONE waiter. Wait is the only way to learn that a child has
+// died, and only one goroutine may call it, so the wait runs once here and both the
+// assertion and the cleanup read its result from the same channel.
+type live struct {
+	cmd  *exec.Cmd
+	done chan error
+}
+
+// startLive starts c and reaps it at the end of the test. It is never waited on before
+// then, so its pid cannot be recycled underneath the assertions.
+func startLive(t *testing.T, c *exec.Cmd) *live {
+	t.Helper()
+	if err := c.Start(); err != nil {
+		t.Fatal(err)
+	}
+	p := &live{cmd: c, done: make(chan error, 1)}
+	go func() { p.done <- c.Wait() }()
+	t.Cleanup(func() {
+		_ = c.Process.Kill()
+		<-p.done
+	})
+	return p
+}
+
+// assertStillRunning fails if the process has died. The window is generous enough that a
+// SIGKILL delivered during Check would always have landed inside it.
+func (p *live) assertStillRunning(t *testing.T, what string) {
+	t.Helper()
+	select {
+	case err := <-p.done:
+		p.done <- err // leave it for the cleanup, which reads the same channel
+		t.Fatalf("%s died as a side effect of Check: Wait = %v (pid %d)", what, err, p.cmd.Process.Pid)
+	case <-time.After(600 * time.Millisecond):
+	}
 }
 
 func assertMisbound(t *testing.T, c *exec.Cmd) {
@@ -414,17 +470,60 @@ func assertMisbound(t *testing.T, c *exec.Cmd) {
 // Probing must not be able to suppress a real kill, so it is answered only on the path where
 // there is no process to signal. A command that has already started cannot be probed, and
 // Check says that rather than guessing.
-func TestCheckOnAStartedCommandIsUnverifiableNotWrong(t *testing.T) {
-	c := Command(context.Background(), "sh", "-c", "sleep 0.2")
-	if err := Start(c); err != nil {
-		t.Fatal(err)
+// Check reads the binding instead of firing it, so a started command is answerable too, and
+// the field checks are answerable whatever the Cancel turns out to be.
+func TestCheckOnAStartedCommand(t *testing.T) {
+	t.Run("intact", func(t *testing.T) {
+		c := Command(context.Background(), "sh", "-c", "sleep 0.2")
+		if err := Start(c); err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = c.Wait() }()
+		if err := Check(c); err != nil {
+			t.Fatalf("Check error = %v, want nil: nothing about a started command hides its binding", err)
+		}
+	})
+
+	// An early return here used to report a started command as unverifiable and drop what
+	// had already been established about it. WaitDelay and SysProcAttr are plain field
+	// reads; a caller told "disarmed" knows what to fix, where "unverifiable" invites a
+	// retry.
+	t.Run("disarmed as well as started", func(t *testing.T) {
+		c := Command(context.Background(), "sh", "-c", "sleep 0.2")
+		c.WaitDelay = 0
+		c.SysProcAttr = nil
+		if err := c.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = c.Wait() }()
+		err := Check(c)
+		if !errors.Is(err, ErrDisarmed) {
+			t.Fatalf("Check error = %v, want ErrDisarmed", err)
+		}
+		for _, want := range []string{"SysProcAttr is nil", "WaitDelay is zero"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("Check error = %q, want it to name %q", err, want)
+			}
+		}
+	})
+}
+
+// The binding is read out of the installed method value. That layout is not guaranteed by
+// the language, so the package self-tests it at startup and refuses to certify anything if
+// it ever stops holding. If this fails, Check has gone permanently unverifiable.
+func TestCancelBindingIsReadableWithoutCalling(t *testing.T) {
+	if !layoutOK {
+		t.Fatal("the method-value self-test failed, so no binding can be read in this build")
 	}
-	defer func() { _ = c.Wait() }()
-	err := Check(c)
-	if !errors.Is(err, ErrUnverifiable) {
-		t.Fatalf("Check error = %v, want ErrUnverifiable", err)
+	a := Command(context.Background(), "true")
+	b := Command(context.Background(), "false")
+	if got := cancelOwner(a.Cancel); got != a {
+		t.Errorf("cancelOwner(a.Cancel) = %p, want %p", got, a)
 	}
-	if errors.Is(err, ErrDisarmed) {
-		t.Fatal("a command that cannot be checked is not the same as one that is wrong")
+	if got := cancelOwner(b.Cancel); got != b {
+		t.Errorf("cancelOwner(b.Cancel) = %p, want %p", got, b)
+	}
+	if cancelOwner(a.Cancel) == cancelOwner(b.Cancel) {
+		t.Error("two commands must not read as the same owner")
 	}
 }

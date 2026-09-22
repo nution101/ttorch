@@ -24,10 +24,9 @@ import (
 	"os/exec"
 	"reflect"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 // WaitDelay is how long Wait may linger after the process is gone before it closes the
@@ -44,6 +43,10 @@ var ErrDisarmed = errors.New("proc: timeout enforcement is disarmed")
 // It is deliberately separate from ErrDisarmed: "this is wrong" and "I cannot tell" are
 // different answers, and only the first is a finding about the caller's code. Both refuse to
 // run, because a gate that runs what it cannot vouch for is worse than one that stops.
+//
+// One thing produces it today: the layout self-test behind cancelOwner failing, which would
+// make every binding unreadable in that binary rather than only this command's. A caller
+// cannot act on it by editing the command, which is exactly why it is not ErrDisarmed.
 var ErrUnverifiable = errors.New("proc: timeout enforcement could not be verified")
 
 // Command is exec.CommandContext plus the three settings that make ctx an enforceable
@@ -68,27 +71,16 @@ func Command(ctx context.Context, name string, arg ...string) *exec.Cmd {
 //
 // The second question is the one that matters and the one an earlier version never asked.
 // `cp := *c` and `c.Cancel = other.Cancel` both leave a Cancel that closes over a DIFFERENT
-// command, whose Process is nil, so it returns without signalling and the forked grandchild
-// outlives the deadline. Both passed a check that only compared code pointers.
+// command, and either way this command's own group is never signalled: its forked
+// grandchild outlives the deadline. What happens to the other command depends on whether it
+// is running. If it is not, the kill returns without signalling anything. If it IS running,
+// the deadline kills that command's whole process group instead, which is worse than doing
+// nothing, because the collateral is a live group this command does not own. Both shapes
+// passed a check that only compared code pointers.
 type killer struct{ cmd *exec.Cmd }
-
-// probe lets Check ask a Cancel which command it belongs to without killing anything.
-//
-// The question is only askable before the command starts, which is the only time Check is
-// meant to run, and that is also what keeps a probe from ever suppressing a real kill: the
-// probe is answered on the path where Process is nil and there is nothing to signal, so a
-// cancel with a live process goes straight to the kill whatever any probe is doing.
-var (
-	probeMu   sync.Mutex // one probe at a time
-	probeWant atomic.Pointer[exec.Cmd]
-	probeHit  atomic.Bool
-)
 
 func (k *killer) cancel() error {
 	if k.cmd.Process == nil {
-		if probeWant.Load() == k.cmd {
-			probeHit.Store(true)
-		}
 		return nil
 	}
 	// Negative pid: the group, not just the leader.
@@ -110,16 +102,48 @@ func (k *killer) cancel() error {
 // pragma, under -l, -l=4, -N -l, -trimpath, -buildmode=pie, -race, -ldflags=-s -w and PGO.
 var cancelPC = reflect.ValueOf((&killer{}).cancel).Pointer()
 
-// boundTo reports whether c.Cancel is the group kill belonging to c. The caller must have
-// established that c.Cancel is one of ours and that c has not started.
-func boundTo(c *exec.Cmd) bool {
-	probeMu.Lock()
-	defer probeMu.Unlock()
-	probeHit.Store(false)
-	probeWant.Store(c)
-	defer probeWant.Store(nil)
-	_ = c.Cancel()
-	return probeHit.Load()
+// methodValue mirrors the runtime layout of a method value: the code pointer, then the
+// captured receiver. (*killer).cancel captures exactly one thing, the *killer it was taken
+// from, so a Cancel whose code pointer is cancelPC has this shape.
+type methodValue struct {
+	code uintptr
+	recv *killer
+}
+
+// cancelOwner returns the command a Cancel installed by this package is bound to. It READS
+// the bound receiver and calls nothing.
+//
+// Calling was the obvious way to ask and it was wrong. A probe that invoked Cancel reached
+// the group kill of whatever command that Cancel actually belonged to, so asking "are you
+// bound to this command?" about a borrowed or copied Cancel killed the process group of the
+// command it was really bound to, from inside a function whose whole contract is to report.
+// Nothing here signals, so the question is free to ask, before or after Start.
+//
+// The caller must have established that f's code pointer is cancelPC, and layoutOK must
+// hold. Check establishes both before reaching this.
+func cancelOwner(f func() error) *exec.Cmd {
+	return (*methodValue)(*(*unsafe.Pointer)(unsafe.Pointer(&f))).recv.cmd
+}
+
+// layoutOK records whether the method-value layout cancelOwner depends on actually holds in
+// this binary. It is a runtime self-test rather than an assumption: build a killer, take its
+// method value, read the receiver back the way Check will, and require it to be the killer
+// we started from.
+//
+// That layout is not guaranteed by the language. If a toolchain ever changes it, this goes
+// false and Check reports ErrUnverifiable for every command rather than trusting a pointer
+// read out of the wrong offset. Wrong in the safe direction: a caller refuses to run rather
+// than certifying a binding nobody established.
+var layoutOK = verifyLayout()
+
+func verifyLayout() bool {
+	// A stand-in command. Nothing is started on it, and its Cancel is never invoked.
+	stand := &exec.Cmd{}
+	f := (&killer{cmd: stand}).cancel
+	if reflect.ValueOf(f).Pointer() != cancelPC {
+		return false
+	}
+	return cancelOwner(f) == stand
 }
 
 // Check reports whether c can still kill its whole process group when its context ends,
@@ -129,9 +153,11 @@ func boundTo(c *exec.Cmd) bool {
 // built with context.Background() passes. Check answers "when the deadline fires, does the
 // whole tree die", not "is there a deadline".
 //
-// Call it before Start. The binding below is established by asking the installed Cancel
-// which command it holds, which is only safe while there is no process to signal; on a
-// started command Check returns ErrUnverifiable rather than guessing either way.
+// Check never signals anything. The binding below is read out of the installed Cancel, not
+// exercised, so it is answerable before or after Start and costs the caller nothing. An
+// earlier version asked the question by CALLING Cancel, which reached the group kill of
+// whichever command that Cancel really belonged to: Check killed a live process group as a
+// side effect of reporting on it. Nothing here may acquire a side effect again.
 //
 // Each of these fails silently rather than loudly, which is why this exists:
 //
@@ -147,13 +173,19 @@ func boundTo(c *exec.Cmd) bool {
 //   - Cancel is the group kill. Replacing it with anything else, os/exec's default
 //     included, goes back to killing the process alone and leaving what it forked.
 //   - Cancel must be the group kill BOUND TO THIS COMMAND. A copied exec.Cmd, or a Cancel
-//     lifted from another command, carries a kill that captured a different Cmd; it finds
-//     that Cmd's nil Process, returns without signalling, and the tree survives on the
-//     WaitDelay backstop alone. (Measured: both shapes let a forked grandchild run to
-//     completion while Run returned at the deadline.)
+//     lifted from another command, carries a kill that captured a different Cmd, so this
+//     command's group is never signalled and its tree survives on the WaitDelay backstop
+//     alone. (Measured: both shapes let a forked grandchild run to completion while Run
+//     returned at the deadline.) If that other command happens to be running, the deadline
+//     kills ITS group instead, so the same defect also reaches a process group the caller
+//     never meant to touch.
 //   - WaitDelay bounds the wait on pipes. Zeroing it means Wait blocks for as long as a
 //     child that escaped the group holds the write end, with no deadline reaching it.
 func Check(c *exec.Cmd) error {
+	// Field reads first. Every one of these is establishable on its own, so none of them is
+	// skipped because some later question was harder: an early return here once reported a
+	// started command as merely unverifiable when its SysProcAttr was also gone, and
+	// "unverifiable" invites a retry where "disarmed" does not.
 	var lost []string
 	if c.SysProcAttr == nil {
 		lost = append(lost, "SysProcAttr is nil, so the child shares its parent's process group and the group kill finds nothing to kill")
@@ -165,25 +197,31 @@ func Check(c *exec.Cmd) error {
 			lost = append(lost, fmt.Sprintf("SysProcAttr.Pgid is %d, so the child joins that group instead of leading its own", c.SysProcAttr.Pgid))
 		}
 	}
+	// The Cancel questions. Identity comes before the binding because the binding is read
+	// out of a method value, and only an identity match makes it one.
+	var unverifiable string
 	switch {
 	case c.Cancel == nil:
 		lost = append(lost, "Cancel is nil, so the deadline kills the process alone and leaves whatever it forked")
 	case reflect.ValueOf(c.Cancel).Pointer() != cancelPC:
 		lost = append(lost, "Cancel is not the group kill this package installed")
-	case c.Process != nil:
-		// The binding can only be established before the command starts. Say that rather
-		// than pass a command whose kill has not been vouched for.
-		return fmt.Errorf("%w: Check must run before Start, so the group kill's binding can be established without signalling anything", ErrUnverifiable)
-	case !boundTo(c):
+	case !layoutOK:
+		unverifiable = "the method-value layout this package reads a Cancel's binding from does not hold in this binary, so no command's binding can be established"
+	case cancelOwner(c.Cancel) != c:
 		lost = append(lost, "Cancel belongs to a different command, so the deadline would signal that command's process group and not this one's (a copied exec.Cmd, or a Cancel taken from another command, does exactly this)")
 	}
 	if c.WaitDelay == 0 {
 		lost = append(lost, "WaitDelay is zero, so Wait can block forever on a pipe an escaped child holds")
 	}
-	if len(lost) == 0 {
-		return nil
+	// Something definite outranks something undetermined: a caller told "disarmed" knows
+	// what to fix.
+	if len(lost) > 0 {
+		return fmt.Errorf("%w: %s", ErrDisarmed, strings.Join(lost, "; "))
 	}
-	return fmt.Errorf("%w: %s", ErrDisarmed, strings.Join(lost, "; "))
+	if unverifiable != "" {
+		return fmt.Errorf("%w: %s", ErrUnverifiable, unverifiable)
+	}
+	return nil
 }
 
 // Start checks c and starts it. It is exec.Cmd.Start for a command from Command.
