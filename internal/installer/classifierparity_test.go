@@ -28,6 +28,12 @@ import (
 func TestClassifierCoversEveryInstalledSubtree(t *testing.T) {
 	// Mirror the payload with each file's own source path as its content, so the destinations
 	// desiredFiles returns can be mapped back to the sources that produced them.
+	//
+	// THIS MIRROR ASSUMES ROUTING IS PATH-ONLY. Substituting the content is what makes the
+	// mapping back possible, so if desiredFiles ever routes on what a file CONTAINS rather
+	// than where it sits, frontmatter or a marker line or a shebang, this test stops
+	// reflecting reality and will not fail to tell you. Route on content and this mirror has
+	// to change with it.
 	mirror := fstest.MapFS{}
 	if err := fs.WalkDir(ttorch.Content(), embedRoot, func(fp string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
@@ -56,9 +62,15 @@ func TestClassifierCoversEveryInstalledSubtree(t *testing.T) {
 	}
 	sort.Strings(installed)
 
+	// Key on the TOP-LEVEL subtree, which is what agentInstructionRoots is keyed on. Keying on
+	// the source's own directory would give nested dirs like skills/ttorch-review, and the
+	// remediation hint below would then name the wrong root.
 	subtrees := map[string]bool{}
 	for _, src := range installed {
-		subtrees[path.Dir(strings.TrimPrefix(src, embedRoot+"/"))] = true
+		rel := strings.TrimPrefix(src, embedRoot+"/")
+		if top, _, nested := strings.Cut(rel, "/"); nested {
+			subtrees[top] = true
+		}
 		if size, dims := review.Classify([]string{src}, 5, false, true); size == review.SizeDocsOnly {
 			t.Errorf("installer writes %s into a session's directories, but the trust gate\n"+
 				"classifies a diff of it as %s %v and drops the security reviewer.\n"+
@@ -74,26 +86,23 @@ func TestClassifierCoversEveryInstalledSubtree(t *testing.T) {
 
 	// The loop above only sees filenames the payload happens to carry today, and most of them
 	// are rescued by their basename (SKILL.md, AGENTS.global.md) rather than by their subtree.
-	// That would leave agentInstructionRoots barely tested. So probe each subtree with a
-	// deliberately neutral filename, one no basename rule can save, and require coverage of
-	// every subtree that routes it. A subtree routed by prefix must be covered by prefix.
+	// That would leave agentInstructionRoots barely tested, so probe each installed subtree
+	// with a deliberately neutral filename that no basename rule can save.
+	//
+	// The requirement is on the SUBTREE, not on the route that reaches it. An earlier version
+	// probed whether the neutral name was itself routed and skipped the subtree when it was
+	// not, which exempted content/assets: only the exact path assets/AGENTS.global.md is
+	// installed there, so the probe routed nowhere and the root went unenforced. Removing
+	// {content, assets} then left this test green while content/assets/notes.md regressed to
+	// prose. If the installer takes anything out of a subtree and puts it where a session
+	// reads it, that subtree is an instruction subtree, however few of its files are routed.
 	for sub := range subtrees {
 		probeSrc := path.Join(embedRoot, sub, "notes.md")
-		probe := fstest.MapFS{probeSrc: &fstest.MapFile{Data: []byte(probeSrc)}}
-		routed, _, err := desiredFiles(probe, sandbox(t))
-		if err != nil {
-			t.Fatalf("desiredFiles(%s): %v", probeSrc, err)
-		}
-		if len(routed) == 0 {
-			// Routed by exact path rather than by prefix (content/assets, where only
-			// AGENTS.global.md is installed). Nothing for the prefix rule to cover.
-			continue
-		}
 		if size, dims := review.Classify([]string{probeSrc}, 5, false, true); size == review.SizeDocsOnly {
-			t.Errorf("the installer routes anything under %s/%s, but the trust gate classifies\n"+
-				"%s as %s %v and drops the security reviewer.\n"+
+			t.Errorf("the installer writes files out of %s/%s into a session's directories, but\n"+
+				"the trust gate classifies %s as %s %v and drops the security reviewer.\n"+
 				"Add {%q, %q} to agentInstructionRoots in internal/review/size.go.",
-				embedRoot, sub, probeSrc, size, dims, embedRoot, path.Base(sub))
+				embedRoot, sub, probeSrc, size, dims, embedRoot, sub)
 		}
 	}
 }
