@@ -1335,7 +1335,22 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 	// the floor is unioned on top so a stamp written wrong cannot lower what gets dispatched
 	// here, the same way it cannot lower what gets required at record time. It fails safe to
 	// the full built-in set when no stamp covers this head, so this never under-reviews.
-	dims, dropped := m.requiredDimensions(t, head)
+	//
+	// It is then unioned with every dimension THIS EPISODE HAS ALREADY DISPATCHED, which makes
+	// the set monotone across ticks and not merely within one. The composed set can still
+	// shrink mid-episode: the floor falls back to the full three when it cannot resolve a base,
+	// so a transient git failure dispatches a security reviewer that the next tick no longer
+	// asks for. Without the union the dispatch loop below stops polling that dimension,
+	// allReady goes true over the remaining ones, and the episode records a pass while the
+	// reviewer the gate itself asked for is still working, after which teardownReviewers kills
+	// it. foldDimensions cannot cover this: it adds an extra only once that extra's report is
+	// pinned, which is what has not happened yet.
+	//
+	// Sticky does not mean unbounded. A dimension that stays required and never reports is
+	// re-dispatched up to maxReviewerAttempts and then surfaced as a block, so the episode ends
+	// on an unanswered reviewer rather than wedging on one.
+	required, dropped := m.requiredDimensions(t, head)
+	dims := unionDimensions(required, dispatchedDimensions(prog))
 	// VALIDATE BEFORE COMPOSING ANYTHING FOR THE MANAGER. Both records these names come from
 	// are files in the review inputs dir, and the gate_blocked payload below is the channel
 	// the manager acts on, so an unusable name must be caught here rather than quoted into a

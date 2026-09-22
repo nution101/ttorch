@@ -103,7 +103,14 @@ func writeCleanReport(t *testing.T, dir, dim, sha string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, dim+".json"), b, 0o644); err != nil {
+	path, err := review.InputPath(dir, dim, review.ReportSuffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(review.ReportsDir(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -442,7 +449,14 @@ func TestGateOnce_HonoursADispatchedReviewerAfterTheSetShrinks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, review.DimensionSecurity+".json"), b, 0o644); err != nil {
+	rpath, err := review.InputPath(dir, review.DimensionSecurity, review.ReportSuffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(review.ReportsDir(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rpath, b, 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -467,26 +481,49 @@ func TestGateOnce_HonoursADispatchedReviewerAfterTheSetShrinks(t *testing.T) {
 	}
 }
 
-// TestGateOnce_DroppedDimensionWithNoReportDoesNotWedge is the wedge direction. Folding an
-// extra dimension must never turn into REQUIRING it: the dispatch loop stops polling a
-// dimension that left the required set, so if the gate then demanded its report the episode
-// would wait forever and time out on a reviewer nothing is going to re-dispatch. An extra is
-// folded only when its report is present and pinned, so a silent one is simply not folded.
-func TestGateOnce_DroppedDimensionWithNoReportDoesNotWedge(t *testing.T) {
+// TestGateOnce_DroppedDimensionWithNoReportIsBoundedNotSkipped is the wedge direction, and it
+// asserts the opposite of what it used to. It was written when a dimension that left the
+// required set stopped being polled, and it pinned that as correct: a dropped dimension which
+// never reported "must not hold up the gate", so the episode recorded a pass. That is the
+// defect TestGateOnce_ADispatchedReviewerStaysRequiredUntilItReports now covers, and this test
+// was the reason the suite stayed green over it.
+//
+// The concern behind it was real: requiring a dimension nothing will re-dispatch wedges the
+// episode forever. The answer is not to skip the dimension but to bound it. A dispatched
+// dimension stays required, so the dispatch loop keeps re-dispatching it, and the attempt
+// ceiling ends the episode with a surfaced block instead of a silent pass.
+func TestGateOnce_DroppedDimensionWithNoReportIsBoundedNotSkipped(t *testing.T) {
 	m, dir, head := shrunkSetHarness(t, "sh2")
+	t.Cleanup(func() { _, _ = m.Teardown("sh2", true) })
+	rec := recordingReviewer(t, false)
 	writeCleanReport(t, dir, review.DimensionCorrectness, head)
 	writeCleanReport(t, dir, review.DimensionScope, head)
 	// The security reviewer was dispatched and never reported.
 
-	out, err := m.GateOnce("sh2")
+	// A generous ceiling: the dimension is still required, so it is re-dispatched rather than
+	// skipped, and no verdict is recorded on this tick.
+	out, err := m.gateOnceAt("sh2", time.Minute, 5, time.Hour, time.Now())
 	if err != nil {
-		t.Fatalf("GateOnce: %v", err)
+		t.Fatalf("gateOnceAt: %v", err)
 	}
-	if out != GateRecorded {
-		t.Fatalf("a dropped dimension that never reported must not hold up the gate, got %q", out)
+	if out != GateDispatched {
+		t.Fatalf("outcome = %q, want %q: an unanswered dispatched dimension is re-dispatched", out, GateDispatched)
 	}
-	if v, ok, _ := m.Store.GetVerdict(context.Background(), "sh2"); !ok || v.Overall != review.Pass {
-		t.Fatalf("the required dimensions were clean, so the verdict must pass: ok=%v %+v", ok, v)
+	if rec.calls[review.DimensionSecurity] == 0 {
+		t.Fatal("the dropped dimension was not re-dispatched, so nothing will ever answer it")
+	}
+	if v, ok, _ := m.Store.GetVerdict(context.Background(), "sh2"); ok && v.Overall == review.Pass {
+		t.Fatalf("a pass was recorded while a dispatched reviewer had not reported: %+v", v)
+	}
+	// And it terminates: at the ceiling the episode blocks rather than looping forever.
+	if out, err = m.gateOnceAt("sh2", time.Minute, 1, time.Hour, time.Now()); err != nil {
+		t.Fatalf("gateOnceAt at the ceiling: %v", err)
+	}
+	if out != GateBlocked {
+		t.Fatalf("outcome = %q, want %q at the attempt ceiling", out, GateBlocked)
+	}
+	if !hasGateBlockedEvent(t, m, "sh2") {
+		t.Fatal("the unanswered dimension must be surfaced rather than dropped")
 	}
 }
 
@@ -559,7 +596,14 @@ func TestFoldDimensions_IgnoresTheAdvisoryAudits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, review.DimensionQA+".json"), b, 0o644); err != nil {
+	rpath, err := review.InputPath(dir, review.DimensionQA, review.ReportSuffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(review.ReportsDir(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rpath, b, 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -844,5 +888,47 @@ func writeSecurityReportOnly(t *testing.T, adv, sha string, findings []review.Fi
 	}
 	if err := os.WriteFile(advisoryReportPath(t, adv, review.DimensionSecurity), b, 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestGateOnce_ADispatchedReviewerStaysRequiredUntilItReports is the red proof for the second
+// half of the shrinking-set defect. The first half (a dispatched reviewer's blocking report
+// being discarded) is covered above. This is the half where the report never arrives.
+//
+// foldDimensions is monotone PER TICK: it can add a dimension, never drop one. Across TICKS it
+// was not. The required set is recomputed every tick, so when it shrinks under a reviewer that
+// is still running, the dispatch loop stops polling that dimension, allReady goes true over the
+// remaining ones, and the episode records a pass while the security reviewer it dispatched is
+// still working. teardownReviewers then kills it. Nothing waits for the answer the gate asked
+// for, and nothing says it was not waited for.
+//
+// The contract this asserts: once a dimension has been dispatched in an episode it stays
+// required until it reports or the episode ends. The episode must still END rather than wedge,
+// which the attempt ceiling provides, so this drives gateOnceAt with a ceiling of one.
+func TestGateOnce_ADispatchedReviewerStaysRequiredUntilItReports(t *testing.T) {
+	m, dir, head := shrunkSetHarness(t, "sh4")
+	t.Cleanup(func() { _, _ = m.Teardown("sh4", true) })
+	recordingReviewer(t, false)
+	writeCleanReport(t, dir, review.DimensionCorrectness, head)
+	writeCleanReport(t, dir, review.DimensionScope, head)
+	// The security reviewer was dispatched on the prior tick and has not reported.
+
+	out, err := m.gateOnceAt("sh4", time.Minute, 1, time.Hour, time.Now())
+	if err != nil {
+		t.Fatalf("gateOnceAt: %v", err)
+	}
+	if out == GateRecorded {
+		t.Fatal("the gate recorded a verdict while a reviewer it dispatched had not reported")
+	}
+	if v, ok, _ := m.Store.GetVerdict(context.Background(), "sh4"); ok && v.Overall == review.Pass {
+		t.Fatalf("a pass was recorded over a dispatched reviewer that never answered: %+v", v)
+	}
+	// And it must end rather than wedge: the ceiling is one and the reviewer was already
+	// dispatched once, so this tick is over it.
+	if out != GateBlocked {
+		t.Fatalf("outcome = %q, want %q once the dispatched reviewer is over the attempt ceiling", out, GateBlocked)
+	}
+	if !hasGateBlockedEvent(t, m, "sh4") {
+		t.Fatal("the unanswered dimension must be surfaced for the manager, not silently dropped")
 	}
 }
