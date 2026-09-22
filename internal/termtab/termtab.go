@@ -7,6 +7,15 @@
 // (worker teardown) or when the shared session is killed, always leaving the
 // worker's window and process intact.
 //
+// The view tab is READ-ONLY. A tmux session group shares window objects, not
+// copies of them, so the pane a view tab shows IS the worker's pane — anything
+// typed into the tab would be delivered straight to the live worker's stdin, and
+// nothing about the tab would tell the person typing that it had. The view client
+// therefore attaches with the read-only client flag (see viewCommand), which lets
+// the lead watch and scroll the worker's history but never type into it. Steering
+// a worker goes through the manager (ttorch send), which addresses the pane with no
+// client at all so a read-only view tab cannot intercept it.
+//
 // The whole feature is macOS-only and best-effort: Open returns nil when the
 // feature is disabled, the OS is not macOS, or the underlying osascript fails
 // (it logs a one-line note to stderr in the latter case). It must never fail a
@@ -38,7 +47,7 @@ func Open(session, window string) error {
 	if term == "auto" {
 		term = detectTerminal()
 	}
-	tmuxCmd := viewCommand(session, window)
+	tmuxCmd := viewCommand(session, window, tmux.SupportsReadOnlyView())
 	script := appleScript(term, tmuxCmd)
 	if err := exec.Command("osascript", "-e", script).Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "ttorch: could not open a terminal view for %s (workers still run in tmux; Ctrl-b w to navigate): %v\n", window, err)
@@ -207,12 +216,29 @@ func viewName(window string) string {
 }
 
 // viewCommand builds the tmux command the native tab runs. It creates (or
-// attaches to) a grouped view session sharing the source session's windows, pins
-// destroy-unattached OFF on the view (scoped explicitly to the view session), turns
-// on title reporting for the view session so the tab shows the worker's friendly
-// label (tmux.TitleFormat reads the shared window's @ttorch_label; set-titles is a
-// per-session option, so the grouped view needs its own), and selects the worker's
-// window.
+// attaches to) a grouped view session sharing the source session's windows as a
+// READ-ONLY client, pins destroy-unattached OFF on the view (scoped explicitly to
+// the view session), turns on title reporting for the view session so the tab
+// shows the worker's friendly label (tmux.TitleFormat reads the shared window's
+// @ttorch_label; set-titles is a per-session option, so the grouped view needs its
+// own), and selects the worker's window.
+//
+// `-f read-only` is what makes the tab a view rather than a second keyboard on the
+// worker. The session must stay GROUPED — that is what gives the tab its own
+// current-window pointer, so selecting the worker's window here does not yank every
+// other client to it — but a group shares the window objects themselves, so the
+// tab's pane is literally the worker's pane. Without the flag, a keystroke aimed at
+// the tab arrived in the running worker's stdin with nothing on screen to say so;
+// an unsent "go ahead" landed in a worker no one had aimed at. The flag is applied
+// on the attaching client, so it holds on both paths of `new-session -A` (first
+// open, and reattach after the tab was closed). It blocks key forwarding to the
+// pane only: copy-mode scrollback, and detaching, still work.
+//
+// readOnly is a capability gate, not a preference — tmux.SupportsReadOnlyView.
+// A read-only client also makes tmux refuse an unattributed `send-keys`, so the
+// flag may only be set on a tmux where tmux.SendLine can address the pane with no
+// client at all; older tmux keeps the previous writable view rather than a view
+// that silently breaks every steer.
 //
 // destroy-unattached is pinned OFF — never on. tmux cannot distinguish a closed tab
 // from a dropped client (both leave the session unattached), so a self-destructing
@@ -236,10 +262,14 @@ func viewName(window string) string {
 // and the tab's only process is gone, so the terminal closes the tab on its standard
 // "close on clean exit" behavior. Without exec, the shell survived tmux and the lead
 // was left with a dead zsh tab — the zombie-tab bug Teardown must not leave behind.
-func viewCommand(session, window string) string {
+func viewCommand(session, window string, readOnly bool) string {
 	view := viewName(window)
+	ro := ""
+	if readOnly {
+		ro = "-f read-only "
+	}
 	return fmt.Sprintf(
-		"exec tmux new-session -A -s %s -t %s \\; set-option -t %s destroy-unattached off \\; set-option -t %s set-titles on \\; set-option -t %s set-titles-string %s \\; select-window -t %s:%s",
+		"exec tmux new-session -A "+ro+"-s %s -t %s \\; set-option -t %s destroy-unattached off \\; set-option -t %s set-titles on \\; set-option -t %s set-titles-string %s \\; select-window -t %s:%s",
 		shq(view), shq(session), shq(view), shq(view), shq(view), shq(tmux.TitleFormat), shq(view), shq(window),
 	)
 }

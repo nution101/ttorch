@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -256,13 +257,85 @@ func LabelWindow(session, window, label string) error {
 	return err
 }
 
+// Version returns the tmux version banner ("tmux 3.5a"), or "" if tmux cannot be
+// run.
+func Version() string {
+	out, err := run("-V")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
+// versionAtLeast reports whether a tmux version banner is at least major.minor.
+// It accepts the forms tmux emits — "tmux 3.5a", "tmux 3.4", "tmux next-3.6" —
+// and returns false for anything it cannot parse ("tmux master", a portable
+// fork's own string, an empty banner). False is the safe answer: every caller
+// falls back to behavior that works on any tmux.
+func versionAtLeast(banner string, major, minor int) bool {
+	v := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(banner), "tmux"))
+	v = strings.TrimPrefix(strings.TrimSpace(v), "next-")
+	maj, rest, ok := strings.Cut(v, ".")
+	if !ok {
+		return false
+	}
+	gotMaj, err := strconv.Atoi(maj)
+	if err != nil {
+		return false
+	}
+	// The patch suffix is a letter ("3.5a"), so take the leading digits of the
+	// minor field and drop the rest.
+	end := 0
+	for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
+		end++
+	}
+	gotMin, err := strconv.Atoi(rest[:end])
+	if err != nil {
+		return false
+	}
+	return gotMaj > major || (gotMaj == major && gotMin >= minor)
+}
+
+// readOnlyViewSupport answers SupportsReadOnlyView. It probes once — the tmux on
+// PATH cannot change under a running ttorch — and is a package var so a test can
+// pin the answer rather than assert against whatever tmux the machine has.
+var readOnlyViewSupport = sync.OnceValue(func() bool { return versionAtLeast(Version(), 3, 2) })
+
+// SupportsReadOnlyView reports whether this tmux understands both operands the
+// read-only worker view needs: `new-session -f read-only` (package termtab) and
+// the empty `send-keys -c` that keeps the read-only view client from blocking a
+// steer (sendKeys below). Both arrived in tmux 3.2, and they must be gated
+// together — a read-only view on a tmux that rejects the empty -c would make
+// every 'ttorch send' fail whenever the lead's focus sat on a view tab. On an
+// older tmux both are skipped and behavior is unchanged.
+func SupportsReadOnlyView() bool { return readOnlyViewSupport() }
+
+// sendKeys sends keys to a pane without attributing them to any tmux client.
+//
+// With no -c, tmux resolves the target client to whichever client is *current* —
+// in practice the most recently focused one — and refuses with "client is
+// read-only" when that turns out to be a read-only client. The worker view tabs
+// are read-only clients (package termtab), so an unattributed send would fail
+// exactly when the lead was watching a worker, and fail always once the view tabs
+// were the only clients left. An empty -c resolves to no client at all, so the
+// keys reach the pane and nothing about which tab has focus can intercept them.
+func sendKeys(args ...string) error {
+	if SupportsReadOnlyView() {
+		args = append([]string{"send-keys", "-c", ""}, args...)
+	} else {
+		args = append([]string{"send-keys"}, args...)
+	}
+	_, err := run(args...)
+	return err
+}
+
 // SendLine types a line into a window then presses Enter. The text and the Enter
 // are sent separately (a combined send can submit before a TUI has rendered the
 // input); a short settle delay precedes Enter, longer for slash-commands which may
 // open a completion popup.
 func SendLine(session, window, text string) error {
 	t := target(session, window)
-	if _, err := run("send-keys", "-t", t, "-l", text); err != nil {
+	if err := sendKeys("-t", t, "-l", text); err != nil {
 		return err
 	}
 	delay := 300 * time.Millisecond
@@ -270,14 +343,12 @@ func SendLine(session, window, text string) error {
 		delay = 1200 * time.Millisecond
 	}
 	time.Sleep(delay)
-	_, err := run("send-keys", "-t", t, "Enter")
-	return err
+	return sendKeys("-t", t, "Enter")
 }
 
 // SendKey sends a single named key (e.g. "Escape", "C-c") to a window.
 func SendKey(session, window, key string) error {
-	_, err := run("send-keys", "-t", target(session, window), key)
-	return err
+	return sendKeys("-t", target(session, window), key)
 }
 
 // CapturePane returns the last n lines of a window's pane.

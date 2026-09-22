@@ -33,9 +33,11 @@ func TestViewNameHasNoBadChars(t *testing.T) {
 }
 
 func TestViewCommand(t *testing.T) {
-	cmd := viewCommand("ttorch", "wk-42")
+	cmd := viewCommand("ttorch", "wk-42", true)
 	checks := []string{
 		"new-session -A",
+		// The view client attaches read-only; see TestViewCommandIsReadOnly.
+		"-f read-only",
 		"-s 'ttv-wk-42'",
 		"-t 'ttorch'",
 		// Pinned OFF — never on — so a client disconnect cannot self-destruct the view
@@ -59,9 +61,45 @@ func TestViewCommand(t *testing.T) {
 // the exec'd tmux exits and the tab has no surviving zsh — the terminal closes the now-
 // empty tab instead of leaving a zombie shell behind.
 func TestViewCommandExecsTmux(t *testing.T) {
-	cmd := viewCommand("ttorch", "wk-42")
+	cmd := viewCommand("ttorch", "wk-42", true)
 	if !strings.HasPrefix(cmd, "exec tmux ") {
 		t.Errorf("view command must exec tmux so no shell survives the view, got %q", cmd)
+	}
+}
+
+// TestViewCommandIsReadOnly pins the shared-pane fix: the view client must attach
+// read-only. A tmux session group shares window OBJECTS, so the pane the view tab
+// shows is the worker's own pane — a writable view tab is a second keyboard on a
+// live worker, and nothing on screen distinguishes it from a viewer. Keystrokes
+// aimed at a tab were observed arriving in a worker's stdin. The flag must be on
+// the new-session that attaches the client, so it applies on both paths of -A
+// (first open, and reattach after the tab was closed).
+func TestViewCommandIsReadOnly(t *testing.T) {
+	cmd := viewCommand("ttorch", "wk-42", true)
+	if !strings.Contains(cmd, "new-session -A -f read-only ") {
+		t.Errorf("view command must attach the view client read-only, got %q", cmd)
+	}
+	// The grouping itself must stay: it is what gives the tab its own current-window
+	// pointer, so selecting the worker's window here does not move every other client.
+	if !strings.Contains(cmd, "-t 'ttorch'") {
+		t.Errorf("view command must stay grouped onto the source session, got %q", cmd)
+	}
+}
+
+// TestViewCommandWritableWithoutSupport pins the capability gate. A read-only view
+// client also makes tmux refuse an unattributed send-keys, so on a tmux that cannot
+// take the empty `send-keys -c` that keeps steering working (tmux.SupportsReadOnlyView),
+// the view must stay writable rather than become a tab that silently breaks every
+// 'ttorch send'. Everything else about the command is unchanged.
+func TestViewCommandWritableWithoutSupport(t *testing.T) {
+	cmd := viewCommand("ttorch", "wk-42", false)
+	if strings.Contains(cmd, "read-only") {
+		t.Errorf("view command must not ask for read-only when tmux cannot support it, got %q", cmd)
+	}
+	for _, c := range []string{"new-session -A -s 'ttv-wk-42' -t 'ttorch'", "select-window -t 'ttv-wk-42':'wk-42'"} {
+		if !strings.Contains(cmd, c) {
+			t.Errorf("view command missing %q in %q", c, cmd)
+		}
 	}
 }
 
@@ -73,7 +111,7 @@ func TestViewCommandExecsTmux(t *testing.T) {
 // was lost. Pinning off (overriding any inherited global on) keeps the view, and the
 // fleet, intact across a disconnect.
 func TestViewCommandSurvivesDisconnect(t *testing.T) {
-	cmd := viewCommand("ttorch", "wk-42")
+	cmd := viewCommand("ttorch", "wk-42", true)
 	if !strings.Contains(cmd, "set-option -t 'ttv-wk-42' destroy-unattached off") {
 		t.Errorf("view command must pin destroy-unattached off, got %q", cmd)
 	}
@@ -83,7 +121,7 @@ func TestViewCommandSurvivesDisconnect(t *testing.T) {
 }
 
 func TestViewCommandUsesSanitizedView(t *testing.T) {
-	cmd := viewCommand("ttorch", "wk.bad:name")
+	cmd := viewCommand("ttorch", "wk.bad:name", true)
 	if !strings.Contains(cmd, "-s 'ttv-wkbadname'") {
 		t.Errorf("viewCommand did not use sanitized view name: %q", cmd)
 	}
@@ -115,7 +153,7 @@ func TestShqQuotes(t *testing.T) {
 // they reach tmux as literal operands rather than executing in the shell that
 // osascript drives.
 func TestViewCommandIsInjectionSafe(t *testing.T) {
-	cmd := viewCommand("s$(touch /tmp/pwn)", "wk-x; rm -rf ~ #")
+	cmd := viewCommand("s$(touch /tmp/pwn)", "wk-x; rm -rf ~ #", true)
 	// The malicious operands appear only in their fully single-quoted form.
 	if !strings.Contains(cmd, `-t 's$(touch /tmp/pwn)'`) {
 		t.Errorf("session not single-quoted: %q", cmd)

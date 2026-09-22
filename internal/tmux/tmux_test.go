@@ -32,6 +32,7 @@ const fakeTmuxScript = `#!/bin/sh
 } >>"$TTORCH_FAKE_LOG"
 
 case "$1" in
+-V)              printf 'tmux %s\n' "${FAKE_VERSION:-3.5a}"; exit 0 ;;
 has-session)     exit "${FAKE_HAS_SESSION_EXIT:-0}" ;;
 list-windows)    printf '%s' "$FAKE_LIST_WINDOWS"; exit "${FAKE_LIST_WINDOWS_EXIT:-0}" ;;
 display-message) printf '%s' "$FAKE_DISPLAY";      exit "${FAKE_DISPLAY_EXIT:-0}" ;;
@@ -378,14 +379,25 @@ func TestLabelWindow(t *testing.T) {
 	}
 }
 
+// pinReadOnlyView pins the tmux-capability answer for one test so the send-keys
+// argv assertions below do not depend on the version of tmux the machine happens
+// to have (and so they never see the `tmux -V` probe).
+func pinReadOnlyView(t *testing.T, v bool) {
+	t.Helper()
+	prev := readOnlyViewSupport
+	readOnlyViewSupport = func() bool { return v }
+	t.Cleanup(func() { readOnlyViewSupport = prev })
+}
+
 func TestSendLine_PlainText(t *testing.T) {
+	pinReadOnlyView(t, true)
 	log := installFakeTmux(t)
 	if err := SendLine("s", "w", "echo hi there"); err != nil {
 		t.Fatalf("SendLine: %v", err)
 	}
 	want := [][]string{
-		{"send-keys", "-t", "s:w", "-l", "echo hi there"},
-		{"send-keys", "-t", "s:w", "Enter"},
+		{"send-keys", "-c", "", "-t", "s:w", "-l", "echo hi there"},
+		{"send-keys", "-c", "", "-t", "s:w", "Enter"},
 	}
 	if got := readInvocations(t, log); !reflect.DeepEqual(got, want) {
 		t.Errorf("invocations =\n%v\nwant\n%v", got, want)
@@ -393,6 +405,7 @@ func TestSendLine_PlainText(t *testing.T) {
 }
 
 func TestSendLine_SlashCommandUsesLongerSettle(t *testing.T) {
+	pinReadOnlyView(t, true)
 	log := installFakeTmux(t)
 	start := time.Now()
 	if err := SendLine("s", "w", "/clear"); err != nil {
@@ -404,8 +417,8 @@ func TestSendLine_SlashCommandUsesLongerSettle(t *testing.T) {
 		t.Errorf("slash-command settle = %v, want >= 1s", elapsed)
 	}
 	want := [][]string{
-		{"send-keys", "-t", "s:w", "-l", "/clear"},
-		{"send-keys", "-t", "s:w", "Enter"},
+		{"send-keys", "-c", "", "-t", "s:w", "-l", "/clear"},
+		{"send-keys", "-c", "", "-t", "s:w", "Enter"},
 	}
 	if got := readInvocations(t, log); !reflect.DeepEqual(got, want) {
 		t.Errorf("invocations =\n%v\nwant\n%v", got, want)
@@ -413,6 +426,7 @@ func TestSendLine_SlashCommandUsesLongerSettle(t *testing.T) {
 }
 
 func TestSendLine_FirstSendFails(t *testing.T) {
+	pinReadOnlyView(t, true)
 	log := installFakeTmux(t)
 	t.Setenv("FAKE_GENERIC_EXIT", "1") // the literal send-keys fails
 	if err := SendLine("s", "w", "echo hi"); err == nil {
@@ -425,6 +439,78 @@ func TestSendLine_FirstSendFails(t *testing.T) {
 }
 
 func TestSendKey(t *testing.T) {
+	pinReadOnlyView(t, true)
+	log := installFakeTmux(t)
+	if err := SendKey("s", "w", "C-c"); err != nil {
+		t.Fatalf("SendKey: %v", err)
+	}
+	want := []string{"send-keys", "-c", "", "-t", "s:w", "C-c"}
+	if inv := readInvocations(t, log); len(inv) != 1 || !reflect.DeepEqual(inv[0], want) {
+		t.Errorf("invocation = %v, want %v", inv, want)
+	}
+}
+
+func TestVersionAtLeast(t *testing.T) {
+	cases := []struct {
+		banner string
+		want   bool
+	}{
+		{"tmux 3.2", true},
+		{"tmux 3.2a", true},
+		{"tmux 3.5a", true},
+		{"tmux 3.7b", true},
+		{"tmux 4.0", true},
+		{"tmux 10.1", true},
+		{"tmux next-3.4", true},
+		{"tmux 3.1c", false},
+		{"tmux 3.0a", false},
+		{"tmux 2.9", false},
+		// Unparseable banners answer false so the caller keeps the behavior that
+		// works on every tmux, rather than guessing a capability it may not have.
+		{"tmux master", false},
+		{"tmux openbsd-7.4", false},
+		{"", false},
+		{"3.5a", true},
+	}
+	for _, c := range cases {
+		if got := versionAtLeast(c.banner, 3, 2); got != c.want {
+			t.Errorf("versionAtLeast(%q, 3, 2) = %v, want %v", c.banner, got, c.want)
+		}
+	}
+}
+
+// TestSendKeysIsNotAttributedToAClient pins the steer half of the read-only view
+// fix. With no -c, tmux attributes send-keys to whichever client is *current* and
+// refuses with "client is read-only" when that is one of the read-only worker view
+// tabs — so a steer would fail whenever the lead's focus sat on a view tab, and
+// always once those tabs were the only clients. The empty -c resolves to no client
+// at all, which is what makes the pane the only thing addressed.
+func TestSendKeysIsNotAttributedToAClient(t *testing.T) {
+	pinReadOnlyView(t, true)
+	log := installFakeTmux(t)
+	if err := SendKey("s", "w", "Escape"); err != nil {
+		t.Fatalf("SendKey: %v", err)
+	}
+	inv := readInvocations(t, log)
+	if len(inv) != 1 {
+		t.Fatalf("invocations = %v, want one", inv)
+	}
+	for i, a := range inv[0] {
+		if a == "-c" {
+			if i+1 >= len(inv[0]) || inv[0][i+1] != "" {
+				t.Fatalf("send-keys -c must name no client, got %v", inv[0])
+			}
+			return
+		}
+	}
+	t.Fatalf("send-keys must pass an empty -c so no client is resolved, got %v", inv[0])
+}
+
+// TestSendKeysUnattributedOnlyWhenSupported is the other side of the gate: an
+// older tmux rejects an unfound client instead of ignoring it, so there the send
+// keeps its original form (and termtab leaves the view writable to match).
+func TestSendKeysUnattributedOnlyWhenSupported(t *testing.T) {
+	pinReadOnlyView(t, false)
 	log := installFakeTmux(t)
 	if err := SendKey("s", "w", "C-c"); err != nil {
 		t.Fatalf("SendKey: %v", err)
@@ -432,6 +518,26 @@ func TestSendKey(t *testing.T) {
 	want := []string{"send-keys", "-t", "s:w", "C-c"}
 	if inv := readInvocations(t, log); len(inv) != 1 || !reflect.DeepEqual(inv[0], want) {
 		t.Errorf("invocation = %v, want %v", inv, want)
+	}
+}
+
+// TestSupportsReadOnlyViewProbesVersion confirms the capability is decided by the
+// tmux version banner, not assumed.
+func TestSupportsReadOnlyViewProbesVersion(t *testing.T) {
+	log := installFakeTmux(t)
+	t.Setenv("FAKE_VERSION", "3.5a")
+	if !versionAtLeast(Version(), 3, 2) {
+		t.Error("tmux 3.5a must support the read-only view")
+	}
+	t.Setenv("FAKE_VERSION", "3.0a")
+	if versionAtLeast(Version(), 3, 2) {
+		t.Error("tmux 3.0a must not be treated as supporting the read-only view")
+	}
+	inv := readInvocations(t, log)
+	for _, i := range inv {
+		if !reflect.DeepEqual(i, []string{"-V"}) {
+			t.Errorf("Version ran %v, want only 'tmux -V'", i)
+		}
 	}
 }
 

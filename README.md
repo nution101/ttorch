@@ -456,6 +456,14 @@ The native tab only views the worker — the worker process keeps running inside
 window, and closing the tab tears down only that view (the worker and its window stay
 alive). iTerm gets a new tab; Terminal.app gets a new window.
 
+**The view tab is read-only.** It shares the worker's actual pane rather than a copy of
+it, so a writable tab would be a second keyboard on a running agent with nothing on
+screen to say so. You can scroll the worker's history (`Ctrl-b PgUp`) and close the tab,
+but you cannot type into the worker from it. Steer a worker through the manager with
+`ttorch send <id> <text>`, which addresses the pane with no client at all so a view tab
+cannot intercept it. This needs tmux 3.2 or newer; on an older tmux the view tab stays
+writable, as before.
+
 **iTerm2 is recommended** for the cleanest experience: it gives one window with a tab per
 worker. When iTerm2 is installed, running bare `ttorch` opens the **manager itself in a new
 iTerm2 window**, so the manager tab and the per-worker view tabs all live together in one
