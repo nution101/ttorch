@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"context"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -11,6 +12,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -170,7 +172,43 @@ func TestGateConfigCoversTheDecidingCode(t *testing.T) {
 	}
 }
 
-// absentByDesign are covered entries that do NOT exist in this repo and are not expected to.
+// usesGuardIdentifier reports whether a test file REFERENCES any of the guard's symbols in
+// its code. Comments do not count: a file that merely discusses the guard is not a proof of
+// it, and treating prose as a reference is expensive in exactly the wrong place.
+func usesGuardIdentifier(file string) (bool, error) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, file, nil, 0) // no ParseComments: comments are not uses
+	if err != nil {
+		return false, err
+	}
+	want := make(map[string]bool, len(guardIdentifiers))
+	for _, id := range guardIdentifiers {
+		want[id] = true
+	}
+	var found bool
+	ast.Inspect(f, func(n ast.Node) bool {
+		if id, ok := n.(*ast.Ident); ok && want[id.Name] {
+			found = true
+		}
+		return !found
+	})
+	return found, nil
+}
+
+// guardIdentifiers are the symbols that make a test file one of the gate's own proofs. A
+// test that references any of them is asserting something about the guard, so deleting it
+// weakens the guard.
+//
+// Derived rather than enumerated, for the reason an enumerated content/ subtree list failed
+// three times: a hand list of proof files decays the moment someone adds a proof. This scans
+// for references, so a NEW test that touches the guard must be covered or the check fails.
+var guardIdentifiers = []string{
+	"matchesGateConfig", "diffTouchesGateConfig", "resolveGateScope", "embedsContentRoot",
+	"gateConfigFiles", "ttorchSourceFiles", "gateConfigPrefixes", "ttorchSourcePrefixes",
+	"collidesInTree", "linksOverGateConfig", "fsIdentityKey",
+}
+
+// absentByDesign are covered entries that do NOT exist in this repo and are not expected to.// absentByDesign are covered entries that do NOT exist in this repo and are not expected to.
 // Each is exempt from the dead-coverage check below for a stated reason, so the exemption is
 // a decision on the record rather than a quiet hole in it.
 //
@@ -183,11 +221,12 @@ var absentByDesign = map[string]string{
 	// so a worker introducing one substitutes the thing the gate validates against. Their
 	// appearance in a diff is the event being guarded, so requiring them to exist would
 	// invert the test.
-	"go.work":     "auto-discovered via GOWORK; its replace directives override go.mod",
-	"go.work.sum": "inert without go.work, covered alongside it so the pair cannot drift",
-	"vendor/":     "a consistent vendor/ makes the toolchain build from it instead of the module cache",
-	".claude/":    "project-level agent config; a .claude/agents/ttorch-reviewer-*.md would REPLACE a gate reviewer",
-	".mcp.json":   "project-level MCP servers for those same sessions",
+	"go.work":        "auto-discovered via GOWORK; its replace directives override go.mod",
+	"go.work.sum":    "inert without go.work, covered alongside it so the pair cannot drift",
+	"vendor/":        "a consistent vendor/ makes the toolchain build from it instead of the module cache",
+	".claude/":       "project-level agent config; a .claude/agents/ttorch-reviewer-*.md would REPLACE a gate reviewer",
+	".mcp.json":      "project-level MCP servers for those same sessions",
+	".gitattributes": "no attributes are set in this repo; covered so that landing one is the event",
 }
 
 // TestGateConfigFilesAreRealPaths guards the other direction: an entry that names nothing is
@@ -447,10 +486,31 @@ func TestOrchestratorFilesAreClassified(t *testing.T) {
 	}
 	for _, e := range entries {
 		n := e.Name()
-		if e.IsDir() || !strings.HasSuffix(n, ".go") || strings.HasSuffix(n, "_test.go") {
+		if e.IsDir() || !strings.HasSuffix(n, ".go") {
 			continue
 		}
 		rel := "internal/orchestrator/" + n
+		if strings.HasSuffix(n, "_test.go") {
+			// Parsed, not grepped. A substring scan counts a guard name MENTIONED in a
+			// comment, which would have marked orchestrator_test.go a proof file for two
+			// passing references in prose and cost 43 of 196 commits to cover.
+			isProof, err := usesGuardIdentifier(n)
+			if err != nil {
+				t.Fatalf("parsing %s: %v", n, err)
+			}
+			if isProof && !covered[rel] {
+				t.Errorf("%s references the guard (%v) but is not covered. A diff can then "+
+					"delete the proof in the SAME unflagged merge as the attack it catches, "+
+					"which is how TestTtorchRepoIsScopedIn was removable. Add it to "+
+					"ttorchSourceFiles.", rel, guardIdentifiers)
+			}
+			if !isProof && covered[rel] {
+				t.Errorf("%s is covered but references none of the guard's symbols, so it is "+
+					"costing a flag for nothing. Drop it from ttorchSourceFiles, or add the "+
+					"assertion that makes it a proof.", rel)
+			}
+			continue
+		}
 		_, classified := nonDecidingFiles[rel]
 		if covered[rel] == classified {
 			if classified {
@@ -1158,9 +1218,7 @@ func TestNotCoveredListIsHonest(t *testing.T) {
 	open := "```" + notCoveredFence
 	i := strings.Index(text, open)
 	if i < 0 {
-		t.Fatalf("%s has no ```%s block. The not-covered list must stay machine-readable so "+
-			"this test stays wired to it; a missing fence is how the check gets unwired "+
-			"without anyone deciding to unwire it.", path, notCoveredFence)
+		t.Fatalf("%s has no ```%s block.", path, notCoveredFence)
 	}
 	rest := text[i+len(open):]
 	j := strings.Index(rest, "```")
@@ -1190,4 +1248,404 @@ func TestNotCoveredListIsHonest(t *testing.T) {
 				"written. Fix the list; do not relax this test.", e)
 		}
 	}
+}
+
+// TestMatchesGateConfig_CoveredDirectoryOwnPath exercises the own-path branch of
+// matchesGateConfig directly, with no symlink anywhere in the test.
+//
+// This exists because the branch was VACUOUSLY covered. Deleting it entirely left the whole
+// internal/orchestrator suite green: every test that reached an own-path match did so
+// through a symlink fixture, and linksOverGateConfig's ancestor-prefix check catches those
+// same fixtures by a different mechanism, since a prefix trivially matches itself. The tests
+// credited one mechanism and were held up by another, so the next person to simplify the
+// branch away would have lost the own-path match with nothing going red.
+//
+// Deliberately a unit assertion rather than an end-to-end one. A bare directory path reaches
+// a diff only when the entry IS a link, so any end-to-end fixture reintroduces the symlink
+// that made the coverage vacuous in the first place. Calling the matcher is the only way to
+// isolate this branch.
+func TestMatchesGateConfig_CoveredDirectoryOwnPath(t *testing.T) {
+	for _, p := range ttorchScope.prefixes() {
+		own := strings.TrimSuffix(p, "/")
+		if own == p {
+			continue // a filename prefix, not a directory
+		}
+		if !matchesGateConfig(own, ttorchScope) {
+			t.Errorf("matchesGateConfig(%q) = false. The covered directory's OWN path must "+
+				"match: a symlink standing in its place reports exactly this string, and "+
+				"without it the .claude -> payload attack matched nothing at all.", own)
+		}
+		// The bound that stops the fix becoming a prefix-trim: a longer name sharing the
+		// covered directory's prefix must NOT match.
+		if near := own + "ious"; matchesGateConfig(near, ttorchScope) {
+			t.Errorf("matchesGateConfig(%q) = true. Matching the own path must compare whole "+
+				"paths; trimming the trailing slash off the prefix would pull in every name "+
+				"that merely starts the same.", near)
+		}
+	}
+	// The same, stated as the concrete case from the round-10 report so a reader can find it.
+	if !matchesGateConfig(".claude", ttorchScope) {
+		t.Error("matchesGateConfig(\".claude\") must be true; this is the exact call that " +
+			"returned false and let a symlink replace the project-level security reviewer")
+	}
+}
+
+// TestGateTestsSelectorCoversTheProofs asserts the Makefile's GATE_TESTS regex selects every
+// test in the gate's proof files.
+//
+// .ttorch/validate.sh runs `make test-gate` because the fast lane skips the end-to-end
+// attacks. That only helps for tests the selector actually names, and it silently did not
+// name three: TestMergeLocal_GateConfigChangeRefusedWithoutAllowGateChange,
+// TestMergeLocal_AllowGateChangeAuthorizesGateConfigChange and
+// TestMergeLocal_GateInstructionChangeNeedsAllowGateChange, the last being the one that
+// proves the reviewer skill itself needs --allow-gate-change. They are skipped by -short
+// too, so they ran in neither local lane.
+//
+// A hand-maintained regex drifts the moment someone adds a test, which is exactly what
+// happened. This derives the expected set the same way the covered set derives its proof
+// files, so a new test in a proof file must be selected or this fails.
+func TestGateTestsSelectorCoversTheProofs(t *testing.T) {
+	root := repoRootForGateConfig(t)
+	mk, err := os.ReadFile(filepath.Join(root, "Makefile"))
+	if err != nil {
+		t.Fatalf("reading the Makefile: %v", err)
+	}
+	m := regexp.MustCompile(`(?m)^GATE_TESTS = '(.*)'$`).FindSubmatch(mk)
+	if m == nil {
+		t.Fatal("the Makefile has no GATE_TESTS assignment; .ttorch/validate.sh runs " +
+			"`make test-gate` against it, so losing it silently unruns every gate proof")
+	}
+	// Model make's expansion before compiling. The Makefile must write $$ for a literal $,
+	// and reading the raw text instead of the expanded value is how this check passed while
+	// the recipe was broken: an earlier per-name form "^A$|^B$" contained "$|", which is
+	// make's order-only-prerequisite automatic variable, so make silently removed both the
+	// $ and the | and handed go test "^A^B". The regex stayed valid and matched nothing.
+	raw := strings.ReplaceAll(string(m[1]), "$$", "$")
+	if strings.Contains(strings.ReplaceAll(raw, "$", ""), "$") {
+		t.Fatalf("GATE_TESTS still contains an unescaped $: %q", m[1])
+	}
+	sel, err := regexp.Compile(raw)
+	if err != nil {
+		t.Fatalf("GATE_TESTS is not a valid regex after make expansion: %v", err)
+	}
+	// It must actually anchor. An unanchored selector lets TestFoo pull in TestFooBar and,
+	// worse, a typo match nothing while still compiling.
+	if !strings.HasPrefix(raw, "^") || !strings.HasSuffix(raw, "$") {
+		t.Errorf("GATE_TESTS must be anchored at both ends, got %q", raw)
+	}
+
+	decl := regexp.MustCompile(`(?m)^func (Test\w+)`)
+	var proofs []string
+	for _, f := range []string{"gateattacks_test.go", "gateconfig_test.go"} {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("reading %s: %v", f, err)
+		}
+		for _, mm := range decl.FindAllStringSubmatch(string(b), -1) {
+			proofs = append(proofs, mm[1])
+		}
+	}
+	// The gate-config tests that live in orchestrator_test.go alongside unrelated ones.
+	b, err := os.ReadFile("orchestrator_test.go")
+	if err != nil {
+		t.Fatalf("reading orchestrator_test.go: %v", err)
+	}
+	onTopic := regexp.MustCompile(`GateConfig|AllowGateChange|GateInstruction|MatchesGateConfig|GateGuard`)
+	for _, mm := range decl.FindAllStringSubmatch(string(b), -1) {
+		if onTopic.MatchString(mm[1]) {
+			proofs = append(proofs, mm[1])
+		}
+	}
+
+	if len(proofs) == 0 {
+		t.Fatal("found no proof tests; this check is asserting nothing")
+	}
+	for _, name := range proofs {
+		if !sel.MatchString(name) {
+			t.Errorf("GATE_TESTS does not select %s, so `make test-gate` does not run it and "+
+				"-short skips it: it executes in neither lane that gates a merge. Add it to "+
+				"the selector.", name)
+		}
+	}
+}
+
+// Moved here from orchestrator_test.go. These are the gate's own proofs, and a proof
+// that is not covered can be deleted in the same unflagged merge as the attack it
+// catches. Covering orchestrator_test.go where they used to live would have cost 43 of
+// 196 commits and taken the covered set to 110/196 = 56%, past the more-than-half line
+// that is the stated reason internal/orchestrator/ is not covered wholesale. Moving them
+// into a file that is already covered costs 0.
+
+// The case-fold cases used to pin a KNOWN LIMIT here (the match was byte-exact, so a
+// differently-cased path naming a covered file slipped through). They now pin the behaviour:
+// both sides of every comparison are folded, including the "AGENTS.md" literal, which is the
+// side a half-fix leaves behind. The boundary cases below hold the fold to what it is for —
+// a differently-spelled name for the SAME file — not a licence to match anything adjacent.
+func TestMatchesGateConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path string
+		want bool
+	}{
+		{"the validate script", ".ttorch/validate.sh", true},
+		{"the learnings ledger, which writes into AGENTS.md", ".ttorch/learnings.jsonl", true},
+		{"anything else under .ttorch/", ".ttorch/offload/run.sh", true},
+		{"the published shell installer", "docs/install.sh", true},
+		{"the published powershell installer", "docs/install.ps1", true},
+		{"the delivery-mode config", "AGENTS.md", true},
+		{"the symlink to it that every session loads", "CLAUDE.md", true},
+		{"the gate procedure skill", "content/skills/ttorch-review/SKILL.md", true},
+		{"the manager skill", "content/skills/ttorch-manager/SKILL.md", true},
+		{"the validate skill", "content/skills/ttorch-validate/SKILL.md", true},
+		{"a reviewer definition", "content/agents/ttorch-reviewer-security.md", true},
+		{"another reviewer definition", "content/agents/ttorch-reviewer-scope.md", true},
+		// Every file under content/ is installed into ~/.claude by installer.desiredFiles,
+		// which walks the tree rather than working from a list. These four were pinned as
+		// NOT covered on the argument that the gate dispatches only the reviewers; that was
+		// the wrong criterion, and it left 35 of the 42 embedded files open.
+		{"the worker agent definition", "content/agents/ttorch-worker.md", true},
+		{"a curated agent profile", "content/agents/golang-pro.md", true},
+		{"the /ttorch entry point", "content/commands/ttorch.md", true},
+		{"the global AGENTS.md source", "content/assets/AGENTS.global.md", true},
+		{"the hook that runs on every prompt", "content/hooks/prompt-reminders.sh", true},
+
+		// The deciding Go code. The four orchestrator files are named exactly; the three
+		// supporting packages are covered wholesale because each is small and single-purpose.
+		{"the gate implementation", "internal/orchestrator/gate.go", true},
+		{"the merge gate", "internal/orchestrator/merge.go", true},
+		{"the gate-config guard itself", "internal/orchestrator/validate.go", true},
+		{"the validate cache", "internal/orchestrator/validatecache.go", true},
+		{"the findings contract", "internal/review/review.go", true},
+		{"the reviewer-set classifier", "internal/review/size.go", true},
+		{"the approval token", "internal/approval/approval.go", true},
+		{"the check runner", "internal/validate/validate.go", true},
+		{"the delivery-mode parser", "internal/projectinit/projectinit.go", true},
+		{"a workspace file", "go.work", true},
+		{"a vendored dependency", "vendor/example.com/dep/d.go", true},
+		{"the module file", "go.mod", true},
+		{"the module checksums", "go.sum", true},
+		{"a project-level reviewer definition", ".claude/agents/ttorch-reviewer-security.md", true},
+		{"project-level MCP servers", ".mcp.json", true},
+		{"a nested instruction file", "internal/orchestrator/CLAUDE.md", true},
+		{"a nested delivery-mode file", "internal/AGENTS.md", true},
+		// Reclassified deliberately: a session reading files under docs/ loads this, so it is
+		// an instruction file, not a copy of one. An earlier table pinned it as a near-miss.
+		{"an instruction file under docs", "docs/AGENTS.md", true},
+		{"the full-suite CI authority", ".github/workflows/ci.yml", true},
+
+		// Case-folding: both sides are folded, so a differently-cased spelling of a covered
+		// file is caught. "AGENTS.md" is the entry a one-sided fold would miss.
+		{"the mode config, lowercased", "agents.md", true},
+		{"the mode config, mixed case", "Agents.Md", true},
+		{"a skill path, mixed case", "Content/Skills/ttorch-review/SKILL.md", true},
+		{"a reviewer definition, mixed case", "Content/Agents/TTorch-Reviewer-Security.md", true},
+		{"the validate script, mixed case", ".TTorch/Validate.SH", true},
+		{"a deciding go file, mixed case", "Internal/Orchestrator/Gate.go", true},
+
+		// Unicode case FOLDING, not simple lowercasing. A case-insensitive filesystem folds;
+		// strings.ToLower does not, and these are the spellings that exploited the gap.
+		{"U+017F long s for AGENTS.md", "agent\u017f.md", true},
+		{"U+017F long s in a covered prefix", "content/skill\u017f/x.md", true},
+		{"U+017F in the validate script", ".ttorch/validate.\u017fh", true},
+		{"U+212A under the content tree", "content/\u212Askills/x.md", true},
+		{"U+212A where a k is covered", "content/agents/ttorch-reviewer-\u212A.md", true},
+		// U+212A inside a prefix that is still narrow, so the fold is doing real work here
+		// rather than being subsumed by "content/". Both of these used to be carried by the
+		// content/skills/ entry, which no longer distinguishes them.
+		{"U+212A in a narrow covered prefix", ".github/wor\u212Aflows/ci.yml", true},
+		{"U+212A must not widen past that prefix", ".github/wor\u212Aflow/ci.yml", false},
+
+		{"a file merely mentioning agents", "docs/AGENTS-guide.md", false},
+		{"a directory that merely starts like .claude", ".claude-backup/x.md", false},
+		{"a validate script somewhere else", "sub/.ttorch/validate.sh", false},
+		{"a ledger somewhere else", "sub/.ttorch/learnings.jsonl", false},
+		{"a directory that merely starts like .ttorch", ".ttorch-backup/x.sh", false},
+		{"ordinary docs prose", "docs/ONBOARDING.md", false},
+		{"a doc that merely mentions install", "docs/installing.md", false},
+		{"a directory that merely starts the same", "contents/skills/x.md", false},
+		{"ordinary orchestrator source", "internal/orchestrator/spawn.go", false},
+		{"the land queue", "internal/orchestrator/landqueue.go", false},
+		{"ordinary source elsewhere", "internal/cli/cli.go", false},
+		{"a non-workflow github file", ".github/CODEOWNERS", false},
+		{"a directory that merely starts like vendor", "vendored/x.go", false},
+		{"a package that merely starts the same", "internal/reviewer/x.go", false},
+
+		// Folding must not widen the match past a same-file respelling.
+		{"a mixed-case near-miss", "Contents/Skills/x.md", false},
+		{"a mixed-case nested instruction file", "Docs/Agents.md", true},
+	} {
+		if got := matchesGateConfig(tc.path, ttorchScope); got != tc.want {
+			t.Errorf("%s: matchesGateConfig(%q, ttorchScope) = %v, want %v", tc.name, tc.path, got, tc.want)
+		}
+	}
+}
+
+// TestMergeLocal_GateConfigChangeRefusedWithoutAllowGateChange: a worker's diff that touches
+// the gate definition (.ttorch/validate.sh) must NOT merge in trusted mode on an auto-mint
+// (changing the gate is never autonomous) NOR on a plain human approval. Before the
+// allow-gate-change scope existed, a human token skipped diffTouchesGateConfig outright and
+// this merge succeeded with nothing in the audit log naming the file; the second half of this
+// test is the red proof for that. The scope does not make the bypass unreachable — a process
+// running as the lead can still write the token file with the marker in it — it makes an
+// ordinary approval stop authorizing a gate change by accident.
+func TestMergeLocal_GateConfigChangeRefusedWithoutAllowGateChange(t *testing.T) {
+	m, repo := deliveryHarness(t, "gateconfig")
+	commitGateScript(t, repo, "exit 0") // a passing default-branch gate
+	if _, err := projectinit.Init(repo, "trusted"); err != nil {
+		t.Fatal(err)
+	}
+	task, err := m.Spawn("gc1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := task.Worktree
+	// The worker's diff changes the gate definition itself.
+	if err := os.WriteFile(filepath.Join(wt, ".ttorch", "validate.sh"), []byte("exit 0\n# tweaked by worker\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, wt, "add", "-A")
+	gitIn(t, wt, "commit", "-q", "-m", "edit gate")
+	head := gitIn(t, wt, "rev-parse", "HEAD")
+	writeReviewReports(t, m.P.ReviewInputsDir("gc1"), head, nil)
+	if _, err := m.TrustRecord("gc1", "", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	// A diff touching the gate definition must NOT auto-approve.
+	if approval.Valid(m.P.ApprovalFile("gc1")) {
+		t.Fatal("a diff touching the gate definition must not auto-approve in trusted mode")
+	}
+	if reloaded, _, _ := m.Store.GetTask(context.Background(), "gc1"); reloaded.ApprovedBy != "" {
+		t.Fatalf("a gate-config change must not record an auto approver: %+v", reloaded)
+	}
+	// A PLAIN human approval does not authorize a gate change either: the check still runs,
+	// the refusal names the offending file, and nothing merges.
+	if err := m.Approve("gc1", time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	defHead := gitIn(t, repo, "rev-parse", "HEAD")
+	_, err = m.MergeLocal("gc1", false)
+	if err == nil {
+		t.Fatal("a plain human approval must not authorize a gate-definition change")
+	}
+	if !strings.Contains(err.Error(), ".ttorch/validate.sh") {
+		t.Fatalf("the refusal must name the offending gate-definition file, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "--allow-gate-change") {
+		t.Fatalf("the refusal must say which explicit approval is needed, got: %v", err)
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") != defHead {
+		t.Fatal("the gate-definition change must not have merged")
+	}
+	_, _ = m.Teardown("gc1", true)
+}
+
+// TestMergeLocal_AllowGateChangeAuthorizesGateConfigChange is the green half: the same diff
+// merges once the lead approves it with --allow-gate-change, and the merge's audit line NAMES
+// the gate-definition file it changed, so a gate change is never reconstructable only by
+// re-reading the diff afterwards.
+func TestMergeLocal_AllowGateChangeAuthorizesGateConfigChange(t *testing.T) {
+	m, repo := deliveryHarness(t, "gateallow")
+	commitGateScript(t, repo, "exit 0")
+	if _, err := projectinit.Init(repo, "trusted"); err != nil {
+		t.Fatal(err)
+	}
+	task, err := m.Spawn("ga1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := task.Worktree
+	if err := os.WriteFile(filepath.Join(wt, ".ttorch", "validate.sh"), []byte("exit 0\n# tweaked by worker\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, wt, "add", "-A")
+	gitIn(t, wt, "commit", "-q", "-m", "edit gate")
+	head := gitIn(t, wt, "rev-parse", "HEAD")
+	writeReviewReports(t, m.P.ReviewInputsDir("ga1"), head, nil)
+	if _, err := m.TrustRecord("ga1", "", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Approve("ga1", time.Minute, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.MergeLocal("ga1", false); err != nil {
+		t.Fatalf("an explicitly gate-change-approved diff should merge: %v", err)
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") != head {
+		t.Fatal("the approved gate-definition change should have fast-forwarded the default branch")
+	}
+	b, _ := os.ReadFile(m.P.AuditLog())
+	if !strings.Contains(string(b), "gate-change=.ttorch/validate.sh") {
+		t.Fatalf("the merge audit line must name the gate-definition file that changed: %s", b)
+	}
+	if !strings.Contains(string(b), "approver=human") {
+		t.Fatalf("the gate-change merge must audit as approver=human: %s", b)
+	}
+	if !strings.Contains(string(b), "scope=allow-gate-change") {
+		t.Fatalf("the approval itself must be audited as scoped to a gate change: %s", b)
+	}
+	_, _ = m.Teardown("ga1", true)
+}
+
+// TestMergeLocal_GateInstructionChangeNeedsAllowGateChange: the gate's own INSTRUCTIONS are a
+// gate-definition change too. content/skills/ttorch-review/SKILL.md is embedded and installed
+// to ~/.claude/skills, so a landed edit to it changes what the gate does on the next run for
+// every repo on the machine. Before content/skills/ was covered, this merged on a plain
+// approval with nothing in the audit naming it — which made the claim written in that very
+// file false about itself.
+func TestMergeLocal_GateInstructionChangeNeedsAllowGateChange(t *testing.T) {
+	m, repo := deliveryHarness(t, "gateinstr")
+	commitGateScript(t, repo, "exit 0")
+	if _, err := projectinit.Init(repo, "trusted"); err != nil {
+		t.Fatal(err)
+	}
+	task, err := m.Spawn("gi1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := task.Worktree
+	skill := filepath.Join(wt, "content", "skills", "ttorch-review")
+	if err := os.MkdirAll(skill, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "# gate procedure\nreviewers: none\n"
+	if err := os.WriteFile(filepath.Join(skill, "SKILL.md"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, wt, "add", "-A")
+	gitIn(t, wt, "commit", "-q", "-m", "edit the gate's reviewer instructions")
+	head := gitIn(t, wt, "rev-parse", "HEAD")
+	writeReviewReports(t, m.P.ReviewInputsDir("gi1"), head, nil)
+	if _, err := m.TrustRecord("gi1", "", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	// It must not auto-approve, for the same reason a validate.sh change does not.
+	if approval.Valid(m.P.ApprovalFile("gi1")) {
+		t.Fatal("a diff touching the gate's instructions must not auto-approve in trusted mode")
+	}
+	// Nor merge on a plain human approval.
+	if err := m.Approve("gi1", time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	defHead := gitIn(t, repo, "rev-parse", "HEAD")
+	_, err = m.MergeLocal("gi1", false)
+	if err == nil {
+		t.Fatal("a plain human approval must not authorize a change to the gate's own instructions")
+	}
+	if !strings.Contains(err.Error(), "content/skills/ttorch-review/SKILL.md") {
+		t.Fatalf("the refusal must name the instruction file, got: %v", err)
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") != defHead {
+		t.Fatal("the instruction change must not have merged")
+	}
+	// With the explicit flag it merges and the audit names the file.
+	if err := m.Approve("gi1", time.Minute, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.MergeLocal("gi1", false); err != nil {
+		t.Fatalf("an explicitly gate-change-approved instruction change should merge: %v", err)
+	}
+	if b, _ := os.ReadFile(m.P.AuditLog()); !strings.Contains(string(b), "gate-change=content/skills/ttorch-review/SKILL.md") {
+		t.Fatalf("the merge audit line must name the instruction file: %s", b)
+	}
+	_, _ = m.Teardown("gi1", true)
 }
