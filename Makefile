@@ -5,7 +5,7 @@ PKG     := github.com/nution101/ttorch/internal/buildinfo
 LDFLAGS := -s -w -X $(PKG).Version=$(VERSION) -X $(PKG).Commit=$(COMMIT) -X $(PKG).Date=$(DATE)
 PLATFORMS := darwin/amd64 darwin/arm64 linux/amd64 linux/arm64
 
-.PHONY: build install test test-fast vet fmt fmtcheck lint dist clean
+.PHONY: test-gate build install test test-fast vet fmt fmtcheck lint dist clean
 
 build:
 	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o bin/ttorch ./cmd/ttorch
@@ -23,6 +23,21 @@ install:
 # -race without changing the default local invocation.
 test:
 	go test $(TESTFLAGS) ./...
+
+# The gate's own proofs. `.ttorch/validate.sh` runs this ON TOP of test-fast, because the
+# fast lane skips them: 16 of the 18 tests in gateattacks_test.go reach deliveryHarness,
+# which calls skipIfShort, so `go test -short` runs none of the end-to-end attacks. ci.yml
+# fires on push to main and on pull_request, so a branch with no PR is not covered there
+# either, and the attack suite that justifies the whole trust gate ran in NEITHER lane that
+# gates a merge.
+#
+# Deliberately NOT -short. These are the tests that demonstrate the guard refuses the
+# attacks it exists to refuse; a gate that does not run them is asserting its own
+# correctness. Measured cost below in test-gate's own run time.
+GATE_TESTS = 'TestGateGuard|TestMergeLocal_DecidingCodeChangeNeedsAllowGateChange|TestTreeHasNoUncoveredSymlinks|TestMatchesGateConfig|TestNoEmbedRootOutsideContent|TestInstallerExposesNoFSChoice|TestEmbeddedPayloadIsNotAssignable|TestEveryInstalledContentFileIsCovered|TestGateConfig|TestOrchestratorFilesAreClassified|TestSanitizeAuditLine|TestEntriesWithDirs|TestFSIdentityKey|TestTrailingNFD|TestTtorchRuntimeFileIsIgnored|TestDiffFiles_RenameKeepsTheCodeVisible'
+
+test-gate:
+	go test $(TESTFLAGS) -run $(GATE_TESTS) ./internal/orchestrator/
 
 # Fast lane — `-short` skips the slow internal/orchestrator integration tests, leaving the
 # unit coverage that finishes in seconds. Used by the local trusted gate
