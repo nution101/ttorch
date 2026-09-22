@@ -14,7 +14,7 @@ const (
 	// SizeDocsOnly is a diff whose every changed file is inert prose (Markdown, plain
 	// text, a LICENSE-style file): no executable surface, so no security review. Agent
 	// configuration spelled as Markdown (CLAUDE.md, .claude/agents/*.md) is NOT inert and
-	// never qualifies -- see isAgentInstruction.
+	// never qualifies. See isAgentInstruction.
 	SizeDocsOnly Size = "docs-only"
 	// SizeTrivial is a small single-file code change: low scope-creep risk, so scope
 	// review is dropped — but it is still code, so security review is KEPT.
@@ -56,8 +56,8 @@ var fullReviewers = []string{DimensionCorrectness, DimensionScope, DimensionSecu
 // not produce a trustworthy stat (it too forces the full set). Security review is dropped
 // only for a diff with no code at all (docs-only); every code path keeps it, and so does
 // every path that instructs an agent session (CLAUDE.md, AGENTS.md, SKILL.md, .claude/**,
-// content/agents/**, content/skills/**), which is
-// configuration rather than prose however it is spelled -- see isAgentInstruction.
+// and the content/ subtrees the installer writes into a session's directories), which is
+// configuration rather than prose however it is spelled. See isAgentInstruction.
 func Classify(files []string, lines int, binary, ok bool) (Size, []string) {
 	switch {
 	case !ok || len(files) == 0 || hasEmpty(files):
@@ -86,13 +86,21 @@ var docBasenames = map[string]bool{
 	"COPYING": true, "README": true, "CHANGELOG": true, "CONTRIBUTING": true,
 }
 
-// agentInstructionBasenames are agent-instruction files: prose by extension, configuration
-// by effect. A session reads them and follows what they say, so a change to one changes how
-// an agent behaves. SKILL.md is here because a skill body is executed as instructions the
-// moment the skill is invoked. Compared with strings.EqualFold, so it is a slice rather than
-// a map: a map lookup needs a normalized key, and the normalization that looked right
-// (strings.ToUpper) is not the folding that decides here.
-var agentInstructionBasenames = []string{"CLAUDE.md", "AGENTS.md", "SKILL.md"}
+// agentInstructionStems name agent-instruction files: prose by extension, configuration by
+// effect. A session reads them and follows what they say, so a change to one changes how an
+// agent behaves. SKILL is here because a skill body is executed as instructions the moment
+// the skill is invoked.
+//
+// These are STEMS, not whole basenames, because the convention admits a qualifier between
+// the name and the extension: AGENTS.global.md is the payload ttorch merges into the global
+// AGENTS.md, and CLAUDE.local.md is the per-machine override. Matching whole basenames left
+// both classified as prose. Only the first dot-separated component is compared, so skills.md
+// and my-agents.md are unaffected.
+//
+// Compared with strings.EqualFold, so this is a slice rather than a map: a map lookup needs a
+// normalized key, and the normalization that looked right (strings.ToUpper) is not the
+// folding that decides here.
+var agentInstructionStems = []string{"CLAUDE", "AGENTS", "SKILL"}
 
 // agentInstructionDirs are directories whose contents configure an agent session wherever
 // they appear: settings, hooks that run around the session, and subagent definitions that
@@ -101,14 +109,31 @@ var agentInstructionBasenames = []string{"CLAUDE.md", "AGENTS.md", "SKILL.md"}
 var agentInstructionDirs = []string{".claude", ".agents"}
 
 // agentInstructionRoots are repository-rooted directories holding instruction files that are
-// not yet in an agent directory and are not named for one: ttorch embeds these and the
-// installer writes them into ~/.claude and ~/.agents, so a change here changes what every
-// future session is told to do. Anchored at the repository root rather than matched at any
-// depth, which keeps an unrelated docs/skills/ or a vendored content/agents/ from dragging a
-// security reviewer into an ordinary docs diff.
+// neither inside an agent directory nor named for one. ttorch embeds these and the installer
+// writes them into the user's global agent directories, so a change here changes what every
+// future session on the machine is told to do.
+//
+// The list is exactly the set of subtrees installer.desiredFiles routes to a session-visible
+// destination. It was derived from that switch rather than from memory, after a first version
+// anchored on agents and skills alone and left content/commands and content/assets classified
+// as prose. content/assets is the one that mattered: AGENTS.global.md is merged into the
+// global AGENTS.md block, so the guard covered the installed copy and left the source open.
+// Two hand-maintained enumerations have already drifted once, so
+// TestClassifierCoversEveryInstalledSubtree in internal/installer fails if the installer
+// grows a subtree this list does not carry.
+//
+// content/hooks holds shell scripts, which keep the security reviewer on their extension
+// alone; it is listed so the two sets stay comparable, and so a README dropped beside a hook
+// is not treated as inert.
+//
+// Anchored at the repository root rather than matched at any depth, which keeps an unrelated
+// docs/skills/ or a vendored content/agents/ out of it.
 var agentInstructionRoots = [][]string{
 	{"content", "agents"},
 	{"content", "skills"},
+	{"content", "commands"},
+	{"content", "assets"},
+	{"content", "hooks"},
 }
 
 // isAgentInstruction reports whether p instructs an agent rather than documenting the
@@ -127,11 +152,8 @@ var agentInstructionRoots = [][]string{
 // it: the guard has to be at least as insensitive as the filesystem it defends.
 func isAgentInstruction(p string) bool {
 	segs := strings.Split(path.Clean(p), "/")
-	base := segs[len(segs)-1]
-	for _, name := range agentInstructionBasenames {
-		if strings.EqualFold(base, name) {
-			return true
-		}
+	if hasInstructionStem(segs[len(segs)-1]) {
+		return true
 	}
 	for _, seg := range segs {
 		for _, dir := range agentInstructionDirs {
@@ -142,6 +164,28 @@ func isAgentInstruction(p string) bool {
 	}
 	for _, root := range agentInstructionRoots {
 		if hasFoldedPrefix(segs, root) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasInstructionStem reports whether a basename names an instruction file. It compares only
+// the first dot-separated component against agentInstructionStems, and only for a file that
+// would otherwise read as prose, so AGENTS.md, AGENTS.global.md and AGENTS.MD all match while
+// skills.md, my-agents.md and claude-usage.md do not. Restricting it to prose extensions
+// keeps the rule to its purpose: a basename carrying any other extension already keeps the
+// security reviewer, and this check exists only to rescue the ones that would not.
+func hasInstructionStem(base string) bool {
+	if !docExtensions[strings.ToLower(path.Ext(base))] {
+		return false
+	}
+	stem, _, ok := strings.Cut(base, ".")
+	if !ok {
+		return false
+	}
+	for _, name := range agentInstructionStems {
+		if strings.EqualFold(stem, name) {
 			return true
 		}
 	}
@@ -168,18 +212,18 @@ func hasFoldedPrefix(segs, prefix []string) bool {
 
 // isDocFile reports whether p is an inert-prose documentation file. It is deliberately
 // conservative: only well-known prose extensions and basenames qualify, so anything that
-// could execute or carry configuration (.go, .sh, .yaml, .json, .html, .svg, ...) is treated
-// as code and keeps the full reviewer set. Agent-instruction files are configuration whatever
-// they are spelled (see isAgentInstruction), so they are checked first and never qualify --
-// README.md and docs/*.md still do.
+// could execute or carry configuration (.go, .sh, .yaml, .json, .html, .svg and so on) is
+// treated as code and keeps the full reviewer set. Agent-instruction files are configuration
+// whatever they are spelled (see isAgentInstruction), so they are checked first and never
+// qualify. README.md and docs/*.md still do.
 //
 // WHAT THIS DOES NOT COVER: the check is by name and by location, so Markdown that is neither
 // named as an instruction file nor under an instruction directory, yet is read as instructions
 // by something, is still inert here. A brief a manager points a worker at, a runbook a prompt
 // tells an agent to follow, an instruction file under a directory layout this list does not
-// know: all classify docs-only and drop the security reviewer. The scaling rule's premise --
-// prose has no executable surface -- holds for ordinary prose and is enforced by name for the
-// instruction files above, not established for Markdown in general.
+// know: all classify docs-only and drop the security reviewer. The scaling rule's premise,
+// that prose has no executable surface, holds for ordinary prose and is enforced by name for
+// the instruction files above. It is not established for Markdown in general.
 func isDocFile(p string) bool {
 	if isAgentInstruction(p) {
 		return false

@@ -254,6 +254,13 @@ func TestClassify_InstructionFilesOutsideDotClaudeAreNotInertProse(t *testing.T)
 			"content/agents/ttorch-reviewer-correctness.md",
 			"content/agents/ttorch-reviewer-scope.md",
 		}},
+		// The other two subtrees installer.desiredFiles routes to a session-visible
+		// location. content/hooks is installed too but is .sh, so it is code already.
+		{"the slash command", []string{"content/commands/ttorch.md"}},
+		{"the global guidance payload", []string{"content/assets/AGENTS.global.md"}},
+		// AGENTS plus a qualifier is still an AGENTS file, wherever it sits.
+		{"a qualified AGENTS basename", []string{"AGENTS.global.md"}},
+		{"a qualified CLAUDE basename", []string{"sub/CLAUDE.local.md"}},
 		// Folded spellings of each of the three predicates, because a one-sided fold in this
 		// file is the bug that has recurred across this wave.
 		{"folded content prefix", []string{"Content/Agents/ttorch-reviewer-security.md"}},
@@ -291,6 +298,24 @@ func TestClassify_OrdinaryProseStaysDocsOnly(t *testing.T) {
 		{"content/agent-notes.md"},  // under content, not content/agents
 		{"skills.md"},               // not SKILL.md
 		{"docs/design.md", "CHANGELOG", "LICENSE", "README.md"},
+		// The inverse set the reviewer ran at bd2c5b5, kept here so a later widening of the
+		// predicate has to move one of them to go green.
+		{"README"},
+		{"docs/ONBOARDING.md"},
+		{"LICENCE"},
+		{"NOTICE"},
+		{"docs/ARCHITECTURE.md"},
+		{"docs/design/overview.md"},
+		{"contentious/agents-notes.md"},
+		{"content-agents/x.md"},
+		{"docs/agents/guide.md"},
+		{"vendor/x/content/agents/y.md"},
+		{"my-agents.md"},
+		// New near-misses for the stem rule, which matches a qualifier after the name.
+		{"skills.md"},
+		{"agentsgroup.md"},
+		{"claude.io/index.md"},
+		{"docs/command-reference.md"},
 	}
 	for _, files := range cases {
 		t.Run(files[0], func(t *testing.T) {
