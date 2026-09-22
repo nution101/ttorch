@@ -1063,7 +1063,7 @@ func TestGateOnce_APersistentlyFailingLaunchIsCharged(t *testing.T) {
 	if out, err := m.gateOnceAt("mf1", time.Minute, 1, time.Hour, now); err != nil || out != GateDispatched {
 		t.Fatalf("tick1 = (%q, %v), want dispatched", out, err)
 	}
-	prog := m.readGateProgress(m.P.ReviewInputsDir("mf1"))
+	prog, _ := m.readGateProgress(m.P.ReviewInputsDir("mf1"))
 	for _, d := range m.ReviewersFor("mf1") {
 		if prog.Attempts[d] == 0 {
 			t.Errorf("dimension %s burned no attempt for a launch that will keep failing", d)
@@ -1116,7 +1116,7 @@ func TestGateOnce_AnUnclassifiedLaunchFailureIsCharged(t *testing.T) {
 	if out, err := m.gateOnceAt("uk1", time.Minute, 1, time.Hour, now); err != nil || out != GateDispatched {
 		t.Fatalf("tick1 = (%q, %v), want dispatched", out, err)
 	}
-	prog := m.readGateProgress(m.P.ReviewInputsDir("uk1"))
+	prog, _ := m.readGateProgress(m.P.ReviewInputsDir("uk1"))
 	for _, d := range m.ReviewersFor("uk1") {
 		if prog.Attempts[d] == 0 {
 			t.Errorf("dimension %s: an unclassified failure must be charged, not retried forever", d)
@@ -1179,7 +1179,7 @@ func TestGateOnce_AWedgedTmuxStillEscalates(t *testing.T) {
 			t.Fatalf("tick %d blocked inside the stall window; a transient wedge must be survivable", i+1)
 		}
 	}
-	prog := m.readGateProgress(m.P.ReviewInputsDir("wg1"))
+	prog, _ := m.readGateProgress(m.P.ReviewInputsDir("wg1"))
 	for d, n := range prog.Attempts {
 		if n != 0 {
 			t.Errorf("dimension %s burned %d attempt(s) to a wedged probe; the retry budget must survive the hang", d, n)
@@ -1199,5 +1199,95 @@ func TestGateOnce_AWedgedTmuxStillEscalates(t *testing.T) {
 	}
 	if _, ok := m.TrustShow("wg1"); ok {
 		t.Fatal("no verdict may be recorded from an episode where no reviewer ever ran")
+	}
+}
+
+// TestGateOnce_ALostProgressRecordFailsClosed is security's probe. The shrinking-set defence
+// rests on the episode's dispatch record, and that record is a file in the review-inputs dir,
+// which is the one directory this branch refuses to root a reviewer's cwd under because it
+// cannot vouch for its contents.
+//
+// Both halves of the defence read it. The union that keeps a dispatched dimension required
+// takes its set from there, and foldDimensions, the intended backstop, takes its dispatched
+// argument from the same place. So losing the record does not degrade the defence, it removes
+// it: a critical security report pinned to head goes unfolded, the verdict passes, and in
+// trusted mode an approval is minted over it.
+//
+// A truncated write lands in the same state as an rm, and writeGateProgress is best-effort, so
+// this does not need an attacker. An unreadable record must mean "we cannot prove nothing was
+// outstanding", which blocks, rather than "nothing was dispatched", which passes.
+func TestGateOnce_ALostProgressRecordFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		lose func(t *testing.T, path string)
+	}{
+		{"deleted", func(t *testing.T, path string) {
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"truncated", func(t *testing.T, path string) {
+			if err := os.WriteFile(path, []byte("{\"head\":"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := "lost-" + tc.name
+			m, dir, head := shrunkSetHarness(t, id)
+			t.Cleanup(func() { _, _ = m.Teardown(id, true) })
+			recordingReviewer(t, false)
+
+			// Lose the record, then let the gate tick. Losing it makes the episode look
+			// unopened, so this tick re-preps and re-stamps, which is already the damage:
+			// the episode that dispatched a security reviewer has been forgotten.
+			tc.lose(t, filepath.Join(dir, gateProgressFile))
+			if _, err := m.gateOnceAt(id, time.Minute, 2, time.Hour, time.Now()); err != nil {
+				t.Fatalf("gateOnceAt after the loss: %v", err)
+			}
+
+			// The reviewers of the forgotten episode report into the new one. The diff is
+			// docs-only, so the derived set is {correctness, scope} and security is an extra
+			// that only the lost record knew had been dispatched.
+			writeCleanReport(t, dir, review.DimensionCorrectness, head)
+			writeCleanReport(t, dir, review.DimensionScope, head)
+			writeFindingReport(t, dir, review.DimensionSecurity, head, []review.Finding{{
+				Dimension: review.DimensionSecurity, Severity: review.SeverityCritical,
+				Reviewer: "ttorch-reviewer-security", Summary: "unauthenticated path traversal in the new handler",
+			}})
+
+			out, err := m.gateOnceAt(id, time.Minute, 2, time.Hour, time.Now())
+			if err != nil {
+				t.Fatalf("gateOnceAt: %v", err)
+			}
+			if out == GateRecorded {
+				t.Fatal("a verdict was recorded after the episode's dispatch record was lost")
+			}
+			if v, ok, _ := m.Store.GetVerdict(context.Background(), id); ok && v.Overall == review.Pass {
+				t.Fatalf("a PASS was recorded over a pinned critical report: %+v", v)
+			}
+			if _, err := os.Stat(m.P.ApprovalFile(id)); err == nil {
+				t.Fatal("an approval was minted over a pinned critical report")
+			}
+		})
+	}
+}
+
+// writeFindingReport drops a report carrying findings into a dir's reports subdirectory.
+func writeFindingReport(t *testing.T, dir, dim, sha string, findings []review.Finding) {
+	t.Helper()
+	b, err := json.Marshal(review.Report{Dimension: dim, ReviewedSHA: sha, Findings: findings})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := review.InputPath(dir, dim, review.ReportSuffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(review.ReportsDir(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		t.Fatal(err)
 	}
 }

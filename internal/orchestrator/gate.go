@@ -760,7 +760,12 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 	// task with no gate episode (the manual flow throughout) has no extras.
 	inputs := m.P.ReviewInputsDir(taskID)
 	var dispatched []string
-	if prog := m.readGateProgress(inputs); prog.Head == sha {
+	switch prog, readable := m.readGateProgress(inputs); {
+	case m.lostEpisodeRecord(inputs, sha, readable):
+		// The episode's memory is gone. Fold as though every built-in reviewer had been
+		// dispatched, so a report from one the derived set no longer names still counts.
+		dispatched = requiredReviewers
+	case prog.Head == sha:
 		dispatched = dispatchedDimensions(prog)
 	}
 	dims := m.foldDimensions(inputs, sha, required, dispatched)
@@ -1328,7 +1333,8 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 	}
 
 	dir := m.P.ReviewInputsDir(taskID)
-	prog := m.readGateProgress(dir)
+	prog, progReadable := m.readGateProgress(dir)
+	lostRecord := m.lostEpisodeRecord(dir, head, progReadable)
 
 	// Episode boundary: a first-ever gate, or the worker advanced past a prior episode's head
 	// (a re-gate). Reset the episode for the new head — tear down the prior head's reviewer
@@ -1344,6 +1350,13 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 			return GateBlocked, nil
 		}
 		episodeDims, _ := m.requiredDimensions(t, head)
+		if lostRecord {
+			// An episode covered this head and its dispatch record is gone, so the successor
+			// episode inherits the assumption that every built-in reviewer was outstanding.
+			// Without it the reset is where the forgotten dimension is lost for good: the new
+			// record names only the currently derived set, and every later tick reads that.
+			episodeDims = unionDimensions(episodeDims, requiredReviewers)
+		}
 		prog = gateProgress{Head: head, Dims: episodeDims, Attempts: map[string]int{}}
 		m.writeGateProgress(dir, prog)
 	}
@@ -1712,6 +1725,20 @@ func reviewerWindow(taskID, dim string) string {
 	return "rv-" + taskID + "-" + dim
 }
 
+// lostEpisodeRecord reports whether the gate's memory of an episode for head has gone missing:
+// the progress record could not be read, AND an episode covering head exists anyway, which the
+// prep stamp attests.
+//
+// Callers treat that as "we cannot prove nothing was outstanding" and fall back to the full
+// built-in reviewer set as the dispatched set. Blocking outright was the other option and is
+// worse: the same state is reached legitimately when a manager preps by hand and the daemon
+// gates afterwards, and refusing that is a false alarm on a normal workflow. Assuming every
+// built-in dimension was dispatched costs an over-review in that case and, in the case this
+// exists for, keeps a critical report from a forgotten reviewer inside the fold.
+func (m *Manager) lostEpisodeRecord(dir, head string, readable bool) bool {
+	return !readable && review.ValidateState(dir, head) != "unprepped"
+}
+
 // reviewerWindowAlive reports whether a dimension's reviewer window is still present. A
 // dimension with no usable window name has no window.
 func (m *Manager) reviewerWindowAlive(taskID, dim string) bool {
@@ -1771,28 +1798,42 @@ func (m *Manager) surfaceGateBlocked(taskID, head, reason string) {
 	m.audit(fmt.Sprintf("gate-blocked task=%s commit=%s actor=daemon reason=%q", taskID, short(head), reason))
 }
 
-// readGateProgress loads the per-task gate progress record, returning a zero gateProgress (a
-// fresh episode) when it is absent or unparseable — fail-safe, since a missing/garbled record
-// just re-preps and re-derives from the live reviewer windows and report files.
-func (m *Manager) readGateProgress(dir string) gateProgress {
+// readGateProgress loads the per-task gate progress record. ok is false when the record was
+// absent or unparseable, which callers MUST NOT read as "nothing was dispatched".
+//
+// The zero value used to be returned silently as fail-safe, on the reasoning that a missing
+// record just re-preps and re-derives from the live windows and report files. That reasoning
+// was wrong in one direction that matters. The record is the episode's only memory of which
+// reviewers it dispatched, and the defence that keeps a dispatched dimension required reads
+// it, as does foldDimensions, the intended backstop. Losing it does not degrade that defence,
+// it removes it: a critical report from a dimension no longer in the derived set goes
+// unfolded and the verdict passes. The file sits in the review-inputs dir, whose contents
+// this branch does not vouch for, and writeGateProgress is best-effort, so a truncated write
+// reaches the same state as a delete without anyone trying.
+//
+// See lostEpisodeRecord for what callers do with ok=false.
+func (m *Manager) readGateProgress(dir string) (gateProgress, bool) {
 	var p gateProgress
 	b, err := os.ReadFile(filepath.Join(dir, gateProgressFile))
 	if err != nil {
-		return gateProgress{}
+		return gateProgress{Attempts: map[string]int{}}, false
 	}
 	if err := json.Unmarshal(b, &p); err != nil {
-		return gateProgress{}
+		return gateProgress{Attempts: map[string]int{}}, false
 	}
 	if p.Attempts == nil {
 		p.Attempts = map[string]int{}
 	}
-	return p
+	return p, true
 }
 
-// writeGateProgress persists the gate progress record beside the review inputs. Best-effort: a
-// failed write degrades safely — the next tick re-derives episode state from the reviewer
-// windows and report files (a live window still suppresses re-dispatch), so the worst case is a
-// lost attempt counter, never a double-record.
+// writeGateProgress persists the gate progress record beside the review inputs. The write is
+// best-effort, and the cost of losing it is NOT "a lost attempt counter, never a
+// double-record", which is what this comment used to claim. The record is what the gate knows
+// about dimensions it dispatched that the derived set no longer names, so losing it can drop
+// a blocking finding out of the fold entirely. That is why the read fails closed rather than
+// the write being made stronger: a best-effort write whose loss is handled is safer than a
+// careful write whose loss is not. See readGateProgress and lostEpisodeRecord.
 func (m *Manager) writeGateProgress(dir string, p gateProgress) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "ttorch: could not create the gate progress dir for %s: %v\n", dir, err)
