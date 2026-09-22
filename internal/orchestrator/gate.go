@@ -965,15 +965,30 @@ func (m *Manager) AdvisoryPrep(taskID string, dims []string) (inputsDir, advisor
 	if err != nil || !ok {
 		return "", "", fmt.Errorf("unknown task %q", taskID)
 	}
-	// The reviewer reads exactly the inputs trust prep materializes (diff.patch / brief.md /
-	// validate.json / head.txt), so reuse it rather than duplicate the materialization.
-	inputsDir, err = m.TrustPrep(taskID)
-	if err != nil {
-		return "", "", err
-	}
 	head, err := worktree.Head(t.Worktree)
 	if err != nil {
 		return "", "", err
+	}
+	// The reviewer reads exactly the inputs trust prep materializes (diff.patch / brief.md /
+	// validate.json / head.txt), so reuse them rather than duplicate the materialization. But
+	// only PREP them when this commit has no episode yet.
+	//
+	// TrustPrep does not just materialize: it opens a new gate episode, archiving the current
+	// reports and re-stamping. Running it unconditionally meant an advisory audit knocked over
+	// a gate that was mid-review. Reports that were present and current became neither, the
+	// gate re-dispatched, and with attempts at the ceiling the next tick surfaced gate_blocked
+	// on a healthy task. A worker fires that at itself with `ttorch security-review prep`. The
+	// direction is safe, it blocks rather than passes, but it is a denial of gating for free.
+	//
+	// Reusing an existing episode's inputs is sound because the stamp attests they were
+	// materialized for this same commit. It does skip TrustPrep's dirty-worktree refusal in
+	// that case, which costs nothing here: the inputs under review are the committed diff, and
+	// they are the ones the gate is already reviewing.
+	inputsDir = m.P.ReviewInputsDir(taskID)
+	if review.ValidateState(inputsDir, head) == "unprepped" {
+		if inputsDir, err = m.TrustPrep(taskID); err != nil {
+			return "", "", err
+		}
 	}
 	advisoryDir, err = m.prepareAdvisoryEpisode(taskID, head, dims)
 	if err != nil {

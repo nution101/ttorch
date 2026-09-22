@@ -1344,3 +1344,48 @@ func TestGateOnce_ARepeatingUnstartedLaunchStillEscalates(t *testing.T) {
 		t.Fatal("a repeating unstarted launch must surface gate_blocked, not spin on daemon stderr")
 	}
 }
+
+// TestAdvisoryPrep_DoesNotDisturbALiveGateEpisode: the advisory audit must not be able to
+// knock over a gate that is mid-review.
+//
+// AdvisoryPrep reused TrustPrep to materialize inputs, which is right, except that TrustPrep
+// opens a NEW gate episode: it archives the current reports and re-stamps. Reports that were
+// present and current became neither, so the gate re-dispatched, and with attempts already at
+// the ceiling the next tick surfaced gate_blocked on a healthy task. A worker triggers it by
+// running `ttorch security-review prep` on itself.
+//
+// The direction is safe, it blocks rather than passes, which is why it is not a high. It is
+// still a denial of gating that anyone can fire at themselves.
+func TestAdvisoryPrep_DoesNotDisturbALiveGateEpisode(t *testing.T) {
+	m, _ := trustedTaskWithSubstantialDiff(t, "advisory-quiet", "aq1")
+	t.Cleanup(func() { _, _ = m.Teardown("aq1", true) })
+	recordingReviewer(t, false)
+
+	// A gate episode mid-review: dispatched, with two of three reports already in.
+	if out, err := m.GateOnce("aq1"); err != nil || out != GateDispatched {
+		t.Fatalf("tick1 = (%q, %v), want dispatched", out, err)
+	}
+	dir := m.P.ReviewInputsDir("aq1")
+	head := gitIn(t, mustTask(t, m, "aq1").Worktree, "rev-parse", "HEAD")
+	writeCleanReport(t, dir, review.DimensionCorrectness, head)
+	writeCleanReport(t, dir, review.DimensionScope, head)
+	for _, dim := range []string{review.DimensionCorrectness, review.DimensionScope} {
+		if !m.reviewReportPinned(dir, dim, head) {
+			t.Fatalf("the harness needs %s current before the advisory prep runs", dim)
+		}
+	}
+
+	if _, _, err := m.AdvisoryPrep("aq1", []string{review.DimensionSecurity}); err != nil {
+		t.Fatalf("AdvisoryPrep: %v", err)
+	}
+
+	for _, dim := range []string{review.DimensionCorrectness, review.DimensionScope} {
+		if !m.reviewReportPinned(dir, dim, head) {
+			t.Errorf("the advisory prep archived the gate's %s report; the gate must re-review it for nothing", dim)
+		}
+	}
+	prog, ok := m.readGateProgress(dir)
+	if !ok || prog.Head != head {
+		t.Fatalf("the advisory prep lost the gate's episode record: ok=%v head=%q", ok, prog.Head)
+	}
+}
