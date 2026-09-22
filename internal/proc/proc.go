@@ -35,6 +35,14 @@ import (
 // output already written and short enough that no caller notices.
 const WaitDelay = 2 * time.Second
 
+// Unix only, deliberately without a build constraint. Setpgid, Pgid and kill(-pid) have no
+// Windows equivalent, so a //go:build unix line here would be honest about this file and
+// useless in practice: GOOS=windows already fails to build internal/singleton and
+// internal/watch on syscall.Flock as well, so constraining this package alone would move
+// the first error without making the binary buildable. Makefile PLATFORMS is darwin and
+// linux, and CI is ubuntu plus macos. A Windows port is its own change, and it is the port
+// that would add the constraints, together with the implementations behind them.
+
 // ErrDisarmed reports a command whose timeout enforcement has been removed. Start, Run and
 // CombinedOutput return it instead of running such a command, so a disarm is loud.
 var ErrDisarmed = errors.New("proc: timeout enforcement is disarmed")

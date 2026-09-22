@@ -140,6 +140,14 @@ done`
 // argument. Only the flag puts the binary into child mode.
 const specEnv = "TTORCH_PROC_TEST_SPEC"
 
+// A SIGSTOPped child is knowingly out of scope. It never polls the stop file, so reapFixture
+// spins its ten seconds and fails the test, leaving one stopped process behind. The only fix
+// that reaches a stopped process is a signal to a pid this fixture no longer owns, which is
+// the stale-pid kill round 3 removed from here on purpose: on a shared build host that kill
+// lands on whatever process has since been given the pid. Trading a defect that fires on
+// every passing run for one that needs an external SIGSTOP is the wrong way round, and the
+// leak is not silent — the test fails and names it.
+
 // reapFixture ends everything the fixture started and proves the child is gone.
 //
 // It signals nothing. Writing the stop file is what ends the shell and the child, so there
