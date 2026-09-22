@@ -423,3 +423,32 @@ func TestReviewWorkspaceDir_RefusesATraversingTaskID(t *testing.T) {
 		}
 	}
 }
+
+// TestSpawnReviewer_ThePromptIsNotWorkerWritable: BriefCommand launches the session with
+// "$(cat <briefPath>)", so the prompt is read by the pane at launch, not by this process at
+// write time. While it sat in the review-inputs dir, a write landing in that window replaced
+// the reviewer's entire instructions — and that directory is the one the gate says it cannot
+// vouch for. Isolation that hands the reviewer a worker-writable prompt is not isolation.
+func TestSpawnReviewer_ThePromptIsNotWorkerWritable(t *testing.T) {
+	m, repo, wt := trustHarness(t, "prompt1", "trusted", "exit 0")
+	inputsDir := m.P.ReviewInputsDir("prompt1")
+	head := plantHostileHarnessConfig(t, wt, inputsDir)
+	if _, err := m.TrustPrep("prompt1"); err != nil {
+		t.Fatal(err)
+	}
+	for _, dim := range []string{review.DimensionCorrectness, review.DimensionScope, review.DimensionSecurity} {
+		cwd, _, err := m.reviewerCwd("prompt1", dim, inputsDir, repo, wt, head)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The prompt must land inside the reviewer's own workspace, which the worker cannot
+		// write, and nowhere under the review-inputs dir, which it can.
+		got := reviewerPromptPath(cwd)
+		if rel, err := filepath.Rel(cwd, got); err != nil || strings.HasPrefix(rel, "..") {
+			t.Fatalf("%s: prompt at %q is not under the reviewer's workspace %q", dim, got, cwd)
+		}
+		if rel, err := filepath.Rel(inputsDir, got); err == nil && !strings.HasPrefix(rel, "..") {
+			t.Fatalf("%s: prompt at %q is inside the worker-writable inputs dir", dim, got)
+		}
+	}
+}

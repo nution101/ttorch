@@ -47,8 +47,10 @@ const supersededDirName = "superseded"
 // current episode's so the archive says which layout each file came from.
 const legacyReportsDirName = "legacy-flat"
 
-// reviewerBriefSuffix names the prompt file the daemon writes for one dimension's reviewer.
-// Like the report suffix it is joined through review.InputPath, never by hand.
+// reviewerBriefSuffix is where a dimension's prompt USED to be written, in the review-inputs
+// dir. The prompt now lives in the reviewer's own workspace, because BriefCommand has the pane
+// read it at launch and the inputs dir is worker-writable (see spawnReviewer). The name
+// survives so the archive sweep still recognises a leftover as a control file, not a report.
 const reviewerBriefSuffix = ".reviewer-brief.md"
 
 // scaledReviewers is the persisted reviewer-set decision: the change-size class and the
@@ -1908,10 +1910,6 @@ func (m *Manager) spawnReviewer(taskID, dim, inputsDir, head, repo, wt string) e
 	// First, before tmux, the harness, or any file: the dimension name decides a file path
 	// written under inputsDir, the tmux window name, and the report path handed to the
 	// reviewer. It arrives from a worker-writable file, so an unusable one launches nothing.
-	briefPath, err := review.InputPath(inputsDir, dim, reviewerBriefSuffix)
-	if err != nil {
-		return err
-	}
 	reportPath, err := review.InputPath(inputsDir, dim, review.ReportSuffix)
 	if err != nil {
 		return err
@@ -1946,6 +1944,19 @@ func (m *Manager) spawnReviewer(taskID, dim, inputsDir, head, repo, wt string) e
 	// on it.
 	_ = harness.WriteWorkerSettings(h, cwd)
 	harness.TrustWorktree(h, repo, cwd)
+	// The prompt is written into the reviewer's OWN workspace, not the review-inputs dir.
+	//
+	// BriefCommand launches the session with "$(cat <briefPath>)", so the file is read by the
+	// pane at launch rather than by this process at write time. While it lived in the inputs
+	// dir, a write landing between the WriteFile here and the cat there replaced the
+	// reviewer's entire instructions, and the inputs dir is the directory the gate does not
+	// vouch for. Handing an isolated reviewer a worker-writable prompt gives back most of what
+	// moving its cwd took away.
+	//
+	// The workspace is under paths.ReviewWorkspaceDir, is rebuilt per dispatch, and its
+	// per-dimension name is already validated by reviewWorkspaceDir, so the join needs no
+	// second check.
+	briefPath := reviewerPromptPath(cwd)
 	brief := reviewerBrief(taskID, dim, inputsDir, head, reportPath, bare)
 	if err := os.WriteFile(briefPath, []byte(brief), 0o644); err != nil {
 		return err
@@ -1961,6 +1972,21 @@ func (m *Manager) spawnReviewer(taskID, dim, inputsDir, head, repo, wt string) e
 	}
 	m.audit(fmt.Sprintf("gate-dispatch-reviewer task=%s dim=%s commit=%s actor=daemon", taskID, dim, short(head)))
 	return nil
+}
+
+// reviewerPromptPath is where a dispatched reviewer's prompt is written: inside the
+// reviewer's OWN workspace, never the review-inputs dir.
+//
+// BriefCommand launches the session with "$(cat <path>)", so the file is read by the pane at
+// launch rather than by this process at write time. While the prompt lived in the inputs dir,
+// a write landing between the WriteFile and the cat replaced the reviewer's entire
+// instructions, and that directory is the one the gate does not vouch for. Handing an isolated
+// reviewer a worker-writable prompt gives back most of what moving its cwd took away.
+//
+// cwd is the per-dimension workspace under paths.ReviewWorkspaceDir, whose name reviewWorkspaceDir
+// has already validated, so the join needs no second check.
+func reviewerPromptPath(cwd string) string {
+	return filepath.Join(cwd, "reviewer-brief.md")
 }
 
 // reviewerBrief is the initial prompt for a daemon-dispatched reviewer. It dispatches the real
