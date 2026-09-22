@@ -1165,6 +1165,17 @@ func TestCapitalisationDoesNotDecideTheVerdict(t *testing.T) {
 	repo, _ := fixture(t)
 	const rules = "No changes to any product branch and no PR until I have reviewed the work. Commit on your\nown branch, leave the worktree clean, and report the sha."
 	cases := map[string][2]string{
+		// Every rule that reports a count or quotes a span belongs here, not just the one
+		// whose defect prompted the test: rule 3 counted and quoted spans for a round after
+		// rule 4 stopped.
+		"two hard counts, unhedged": {
+			"there are 21 occurrences. there are 19 files. commit on your own branch, leave the worktree clean, and report the sha.",
+			"There are 21 occurrences. There are 19 files. Commit on your own branch, leave the worktree clean, and report the sha.",
+		},
+		"two hard counts, hedged": {
+			"there are 21 occurrences. there are 19 files. both figures may be wrong, so count them yourself and report the number you find. commit on your own branch, leave the worktree clean, and report the sha.",
+			"There are 21 occurrences. There are 19 files. Both figures may be wrong, so count them yourself and report the number you find. Commit on your own branch, leave the worktree clean, and report the sha.",
+		},
 		"three bare bans": {
 			"do not push to main. do not commit anything at all. do not merge anything either. commit on your own branch, leave the worktree clean, and report the sha.",
 			"Do not push to main. Do not commit anything at all. Do not merge anything either. Commit on your own branch, leave the worktree clean, and report the sha.",
@@ -1191,6 +1202,29 @@ func TestCapitalisationDoesNotDecideTheVerdict(t *testing.T) {
 		if !strings.EqualFold(strings.Join(lo.Notes, "|"), strings.Join(up.Notes, "|")) {
 			t.Errorf("%s: notes differ by case alone:\nlower: %v\nupper: %v", name, lo.Notes, up.Notes)
 		}
+	}
+}
+
+// Rule 3 counts the numbers stated and quotes the sentence carrying each one. It counted
+// spans and quoted spans for a round after rule 4 stopped doing both, so a merged span
+// certified one hard count where the same words capitalised certified two.
+func TestRuleHardCountsCountsAndQuotesSentences(t *testing.T) {
+	repo, _ := fixture(t)
+	const rules = "No changes to any product branch and no PR until I have reviewed the work. Commit on your\nown branch, leave the worktree clean, and report the sha."
+
+	hedged := "there are 21 occurrences. there are 19 files. both figures may be wrong, so count them yourself and report the number you find. " + strings.ToLower(rules)
+	r := Lint(strings.Replace(satisfying, rules, hedged, 1), Options{Repo: repo})
+	requireClean(t, r, RuleHardCounts)
+	if !hasNote(r, "hard-counts: 2 hard count(s)") {
+		t.Errorf("want both counts counted, got %v", r.Notes)
+	}
+
+	// Unhedged, and the quote must be the sentence with the count, not the merged span.
+	bare := "the helper is fine. there are 21 occurrences to fix. " + strings.ToLower(rules)
+	r = Lint(strings.Replace(satisfying, rules, bare, 1), Options{Repo: repo})
+	f := requireStatus(t, r, RuleHardCounts, StatusFail)
+	if f.Quote != "there are 21 occurrences to fix" {
+		t.Errorf("want the sentence carrying the count quoted, got %q", f.Quote)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -522,23 +523,42 @@ var (
 // incidental prose; the failure this rule exists for needs a plural claim to bound.
 const minHardCount = 2
 
-// hardCounts returns the indexes, into sents, of the sentences that state a hard count.
-// hardCounts returns the spans stating a hard count.
-func hardCounts(sents []span) []int {
-	var out []int
+// countHit is one hard count: which span states it, the sentence inside that span carrying
+// it, and where the number sits.
+type countHit struct {
+	sent int    // index into sents
+	unit [2]int // the sentence carrying the count, relative to the span
+	loc  [2]int // the number itself, relative to the span
+}
+
+// hardCounts returns every hard count in the brief, one per number stated, not one per span.
+// A span holds more than one sentence whenever the splitter merged them, and counting spans
+// meant "there are 21 occurrences. there are 19 files." certified one hard count in
+// lowercase and two capitalised.
+func hardCounts(sents []span) []countHit {
+	var out []countHit
 	for i, s := range sents {
+		seen := map[int]bool{} // the number's offset: both patterns can match one count
 		for _, re := range []*regexp.Regexp{countNounRe, countPhraseRe} {
-			m := re.FindStringSubmatch(s.text)
-			if m == nil {
-				continue
+			for _, m := range re.FindAllStringSubmatchIndex(s.text, -1) {
+				num := s.text[m[2]:m[3]]
+				if n, err := strconv.Atoi(num); err != nil || n < minHardCount {
+					continue
+				}
+				if seen[m[2]] {
+					continue
+				}
+				seen[m[2]] = true
+				out = append(out, countHit{sent: i, unit: unitAround(s.text, m[2]), loc: [2]int{m[2], m[3]}})
 			}
-			if n, err := strconv.Atoi(m[1]); err != nil || n < minHardCount {
-				continue
-			}
-			out = append(out, i)
-			break
 		}
 	}
+	sort.Slice(out, func(a, b int) bool {
+		if out[a].sent != out[b].sent {
+			return out[a].sent < out[b].sent
+		}
+		return out[a].loc[0] < out[b].loc[0]
+	})
 	return out
 }
 
@@ -551,11 +571,12 @@ func checkHardCounts(ctx context.Context, b *brief, _ Options) ([]Finding, []str
 	hedged := hedgedBlocks(sents)
 	asksForTheNumber := reportsTheNumber(b)
 	var findings []Finding
-	for n, i := range counts {
+	reported := map[[2]int]bool{} // one finding per sentence, not per count inside it
+	for n, c := range counts {
 		if n%budgetCheckEvery == 0 && ctx.Err() != nil {
 			return append(findings, budgetFinding(RuleHardCounts)), nil
 		}
-		s := sents[i]
+		s := sents[c.sent]
 		var detail string
 		switch {
 		case !hedgedAt(hedged, s.blk):
@@ -565,8 +586,14 @@ func checkHardCounts(ctx context.Context, b *brief, _ Options) ([]Finding, []str
 		default:
 			continue
 		}
+		key := [2]int{c.sent, c.unit[0]}
+		if reported[key] {
+			continue
+		}
+		reported[key] = true
+		unit := span{text: s.text[c.unit[0]:c.unit[1]], off: s.off + c.unit[0]}
 		findings = append(findings, Finding{
-			Rule: RuleHardCounts, Status: StatusFail, Quote: s.trim(), Line: b.lineAt(s.off),
+			Rule: RuleHardCounts, Status: StatusFail, Quote: unit.trim(), Line: b.lineAt(unit.off),
 			Detail: detail,
 		})
 	}

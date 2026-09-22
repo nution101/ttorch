@@ -161,7 +161,7 @@ func TestHedgedAtRequiresAttachment(t *testing.T) {
 			t.Errorf("%s: fixture must state exactly one hard count, got %d", name, len(counts))
 			continue
 		}
-		if got := hedgedAt(hedgedBlocks(sents), sents[counts[0]].blk); got != tc.want {
+		if got := hedgedAt(hedgedBlocks(sents), sents[counts[0].sent].blk); got != tc.want {
 			t.Errorf("%s: hedgedAt = %v, want %v for %q", name, got, tc.want, tc.brief)
 		}
 	}
@@ -310,7 +310,7 @@ func TestSplitterHoldsBothDirections(t *testing.T) {
 	if len(counts) != 1 {
 		t.Fatalf("want one hard count, got %d", len(counts))
 	}
-	if !hedgedAt(hedgedBlocks(sents), sents[counts[0]].blk) {
+	if !hedgedAt(hedgedBlocks(sents), sents[counts[0].sent].blk) {
 		t.Error("a hedge in the next list item must still reach the count")
 	}
 }
@@ -407,7 +407,7 @@ func TestWithinSentenceScopesRespectAMergedStop(t *testing.T) {
 		if len(counts) != 1 {
 			t.Fatalf("want one hard count, got %d", len(counts))
 		}
-		if !hedgedAt(hedgedBlocks(sents), sents[counts[0]].blk) {
+		if !hedgedAt(hedgedBlocks(sents), sents[counts[0].sent].blk) {
 			t.Error("hedgedAt is block-scoped and must not be narrowed to the sentence")
 		}
 	})
