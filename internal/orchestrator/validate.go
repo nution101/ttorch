@@ -83,8 +83,8 @@ func (m *Manager) Validate(taskID string) ([]validate.Result, error) {
 // every repo on the machine the first time they do.
 //
 // The orchestrator entries are listed by exact FILE and not as "internal/orchestrator/",
-// because the package is 39% of this repo's commits and covering all of it would put more
-// than half of every change behind --allow-gate-change (measured: see docs/ARCHITECTURE.md).
+// because covering all of it would put more than half of every change behind
+// --allow-gate-change (measured: see docs/ARCHITECTURE.md, which holds every figure).
 // audit.go is here because MergeLocal refuses to merge when writeAudit fails, so a one-line
 // change there strips the record from every trusted merge; it costs 0 additional commits,
 // since nothing has ever touched it alone.
@@ -175,7 +175,8 @@ var gateConfigFiles = []string{
 // TestEveryInstalledContentFileIsCovered walks the real embedded tree and asserts every file
 // under content/ matches, which gives derivation's safety property without the coupling.
 //
-// Cost: 84/196 commits, up from 76 with the narrow prefixes (+8). See docs/ARCHITECTURE.md.
+// Cost: see docs/ARCHITECTURE.md. Widening from the two narrow prefixes to content/ added
+// 8 commits of 196.
 //
 // internal/review/ is the verdict itself: the findings contract, the severity-to-block rule,
 // and the diff-size classifier that decides WHICH reviewers run at all. internal/approval/ is
@@ -323,7 +324,12 @@ var gateConfigPrefixes = []string{
 //	orbit,NFD,fold,NFD        33 misses
 //	SimpleFold orbit alone    13,328 misses
 //
-// TestFSIdentityKeyMatchesTheFilesystem keeps a bounded version of that sweep in the suite.
+// TestFSIdentityKeySweep keeps a bounded version of that sweep (2,367 pairs) in the suite.
+// It calls skipIfShort, so it does NOT run in the fast lane .ttorch/validate.sh uses; CI runs
+// the full suite and is where the sweep actually executes. TestFSIdentityKeyMatchesTheFilesystem
+// checks seven hand-picked pairs and does run in both lanes. An earlier version of this
+// comment cited that seven-pair test as the sweep, which answered "is the fold measured where
+// the gate runs" backwards.
 //
 // cases.Caser is documented as possibly stateful and not safe to share, so a Caser is built
 // per call rather than cached in a package var.
@@ -399,7 +405,22 @@ func matchesGateConfig(name string) bool {
 		}
 	}
 	for _, p := range gateConfigPrefixes {
-		if strings.HasPrefix(folded, fsIdentityKey(p)) {
+		fp := fsIdentityKey(p)
+		if strings.HasPrefix(folded, fp) {
+			return true
+		}
+		// The DIRECTORY'S OWN PATH, with no trailing slash. Every entry here ends in "/", so
+		// the prefix test alone matched ".claude/agents/x" and missed ".claude" -- and a
+		// changed path that IS the covered directory is exactly what a symlink standing in
+		// its place reports. Compared as a whole path rather than by trimming the slash off
+		// the prefix: trimming would turn "content/" into the prefix "content" and pull in
+		// "contentious/", which TestMatchesGateConfig pins as a near-miss.
+		//
+		// Costs nothing, and not by luck. git names a directory in a diff only when that
+		// path IS an entry, which for a directory means a symlink or a gitlink; ordinary
+		// commits report the files inside it. Measured over the 196-commit corpus: 0
+		// commits newly flagged, the covered set unchanged.
+		if dir, ok := strings.CutSuffix(fp, "/"); ok && folded == dir {
 			return true
 		}
 	}
@@ -707,6 +728,9 @@ func diffTouchesGateConfig(repo, base, rev string) (*gateConfigHit, error) {
 			}, nil
 		}
 	}
+	if hit, err := linksOverGateConfig(repo, base, rev); err != nil || hit != nil {
+		return hit, err
+	}
 	if hit, err := collidesInTree(repo, base, rev); err != nil || hit != nil {
 		return hit, err
 	}
@@ -716,6 +740,81 @@ func diffTouchesGateConfig(repo, base, rev string) (*gateConfigHit, error) {
 		}
 	}
 	return nil, nil
+}
+
+// linksOverGateConfig refuses a diff that introduces a symlink or gitlink standing at, or
+// above, covered ground.
+//
+// A symlink AT a covered path is refusable on its own, and Blocking rather than flaggable.
+// The reason is that --allow-gate-change authorizes a change a human has read in the diff,
+// and a link's diff does not show what changes. Committing
+//
+//	.claude -> docs/payload
+//	docs/payload/agents/ttorch-reviewer-security.md
+//
+// reports two paths. Before this check neither matched anything, so the merge was not even
+// flagged; with the directory's own path now matching, ".claude" would be flaggable, and a
+// lead reading "changes a gate-definition file (.claude)" would be approving the contents of
+// docs/payload without being shown them. The bytes that take effect live at a path the
+// refusal never names, and repointing the link later moves them again with no diff at
+// .claude at all. No flag can make that reviewable, so there is no flag.
+//
+// "Above" covers the ancestor case: docs/install.sh is covered, so a symlink at "docs"
+// redirects it while reporting only "docs". A path-based guard cannot see through either.
+//
+// Only links the diff INTRODUCES are reported (see worktree.ChangedLinks). This repo's own
+// CLAUDE.md is a committed symlink; refusing every changed link would refuse every commit
+// that touches it, with no flag to clear it, and repointing an existing link is already
+// flaggable through the name match.
+//
+// Limit, stated rather than implied: a symlink at a path that shadows NOTHING covered is not
+// refused, even though any directory symlink can introduce files git never lists by path.
+// Refusing all of them would fire on ordinary repository layout, and the basename rule makes
+// "could a nested AGENTS.md appear under it" true of every directory in the tree.
+func linksOverGateConfig(repo, base, rev string) (*gateConfigHit, error) {
+	links, err := worktree.ChangedLinks(repo, base, rev)
+	if err != nil {
+		return nil, err
+	}
+	for _, l := range links {
+		if !linkShadowsGateConfig(l.Path) {
+			continue
+		}
+		kind := "a symlink"
+		if l.Mode == "160000" {
+			// A gitlink checks out as an empty directory until `submodule update --init`,
+			// so the covered ground is hidden rather than replaced. Same refusal: the tree
+			// the gate validates is not the tree the path describes.
+			kind = "a submodule pointer (gitlink)"
+		}
+		return &gateConfigHit{
+			Path: sanitizePathForMessage(l.Path),
+			Reason: fmt.Sprintf("introduces %s at %s, which stands at or above gate-definition ground; "+
+				"the bytes that take effect are not the bytes at the path this diff reports, so no "+
+				"approval scope can authorize it", kind, sanitizePathForMessage(l.Path)),
+			Blocking: true,
+		}, nil
+	}
+	return nil, nil
+}
+
+// linkShadowsGateConfig reports whether a link at p stands at, or above, covered ground.
+func linkShadowsGateConfig(p string) bool {
+	if matchesGateConfig(p) {
+		return true
+	}
+	under := fsIdentityKey(p) + "/"
+	for _, f := range gateConfigFiles {
+		if strings.HasPrefix(fsIdentityKey(f), under) {
+			return true
+		}
+	}
+	for _, pre := range gateConfigPrefixes {
+		if strings.HasPrefix(fsIdentityKey(pre), under) {
+			return true
+		}
+	}
+	return false
 }
 
 // collidesInTree reports the first NEWLY INTRODUCED filesystem entry in rev's tree that
@@ -732,8 +831,9 @@ func diffTouchesGateConfig(repo, base, rev string) (*gateConfigHit, error) {
 // The whole covered directory vanishes from the bytes the gate validates, git warns about
 // nothing, and because a missing .github/workflows/ breaks no Go build the validate then goes
 // green against a checkout that is not the tree — which is the exact outcome running this
-// guard before the validate exists to prevent. content/ and .claude/ go the same way. The spelling has to sort after the directory's entries for the blob to win, which
-// plain ASCII cannot do ('/' sorts low) but a non-ASCII spelling does for free.
+// guard before the validate exists to prevent. content/ and .claude/ go the same way. The
+// spelling has to sort after the directory's entries for the blob to win, which plain ASCII
+// cannot do ('/' sorts low) but a non-ASCII spelling does for free.
 //
 // So the keyed set is every blob plus every ancestor directory those blobs imply. Git stores
 // no empty trees in a commit, so the implied set is exactly what `ls-tree -r -t` would list;

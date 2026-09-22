@@ -662,6 +662,59 @@ func ChangedFiles(path, base, rev string) ([]string, error) {
 	return splitNUL(out), nil
 }
 
+// ChangedLink is a path whose entry in rev is a SYMLINK (mode 120000) or a GITLINK /
+// submodule pointer (mode 160000), and which was not already that kind of entry in base.
+type ChangedLink struct {
+	Path string
+	Mode string // "120000" or "160000"
+}
+
+// ChangedLinks returns the links base..rev introduces.
+//
+// A path-matching guard reads the diff's path names and assumes the bytes at a path are the
+// bytes committed there. A symlink breaks that assumption without producing a second entry
+// for a collision check to notice: committing `.claude -> docs/payload` alongside
+// `docs/payload/agents/ttorch-reviewer-security.md` changes two paths that matched nothing,
+// and a fresh clone then resolves .claude/agents/ttorch-reviewer-security.md to the payload.
+// A gitlink does the same with one entry and no second path at all.
+//
+// Only NEWLY INTRODUCED links are reported: dst is a link mode and src is not the same mode.
+// The repository's own CLAUDE.md is a committed symlink, so reporting every changed link
+// would refuse every commit that touches it, with no flag to clear it. Repointing an
+// existing symlink keeps src == dst == 120000 and stays with the name match, which is
+// flaggable; introducing one where none stood is the shape that hides a path from the diff.
+//
+// `git diff --raw -z` emits ":srcmode dstmode srcsha dstsha status\0path\0". --no-renames
+// for the same reason ChangedFiles needs it.
+func ChangedLinks(path, base, rev string) ([]ChangedLink, error) {
+	out, err := checkedGitRaw("-C", path, "diff", "--raw", "-z", "--no-renames", base, rev)
+	if err != nil {
+		return nil, err
+	}
+	fields := splitNUL(out)
+	var links []ChangedLink
+	// Records alternate: metadata, path, metadata, path...
+	for i := 0; i+1 < len(fields); i += 2 {
+		meta, p := fields[i], fields[i+1]
+		if !strings.HasPrefix(meta, ":") {
+			return nil, fmt.Errorf("unparseable `git diff --raw` record %q", meta)
+		}
+		parts := strings.Fields(strings.TrimPrefix(meta, ":"))
+		if len(parts) < 2 {
+			return nil, fmt.Errorf("unparseable `git diff --raw` record %q", meta)
+		}
+		src, dst := parts[0], parts[1]
+		if dst != "120000" && dst != "160000" {
+			continue
+		}
+		if src == dst {
+			continue
+		}
+		links = append(links, ChangedLink{Path: p, Mode: dst})
+	}
+	return links, nil
+}
+
 // TreeFiles returns every path in rev's committed tree, NUL-separated and unquoted.
 //
 // The gate-config guard needs the WHOLE tree, not just the diff. The collision attack adds

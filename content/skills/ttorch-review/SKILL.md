@@ -204,6 +204,19 @@ invalidates the verdict — re-prep, re-review, re-record.
   an approval to be an approval of. Only collisions the diff *introduces* are reported, so a
   repo that already contains a colliding pair can still land the rename that fixes it.
 
+  A third refusal is blocking for the same reason: **a newly introduced symlink or gitlink
+  standing at, or above, covered ground.** `.claude -> docs/payload` committed alongside
+  `docs/payload/agents/ttorch-reviewer-security.md` replaces the project-level security
+  reviewer in a fresh clone while reporting two paths that a reader cannot connect, and
+  repointing the link later moves the bytes again with no diff at `.claude` at all. The
+  collision check cannot backstop it: a link is one entry, not a colliding pair. Approving
+  it would mean approving contents the diff never shows, so there is no flag for it. Note
+  the two bounds. *Newly introduced* only, because this repo's own `CLAUDE.md` is a
+  committed symlink and repointing an existing link stays flaggable through the name match.
+  *At or above covered ground* only, so a link shadowing nothing covered still merges; any
+  directory symlink can introduce files git never lists by path, and refusing all of them
+  would fire on ordinary layout.
+
 - **What that claim does NOT cover**, stated so nobody reads it as wider than it is:
   - Gated means trusted mode or `--require-verdict`. A `local`/`validated` merge without
     `--require-verdict` does not run this check at all, so it still merges a gate-definition
