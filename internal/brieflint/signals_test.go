@@ -328,3 +328,36 @@ func firstCitationExempt(t *testing.T, text string) (string, bool) {
 	t.Fatalf("no citation found in %q", text)
 	return "", false
 }
+
+// A bound has to plausibly govern the ban it is credited to. Soft-wrap joining made a whole
+// paragraph one sentence, so an unrelated later clause bounded a blanket prohibition; the
+// cure must not reject the ordinary shapes where a bound genuinely trails or leads several
+// bans.
+func TestBoundMustGovernTheBanItBounds(t *testing.T) {
+	cases := map[string]bool{
+		"Do not push to main.":                                    true,
+		"Do not push until the gate is green.":                    true,
+		"Do not push anything at all until the gate is green.":    true,
+		"Until the gate is green, do not push.":                   true,
+		"Do not push, and do not merge, until the gate is green.": true,
+		"Do not merge without my approval.":                       true,
+		"Do not open a PR.":                                       true,
+		"Do not push, do not merge and do not commit anything at all, and before you begin, read the notes.": false,
+		"Do not push, do not merge and do not commit anything at all.":                                       false,
+		"Never commit.":                  false,
+		"Do not push. Before you begin.": false,
+	}
+	for text, want := range cases {
+		got := true
+		for _, s := range sentences(text) {
+			for _, ban := range prohibitionRe.FindAllStringIndex(s.text, -1) {
+				if !boundedBan(s.text, ban) {
+					got = false
+				}
+			}
+		}
+		if got != want {
+			t.Errorf("bounded = %v, want %v for %q", got, want, text)
+		}
+	}
+}

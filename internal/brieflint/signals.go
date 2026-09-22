@@ -130,6 +130,64 @@ func reportsTheNumber(b *brief) bool {
 	return false
 }
 
+// clauseSplit marks the end of a clause inside a sentence. A comma or semicolon is the only
+// punctuation left that separates clauses, now that neither ends a sentence.
+var clauseSplit = regexp.MustCompile(`[,;]`)
+
+// leadingConjunction is the "and"/"or"/"then" that opens a continuation clause. It is
+// stripped before asking whether a clause LEADS with a bound.
+var leadingConjunction = regexp.MustCompile(`(?i)^\s*(?:and|or|then|but|so)\s+`)
+
+// clauses splits a sentence into comma-delimited clause ranges.
+func clauses(text string) [][2]int {
+	var out [][2]int
+	start := 0
+	for _, m := range clauseSplit.FindAllStringIndex(text, -1) {
+		out = append(out, [2]int{start, m[0]})
+		start = m[1]
+	}
+	return append(out, [2]int{start, len(text)})
+}
+
+// boundedBan reports whether the prohibition at ban in sentence text is qualified by a bound
+// that plausibly governs it.
+//
+// The bound has to be in the ban's own clause, or in a clause at one end of the sentence
+// that opens with the bound and carries no ban of its own ("Until the gate is green, do not
+// push", "do not push, and do not merge, until the gate is green").
+//
+// Sentence scope was what round 3's soft-wrap joining widened. A blanket prohibition and an
+// unrelated later clause became one sentence, so "and before you begin, read the notes"
+// bounded "do not commit anything at all", and a brief banning everything outright was
+// reported as bounded.
+func boundedBan(text string, ban []int) bool {
+	cl := clauses(text)
+	for i, c := range cl {
+		part := text[c[0]:c[1]]
+		if !boundSignal.MatchString(part) {
+			continue
+		}
+		if ban[0] >= c[0] && ban[0] < c[1] {
+			return true
+		}
+		if i != 0 && i != len(cl)-1 {
+			continue
+		}
+		if leadsWithBound(part) && !prohibitionRe.MatchString(part) {
+			return true
+		}
+	}
+	return false
+}
+
+// leadsWithBound reports whether a clause opens with its bound, which is what a qualifier
+// attached to the whole sentence looks like.
+func leadsWithBound(part string) bool {
+	part = leadingConjunction.ReplaceAllString(strings.TrimSpace(part), "")
+	loc := boundSignal.FindStringIndex(part)
+	return loc != nil && loc[0] == 0
+}
+
 // boundSignal marks a prohibition that names what it protects or how far it reaches, rather
 // than banning an action outright: a target ("to main", "into the product branch"), a bound
 // ("until I have reviewed"), or the specific artifact banned ("no PR").

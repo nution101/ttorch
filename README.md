@@ -217,19 +217,34 @@ with no brief is unchanged). Five rules:
 | --- | --- |
 | `target-branch` | The brief names its target as `origin/<branch>`, and that branch exists on the remote |
 | `file-paths` | Every file path the brief cites exists at the ref the citation is about |
-| `hard-counts` | A brief stating "there are 21 occurrences" carries verify-yourself wording near the number, and asks for the worker's own number |
-| `prohibition` | A prohibition states the invariant it protects and the allowed end state, rather than banning `push`/`merge`/PR outright |
+| `hard-counts` | A brief stating "there are 21 occurrences" carries verify-yourself wording near the number, and a reporting phrase somewhere |
+| `prohibition` | A prohibition carries bounding wording in its own clause, and the brief states an allowed end state, rather than banning `push`/`merge`/PR outright |
 | `standards` | The brief points at the standards the project expects |
+
+Two of those are answered by git and the rest by vocabulary, which is the difference that
+decides how far to trust a pass. See the note below the table.
 
 Some details that matter in practice:
 
-- **What `hard-counts` checks is wording, not meaning.** It looks for hedge vocabulary in the
-  paragraph or list item holding the number, or the next one, and for a sentence asking the
-  worker to report a figure. It cannot tell a hedge from a sentence forbidding one: "I verified
-  the count myself, so do not re-count it" carries the same words as a hedge and passes. No
-  vocabulary fixes that, because the words are the same words. The rule catches a bare count
-  stated with nothing around it, which is the failure it was written for; it does not certify
-  that a brief hedges, and the output says so.
+- **Which rules check a fact, and which check wording.** `target-branch` and `file-paths` are
+  answered by git: the branch is on the remote or it is not, the path and the line are there or
+  they are not. Everything else is answered by matching vocabulary, and a pass from those means
+  the phrasing was present, not that the brief means it:
+
+  - `hard-counts` looks for hedge vocabulary in the paragraph or list item holding the number,
+    or the next one, plus a reporting phrase anywhere in the brief. It cannot tell a hedge from
+    a sentence forbidding one: "I verified the count myself, so do not re-count it" carries the
+    same words as a hedge and passes. No vocabulary fixes that, because the words are the same
+    words.
+  - `prohibition` looks for bounding vocabulary in the clause carrying the ban, and for an
+    end-state phrase anywhere in the brief. It cannot tell whether the bound it found actually
+    limits the ban.
+  - `file-paths` skips its existence check where a create verb governs the mention, which is
+    also a wording judgement, so a path that reads as being created is never looked for.
+
+  Each of these catches the bare form it was written for: a count stated with nothing around
+  it, a blanket ban with nothing qualifying it, a path nobody asked for. None of them certifies
+  the brief is well written, and every note they print says wording rather than meaning.
 
 - **Which ref a citation is resolved against.** A cited path *without* a line number is about the
   work's base, so it is resolved at `--ref` (the declared target by default). A `file:line`

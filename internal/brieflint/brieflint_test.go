@@ -391,7 +391,7 @@ func TestRuleHardCountsIgnoresProseWithoutACount(t *testing.T) {
 	repo, _ := fixture(t)
 	r := Lint(satisfying, Options{Repo: repo})
 	requireClean(t, r, RuleHardCounts)
-	if !hasNote(r, "hard-counts: the brief states no hard count") {
+	if !hasNote(r, "hard-counts: no hard count was recognised") {
 		t.Fatalf("want a note that no count was found, got %v", r.Notes)
 	}
 }
@@ -630,7 +630,7 @@ func TestRuleFilePathsExemptsPathsTheBriefAsksToCreate(t *testing.T) {
 		"Write dev/report/EVIDENCE.md: the rule set as implemented.", 1)
 	r := Lint(brief, Options{Repo: repo})
 	requireClean(t, r, RuleFilePaths)
-	if !hasNote(r, "the brief asks for them to be created: dev/report/EVIDENCE.md") {
+	if !hasNote(r, "read as asking for them to be created (wording only: a create verb governing the mention): dev/report/EVIDENCE.md") {
 		t.Fatalf("the exemption must be visible in the output, got %v", r.Notes)
 	}
 
@@ -1008,7 +1008,7 @@ func TestCreateExemptionNeedsTheVerbToGovernTheCitation(t *testing.T) {
 	if !strings.Contains(f.Detail, "pkg/nope/ghost.go") {
 		t.Fatalf("the fabricated citation must be reported, not exempted: %s", f.Detail)
 	}
-	if hasNote(r, "asks for them to be created") {
+	if hasNote(r, "read as asking for them to be created") {
 		t.Fatalf("nothing should have been exempted: %v", r.Notes)
 	}
 }

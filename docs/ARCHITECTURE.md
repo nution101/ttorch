@@ -406,8 +406,8 @@ stored brief is a snapshot — `task add` copies it into the task, so a later ed
 reaches nobody — which means a defective brief is only discovered once a worker has acted on it.
 So the checks run at `ttorch task add` (whenever a brief is supplied) and standalone as
 `ttorch brief-lint <file>`: a declared target branch that resolves on the remote, cited paths that
-exist, a hard count with verify-yourself wording near it, a prohibition stated as an invariant plus
-an allowed end state, and a pointer to the project's standards.
+exist, a hard count with verify-yourself wording near it, a prohibition carrying bounding wording
+in its own clause plus an allowed end state, and a pointer to the project's standards.
 
 These properties are load-bearing:
 
@@ -456,13 +456,22 @@ These properties are load-bearing:
   the path as its source rather than its object ("add the case from <path>"). A later reference
   to the same path is checked even if an earlier mention asked for it to be written, and the
   exemption covers existence only, so a cited line is still bounded whenever the file is there.
-- **The hard-counts rule matches wording, and says so.** A hedge must sit in the block holding
-  the number or the one after it, and the brief must ask somewhere for the worker's own figure.
-  Both are lexical. A sentence that forbids a recount is built from the same words as one that
-  asks for it, so it matches; that false accept is inherent to matching vocabulary and is not
-  fixable by extending the vocabulary. The rule stops a bare count stated with nothing around
-  it. Everything it prints says wording rather than meaning, because a reader who takes
-  "hedged" as a finding about the brief has been told something the check never established.
+- **Two rules check a fact; the rest match wording, and say so.** `target-branch` and
+  `file-paths` are answered by git. `hard-counts`, `prohibition` and the create exemption inside
+  `file-paths` are answered by vocabulary, and each carries a false accept that extending the
+  vocabulary cannot remove, because the wording that satisfies the rule is the same wording that
+  defeats it. A sentence forbidding a recount is built from the words of a hedge. A bound in the
+  ban's clause may qualify something else in that clause. A create verb governing a mention may
+  be describing a file that already exists. Each rule stops the bare form it was written for,
+  and every note says wording rather than meaning, because a reader who takes "bounded" as a
+  finding about the brief has been told something the check never established.
+
+  The scope those wording rules search is deliberately narrow and has been wrong in both
+  directions. A hedge is looked for in the block holding the count or the next one; a bound in
+  the clause carrying the ban, or in a clause at the edge of the sentence that opens with the
+  bound and bans nothing itself. Searching the whole sentence let an unrelated trailing clause
+  bound a blanket prohibition once soft-wrapped lines were joined; searching too little pushed
+  hedges out of reach of their counts.
 
 ## 10. On-disk layout
 

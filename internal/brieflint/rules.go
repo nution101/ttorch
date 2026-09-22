@@ -295,7 +295,7 @@ const maxCitations = 64
 func checkFilePaths(ctx context.Context, b *brief, opt Options) ([]Finding, []string) {
 	cites := b.citations(opt.remote())
 	if len(cites) == 0 {
-		return nil, []string{"file-paths: the brief cites no file paths"}
+		return nil, []string{"file-paths: no file path was recognised in the brief (a path is recognised by its shape: a slash, or a bare name with a known extension)"}
 	}
 	if opt.Repo == "" {
 		return []Finding{{
@@ -381,7 +381,7 @@ func checkFilePaths(ctx context.Context, b *brief, opt Options) ([]Finding, []st
 	}
 	if len(created) > 0 {
 		// Visible, never silent: an exemption the reader can see is one they can question.
-		notes = append(notes, fmt.Sprintf("file-paths: %d citation(s) exempt from the existence check, the brief asks for them to be created: %s",
+		notes = append(notes, fmt.Sprintf("file-paths: %d citation(s) exempt from the existence check, read as asking for them to be created (wording only: a create verb governing the mention): %s",
 			len(created), strings.Join(rawPaths(created), ", ")))
 	}
 	return findings, notes
@@ -542,7 +542,7 @@ func checkHardCounts(_ context.Context, b *brief, _ Options) ([]Finding, []strin
 	sents := sentences(b.raw)
 	counts := hardCounts(sents)
 	if len(counts) == 0 {
-		return nil, []string{"hard-counts: the brief states no hard count"}
+		return nil, []string{"hard-counts: no hard count was recognised in the brief"}
 	}
 	asksForTheNumber := reportsTheNumber(b)
 	var findings []Finding
@@ -563,7 +563,7 @@ func checkHardCounts(_ context.Context, b *brief, _ Options) ([]Finding, []strin
 		})
 	}
 	if len(findings) == 0 {
-		return nil, []string{fmt.Sprintf("hard-counts: %d hard count(s), each with hedge wording in reach and a request for the worker's own number (wording only: the check cannot tell a hedge from a sentence forbidding one)", len(counts))}
+		return nil, []string{fmt.Sprintf("hard-counts: %d hard count(s), each with hedge wording in reach, and a reporting phrase somewhere in the brief (wording only: the check cannot tell a hedge from a sentence forbidding one, and the reporting phrase need not be about this count)", len(counts))}
 	}
 	return findings, nil
 }
@@ -592,24 +592,24 @@ func prohibitions(b *brief) []span {
 func checkProhibition(_ context.Context, b *brief, _ Options) ([]Finding, []string) {
 	bans := prohibitions(b)
 	if len(bans) == 0 {
-		return nil, []string{"prohibition: the brief states no prohibition on push/merge/commit/PR"}
+		return nil, []string{"prohibition: no prohibition on push/merge/commit/PR was recognised in the brief"}
 	}
-	var bare []span
-	bounded := false
-	for _, s := range bans {
-		if boundSignal.MatchString(s.text) {
-			bounded = true
-			continue
-		}
-		bare = append(bare, s)
-	}
+	// Per sentence, and per ban inside it. Two things used to widen this. A bound anywhere
+	// in the sentence counted, which soft-wrap joining turned into "anywhere in the
+	// paragraph"; and one bounded ban set a flag that suppressed the report for every bare
+	// one in the brief, so a single "do not push to main" covered a later "do not commit
+	// anything at all".
 	var findings []Finding
-	if !bounded {
-		for _, s := range bare {
+	for _, s := range bans {
+		for _, ban := range prohibitionRe.FindAllStringIndex(s.text, -1) {
+			if boundedBan(s.text, ban) {
+				continue
+			}
 			findings = append(findings, Finding{
 				Rule: RuleProhibition, Status: StatusFail, Quote: s.trim(), Line: b.lineAt(s.off),
-				Detail: "blanket prohibition: state the invariant it protects (for example: no changes to a product branch, no PR) rather than banning the machinery outright",
+				Detail: fmt.Sprintf("blanket prohibition %q: state the invariant it protects (for example: no changes to a product branch, no PR) rather than banning the machinery outright", strings.TrimSpace(s.text[ban[0]:ban[1]])),
 			})
+			break // one finding per sentence; the quote is the sentence either way
 		}
 	}
 	if !endStateSignal.MatchString(b.raw) {
@@ -619,7 +619,7 @@ func checkProhibition(_ context.Context, b *brief, _ Options) ([]Finding, []stri
 		})
 	}
 	if len(findings) == 0 {
-		return nil, []string{fmt.Sprintf("prohibition: %d prohibition(s), each bounded, with an allowed end state", len(bans))}
+		return nil, []string{fmt.Sprintf("prohibition: %d prohibition(s), each with bounding wording in its own clause, and an allowed end state stated somewhere in the brief (wording only: the check cannot tell whether the bound it found actually limits the ban)", len(bans))}
 	}
 	return findings, nil
 }
@@ -656,7 +656,7 @@ func checkStandards(_ context.Context, b *brief, opt Options) ([]Finding, []stri
 	if len(cfg.Standards) > 0 {
 		for _, p := range cfg.Standards {
 			if strings.Contains(b.lower, strings.ToLower(p)) {
-				return nil, []string{fmt.Sprintf("standards: the brief cites the project's declared pointer %q", p)}
+				return nil, []string{fmt.Sprintf("standards: the brief mentions the project's declared pointer %q", p)}
 			}
 		}
 		return []Finding{{
