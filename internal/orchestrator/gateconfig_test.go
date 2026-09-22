@@ -198,17 +198,56 @@ func TestGateConfigCoversTheDecidingCode(t *testing.T) {
 // TestGateCostFiguresMatchTheDoc is what surfaces one.
 func guardSymbols(t *testing.T) map[string]bool {
 	t.Helper()
+	return guardClosure(t).symbols
+}
+
+// guardReach is what the guard's transitive closure touches: the symbols declared in
+// validate.go, and the other packages it reads the repository through.
+type guardReach struct {
+	symbols map[string]bool
+	// packages maps an imported package's qualifier to its import path, for the packages
+	// the closure actually calls into. internal/worktree is the live one: it holds the
+	// blob read and the record framing the scope decision rests on.
+	packages map[string]string
+}
+
+func guardClosure(t *testing.T) guardReach {
+	t.Helper()
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "validate.go", nil, 0)
 	if err != nil {
 		t.Fatalf("parsing validate.go: %v", err)
 	}
+	// Qualifier -> import path, for this module's own packages only. A guard that starts
+	// reading the repo through a new internal package has moved part of its evidence
+	// layer there, and the lane that proves the guard has to follow it.
+	imports := map[string]string{}
+	for _, im := range f.Imports {
+		ip := strings.Trim(im.Path.Value, `"`)
+		if !strings.HasPrefix(ip, "github.com/nution101/ttorch/internal/") {
+			continue
+		}
+		name := ip[strings.LastIndex(ip, "/")+1:]
+		if im.Name != nil {
+			name = im.Name.Name
+		}
+		imports[name] = ip
+	}
 	decls := map[string]ast.Node{}
+	// Methods are keyed by RECEIVER TYPE, not by their own name, and they are reached by
+	// walking that type rather than by seeing their name. Keying them by name would put
+	// `files` and `prefixes` in the symbol set, and a test declaring a local called
+	// `files` would be misread as a proof file.
+	methods := map[string][]*ast.FuncDecl{}
 	for _, d := range f.Decls {
 		switch n := d.(type) {
 		case *ast.FuncDecl:
 			if n.Recv == nil {
 				decls[n.Name.Name] = n
+				break
+			}
+			if recv := receiverTypeName(n); recv != "" {
+				methods[recv] = append(methods[recv], n)
 			}
 		case *ast.GenDecl:
 			for _, sp := range n.Specs {
@@ -225,13 +264,17 @@ func guardSymbols(t *testing.T) map[string]bool {
 	}
 	seen := map[string]bool{}
 	var walk func(string)
-	walk = func(name string) {
-		n, ok := decls[name]
-		if !ok || seen[name] {
-			return
-		}
-		seen[name] = true
+	var walkNode func(ast.Node)
+	usedPkgs := map[string]string{}
+	walkNode = func(n ast.Node) {
 		ast.Inspect(n, func(nd ast.Node) bool {
+			if se, ok := nd.(*ast.SelectorExpr); ok {
+				if q, ok := se.X.(*ast.Ident); ok {
+					if ip, isImport := imports[q.Name]; isImport {
+						usedPkgs[q.Name] = ip
+					}
+				}
+			}
 			if id, ok := nd.(*ast.Ident); ok {
 				if _, isDecl := decls[id.Name]; isDecl {
 					walk(id.Name)
@@ -239,6 +282,20 @@ func guardSymbols(t *testing.T) map[string]bool {
 			}
 			return true
 		})
+	}
+	walk = func(name string) {
+		n, ok := decls[name]
+		if !ok || seen[name] {
+			return
+		}
+		seen[name] = true
+		walkNode(n)
+		// Reaching a type reaches its methods. gateScope is a bare struct whose own
+		// declaration mentions nothing, while files() and prefixes() are where the four
+		// covered-path lists are actually read, so stopping at the type loses them.
+		for _, m := range methods[name] {
+			walkNode(m)
+		}
 	}
 	for _, entry := range []string{"diffTouchesGateConfig", "matchesGateConfig"} {
 		if _, ok := decls[entry]; !ok {
@@ -251,7 +308,41 @@ func guardSymbols(t *testing.T) map[string]bool {
 		t.Fatalf("the guard closure came back with %d symbols, too few to be real; the "+
 			"derivation is broken and every proof file would read as ordinary", len(seen))
 	}
-	return seen
+	// A canary on the traversal, not a second copy of the covered set. These four ARE the
+	// covered-path lists, so a derivation that cannot reach them is not measuring
+	// coverage at all: a test file asserting only on those lists would read as ordinary
+	// and could be deleted in the merge that widened them. They were unreachable until
+	// the method walk above existed, and the suite stayed green throughout. If one is
+	// renamed this fatals, which is the point: the rename should be accompanied by
+	// someone checking the derivation still reaches the new name.
+	for _, list := range []string{"gateConfigFiles", "ttorchSourceFiles", "gateConfigPrefixes", "ttorchSourcePrefixes"} {
+		if !seen[list] {
+			t.Errorf("the guard closure does not reach %s, one of the four lists that "+
+				"define the covered set; a test asserting only on it reads as ordinary", list)
+		}
+	}
+	if len(usedPkgs) == 0 {
+		t.Error("the guard closure reads no other package, which cannot be right: it reads " +
+			"the base tree through internal/worktree. The package walk is broken, and " +
+			"TestGateLaneRunsTheEvidencePackages is asserting nothing.")
+	}
+	return guardReach{symbols: seen, packages: usedPkgs}
+}
+
+// receiverTypeName is the bare type name a method hangs off, pointer or not.
+func receiverTypeName(fn *ast.FuncDecl) string {
+	if fn.Recv == nil || len(fn.Recv.List) == 0 {
+		return ""
+	}
+	switch rt := fn.Recv.List[0].Type.(type) {
+	case *ast.Ident:
+		return rt.Name
+	case *ast.StarExpr:
+		if id, ok := rt.X.(*ast.Ident); ok {
+			return id.Name
+		}
+	}
+	return ""
 }
 
 // proofTestFiles returns the _test.go files in this package that reference the guard.
@@ -1273,6 +1364,79 @@ func TestGateCostFiguresMatchTheDoc(t *testing.T) {
 	if n := len(shas); n != 196 {
 		t.Logf("the corpus is now %d commits, not the 196 the doc's prose cites; the table rows above are measured either way", n)
 	}
+
+	// Pinning three table rows is what let this drift three times. The rows were updated
+	// and the PROSE around them was not, so ARCHITECTURE.md ended up contradicting itself
+	// about the same quantity, and SKILL.md — the copy that installs into every reviewer's
+	// ~/.claude — kept figures two boundary moves old. The accurate copy was not the
+	// installed one.
+	//
+	// So every figure in both publishing files is swept, wherever it appears, and each one
+	// has to BE a measured quantity. The candidates are derived: the paths the reviewer
+	// skill lists as deliberately not covered, and the covered set itself. Anything that
+	// is not one of those numbers is either stale or unverifiable, and the rule for an
+	// unverifiable figure is to delete it rather than publish it.
+	//
+	// It caught one the brief did not: internal/cli/ was published at +32 marginal and
+	// 127/196, which is 84 + 32 with the old base swapped for the new one. A marginal
+	// SHRINKS as the covered set grows, because commits that were cli-only become covered
+	// by other means. Measured two ways, it is +28 and 123/196.
+	own := func(p string) int {
+		var n int
+		for _, files := range touched {
+			for _, f := range files {
+				if f != "" && (f == p || strings.HasPrefix(f, p)) {
+					n++
+					break
+				}
+			}
+		}
+		return n
+	}
+	candidates := readFence(t, notCoveredFence)
+	candidates = append(candidates, ttorchScope.files()...)
+	candidates = append(candidates, ttorchScope.prefixes()...)
+	allowed := map[int]bool{total: true, count("internal/orchestrator/", "internal/review/"): true}
+	for _, c := range candidates {
+		with := count(c)
+		allowed[own(c)] = true
+		allowed[with] = true
+		allowed[with-total] = true
+	}
+	allowedPct := map[string]bool{}
+	for n := range allowed {
+		pct := 100 * float64(n) / float64(len(shas))
+		allowedPct[fmt.Sprintf("%.1f%%", pct)] = true
+		allowedPct[fmt.Sprintf("%d%%", int(math.Round(pct)))] = true
+	}
+
+	skillPath := filepath.Join(root, "content", "skills", "ttorch-review", "SKILL.md")
+	skill, err := os.ReadFile(skillPath)
+	if err != nil {
+		t.Fatalf("reading SKILL.md: %v", err)
+	}
+	fracRe := regexp.MustCompile(`(\d+)/` + fmt.Sprint(len(shas)))
+	pctRe := regexp.MustCompile(`\d+(?:\.\d+)?%`)
+	for _, pub := range []struct{ name, text string }{
+		{"docs/ARCHITECTURE.md", body},
+		{"content/skills/ttorch-review/SKILL.md", string(skill)},
+	} {
+		for _, m := range fracRe.FindAllStringSubmatch(pub.text, -1) {
+			var n int
+			fmt.Sscanf(m[1], "%d", &n)
+			if !allowed[n] {
+				t.Errorf("%s publishes %s, which is not a measured quantity. Re-measure it "+
+					"or delete it; a figure nobody can check is the reason these drifted "+
+					"three times.", pub.name, m[0])
+			}
+		}
+		for _, m := range pctRe.FindAllString(pub.text, -1) {
+			if !allowedPct[m] {
+				t.Errorf("%s publishes %s, which is not a measured percentage of the %d-commit "+
+					"corpus. Re-measure it or delete it.", pub.name, m, len(shas))
+			}
+		}
+	}
 }
 
 // notCoveredFence is the language tag on the machine-readable block in the reviewer skill.
@@ -1484,6 +1648,138 @@ func TestGateTestsSelectorCoversTheProofs(t *testing.T) {
 			t.Errorf("GATE_TESTS does not select %s, so `make test-gate` does not run it and "+
 				"-short skips it: it executes in neither lane that gates a merge. Add it to "+
 				"the selector.", name)
+		}
+	}
+
+	// Coverage alone leaves the selector hand-maintained, and the other half of
+	// hand-maintained is a name that selects nothing: a typo, or a test that was renamed
+	// or deleted, both of which compile and quietly shrink the lane. So the selector is
+	// GENERATED from the proof files and compared byte for byte. The failure prints the
+	// line to paste, which is why this stays a check rather than a code generator: the
+	// Makefile is covered ground, and a test that rewrote it would be a test that can
+	// edit the gate.
+	sort.Strings(proofs)
+	want := "^(" + strings.Join(proofs, "|") + ")$"
+	if raw != want {
+		t.Errorf("GATE_TESTS is not the derived set. Replace the Makefile line with:\n\nGATE_TESTS = '%s'\n",
+			strings.ReplaceAll(want, "$", "$$"))
+	}
+}
+
+// onTopicTestName matches a test that is about the gate BY NAME.
+//
+// This is the sweep that 93ea45a dropped. proofTestFiles derives proof-ness from whether a
+// file uses the guard's identifiers, which is the right primary signal, but it misses a
+// genuine proof that asserts only through merge behaviour: a test that drives mergeLocal
+// with --allow-gate-change touches no guard symbol and reads as ordinary. One such test was
+// written, in orchestrator_test.go, and nothing swept it.
+//
+// Covering orchestrator_test.go wholesale costs 43 of 196 commits, so the fix is not to
+// widen the covered set. It is to refuse to let an on-topic test live somewhere no sweep
+// reaches, and say where it should go instead.
+var onTopicTestName = regexp.MustCompile(`GateConfig|GateGuard|GateScope|GateCost|GateTests|AllowGateChange|GateInstruction|MatchesGateConfig`)
+
+// TestOnTopicTestsLiveInAProofFile fails when a test named for the gate sits in a file the
+// proof derivation does not reach.
+//
+// What it still does NOT catch, stated rather than implied: a test that is about the gate,
+// uses none of its identifiers, AND is named for none of it. Nothing mechanical can see
+// that one. Naming is the only handle left once the symbol signal is gone, so the pattern
+// is deliberately broad — a false positive costs moving a test into a file that is already
+// covered, which is free, while a false negative costs a deletable proof.
+func TestOnTopicTestsLiveInAProofFile(t *testing.T) {
+	proofs := map[string]bool{}
+	for _, n := range proofTestFiles(t) {
+		proofs[n] = true
+	}
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	var swept int
+	for _, e := range entries {
+		n := e.Name()
+		if e.IsDir() || !strings.HasSuffix(n, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, n, nil, 0)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", n, err)
+		}
+		for _, d := range f.Decls {
+			fn, ok := d.(*ast.FuncDecl)
+			if !ok || fn.Recv != nil || !strings.HasPrefix(fn.Name.Name, "Test") {
+				continue
+			}
+			if !onTopicTestName.MatchString(fn.Name.Name) {
+				continue
+			}
+			swept++
+			if !proofs[n] {
+				t.Errorf("%s is named for the gate but lives in %s, which no sweep covers: "+
+					"it is not selected by GATE_TESTS and it can be deleted in the same "+
+					"unflagged merge as the attack it catches. Move it into a proof file "+
+					"(gateconfig_test.go or gateattacks_test.go).", fn.Name.Name, n)
+			}
+		}
+	}
+	if swept == 0 {
+		t.Fatal("the on-topic sweep matched no test at all; the pattern is broken and this " +
+			"check is asserting nothing")
+	}
+}
+
+// TestGateLaneRunsTheEvidencePackages is the "runs in the gate's lane" rule one level out.
+//
+// make test-gate ran ./internal/orchestrator/ only. The blob read and the record framing
+// the scope decision rests on moved to internal/worktree in 0f73e17, and its proofs then
+// executed only because they happen to carry no -short skip, which is luck rather than a
+// guarantee. Rather than name that package in the Makefile and call it done, the packages
+// the guard reads the repository through are DERIVED from its own call closure, so the
+// next time part of the evidence layer moves to a new package the lane has to follow it.
+//
+// Those packages run UNFILTERED. A -run selector aimed at another package's test names
+// matches nothing and still exits 0, which is the vacuous-pass shape this branch has hit
+// twice, so the check refuses a filtered invocation.
+func TestGateLaneRunsTheEvidencePackages(t *testing.T) {
+	root := repoRootForGateConfig(t)
+	mk, err := os.ReadFile(filepath.Join(root, "Makefile"))
+	if err != nil {
+		t.Fatalf("reading the Makefile: %v", err)
+	}
+	m := regexp.MustCompile(`(?ms)^test-gate:\n(\t.*?)(?:\n[^\t\n]|\z)`).FindSubmatch(mk)
+	if m == nil {
+		t.Fatal("the Makefile has no test-gate recipe; .ttorch/validate.sh runs it as the " +
+			"third step of the trusted gate")
+	}
+	recipe := strings.Split(string(m[1]), "\n")
+	// Generating GATE_TESTS proves nothing if the recipe stops reading it. A recipe
+	// changed to a different -run value leaves the derivation green while the lane runs
+	// something else, which is the same vacuous-pass shape one level out.
+	if !strings.Contains(string(m[1]), "-run $(GATE_TESTS) ./internal/orchestrator/") {
+		t.Errorf("test-gate must run ./internal/orchestrator/ under -run $(GATE_TESTS); "+
+			"GATE_TESTS is generated and checked, so a recipe that does not use it runs "+
+			"an unchecked selection. Recipe:\n%s", m[1])
+	}
+	for _, ip := range guardClosure(t).packages {
+		pkg := "./" + ip[strings.Index(ip, "internal/"):] + "/"
+		var found bool
+		for _, line := range recipe {
+			if !strings.Contains(line, pkg) {
+				continue
+			}
+			found = true
+			if strings.Contains(line, "-run") {
+				t.Errorf("test-gate runs %s behind a -run selector aimed at another "+
+					"package's tests, which matches nothing and exits 0. Run it "+
+					"unfiltered.", pkg)
+			}
+		}
+		if !found {
+			t.Errorf("the guard reads the repository through %s, so that package holds part "+
+				"of the evidence the gate rests on, but `make test-gate` does not run it. "+
+				"Its proofs execute in neither lane that gates a merge.", pkg)
 		}
 	}
 }

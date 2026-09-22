@@ -162,10 +162,34 @@ var ttorchSourceFiles = []string{
 	//
 	// Why these two and not every _test.go tree-wide: these are the files that carry the
 	// guard's assertions, and tree-wide coverage would put every test change behind the
-	// flag for no gain, since a test elsewhere cannot weaken this guard. The boundary is
-	// enforced rather than trusted. TestOrchestratorFilesAreClassified derives proof-ness
-	// from whether a test file USES the guard's identifiers, so a new proof file cannot
-	// land outside this list unnoticed.
+	// flag for no gain, since a test elsewhere cannot weaken this guard.
+	//
+	// Three checks hold the boundary, each covering what the one before it cannot see.
+	//
+	// TestOrchestratorFilesAreClassified marks a test file a proof when it uses a symbol
+	// from the guard's transitive closure, and fails both ways: a proof file that is not
+	// covered, and a covered file that proves nothing. The closure skipped METHODS for
+	// several revisions of this comment, so gateConfigFiles, ttorchSourceFiles,
+	// gateConfigPrefixes and ttorchSourcePrefixes were reachable only through
+	// gateScope.files() and .prefixes() and therefore not reachable at all. A test file
+	// asserting on nothing but the four lists that define the covered set read as
+	// ordinary. It now walks a type's methods, and fatals if those four are unreachable.
+	//
+	// TestOnTopicTestsLiveInAProofFile covers what the symbol signal structurally cannot:
+	// a test that drives mergeLocal with --allow-gate-change proves the gate while
+	// touching none of its identifiers. That sweep matches on the test NAME and refuses
+	// one that lives in a file no proof derivation reaches.
+	//
+	// TestGateTestsSelectorCoversTheProofs then GENERATES the Makefile's GATE_TESTS from
+	// the proof files and compares it byte for byte, so a proof that is covered against
+	// deletion also runs in the lane that gates a merge rather than only one of the two.
+	//
+	// What none of them catch, stated rather than left implied: a test that is about the
+	// gate, uses none of its identifiers, AND is named for none of it. Once the symbol
+	// signal is gone the name is the only handle left, and nothing mechanical sees past
+	// it. The place such a test would most likely be written is orchestrator_test.go, and
+	// covering that file wholesale costs 43 of 196 commits, which is the trade being made
+	// here rather than an oversight.
 	//
 	// The gate-config tests used to live in orchestrator_test.go too. Covering that file
 	// cost 43 of 196 commits and took the set to 110/196 = 56%, past the more-than-half
