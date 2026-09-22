@@ -217,6 +217,34 @@ invalidates the verdict — re-prep, re-review, re-record.
   directory symlink can introduce files git never lists by path, and refusing all of them
   would fire on ordinary layout.
 
+- **Paths this gate does NOT cover**, as a machine-readable list so the claim can be checked
+  rather than trusted. `TestNotCoveredListIsHonest` reconciles every entry below against the
+  live matcher and fails if any of them is in fact covered, so this block cannot quietly
+  describe a state the code left behind.
+
+  ```gate-not-covered
+  cmd/ttorch/
+  internal/cli/
+  internal/db/
+  internal/worktree/
+  internal/scheduler/
+  internal/harness/
+  internal/selfupdate/
+  internal/manifest/
+  internal/orchestrator/spawn.go
+  internal/orchestrator/landqueue.go
+  internal/orchestrator/autostart.go
+  internal/orchestrator/overlap.go
+  internal/orchestrator/orchestrator.go
+  ```
+
+  The two that cost the most to leave out, with the measured reason:
+  `internal/cli/` is +32 commits, which would take the covered set to 116/196 = 59.2%, past
+  the more-than-half line that is the stated reason `internal/orchestrator/` is not covered
+  wholesale. `internal/db/` is +15, to 99/196 = 50.5%. `internal/worktree/` holds
+  `ChangedFiles`, the only input to the guard, and is the one whose absence should worry a
+  reviewer most: an incomplete list there makes the guard match nothing at all.
+
 - **What that claim does NOT cover**, stated so nobody reads it as wider than it is:
   - Gated means trusted mode or `--require-verdict`. A `local`/`validated` merge without
     `--require-verdict` does not run this check at all, so it still merges a gate-definition

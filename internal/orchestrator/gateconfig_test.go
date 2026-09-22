@@ -1130,3 +1130,64 @@ func TestGateCostFiguresMatchTheDoc(t *testing.T) {
 		t.Logf("the corpus is now %d commits, not the 196 the doc's prose cites; the table rows above are measured either way", n)
 	}
 }
+
+// notCoveredFence is the language tag on the machine-readable block in the reviewer skill.
+const notCoveredFence = "gate-not-covered"
+
+// TestNotCoveredListIsHonest reconciles the published "not covered" list against the live
+// matcher, and it is deliberately SELF-CONTAINED: it reads this tree and nothing else.
+//
+// An earlier version of this idea, on a sibling branch, resolved a cross-branch ref and
+// t.Fatalf'd when it did not resolve. That hard-fails in any fresh clone and in CI, because
+// actions/checkout fetches only the pushed ref, and CI is the one environment that runs the
+// non-short lane. It also shipped a TTORCH_GATE_RECONCILE_REF=none escape, which disables the
+// check exactly where it is the only thing running. A check that cannot run in CI, or that
+// can be switched off there, is not a check. There is no ref and no env var here.
+//
+// The direction that matters is claiming something is uncovered when it is covered: that
+// understates the guard and sends a reviewer looking for a hole that is already closed. The
+// reverse, a covered path missing from the list, is not detectable from the list alone and is
+// not claimed to be.
+func TestNotCoveredListIsHonest(t *testing.T) {
+	path := filepath.Join(repoRootForGateConfig(t), "content", "skills", "ttorch-review", "SKILL.md")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading the reviewer skill: %v", err)
+	}
+	text := string(b)
+	open := "```" + notCoveredFence
+	i := strings.Index(text, open)
+	if i < 0 {
+		t.Fatalf("%s has no ```%s block. The not-covered list must stay machine-readable so "+
+			"this test stays wired to it; a missing fence is how the check gets unwired "+
+			"without anyone deciding to unwire it.", path, notCoveredFence)
+	}
+	rest := text[i+len(open):]
+	j := strings.Index(rest, "```")
+	if j < 0 {
+		t.Fatalf("the ```%s block in %s is not closed", notCoveredFence, path)
+	}
+	var entries []string
+	for _, line := range strings.Split(rest[:j], "\n") {
+		if tok := strings.TrimSpace(line); tok != "" {
+			entries = append(entries, tok)
+		}
+	}
+	// Non-empty on purpose. internal/cli/ alone is a deliberate, measured exclusion at +32
+	// commits, so an empty list here would be false rather than an achievement.
+	if len(entries) == 0 {
+		t.Fatal("the not-covered list is empty. internal/cli/ and internal/db/ are deliberate " +
+			"exclusions, so an empty list is a false claim rather than a finished job.")
+	}
+	for _, e := range entries {
+		probe := e
+		if strings.HasSuffix(e, "/") {
+			probe = e + "probe.go"
+		}
+		if matchesGateConfig(probe, ttorchScope) {
+			t.Errorf("%s is published as NOT covered, but the matcher covers it. Either the "+
+				"guard widened and this list was not updated, or the entry was wrong when "+
+				"written. Fix the list; do not relax this test.", e)
+		}
+	}
+}
