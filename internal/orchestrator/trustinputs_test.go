@@ -932,3 +932,38 @@ func TestGateOnce_ADispatchedReviewerStaysRequiredUntilItReports(t *testing.T) {
 		t.Fatal("the unanswered dimension must be surfaced for the manager, not silently dropped")
 	}
 }
+
+// TestSpawnReviewer_RefusesATraversingDimension covers the write paths assembled from a
+// dimension name. Dimensions reach the dispatch loop through requiredDimensions, which unions
+// the prep stamp, reviewers.json and the derived floor, and the middle one sits in the
+// worker's review-inputs dir. The dimension then names the reviewer brief, the report path
+// handed to the reviewer, and the tmux window.
+//
+// review.InputPath is what refuses an unusable name, and this asserts spawnReviewer actually
+// goes through it for BOTH paths rather than joining either by hand, since a guard in a
+// helper only holds while every sink uses the helper.
+func TestSpawnReviewer_RefusesATraversingDimension(t *testing.T) {
+	m, _, _ := trustHarness(t, "trav1", "trusted", "exit 0")
+	dir := m.P.ReviewInputsDir("trav1")
+	if err := os.MkdirAll(review.ReportsDir(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, dim := range []string{"../escaped", "..", "sub/dir", ".", ""} {
+		err := m.spawnReviewer("trav1", dim, dir, "deadbeef", t.TempDir(), t.TempDir())
+		if err == nil {
+			t.Fatalf("dimension %q was accepted into a path join", dim)
+		}
+		if !strings.Contains(err.Error(), "unusable review dimension name") {
+			t.Fatalf("dimension %q: err = %v, want the dimension-name refusal", dim, err)
+		}
+		// Nothing may be written anywhere for a name that was refused.
+		for _, suffix := range []string{reviewerBriefSuffix, review.ReportSuffix} {
+			if _, serr := os.Stat(filepath.Join(dir, dim+suffix)); serr == nil {
+				t.Fatalf("dimension %q wrote %s anyway", dim, suffix)
+			}
+			if _, serr := os.Stat(filepath.Join(review.ReportsDir(dir), dim+suffix)); serr == nil {
+				t.Fatalf("dimension %q wrote %s into the reports dir anyway", dim, suffix)
+			}
+		}
+	}
+}
