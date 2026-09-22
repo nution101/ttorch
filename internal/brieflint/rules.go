@@ -619,7 +619,7 @@ func checkProhibition(_ context.Context, b *brief, _ Options) ([]Finding, []stri
 		})
 	}
 	if len(findings) == 0 {
-		return nil, []string{fmt.Sprintf("prohibition: %d prohibition(s), each with bounding wording in its own clause, and an allowed end state stated somewhere in the brief (wording only: the check cannot tell whether the bound it found actually limits the ban)", len(bans))}
+		return nil, []string{fmt.Sprintf("prohibition: %d prohibition(s), each with bounding wording in reach of the ban (its own clause, or a clause at the edge of the sentence that opens with the bound), and an allowed end state stated somewhere in the brief (wording only: the check cannot tell whether the bound it found actually limits the ban)", len(bans))}
 	}
 	return findings, nil
 }

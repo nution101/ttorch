@@ -218,7 +218,7 @@ with no brief is unchanged). Five rules:
 | `target-branch` | The brief names its target as `origin/<branch>`, and that branch exists on the remote |
 | `file-paths` | Every file path the brief cites exists at the ref the citation is about |
 | `hard-counts` | A brief stating "there are 21 occurrences" carries verify-yourself wording near the number, and a reporting phrase somewhere |
-| `prohibition` | A prohibition carries bounding wording in its own clause, and the brief states an allowed end state, rather than banning `push`/`merge`/PR outright |
+| `prohibition` | A prohibition carries bounding wording in reach of the ban, and the brief states an allowed end state, rather than banning `push`/`merge`/PR outright |
 | `standards` | The brief points at the standards the project expects |
 
 Two of those are answered by git and the rest by vocabulary, which is the difference that
@@ -236,7 +236,8 @@ Some details that matter in practice:
     a sentence forbidding one: "I verified the count myself, so do not re-count it" carries the
     same words as a hedge and passes. No vocabulary fixes that, because the words are the same
     words.
-  - `prohibition` looks for bounding vocabulary in the clause carrying the ban, and for an
+  - `prohibition` looks for bounding vocabulary in the clause carrying the ban, or in a clause
+    at the edge of the sentence that opens with the bound and bans nothing itself, and for an
     end-state phrase anywhere in the brief. It cannot tell whether the bound it found actually
     limits the ban.
   - `file-paths` skips its existence check where a create verb governs the mention, which is

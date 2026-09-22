@@ -407,7 +407,7 @@ reaches nobody — which means a defective brief is only discovered once a worke
 So the checks run at `ttorch task add` (whenever a brief is supplied) and standalone as
 `ttorch brief-lint <file>`: a declared target branch that resolves on the remote, cited paths that
 exist, a hard count with verify-yourself wording near it, a prohibition carrying bounding wording
-in its own clause plus an allowed end state, and a pointer to the project's standards.
+in reach of the ban plus an allowed end state, and a pointer to the project's standards.
 
 These properties are load-bearing:
 
