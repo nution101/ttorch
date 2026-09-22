@@ -377,7 +377,7 @@ be installed without the guard covering it — while leaving the guard's rule in
 installer's. That test reports `35 of 42` against the old prefixes, which is the check the
 hand-maintained list never had.
 
-Cost: +8 commits, 76 → 84 of 196 (39% → 43%).
+Cost: +8 commits.
 
 ### The installer's FS parameter, and the skills channel
 
@@ -393,13 +393,13 @@ needed no covered path at all:
 |---|---|
 | `payload/content/agents/ttorch-reviewer-security.md` | no — the prefix is `content/`, not `*/content/` |
 | `payload/embed.go` with `//go:embed all:content` | no |
-| one line in `internal/cli` handing that FS to `Apply` | no — deliberately, at 32/196 commits |
+| one line in `internal/cli` handing that FS to `Apply` | no — deliberately, at 28/196 commits |
 
 That installs a replacement security reviewer, and `collidesInTree` sees nothing because there
 is no colliding pair. So the claim "the installer has no file outside `content/` to reach" was
 conditional on a file the gate does not cover.
 
-Covering `internal/cli/` would close it at +32 commits — 116/196 = 59.2%, past the
+Covering `internal/cli/` would close it at +28 commits — 123/196 = 62.8%, past the
 more-than-half line that is the stated reason `internal/orchestrator/` is not covered
 wholesale. Rather than apply that rule to one package and break it for another, the fix is to
 remove the choice: `Apply` is now unexported `apply`, and `ApplyEmbedded` picks
@@ -794,7 +794,7 @@ read as decisions rather than omissions.
 covering it costs 15 more commits (23/196 on its own, taking the set to 110/196 = 56.1%).
 
 `internal/cli/` wires the `--allow-gate-change` flag and is the larger of the two: 56/196 on
-its own, +32 marginal, which would take the set to 127/196 = **64.8%**. That is past the
+its own, +28 marginal, which would take the set to 123/196 = **62.8%**. That is past the
 more-than-half line that is the stated reason `internal/orchestrator/` is not covered
 wholesale, so covering it would mean applying the rule to one package and breaking it for
 another. It was also the caller that chose the tree `installer.Apply` walked, which made the
@@ -813,7 +813,7 @@ CI as the required check. CI is therefore half of what "validated" means here, a
 `ci.yml` weakens every later change's validation through the same delayed diff channel that
 put the skills on the list. It costs 5 commits.
 
-What the numbers do not fix: at 43%, a bit over two merges in five in this repo need
+What the numbers do not fix: at 48%, a bit under half the merges in this repo need
 `--allow-gate-change`, and the flag is a boolean. A lead who passes it by reflex authorizes
 exactly as much as one who read the diff. The audit line naming the file survives either way,
 which is the guard's durable half. Making the flag take the expected paths — so a bare
