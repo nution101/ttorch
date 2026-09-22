@@ -1476,3 +1476,52 @@ func TestNoRuleReportsAnUnboundedNumberOfFindings(t *testing.T) {
 		t.Errorf("a %d byte brief produced %d bytes of report; the whole point of the caps is that it cannot", len(body), total)
 	}
 }
+
+// countdownCtx reports alive for the first n calls to Err and expired after, so a test can
+// place the expiry at an exact point in a loop rather than racing a clock to it.
+type countdownCtx struct {
+	context.Context
+	n int
+}
+
+func (c *countdownCtx) Err() error {
+	if c.n > 0 {
+		c.n--
+		return nil
+	}
+	return context.DeadlineExceeded
+}
+
+// hardCounts checked the budget on its outer loop, over spans, and did its work in the
+// inner one, over the matches inside a span. Spans merge whenever the next sentence starts
+// lowercase, so a brief can be a single span holding every count in it, and one check then
+// runs for the whole rule. That is the shape of the rule 5 defect fixed one round earlier:
+// the clock was read where the loop was, not where the work was.
+//
+// The expiry is placed with a countdown rather than a deadline. At the cap the inner loop
+// is milliseconds, so no honest timing fixture can exhaust a real budget inside it, and a
+// test that cannot fail is the thing this branch keeps finding.
+func TestHardCountsChecksTheBudgetInsideTheSpan(t *testing.T) {
+	const counts = 1000
+	sents := sentences(strings.Repeat("on 21 uses. ", counts))
+	// The premise: one span, every count inside it. Without that the outer check is enough
+	// and this test would prove nothing.
+	if len(sents) != 1 {
+		t.Fatalf("fixture split into %d spans; it must merge into one for the inner loop to matter", len(sents))
+	}
+
+	// One alive answer, which the outer check consumes. Everything after it is expired, so
+	// only a check inside the inner loop can see it.
+	ctx := &countdownCtx{Context: context.Background(), n: 1}
+	out, complete := hardCounts(ctx, sents)
+	if complete {
+		t.Fatalf("hardCounts ran all %d counts to completion with the budget spent after the first check", counts)
+	}
+	// It stopped partway, not at the top: the outer check passed, so some work was done.
+	if len(out) == 0 || len(out) >= counts {
+		t.Fatalf("got %d counts, want a partial result between 1 and %d", len(out), counts)
+	}
+	if len(out) > budgetCheckEvery {
+		t.Errorf("the inner check fires every %d matches, so at most that many should get through; got %d", budgetCheckEvery, len(out))
+	}
+}

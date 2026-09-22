@@ -585,15 +585,26 @@ type countHit struct {
 // lowercase and two capitalised.
 func hardCounts(ctx context.Context, sents []span) ([]countHit, bool) {
 	var out []countHit
-	scanned := 0
+	// One counter for both loops, because the work is in the inner one. Spans merge
+	// whenever the next sentence starts lowercase, so a brief can be a single span holding
+	// every count in it, and a check on the outer loop alone then runs once for the whole
+	// rule. That is the shape of the budget defect fixed in rule 5 one round earlier:
+	// the clock was read where the loop was, not where the work was.
+	work := 0
 	for i, s := range sents {
-		if scanned%budgetCheckEvery == 0 && ctx.Err() != nil {
+		if work%budgetCheckEvery == 0 && ctx.Err() != nil {
 			return out, false
 		}
-		scanned++
+		work++
 		seen := map[int]bool{} // the number's offset: both patterns can match one count
 		for _, re := range []*regexp.Regexp{countNounRe, countPhraseRe} {
 			for _, m := range re.FindAllStringSubmatchIndex(s.text, -1) {
+				// Counted per match EXAMINED, not per match kept: a span of small numbers
+				// rejected below is still a span this loop walked.
+				if work%budgetCheckEvery == 0 && ctx.Err() != nil {
+					return out, false
+				}
+				work++
 				num := s.text[m[2]:m[3]]
 				if n, err := strconv.Atoi(num); err != nil || n < minHardCount {
 					continue
@@ -602,7 +613,6 @@ func hardCounts(ctx context.Context, sents []span) ([]countHit, bool) {
 					continue
 				}
 				seen[m[2]] = true
-				scanned++
 				out = append(out, countHit{sent: i, unit: s.unitAround(m[2]), loc: [2]int{m[2], m[3]}})
 			}
 		}

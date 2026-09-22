@@ -3,6 +3,7 @@ package brieflint
 import (
 	"context"
 	"regexp"
+	"sort"
 	"strings"
 	"unicode/utf8"
 )
@@ -287,23 +288,43 @@ type span struct {
 	text string
 	off  int
 	blk  int
-	// stops are the offsets, within text, of the full stops the splitter merged. Computed
-	// once when the span is built, because every rule that asks "which sentence is this
-	// position in" asks it once per item it found, and computing the answer per question
-	// made two rules quadratic in the brief's size, in consecutive commits.
+	// stops are the offsets, within text, of the full stops the splitter merged, ascending.
+	// Computed once when the span is built, because every rule that asks "which sentence is
+	// this position in" asks it once per item it found, and re-deriving the answer from the
+	// text per question made two rules quadratic in the brief's size, in consecutive
+	// commits.
 	stops []int
 }
 
-// unitAround returns the sentence of this span containing pos: a walk over the precomputed
-// boundaries, never a scan of the text.
+// unitAround returns the sentence of this span containing pos.
+//
+// It binary-searches stops rather than walking them from index 0.
+//
+// Precomputing the boundaries took one question from O(bytes in the span) to O(stops in
+// the span), and that is not the same as removing the cost. Spans merge whenever the next
+// sentence starts lowercase, so one brief can be a single span holding every sentence in
+// it, and rule 3 asks this once per count it finds. The walk was still superlinear in the
+// brief. Measured end to end on one block of "on 21 uses. ", best of three:
+//
+//	  131,072 B    10,922 sentences   walk 0.123s   search 0.099s
+//	  262,144 B    21,845             walk 0.189s   search 0.137s
+//	  524,288 B    43,690             walk 0.455s   search 0.220s
+//	1,048,000 B    87,333             walk 1.430s   search 0.411s
+//
+// Exponent over the last doubling: 1.65 walking, 0.90 searching. A reviewer tuning the
+// shape harder than this reached 6.00s on the walk, inside the 45s budget but only because
+// MaxBriefBytes bounds the input. TestUnitAroundIsFlatInTheNumberOfSentences holds the
+// search, and TestUnitAroundMatchesALinearWalk holds that it answers what the walk did.
 func (s span) unitAround(pos int) [2]int {
+	// First stop strictly after pos. The sentence runs from just past the previous stop to
+	// that one, and to the end of the span when there is none.
+	i := sort.SearchInts(s.stops, pos+1)
 	lo, hi := 0, len(s.text)
-	for _, st := range s.stops {
-		if st > pos {
-			hi = st
-			break
-		}
-		lo = st + 1
+	if i > 0 {
+		lo = s.stops[i-1] + 1
+	}
+	if i < len(s.stops) {
+		hi = s.stops[i]
 	}
 	return [2]int{lo, hi}
 }

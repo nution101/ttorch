@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 // A stem without a `*` must match a whole word: "pr" in the prohibition bound list must not
@@ -425,4 +426,71 @@ func bareBans(text string) int {
 		}
 	}
 	return n
+}
+
+// unitAround is asked once per item a rule finds, and spans merge whenever the next
+// sentence starts lowercase, so one brief can be a single span holding every sentence in
+// it. Walking the stop list from index 0 answered the kth question in k steps. Measured
+// end to end on one block of "on 21 uses. ", best of three, walk against search:
+//
+//	  131,072 B    10,922 sentences   0.123s   0.099s
+//	  262,144 B    21,845             0.189s   0.137s
+//	  524,288 B    43,690             0.455s   0.220s
+//	1,048,000 B    87,333             1.430s   0.411s
+//
+// The walk's exponent over the last doubling is 1.65. The search's is 0.90.
+//
+// The budget here is an assertion about complexity, not a performance target: n questions
+// by a walk is n*n/2 steps, which cannot finish inside it, and by a search is n*log2(n),
+// which finishes in a fraction of it.
+func TestUnitAroundIsFlatInTheNumberOfSentences(t *testing.T) {
+	const n = 400_000
+	var sb strings.Builder
+	sb.Grow(2 * n)
+	stops := make([]int, 0, n)
+	for i := 0; i < n; i++ {
+		sb.WriteString("a.")
+		stops = append(stops, 2*i+1)
+	}
+	s := span{text: sb.String(), stops: stops}
+
+	const budget = 2 * time.Second
+	start := time.Now()
+	for i := 0; i < n; i++ {
+		if u := s.unitAround(2 * i); u[0] != 2*i || u[1] != 2*i+1 {
+			t.Fatalf("sentence %d: got %v, want [%d %d]", i, u, 2*i, 2*i+1)
+		}
+	}
+	if elapsed := time.Since(start); elapsed > budget {
+		t.Fatalf("%d questions took %s; a walk from index 0 is %d steps and does not fit in %s",
+			n, elapsed, n*n/2, budget)
+	}
+}
+
+// The search has to answer exactly what the walk answered. The interesting positions are
+// the boundaries: the byte of a stop, the byte after it, offset 0, and one past the end.
+func TestUnitAroundMatchesALinearWalk(t *testing.T) {
+	walk := func(s span, pos int) [2]int {
+		lo, hi := 0, len(s.text)
+		for _, st := range s.stops {
+			if st > pos {
+				hi = st
+				break
+			}
+			lo = st + 1
+		}
+		return [2]int{lo, hi}
+	}
+	texts := []string{
+		"", "a", "a.", "a. ", "a. b", "a. b.", "one. two. three.",
+		". ", ". . ", "a.. b", "no stop here", "trailing. ",
+	}
+	for _, text := range texts {
+		s := span{text: text, stops: sentenceStops(text)}
+		for pos := 0; pos <= len(text); pos++ {
+			if got, want := s.unitAround(pos), walk(s, pos); got != want {
+				t.Errorf("%q stops %v pos %d: search %v, walk %v", text, s.stops, pos, got, want)
+			}
+		}
+	}
 }
