@@ -61,9 +61,18 @@ var ErrUnverifiable = errors.New("proc: timeout enforcement could not be verifie
 // bound. Set Dir, Env, Stdin, Stdout, Stderr and the rest as usual, then start it with this
 // package's Start, Run or CombinedOutput.
 //
-// SysProcAttr, Cancel and WaitDelay carry the guarantee. Check describes what each one is
-// for and what losing it costs; it runs before every start this package performs, so a
+// SysProcAttr, Cancel and WaitDelay carry the guarantee, and Check describes what each one
+// is for and what losing it costs. It runs before every start this package performs, so a
 // command that has lost one fails loudly rather than running unbounded.
+//
+// FOUR fields decide where the kill lands, though, because Process is the one the kill
+// reads at the moment it fires. Repointing c.Process after Start silently redirects the
+// group kill at whatever process is there instead, and Check cannot see it: Check runs
+// before Start, and a command mutated afterwards was already outside os/exec's contract.
+// Measured, so it is recorded rather than implied: a command whose Process was repointed at
+// another live command killed that command's group at its own deadline. Nothing in this
+// repository does it, and Start overwrites Process, so a pre-Start assignment is harmless.
+// Do not mutate a Cmd after Start.
 func Command(ctx context.Context, name string, arg ...string) *exec.Cmd {
 	c := exec.CommandContext(ctx, name, arg...)
 	// A new process group, so one signal reaches everything the command forked.
@@ -80,13 +89,30 @@ func Command(ctx context.Context, name string, arg ...string) *exec.Cmd {
 // The second question is the one that matters and the one an earlier version never asked.
 // `cp := *c` and `c.Cancel = other.Cancel` both leave a Cancel that closes over a DIFFERENT
 // command, and either way this command's own group is never signalled: its forked
-// grandchild outlives the deadline. What happens to the other command depends on whether it
-// is running. If it is not, the kill returns without signalling anything. If it IS running,
-// the deadline kills that command's whole process group instead, which is worse than doing
-// nothing, because the collateral is a live group this command does not own. Both shapes
-// passed a check that only compared code pointers.
+// grandchild outlives the deadline. What happens to the other command depends on its state.
+// Never started, its Process is nil and the kill returns without signalling. Running, the
+// deadline kills that command's whole process group instead, which is worse than doing
+// nothing, because the collateral is a live group this command does not own. Already
+// reaped, see cancel: the kill still fires, at a pid the OS has freed. Both shapes passed a
+// check that only compared code pointers.
 type killer struct{ cmd *exec.Cmd }
 
+// cancel kills the command's process group. Process nil means the command never started,
+// so there is nothing to signal.
+//
+// It does NOT mean the command is still running. os/exec never clears Process, so after Wait
+// this fires at a pid the OS has already freed, where os.Process.Kill would have refused
+// with "process already finished" (measured: the raw kill returns ESRCH there). On the real
+// path that happens when a deadline lands between Wait reaping the child and the cancel
+// handshake completing, which a reviewer hit in 82 of 4000 timed runs.
+//
+// It stays that way deliberately. The guard that would close it is ProcessState, which Wait
+// writes on another goroutine while this one runs, and reading it here is a genuine data
+// race: with the guard in place, -race reports Wait writing ProcessState against this
+// function reading it. A race in the kill path is a worse defect than a signal to a pid
+// freed microseconds earlier, which is a window too narrow for the pid to have been reused.
+// That narrowness is the whole argument, and it is not available to a caller reaching for a
+// pid reaped seconds ago; see the SIGSTOP note in the tests.
 func (k *killer) cancel() error {
 	if k.cmd.Process == nil {
 		return nil
@@ -138,10 +164,14 @@ func cancelOwner(f func() error) *exec.Cmd {
 // method value, read the receiver back the way Check will, and require it to be the killer
 // we started from.
 //
-// That layout is not guaranteed by the language. If a toolchain ever changes it, this goes
-// false and Check reports ErrUnverifiable for every command rather than trusting a pointer
-// read out of the wrong offset. Wrong in the safe direction: a caller refuses to run rather
-// than certifying a binding nobody established.
+// That layout is not guaranteed by the language, and if a toolchain ever changes it this
+// self-test is the thing that notices. Which way it notices is worth being accurate about,
+// because the check proves the layout by performing the same read it is proving: reading a
+// wrong offset and dereferencing what is there is at least as likely to panic at init as to
+// return a mismatching pointer. So the two outcomes are a crash on startup, or layoutOK
+// false and Check reporting ErrUnverifiable for every command. Both are loud and the suite
+// catches either. What cannot happen is a binding being silently certified from a pointer
+// read out of the wrong place.
 var layoutOK = verifyLayout()
 
 func verifyLayout() bool {

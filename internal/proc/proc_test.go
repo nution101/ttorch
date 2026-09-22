@@ -140,13 +140,25 @@ done`
 // argument. Only the flag puts the binary into child mode.
 const specEnv = "TTORCH_PROC_TEST_SPEC"
 
-// A SIGSTOPped child is knowingly out of scope. It never polls the stop file, so reapFixture
-// spins its ten seconds and fails the test, leaving one stopped process behind. The only fix
-// that reaches a stopped process is a signal to a pid this fixture no longer owns, which is
-// the stale-pid kill round 3 removed from here on purpose: on a shared build host that kill
-// lands on whatever process has since been given the pid. Trading a defect that fires on
-// every passing run for one that needs an external SIGSTOP is the wrong way round, and the
-// leak is not silent — the test fails and names it.
+// A SIGSTOPped child is knowingly out of scope, and the decline is narrower than it was
+// first written. Such a child never polls the stop file, so reapFixture spins its ten
+// seconds and fails the test, leaving one stopped process behind.
+//
+// The fix would be a signal to the child's pid, and this fixture stopped having a claim on
+// that pid seconds earlier: the child has been reaped, the test has slept, and on a shared
+// build host running concurrent validates the pid may belong to another process by then.
+// That is the stale-pid kill round 3 removed here on purpose.
+//
+// It is NOT the same as the post-reap kill proc.cancel can still perform, and the first
+// version of this note read as though it were. There the gap between the reap and the
+// signal is microseconds inside one Wait, too narrow for the pid to have been reused, and
+// closing it would cost a data race on ProcessState. Here the gap is seconds on a busy
+// machine. The width of the window is the whole argument in both places, which is why one
+// is accepted and the other is not.
+//
+// So: trading a defect that fires on every passing run for one that needs an external
+// SIGSTOP is the wrong way round, and this leak is not silent, since the test fails and
+// names it.
 
 // reapFixture ends everything the fixture started and proves the child is gone.
 //
