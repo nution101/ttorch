@@ -146,6 +146,28 @@ func (r Report) Total() int { return len(rules) }
 // the project disabled.
 func (r Report) Skipped() int { return r.skipped }
 
+// MaxBriefBytes caps the text one run will read. A brief is untrusted input and the text
+// rules are linear in its size, so this is a bound on the work rather than a judgement about
+// writing: 1 MiB is several times the largest brief this project has produced (the biggest
+// measured is 193 KB), and a file past it is refused rather than truncated, because linting
+// half a brief and reporting a pass is the failure this package exists to prevent.
+const MaxBriefBytes = 1 << 20
+
+// budgetCheckEvery is how often a text rule looks at the clock while walking a brief. Often
+// enough that a pathological input is cut off, rarely enough that the check costs nothing on
+// an ordinary one.
+const budgetCheckEvery = 256
+
+// budgetFinding reports a rule that ran out of the run budget partway. It is indeterminate,
+// never a pass: the rule stopped, so what it did not reach is unchecked rather than clean.
+func budgetFinding(rule RuleID) Finding {
+	return Finding{
+		Rule:   rule,
+		Status: StatusIndeterminate,
+		Detail: "the run budget expired before this rule finished, so the rest of the brief is unchecked; shorten the brief or raise the budget",
+	}
+}
+
 // Options describes what a single run may consult. The zero value is valid: it lints the
 // brief's text alone and reports every ref-dependent check as indeterminate rather than
 // quietly skipping it.
@@ -186,6 +208,13 @@ type Options struct {
 	// the caller (every `ttorch task add`) at the mercy of the text it was handed. Zero
 	// means defaultBudget. Whatever the budget does not cover is reported as unevaluable,
 	// naming what went unchecked — never passed over in silence.
+	//
+	// The budget covers the git work and the text rules both, and it is worth being exact
+	// about how: git calls derive their deadline from it, and the three text rules check it
+	// as they walk the brief and stop rather than run to completion. Those rules are linear
+	// in the brief's size and the size is capped, so the budget is a backstop there rather
+	// than the primary bound. It was git-only once, and a pathological brief then spent 69s
+	// inside a text rule with the budget looking on.
 	//
 	// The deadline is enforced, not merely declared: see gitCommand, which kills the child's
 	// whole process group and caps the wait on pipes a fork might still hold. Killing git
@@ -261,6 +290,13 @@ func Lint(text string, opt Options) Report {
 	// check.
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
+	if len(text) > MaxBriefBytes {
+		return Report{Findings: []Finding{{
+			Rule:   RuleConfig,
+			Status: StatusIndeterminate,
+			Detail: fmt.Sprintf("the brief is %d bytes, over the %d byte limit, so nothing was checked: a lint that reads part of a brief cannot report on the whole of it", len(text), MaxBriefBytes),
+		}}}
+	}
 	b := parse(text)
 	var rep Report
 	if src := opt.Config.Source; src != "" {

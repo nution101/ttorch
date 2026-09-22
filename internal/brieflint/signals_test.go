@@ -1,6 +1,7 @@
 package brieflint
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -160,7 +161,7 @@ func TestHedgedAtRequiresAttachment(t *testing.T) {
 			t.Errorf("%s: fixture must state exactly one hard count, got %d", name, len(counts))
 			continue
 		}
-		if got := hedgedAt(sents, counts[0]); got != tc.want {
+		if got := hedgedAt(hedgedBlocks(sents), sents[counts[0]].blk); got != tc.want {
 			t.Errorf("%s: hedgedAt = %v, want %v for %q", name, got, tc.want, tc.brief)
 		}
 	}
@@ -309,7 +310,7 @@ func TestSplitterHoldsBothDirections(t *testing.T) {
 	if len(counts) != 1 {
 		t.Fatalf("want one hard count, got %d", len(counts))
 	}
-	if !hedgedAt(sents, counts[0]) {
+	if !hedgedAt(hedgedBlocks(sents), sents[counts[0]].blk) {
 		t.Error("a hedge in the next list item must still reach the count")
 	}
 }
@@ -348,14 +349,7 @@ func TestBoundMustGovernTheBanItBounds(t *testing.T) {
 		"Do not push. Before you begin.": false,
 	}
 	for text, want := range cases {
-		got := true
-		for _, s := range sentences(text) {
-			for _, ban := range prohibitionRe.FindAllStringIndex(s.text, -1) {
-				if !boundedBan(s.text, ban) {
-					got = false
-				}
-			}
-		}
+		got := bareBans(text) == 0
 		if got != want {
 			t.Errorf("bounded = %v, want %v for %q", got, want, text)
 		}
@@ -384,14 +378,7 @@ func TestCreateVerbDoesNotReachAcrossAFullStop(t *testing.T) {
 func TestWithinSentenceScopesRespectAMergedStop(t *testing.T) {
 	t.Run("a bound does not cross a stop", func(t *testing.T) {
 		const text = "do not push to main. do not commit anything at all."
-		var bare int
-		for _, s := range sentences(text) {
-			for _, ban := range prohibitionRe.FindAllStringIndex(s.text, -1) {
-				if !boundedBan(s.text, ban) {
-					bare++
-				}
-			}
-		}
+		bare := bareBans(text)
 		if bare != 1 {
 			t.Errorf("want the second ban unbounded, got %d bare ban(s) in %q", bare, text)
 		}
@@ -420,8 +407,22 @@ func TestWithinSentenceScopesRespectAMergedStop(t *testing.T) {
 		if len(counts) != 1 {
 			t.Fatalf("want one hard count, got %d", len(counts))
 		}
-		if !hedgedAt(sents, counts[0]) {
+		if !hedgedAt(hedgedBlocks(sents), sents[counts[0]].blk) {
 			t.Error("hedgedAt is block-scoped and must not be narrowed to the sentence")
 		}
 	})
+}
+
+// bareBans counts the prohibitions in text that no bound in reach qualifies.
+func bareBans(text string) int {
+	n := 0
+	for _, s := range sentences(text) {
+		hits, _ := prohibitionHits(context.Background(), s.text)
+		for _, hit := range hits {
+			if !hit.bounded {
+				n++
+			}
+		}
+	}
+	return n
 }

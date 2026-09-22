@@ -1193,3 +1193,74 @@ func TestCapitalisationDoesNotDecideTheVerdict(t *testing.T) {
 		}
 	}
 }
+
+// A brief past the size cap is refused, and refused as unevaluable: reading part of a brief
+// says nothing about the whole of it.
+func TestBriefOverTheSizeCapIsRefused(t *testing.T) {
+	repo, _ := fixture(t)
+	big := satisfying + strings.Repeat("filler text that says nothing. ", (MaxBriefBytes/31)+1)
+	if len(big) <= MaxBriefBytes {
+		t.Fatalf("fixture must exceed the cap, got %d bytes", len(big))
+	}
+	r := Lint(big, Options{Repo: repo})
+	if r.Outcome() != OutcomeIndeterminate {
+		t.Fatalf("outcome = %s, want %s", r.Outcome(), OutcomeIndeterminate)
+	}
+	if r.Evaluated() != 0 {
+		t.Errorf("no rule can have run, got %d", r.Evaluated())
+	}
+	if f := r.Findings[0]; !strings.Contains(f.Detail, "over the") || !strings.Contains(f.Detail, "nothing was checked") {
+		t.Errorf("the refusal must state the limit and that nothing ran: %q", f.Detail)
+	}
+}
+
+// The text rules honour the budget they accept. They were given a context they never read,
+// which is how a pathological brief ran to completion for 69 seconds.
+func TestTextRulesStopWhenTheBudgetIsSpent(t *testing.T) {
+	repo, _ := fixture(t)
+	hostile := "Base is origin/main in this repository.\n\n" + strings.Repeat("do not push ", 4000) + "\n"
+	r := Lint(hostile, Options{Repo: repo, Budget: time.Nanosecond})
+	var stopped bool
+	for _, f := range r.Findings {
+		if strings.Contains(f.Detail, "the run budget expired before this rule finished") {
+			stopped = true
+		}
+	}
+	if !stopped {
+		t.Fatalf("a spent budget must stop a text rule and say so, got %v", r.Findings)
+	}
+	if r.Outcome() == OutcomePass {
+		t.Error("a rule that stopped early must not read as a pass")
+	}
+}
+
+// The hostile brief that took 69 seconds must now finish well inside a generous budget. This
+// asserts the complexity rather than a wall-clock number: quadratic behaviour hits the
+// budget and reports that it stopped, where linear behaviour reports the bans.
+//
+// 4000 bans rather than the 8000 that were measured, because the number only has to be big
+// enough for a quadratic regression to blow the budget (4000 measured 17s against this 10s
+// budget, 8000 measured 69s), and a regression should fail the suite quickly.
+func TestAHostileBriefFinishesInsideItsBudget(t *testing.T) {
+	repo, _ := fixture(t)
+	hostile := "Base is origin/main in this repository.\n\n" + strings.Repeat("do not push ", 4000) + "\n"
+	r := Lint(hostile, Options{Repo: repo, Budget: 10 * time.Second})
+	for _, f := range r.Findings {
+		if strings.Contains(f.Detail, "the run budget expired") {
+			t.Fatalf("4000 bans exhausted a 10s budget, which is the quadratic returning: %q", f.Detail)
+		}
+	}
+	var blanket, quote string
+	for _, f := range r.Findings {
+		if f.Rule == RuleProhibition && strings.Contains(f.Detail, "blanket prohibition") {
+			blanket, quote = f.Detail, f.Quote
+		}
+	}
+	if blanket == "" {
+		t.Fatalf("want the bans reported, got %v", r.Findings)
+	}
+	// And the finding must not print the whole brief back: this sentence is 93 KB.
+	if len(quote) > maxQuoteBytes+3 {
+		t.Errorf("the quote is %d bytes; a hostile sentence must be capped", len(quote))
+	}
+}

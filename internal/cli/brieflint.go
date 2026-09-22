@@ -74,7 +74,9 @@ func cmdBriefLint(args []string) error {
 	if err := fs.Parse(args[1:]); err != nil {
 		return lintError{err.Error(), exitLintUsage}
 	}
-	text, err := os.ReadFile(path)
+	// Read at most one byte past the cap. The brief is untrusted input and Lint refuses
+	// anything over it, so there is no reason to pull a gigabyte into memory first.
+	text, err := readCapped(path, brieflint.MaxBriefBytes+1)
 	if err != nil {
 		return lintError{fmt.Sprintf("brief-lint: reading %s: %v", path, err), exitLintUsage}
 	}
@@ -216,3 +218,15 @@ func lintBriefForAdd(text, repo, citationsRef string, offline bool) error {
 // errNoBriefLintWithoutBrief keeps --no-brief-lint from reading as meaningful on an add that
 // supplies no brief at all (where there is nothing to lint).
 var errNoBriefLintWithoutBrief = errors.New("task add: --no-brief-lint needs a brief (--brief / --brief-file) to skip linting")
+
+// readCapped reads at most limit bytes of a file. A brief longer than the lint will accept
+// is refused by the lint itself, with the size in the message; this only keeps the reading
+// of it bounded.
+func readCapped(path string, limit int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(io.LimitReader(f, limit))
+}

@@ -523,6 +523,7 @@ var (
 const minHardCount = 2
 
 // hardCounts returns the indexes, into sents, of the sentences that state a hard count.
+// hardCounts returns the spans stating a hard count.
 func hardCounts(sents []span) []int {
 	var out []int
 	for i, s := range sents {
@@ -541,19 +542,23 @@ func hardCounts(sents []span) []int {
 	return out
 }
 
-func checkHardCounts(_ context.Context, b *brief, _ Options) ([]Finding, []string) {
+func checkHardCounts(ctx context.Context, b *brief, _ Options) ([]Finding, []string) {
 	sents := sentences(b.raw)
 	counts := hardCounts(sents)
 	if len(counts) == 0 {
 		return nil, []string{"hard-counts: no hard count was recognised in the brief"}
 	}
+	hedged := hedgedBlocks(sents)
 	asksForTheNumber := reportsTheNumber(b)
 	var findings []Finding
-	for _, i := range counts {
+	for n, i := range counts {
+		if n%budgetCheckEvery == 0 && ctx.Err() != nil {
+			return append(findings, budgetFinding(RuleHardCounts)), nil
+		}
 		s := sents[i]
 		var detail string
 		switch {
-		case !hedgedAt(sents, i):
+		case !hedgedAt(hedged, s.blk):
 			detail = "states a hard count with no hedge wording near it; in this paragraph or list item, or the next one, say the figure may be wrong or tell the worker to count it themselves"
 		case !asksForTheNumber:
 			detail = "hedges the count but never asks for the worker's own number; tell them to report the figure they actually find"
@@ -592,41 +597,39 @@ func prohibitions(b *brief) []span {
 	return out
 }
 
-func checkProhibition(_ context.Context, b *brief, _ Options) ([]Finding, []string) {
-	bans := prohibitions(b)
-	if len(bans) == 0 {
+func checkProhibition(ctx context.Context, b *brief, _ Options) ([]Finding, []string) {
+	spans := prohibitions(b)
+	if len(spans) == 0 {
 		return nil, []string{"prohibition: no prohibition on push/merge/commit/PR was recognised in the brief"}
 	}
-	// Per sentence, and per ban inside it. Three things used to widen this. A bound
-	// anywhere in the SPAN counted, which soft-wrap joining turned into "anywhere in the
-	// paragraph"; one bounded ban set a flag that suppressed the report for every bare one
-	// in the brief; and a span holds more than one sentence whenever the splitter merged
-	// them, so an all-lowercase brief was judged as a single sentence while the same words
-	// capitalised were judged as three.
 	var findings []Finding
 	banCount := 0
-	for _, s := range bans {
+	var first span // the sentence carrying the first ban, for the end-state finding
+	for _, s := range spans {
+		hits, complete := prohibitionHits(ctx, s.text)
+		if !complete {
+			return append(findings, budgetFinding(RuleProhibition)), nil
+		}
 		reported := map[int]bool{} // one finding per sentence, not per ban inside it
-		for _, ban := range prohibitionRe.FindAllStringIndex(s.text, -1) {
+		for _, hit := range hits {
 			banCount++
-			if boundedBan(s.text, ban) {
+			unit := span{text: s.text[hit.unit[0]:hit.unit[1]], off: s.off + hit.unit[0]}
+			if first.text == "" {
+				first = unit
+			}
+			if hit.bounded || reported[hit.unit[0]] {
 				continue
 			}
-			u := unitAround(s.text, ban[0])
-			if reported[u[0]] {
-				continue
-			}
-			reported[u[0]] = true
-			unit := span{text: s.text[u[0]:u[1]], off: s.off + u[0]}
+			reported[hit.unit[0]] = true
 			findings = append(findings, Finding{
 				Rule: RuleProhibition, Status: StatusFail, Quote: unit.trim(), Line: b.lineAt(unit.off),
-				Detail: fmt.Sprintf("blanket prohibition %q: state the invariant it protects (for example: no changes to a product branch, no PR) rather than banning the machinery outright", strings.TrimSpace(s.text[ban[0]:ban[1]])),
+				Detail: fmt.Sprintf("blanket prohibition %q: state the invariant it protects (for example: no changes to a product branch, no PR) rather than banning the machinery outright", strings.TrimSpace(s.text[hit.loc[0]:hit.loc[1]])),
 			})
 		}
 	}
 	if !endStateSignal.MatchString(b.raw) {
 		findings = append(findings, Finding{
-			Rule: RuleProhibition, Status: StatusFail, Quote: bans[0].trim(), Line: b.lineAt(bans[0].off),
+			Rule: RuleProhibition, Status: StatusFail, Quote: first.trim(), Line: b.lineAt(first.off),
 			Detail: "prohibits delivery machinery but never states the allowed end state; say where the work is meant to stop (for example: commit on your own branch, leave the worktree clean, report the sha, and wait)",
 		})
 	}
@@ -657,7 +660,10 @@ var standardsSignal = stemRe(
 	"lint rules", "best practice*", "idiom*",
 )
 
-func checkStandards(_ context.Context, b *brief, opt Options) ([]Finding, []string) {
+func checkStandards(ctx context.Context, b *brief, opt Options) ([]Finding, []string) {
+	if ctx.Err() != nil {
+		return []Finding{budgetFinding(RuleStandards)}, nil
+	}
 	cfg := opt.Config
 	if cfg.StandardsEmpty {
 		return []Finding{{

@@ -1,8 +1,10 @@
 package brieflint
 
 import (
+	"context"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // Signal matching — how a brief is judged to have SAID something, without pinning it to a
@@ -100,30 +102,38 @@ var recountSignal = stemRe(
 	"find the actual", "find the true",
 )
 
-// hedgedAt needs no stop-unit narrowing, and that is a decision rather than an omission: its
-// scope is the BLOCK holding the count and the block after it, which is wider than a
-// sentence either way. Splitting a merged span into sentences cannot change which blocks
-// those are, so capitalisation does not move this answer.
+// hedgedBlocks returns the blocks carrying hedge wording: something saying the figure is not
+// to be trusted, or telling the reader to establish it again.
 //
-// hedgedAt reports whether the hard count in sents[i] carries a hedge attached to it:
-// something in reach saying the figure is not to be trusted, or telling the reader to
-// establish it again.
-//
-// Reach is the block holding the count and the block after it: the paragraph or list item
-// the number sits in, and the next one. That is structural rather than a sentence budget.
-// Counting sentences meant an aside between the count and its hedge ("Note: I grepped for
-// the bare name") spent the budget on the aside, and the brief was reported as unhedged
-// although a careful author had hedged it in the next breath.
-func hedgedAt(sents []span, i int) bool {
+// Precomputed for the whole brief, because the question is asked once per hard count and the
+// answer depends only on the block. Asking it by rescanning every span per count made a
+// 36 KB brief of nothing but counts take 19s.
+func hedgedBlocks(sents []span) map[int]bool {
+	out := map[int]bool{}
 	for _, s := range sents {
-		if s.blk != sents[i].blk && s.blk != sents[i].blk+1 {
+		if out[s.blk] {
 			continue
 		}
 		if distrustSignal.MatchString(s.text) || recountSignal.MatchString(s.text) {
-			return true
+			out[s.blk] = true
 		}
 	}
-	return false
+	return out
+}
+
+// hedgedAt reports whether a hard count in block blk carries a hedge attached to it: one in
+// its own block, or in the block after it.
+//
+// Reach is structural rather than a sentence budget. Counting sentences meant an aside
+// between the count and its hedge ("Note: I grepped for the bare name") spent the budget on
+// the aside, and the brief was reported as unhedged although a careful author had hedged it
+// in the next breath.
+//
+// Block scope is also why this needs no stop-unit narrowing, which is a decision rather than
+// an omission: a block is wider than a sentence either way, so splitting a merged span
+// cannot change which blocks are in reach.
+func hedgedAt(hedged map[int]bool, blk int) bool {
+	return hedged[blk] || hedged[blk+1]
 }
 
 // reportsTheNumber reports whether some sentence pairs a reporting verb with a number word.
@@ -160,42 +170,70 @@ func clauses(text string) [][2]int {
 	return append(out, [2]int{start, len(text)})
 }
 
-// boundedBan reports whether the prohibition at ban in sentence text is qualified by a bound
-// that plausibly governs it.
+// prohibitionHit is one ban found in a span: where it sits, which sentence of the span
+// carries it, and whether a bound in reach qualifies it.
+type prohibitionHit struct {
+	loc     [2]int // the ban, relative to the span
+	unit    [2]int // the sentence carrying it, relative to the span
+	bounded bool
+}
+
+// prohibitionHits finds every ban in a span and decides each one's bounding, in one pass
+// over the span.
 //
-// The bound has to be in the ban's own clause, or in a clause at one end of the sentence
+// The bound has to be in the ban's own clause, or in a clause at one end of its sentence
 // that opens with the bound and carries no ban of its own ("Until the gate is green, do not
 // push", "do not push, and do not merge, until the gate is green").
 //
-// Sentence scope was what round 3's soft-wrap joining widened. A blanket prohibition and an
-// unrelated later clause became one sentence, so "and before you begin, read the notes"
-// bounded "do not commit anything at all", and a brief banning everything outright was
-// reported as bounded.
-func boundedBan(text string, ban []int) bool {
-	// Per sentence first. A merged span holds more than one, and a bound in the first
-	// sentence has no business covering a ban in the second.
-	u := unitAround(text, ban[0])
-	return boundedInSentence(text[u[0]:u[1]], []int{ban[0] - u[0], ban[1] - u[0]})
-}
-
-func boundedInSentence(text string, ban []int) bool {
-	cl := clauses(text)
-	for i, c := range cl {
-		part := text[c[0]:c[1]]
-		if !boundSignal.MatchString(part) {
-			continue
+// Sentence scope was what soft-wrap joining widened: a blanket prohibition and an unrelated
+// later clause became one sentence, so "and before you begin, read the notes" bounded "do
+// not commit anything at all".
+//
+// One pass matters as much as the scoping. The first version asked each ban its own
+// question, and each question rescanned the span from byte 0 to find the ban's sentence and
+// that sentence's clauses. That is O(bans x span bytes), and a brief is untrusted input:
+// 8000 bans in one block took 69s where the version before it took 0.13s. Each clause is
+// now scanned a fixed number of times and every ban reads the result.
+func prohibitionHits(ctx context.Context, text string) ([]prohibitionHit, bool) {
+	var out []prohibitionHit
+	scanned := 0
+	for _, u := range stopUnits(text) {
+		unit := text[u[0]:u[1]]
+		cls := clauses(unit)
+		bound := make([]bool, len(cls))
+		bans := make([][][2]int, len(cls))
+		for i, c := range cls {
+			// A clause is the finest unit of work here: one bound scan and one ban scan
+			// over it, both linear. The budget is checked between clauses, so the work
+			// that cannot be interrupted is one clause of a brief whose size is capped.
+			if scanned%budgetCheckEvery == 0 && ctx.Err() != nil {
+				return out, false
+			}
+			scanned++
+			part := unit[c[0]:c[1]]
+			bound[i] = boundSignal.MatchString(part)
+			for _, m := range prohibitionRe.FindAllStringIndex(part, -1) {
+				bans[i] = append(bans[i], [2]int{u[0] + c[0] + m[0], u[0] + c[0] + m[1]})
+			}
 		}
-		if ban[0] >= c[0] && ban[0] < c[1] {
-			return true
+		// A bound at either end of the sentence, opening its clause and banning nothing,
+		// qualifies every ban in that sentence.
+		edge := false
+		for _, i := range []int{0, len(cls) - 1} {
+			if !bound[i] || len(bans[i]) > 0 {
+				continue
+			}
+			if leadsWithBound(unit[cls[i][0]:cls[i][1]]) {
+				edge = true
+			}
 		}
-		if i != 0 && i != len(cl)-1 {
-			continue
-		}
-		if leadsWithBound(part) && !prohibitionRe.MatchString(part) {
-			return true
+		for i := range cls {
+			for _, loc := range bans[i] {
+				out = append(out, prohibitionHit{loc: loc, unit: u, bounded: bound[i] || edge})
+			}
 		}
 	}
-	return false
+	return out, true
 }
 
 // leadsWithBound reports whether a clause opens with its bound, which is what a qualifier
@@ -466,11 +504,25 @@ func isSpace(c byte) bool {
 // ("**do not push**") survives into the quote.
 var markerPrefix = regexp.MustCompile(`^(?:[-*+>#]+\s+)+`)
 
+// maxQuoteBytes caps a quoted sentence. A sentence is normally one line; a brief is
+// untrusted input, and one of them was 93 KB of a single sentence, which a finding then
+// printed in full into a report a human reads. Same treatment as a remote's stderr.
+const maxQuoteBytes = 200
+
 // trim renders a span for quoting: collapsed whitespace with any leading Markdown bullet or
-// heading marker removed, so the quote reads as the sentence the author wrote.
+// heading marker removed, so the quote reads as the sentence the author wrote, and capped so
+// one sentence cannot fill a report.
 func (s span) trim() string {
 	t := strings.Join(strings.Fields(s.text), " ")
-	return markerPrefix.ReplaceAllString(t, "")
+	t = markerPrefix.ReplaceAllString(t, "")
+	if len(t) <= maxQuoteBytes {
+		return t
+	}
+	cut := maxQuoteBytes
+	for cut > 0 && !utf8.RuneStart(t[cut]) {
+		cut--
+	}
+	return t[:cut] + "..."
 }
 
 // createWindow is how many words may sit between a create verb and the path it governs. A
