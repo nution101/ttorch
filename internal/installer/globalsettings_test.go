@@ -453,7 +453,7 @@ func TestRemoveGlobalSettings_NoLedgerIsNoOp(t *testing.T) {
 // so the wiring (not just the helper) is covered.
 func TestApply_WiresGlobalSettings(t *testing.T) {
 	p := sandbox(t)
-	if _, err := Apply(content("skill-v1"), p, "0.1.0"); err != nil {
+	if _, err := apply(content("skill-v1"), p, "0.1.0"); err != nil {
 		t.Fatal(err)
 	}
 	got := readSettings(t, p.GlobalSettingsFile())

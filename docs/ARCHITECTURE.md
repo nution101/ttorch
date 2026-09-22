@@ -306,15 +306,15 @@ Rejected, measured against that same set:
 
 | Rejected | commits | share |
 |---|---|---|
-| + `internal/db/` | 91 | 46% |
-| + `internal/orchestrator/**` and `internal/review/**` wholesale | 124 | 63% |
+| + `internal/db/` | 99 | 50.5% |
+| + `internal/orchestrator/**` and `internal/review/**` wholesale | 130 | 66.3% |
 
 (An earlier count of this corpus reported 9 and 43 for the first two groups; the difference is
 the root commit, which `git diff-tree` skips without `--root`. It changes no conclusion.)
 
 The second rejected row is the answer to "why not just cover the packages".
 `internal/orchestrator/` alone is 78 of the 196 commits — spawn, the land queue, the scheduler
-wiring, the overlap planner — and covering it wholesale puts **63% of every change** behind
+wiring, the overlap planner — and covering it wholesale puts **66.3% of every change** behind
 the flag. A flag that fires on most commits is not a signal; it is a formality, and it
 launders a real gate change through a habit. The five files that actually resolve, enforce,
 cache and record the decision are +5 marginal instead.
@@ -375,7 +375,50 @@ hand-maintained list never had.
 
 Cost: +8 commits, 76 → 84 of 196 (39% → 43%).
 
-### The skills channel
+### The installer's FS parameter, and the skills channel
+
+Two bypasses sat one level out from the `content/` tree: the guard covered the tree the
+installer reads, but not the code that chose which tree it read, and not a second installer
+writing to the same destination.
+
+**`installer.Apply` took an `fs.FS`, and `internal/cli` picked it.** `embedRoot` is the
+constant `"content"`, so any FS with a top-level `content` directory installs. The bypass
+needed no covered path at all:
+
+| Leg | Covered? |
+|---|---|
+| `payload/content/agents/ttorch-reviewer-security.md` | no — the prefix is `content/`, not `*/content/` |
+| `payload/embed.go` with `//go:embed all:content` | no |
+| one line in `internal/cli` handing that FS to `Apply` | no — deliberately, at 32/196 commits |
+
+That installs a replacement security reviewer, and `collidesInTree` sees nothing because there
+is no colliding pair. So the claim "the installer has no file outside `content/` to reach" was
+conditional on a file the gate does not cover.
+
+Covering `internal/cli/` would close it at +32 commits — 116/196 = 59.2%, past the
+more-than-half line that is the stated reason `internal/orchestrator/` is not covered
+wholesale. Rather than apply that rule to one package and break it for another, the fix is to
+remove the choice: `Apply` is now unexported `apply`, and `ApplyEmbedded` picks
+`ttorch.Content` inside `internal/installer/`, which the gate covers. `internal/cli` no longer
+imports the payload at all. Cost: 0 commits.
+
+Two tests hold the two halves, and they are separate on purpose, because the payload tree and
+its delivery are separate legs:
+
+- `TestInstallerExposesNoFSChoice` parses `internal/installer` and fails if any exported
+  function takes an `fs.FS` again.
+- `TestNoEmbedRootOutsideContent` scans every Go file in the repository and fails on a
+  `//go:embed` directive whose root is `content` outside `content.go`. It replaces a version
+  that read `content.go` alone and claimed more than it checked. Only a `content` root is a
+  hazard: `apply` walks `embedRoot` in whatever FS it is given, so `internal/db`'s
+  `//go:embed migrations/*.sql` has nothing at that path and the walk errors rather than
+  installing.
+
+It is a filesystem walk, not `git ls-files`, because `.ttorch/validate.sh` runs on a build
+host that receives an rsync without `.git`, where git exits 128. `TestGateConfigFilesAreRealPaths`
+takes its `t.Skipf` escape there, so it does not run in the lane the gate actually uses; it
+still runs in CI, which is the required check. A guard test that skips where the gate runs is
+not a guard.
 
 **`internal/skills/` installs third-party code into `~/.claude/skills`.** `Recommended()`
 returns refs, `InstallCmd` turns each into `npx skills add <ref>`, and `EnsureInstalled` runs
@@ -385,6 +428,21 @@ shorter route — npx fetches at spawn time, with no ttorch build or install in 
 costs 0 marginal commits. The limits list used to name `~/.claude/skills` only as an
 out-of-repo exposure no diff-channel guard could see, which stopped being true once this route
 existed.
+
+### Keeping the figures honest
+
+Three rounds running, a commit updated the main cost table and left a figure stale somewhere
+else — the *Rejected* table, the prose beneath it, and a "roughly double" claim in the skill
+that was the only stated cost reason for leaving `internal/cli/` uncovered. Transcription is
+the failure mode, so `TestGateCostFiguresMatchTheDoc` re-measures the whole-set total and both
+rejected rows from the live `gateConfigFiles`/`gateConfigPrefixes`/`gateConfigBasenames` and
+compares them to the numbers parsed out of this file.
+
+It derives the covered set from the code rather than restating it, so the table cannot drift
+from the guard. Its limit is the corpus: it needs the 196 non-merge commits reachable from
+`b642ba6`, and CI checks out shallow (`actions/checkout` defaults to depth 1), so there it
+skips and only a full clone exercises it. Raising `fetch-depth` would fix that but changes a
+covered file; it is a deliberate open item rather than an oversight.
 
 ### The input set is the part that keeps being wrong
 
@@ -681,10 +739,24 @@ Since none of them exists here, their appearance in a diff is exactly the event 
 and `absentByDesign` in the test file records that so the dead-coverage check does not demand
 they exist.
 
-`internal/db/` is the one genuine cost judgement left out. It holds `Store.GetVerdict`, the row
-the merge trusts for `Overall == pass`; covering it costs 15 more commits (23/196 on its own,
-taking the set to 46%). Excluded on cost, recorded here and in the skill so it reads as a
-decision rather than an omission.
+Two genuine cost judgements are left out, and both are recorded here and in the skill so they
+read as decisions rather than omissions.
+
+`internal/db/` holds `Store.GetVerdict`, the row the merge trusts for `Overall == pass`;
+covering it costs 15 more commits (23/196 on its own, taking the set to 99/196 = 50.5%).
+
+`internal/cli/` wires the `--allow-gate-change` flag and is the larger of the two: 56/196 on
+its own, +32 marginal, which would take the set to 116/196 = **59.2%**. That is past the
+more-than-half line that is the stated reason `internal/orchestrator/` is not covered
+wholesale, so covering it would mean applying the rule to one package and breaking it for
+another. It was also the caller that chose the tree `installer.Apply` walked, which made the
+`content/` superset argument conditional on an uncovered file; that is closed by
+`installer.ApplyEmbedded` instead, at 0 commits. See "The installer's FS parameter" below.
+
+An earlier version of this section said covering either "would roughly double the flag's
+frequency". On a base of 84 they are +32 and +15, so the claim was overstated — and it was the
+only stated cost reason for leaving `internal/cli/` uncovered, which is where a real bypass
+sat.
 
 `.github/workflows/**` is in for a different reason. The trusted gate never consults CI, which
 is the argument against it — but this repo's `.ttorch/validate.sh` runs only `make test-fast`

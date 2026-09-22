@@ -1,10 +1,12 @@
 package orchestrator
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"math"
 	"os"
 	"os/exec"
 	"path"
@@ -324,6 +326,10 @@ func TestMergeLocal_DecidingCodeChangeNeedsAllowGateChange(t *testing.T) {
 		// ~/.claude/skills via `npx skills add`, before every team launch and every worker
 		// spawn. No ttorch build and no ttorch install in between.
 		{"the recommended external skills", "internal/skills/skills.go", true},
+		// Still the control, and now deliberately so: internal/cli/ costs 32 of 196 commits,
+		// which would take the covered set to 116/196 = 59% — past the more-than-half line
+		// that is the stated reason internal/orchestrator/ is not covered wholesale. The
+		// bypass that ran through it is closed by installer.ApplyEmbedded instead.
 		{"CONTROL: ordinary source", "internal/cli/cli.go", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -811,26 +817,246 @@ func TestEveryInstalledContentFileIsCovered(t *testing.T) {
 	}
 }
 
-// TestContentPrefixCoversWhatDesiredFilesInstalls pins the structural claim the prefix rests
-// on: the installer can only ever install from content/, so covering content/ covers every
-// install channel. content.go embeds `all:content` and nothing else. If a second embed
-// directive appears at the repo root, the prefix stops being a superset and this fails.
-func TestContentPrefixCoversWhatDesiredFilesInstalls(t *testing.T) {
-	src, err := os.ReadFile(filepath.Join(repoRootForGateConfig(t), "content.go"))
+// TestNoEmbedRootOutsideContent scans EVERY Go file in the repository for a `//go:embed`
+// directive and fails on any that embeds a tree other than content/.
+//
+// This replaces a version that read content.go alone. Its comment claimed it would fail if
+// "a second embed directive appears", and for a directive in content.go that was true, but
+// the bypass does not put one there:
+//
+//	payload/content/agents/ttorch-reviewer-security.md   uncovered — the prefix is
+//	                                                      "content/", not "*/content/"
+//	payload/embed.go  with //go:embed all:content        uncovered
+//
+// installer.embedRoot is the constant "content", so ANY fs.FS with a top-level content
+// directory installs. A second embed root is therefore a second payload, and the covered
+// set reaches neither the tree nor the directive. Scanning the whole repo is the check the
+// narrow version was assumed to be.
+//
+// The directive alone is inert — something has to hand the FS to the installer — and
+// ApplyEmbedded is what closes that half, with TestInstallerExposesNoFSChoice holding it.
+// This test is the other half: it fails on the payload tree rather than on its delivery.
+//
+// Only a "content" root is a hazard, so this is not a ban on embedding. internal/db embeds
+// migrations/*.sql today and is fine: apply walks embedRoot ("content") in whatever FS it
+// gets, so an FS rooted at "migrations" has nothing at that path and the walk errors rather
+// than installing.
+func TestNoEmbedRootOutsideContent(t *testing.T) {
+	// Deliberately a filesystem walk and not `git ls-files`. The trusted gate runs this
+	// through .ttorch/validate.sh, and on this machine that goes to a build host that gets
+	// an rsync WITHOUT .git — where git exits 128. TestGateConfigFilesAreRealPaths takes the
+	// t.Skipf escape in that situation, so it silently defends nothing in the lane the gate
+	// actually runs. A guard test that skips where the gate runs is not a guard.
+	root := repoRootForGateConfig(t)
+	var scanned int
+	err := filepath.WalkDir(root, func(abs string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case ".git", "vendor", "node_modules", "bin", "dist":
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), ".go") {
+			return nil
+		}
+		rel, err := filepath.Rel(root, abs)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		body, err := os.ReadFile(abs)
+		if err != nil {
+			return err
+		}
+		scanned++
+		for _, line := range strings.Split(string(body), "\n") {
+			line = strings.TrimSpace(line)
+			rest, ok := strings.CutPrefix(line, "//go:embed ")
+			if !ok {
+				continue
+			}
+			for _, pat := range strings.Fields(rest) {
+				// Strip the all: / any leading prefix form and take the first path element.
+				if _, after, found := strings.Cut(pat, ":"); found {
+					pat = after
+				}
+				top := pat
+				if i := strings.IndexByte(top, '/'); i >= 0 {
+					top = top[:i]
+				}
+				// Only a "content" root matters. installer.embedRoot is the constant
+				// "content", so fs.WalkDir(theFS, "content") is what installs — an FS rooted
+				// anywhere else has no "content" entry at top level and the walk fails
+				// instead of installing. internal/db embeds migrations/*.sql on exactly that
+				// basis and is not an install channel.
+				if top != "content" {
+					continue
+				}
+				if rel != "content.go" {
+					t.Errorf("%s embeds the content tree, but only content.go is supposed to.\n"+
+						"A second package embedding content/ is a second install payload; the guard\n"+
+						"covers content/ and content.go by name and would not see this file.", rel)
+				}
+			}
+		}
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("reading content.go: %v", err)
+		t.Fatalf("walking the repository: %v", err)
 	}
-	var embeds []string
-	for _, line := range strings.Split(string(src), "\n") {
-		line = strings.TrimSpace(line)
-		if rest, ok := strings.CutPrefix(line, "//go:embed "); ok {
-			embeds = append(embeds, strings.TrimSpace(rest))
+	if scanned == 0 {
+		t.Fatal("scanned no Go files; this test is asserting nothing")
+	}
+}
+
+// TestInstallerExposesNoFSChoice holds the other half: the installer must not let code
+// outside its own package choose the tree it installs.
+//
+// installer.Apply used to take an fs.FS and internal/cli picked it, which made the guard's
+// superset argument conditional on a file the gate deliberately does not cover (32 of 196
+// commits). Covering internal/cli/ instead would have taken the set to 116/196 = 59%, past
+// the more-than-half line that is the stated reason internal/orchestrator/ is not covered
+// wholesale — so the fix was to unexport apply and add ApplyEmbedded, which picks
+// ttorch.Content inside the covered package. That costs 0 commits.
+//
+// If an exported function in internal/installer takes an fs.FS again, the parameter is back
+// and so is the bypass, so this fails.
+func TestInstallerExposesNoFSChoice(t *testing.T) {
+	root := repoRootForGateConfig(t)
+	dir := filepath.Join(root, "internal", "installer")
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, dir, func(fi os.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatalf("parsing internal/installer: %v", err)
+	}
+	var checked int
+	for _, pkg := range pkgs {
+		for name, f := range pkg.Files {
+			for _, d := range f.Decls {
+				fn, ok := d.(*ast.FuncDecl)
+				if !ok || fn.Recv != nil || !fn.Name.IsExported() {
+					continue
+				}
+				checked++
+				for _, param := range fn.Type.Params.List {
+					sel, ok := param.Type.(*ast.SelectorExpr)
+					if !ok {
+						continue
+					}
+					ident, ok := sel.X.(*ast.Ident)
+					if !ok || ident.Name != "fs" || sel.Sel.Name != "FS" {
+						continue
+					}
+					t.Errorf("%s: exported %s takes an fs.FS.\n"+
+						"That lets uncovered code choose the tree the installer walks into ~/.claude,\n"+
+						"which is the bypass ApplyEmbedded exists to close. Keep the FS choice inside\n"+
+						"this package, or cover whatever picks it.", filepath.Base(name), fn.Name.Name)
+				}
+			}
 		}
 	}
-	if want := []string{"all:content"}; len(embeds) != 1 || embeds[0] != want[0] {
-		t.Errorf("content.go embeds %v, want exactly %v.\n"+
-			"gateConfigPrefixes covers \"content/\" on the grounds that installer.desiredFiles\n"+
-			"has nothing outside content/ to install. A second embedded tree breaks that, and\n"+
-			"needs its own entry in the covered set.", embeds, want)
+	if checked == 0 {
+		t.Fatal("found no exported functions in internal/installer; this test is asserting nothing")
+	}
+}
+
+// gateCostBase is the corpus every cost figure in docs/ARCHITECTURE.md is measured over:
+// the non-merge commits reachable from this sha. Pinned so the figures are reproducible as
+// history grows.
+const gateCostBase = "b642ba6"
+
+// TestGateCostFiguresMatchTheDoc re-measures the cost figures and fails if docs/ARCHITECTURE.md
+// disagrees.
+//
+// The figures are the whole justification for where the covered set stops, and for three
+// rounds running a commit updated the main table and left one stale elsewhere — the Rejected
+// table, the prose under it, and a "roughly double" claim in the skill that was the only
+// stated cost reason for leaving internal/cli/ uncovered, which is where a real bypass sat.
+// Transcription is the failure mode, so this measures instead of trusting.
+//
+// It derives the covered set from the live gateConfigFiles/gateConfigPrefixes/
+// gateConfigBasenames rather than restating them, so the table cannot drift from the guard
+// either.
+//
+// Limit worth knowing: it needs the corpus. CI checks out shallow (actions/checkout defaults
+// to depth 1), so gateCostBase is unreachable there and this skips; only a full clone
+// exercises it. Raising fetch-depth would fix that but changes a covered file.
+func TestGateCostFiguresMatchTheDoc(t *testing.T) {
+	skipIfShort(t)
+	root := repoRootForGateConfig(t)
+	git := func(args ...string) (string, error) {
+		out, err := exec.Command("git", append([]string{"-C", root}, args...)...).Output()
+		return string(out), err
+	}
+	if _, err := git("rev-parse", "--verify", gateCostBase+"^{commit}"); err != nil {
+		t.Skipf("%s is unreachable (shallow clone?), so the cost corpus is not available: %v", gateCostBase, err)
+	}
+	log, err := git("log", "--no-merges", "--format=%H", gateCostBase)
+	if err != nil {
+		t.Fatalf("listing the corpus: %v", err)
+	}
+	shas := strings.Fields(log)
+
+	touched := make([][]string, 0, len(shas))
+	for _, sha := range shas {
+		out, err := git("show", "--no-renames", "--name-only", "--format=", sha)
+		if err != nil {
+			t.Fatalf("reading %s: %v", sha, err)
+		}
+		touched = append(touched, strings.Split(strings.TrimSpace(out), "\n"))
+	}
+
+	// count returns how many commits touch any path the real matcher covers, optionally with
+	// extra prefixes layered on top for the rejected rows.
+	count := func(extra ...string) int {
+		var n int
+		for _, files := range touched {
+			for _, f := range files {
+				if f == "" {
+					continue
+				}
+				hit := matchesGateConfig(f)
+				for _, p := range extra {
+					hit = hit || strings.HasPrefix(f, p)
+				}
+				if hit {
+					n++
+					break
+				}
+			}
+		}
+		return n
+	}
+
+	doc, err := os.ReadFile(filepath.Join(root, "docs", "ARCHITECTURE.md"))
+	if err != nil {
+		t.Fatalf("reading ARCHITECTURE.md: %v", err)
+	}
+	body := string(doc)
+
+	total := count()
+	for _, tc := range []struct {
+		what  string
+		want  string
+		extra []string
+	}{
+		{"the whole set", fmt.Sprintf("| **the whole set** | **%d / %d = %d%%** | |", total, len(shas), int(math.Round(100*float64(total)/float64(len(shas))))), nil},
+		{"+ internal/db/", fmt.Sprintf("| + `internal/db/` | %d | %.1f%% |", count("internal/db/"), 100*float64(count("internal/db/"))/float64(len(shas))), []string{"internal/db/"}},
+		{"+ orchestrator and review wholesale", fmt.Sprintf("| + `internal/orchestrator/**` and `internal/review/**` wholesale | %d | %.1f%% |",
+			count("internal/orchestrator/", "internal/review/"),
+			100*float64(count("internal/orchestrator/", "internal/review/"))/float64(len(shas))), nil},
+	} {
+		if !strings.Contains(body, tc.want) {
+			t.Errorf("docs/ARCHITECTURE.md does not contain the measured row for %s.\nmeasured: %s\nUpdate the doc, or explain the difference — do not adjust this test to match a transcribed figure.", tc.what, tc.want)
+		}
+	}
+	if n := len(shas); n != 196 {
+		t.Logf("the corpus is now %d commits, not the 196 the doc's prose cites; the table rows above are measured either way", n)
 	}
 }

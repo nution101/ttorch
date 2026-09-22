@@ -224,7 +224,11 @@ invalidates the verdict — re-prep, re-review, re-record.
     five, so the narrower list cannot decay into false coverage unnoticed.
   - `internal/cli/` wires the `--allow-gate-change` flag but is not covered, and
     `internal/db/` holds the verdict row the merge trusts for `Overall == pass`. Both are cost
-    judgements rather than oversights, and both would roughly double the flag's frequency.
+    judgements rather than oversights: +32 and +15 commits on a base of 84, taking the set to
+    59.2% and 50.5%. `internal/cli/` is the one that matters, because it also used to choose
+    the tree the installer walked — see `docs/ARCHITECTURE.md`, which holds the figures. An
+    earlier version of this line said both "would roughly double the flag's frequency", which
+    overstated the cost of the one package a real bypass ran through.
   - Filesystems whose folding rules differ from Unicode's. `fsIdentityKey` models APFS and
     NTFS, and `TestFSIdentityKeySweep` measures it against the real filesystem rather than
     against a reading of the tables. A filesystem that collapses something Unicode does not

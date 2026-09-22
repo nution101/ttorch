@@ -22,7 +22,6 @@ import (
 	"syscall"
 	"time"
 
-	ttorchembed "github.com/nution101/ttorch"
 	"github.com/nution101/ttorch/internal/buildinfo"
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/doctor"
@@ -220,7 +219,7 @@ func cmdDoctor(args []string) error {
 
 func cmdInstall() error {
 	p := paths.Default()
-	res, err := installer.Apply(ttorchembed.Content, p, buildinfo.CurrentVersion())
+	res, err := installer.ApplyEmbedded(p, buildinfo.CurrentVersion())
 	if err != nil {
 		return err
 	}
@@ -2247,7 +2246,7 @@ func cmdLearnings(args []string) error {
 }
 
 func reapplyContent(p paths.Paths) error {
-	res, err := installer.Apply(ttorchembed.Content, p, buildinfo.CurrentVersion())
+	res, err := installer.ApplyEmbedded(p, buildinfo.CurrentVersion())
 	if err != nil {
 		return err
 	}

@@ -12,6 +12,8 @@ import (
 
 	"github.com/nution101/ttorch/internal/manifest"
 	"github.com/nution101/ttorch/internal/paths"
+
+	ttorchembed "github.com/nution101/ttorch"
 )
 
 const (
@@ -28,9 +30,29 @@ type Result struct {
 	Notes  []string
 }
 
-// Apply installs (or updates) the managed content. It is idempotent and never
-// overwrites developer-edited files (see the manifest package).
-func Apply(content fs.FS, p paths.Paths, version string) (*Result, error) {
+// ApplyEmbedded installs (or updates) the managed content from ttorch's own embedded
+// payload. It is the only way to reach the installer from outside this package.
+//
+// The FS is chosen HERE, in a package the trust gate covers, rather than by the caller.
+// It used to be a parameter on an exported Apply, and internal/cli picked the tree —
+// deliberately uncovered at 32 of 196 commits. That made the gate guard's "the installer
+// has no file outside content/ to reach" conditional on an uncovered file, and the bypass
+// needed no covered path at all: a payload/content/ tree, a payload/embed.go carrying its
+// own `//go:embed all:content`, and one line in internal/cli handing that FS to Apply
+// installs a replacement security reviewer. embedRoot is the constant "content", so any FS
+// with a top-level content directory installs.
+//
+// Unexporting apply closes that without widening the covered set: the tree can now only be
+// changed by editing content/ or content.go (covered), or this package (covered).
+// TestInstallerExposesNoFSChoice fails if an exported function takes an fs.FS again.
+func ApplyEmbedded(p paths.Paths, version string) (*Result, error) {
+	return apply(ttorchembed.Content, p, version)
+}
+
+// apply installs (or updates) the managed content. It is idempotent and never
+// overwrites developer-edited files (see the manifest package). Unexported on purpose —
+// see ApplyEmbedded.
+func apply(content fs.FS, p paths.Paths, version string) (*Result, error) {
 	desired, global, err := desiredFiles(content, p)
 	if err != nil {
 		return nil, err

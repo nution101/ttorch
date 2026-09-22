@@ -43,7 +43,7 @@ func read(t *testing.T, p string) string {
 
 func TestApply_LaysDownDualMirrorAndGuidance(t *testing.T) {
 	p := sandbox(t)
-	res, err := Apply(content("skill-v1"), p, "0.1.0")
+	res, err := apply(content("skill-v1"), p, "0.1.0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestApply_LaysDownDualMirrorAndGuidance(t *testing.T) {
 	}
 
 	// Second apply with identical content -> everything unchanged.
-	res, err = Apply(content("skill-v1"), p, "0.1.0")
+	res, err = apply(content("skill-v1"), p, "0.1.0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestApply_LaysDownDualMirrorAndGuidance(t *testing.T) {
 
 func TestApply_InstallsAndRemovesHookScript(t *testing.T) {
 	p := sandbox(t)
-	if _, err := Apply(content("skill-v1"), p, "0.1.0"); err != nil {
+	if _, err := apply(content("skill-v1"), p, "0.1.0"); err != nil {
 		t.Fatal(err)
 	}
 	hookPath := filepath.Join(p.ClaudeHooks(), "prompt-reminders.sh")
@@ -101,7 +101,7 @@ func TestApply_InstallsAndRemovesHookScript(t *testing.T) {
 
 func TestApply_PreservesUserEditsAcrossUpdate(t *testing.T) {
 	p := sandbox(t)
-	if _, err := Apply(content("skill-v1"), p, "0.1.0"); err != nil {
+	if _, err := apply(content("skill-v1"), p, "0.1.0"); err != nil {
 		t.Fatal(err)
 	}
 	claudeSkill := filepath.Join(p.ClaudeSkills(), "ttorch-manager", "SKILL.md")
@@ -112,7 +112,7 @@ func TestApply_PreservesUserEditsAcrossUpdate(t *testing.T) {
 	}
 
 	// Upstream ships a new version.
-	res, err := Apply(content("skill-v2"), p, "0.2.0")
+	res, err := apply(content("skill-v2"), p, "0.2.0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +136,7 @@ func TestApply_PreservesUserGuidanceOutsideMarkers(t *testing.T) {
 	if err := os.WriteFile(p.GlobalAgentsMD(), []byte("# My rules\nbe nice\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Apply(content("skill-v1"), p, "0.1.0"); err != nil {
+	if _, err := apply(content("skill-v1"), p, "0.1.0"); err != nil {
 		t.Fatal(err)
 	}
 	got := read(t, p.GlobalAgentsMD())
