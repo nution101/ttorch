@@ -557,21 +557,23 @@ func parseTouches(s string) []string {
 // resolveBrief returns the brief content from the --brief / --brief-file flags, or "" when
 // neither is set (the worker then gets the generic stub). cmd names the calling subcommand for
 // error messages (e.g. "spawn", "task add"), which `ttorch spawn` and `ttorch task add` share.
-// It errors if both are set (ambiguous) or if --brief-file is unreadable or empty, so a bad
-// invocation fails before any side effect rather than silently launching the worker on the stub.
+// It errors if both are set (ambiguous) or if --brief-file is unreadable, oversize or empty,
+// so a bad invocation fails before any side effect rather than silently launching the worker
+// on the stub. The file is read through readBriefFile, under the lint's own size cap, which
+// is the read `ttorch brief-lint` has always used and these two paths did not.
 func resolveBrief(cmd, brief, briefFile string) (string, error) {
 	if brief != "" && briefFile != "" {
 		return "", fmt.Errorf("%s: pass only one of --brief or --brief-file", cmd)
 	}
 	if briefFile != "" {
-		b, err := os.ReadFile(briefFile)
+		b, err := readBriefFile(cmd, briefFile)
 		if err != nil {
-			return "", fmt.Errorf("%s: reading --brief-file: %w", cmd, err)
+			return "", err
 		}
-		if strings.TrimSpace(string(b)) == "" {
+		if strings.TrimSpace(b) == "" {
 			return "", fmt.Errorf("%s: --brief-file %q is empty", cmd, briefFile)
 		}
-		return string(b), nil
+		return b, nil
 	}
 	return brief, nil
 }

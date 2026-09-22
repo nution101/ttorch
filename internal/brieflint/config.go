@@ -84,9 +84,16 @@ func LoadConfig(dir string) Config {
 		return c
 	}
 	path := filepath.Join(dir, configFile)
-	// Read one byte past the cap, the way the CLI reads a brief: the extra byte is what
-	// distinguishes a file exactly at the cap from one over it, without trusting a stat that
-	// a special file can lie about.
+	// Read one byte past the cap. The extra byte is what distinguishes a file exactly at
+	// the cap from one over it, without trusting a stat that a special file can lie about.
+	//
+	// This said "the way the CLI reads a brief", which was true of `ttorch brief-lint` and
+	// false of the --brief-file of `task add` and `spawn`, the two paths the same change
+	// routed briefs through. Both read with a bare os.ReadFile and reached 1.28 GB on a
+	// file this cap would have refused at 21 MB. A comment asserting a property the
+	// neighbouring path does not have is what stops the next reader from checking, so this
+	// one now claims nothing about the callers: see readBriefFile in internal/cli, which is
+	// the single read all three of them go through.
 	b, err := readCapped(path, maxConfigBytes+1)
 	if err != nil {
 		return c

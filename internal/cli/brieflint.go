@@ -74,25 +74,14 @@ func cmdBriefLint(args []string) error {
 	if err := fs.Parse(args[1:]); err != nil {
 		return lintError{err.Error(), exitLintUsage}
 	}
-	// Read at most one byte past the cap. The brief is untrusted input and Lint refuses
-	// anything over it, so there is no reason to pull a gigabyte into memory first.
-	text, err := readCapped(path, brieflint.MaxBriefBytes+1)
+	text, err := readBriefFile("brief-lint", path)
 	if err != nil {
-		return lintError{fmt.Sprintf("brief-lint: reading %s: %v", path, err), exitLintUsage}
+		return err
 	}
-	if len(text) > brieflint.MaxBriefBytes {
-		// Lint refuses this too, but it can only report the bytes it was handed, and this
-		// path hands it a truncated read. Report the file's real size.
-		size := int64(len(text))
-		if fi, statErr := os.Stat(path); statErr == nil {
-			size = fi.Size()
-		}
-		return lintError{fmt.Sprintf("brief-lint: %s is %d bytes, over the %d byte limit; nothing was checked, because a lint that reads part of a brief cannot report on the whole of it", path, size, brieflint.MaxBriefBytes), exitLintIndeterminate}
-	}
-	if strings.TrimSpace(string(text)) == "" {
+	if strings.TrimSpace(text) == "" {
 		return lintError{fmt.Sprintf("brief-lint: %s is empty", path), exitLintUsage}
 	}
-	rep := brieflint.Lint(string(text), brieflint.Options{
+	rep := brieflint.Lint(text, brieflint.Options{
 		Repo:         *repo,
 		Remote:       *remote,
 		Ref:          *ref,
@@ -239,6 +228,36 @@ func lintBriefBeforeStore(who, stored, text, repo, citationsRef string, offline 
 // errNoBriefLintWithoutBrief keeps --no-brief-lint from reading as meaningful on an add that
 // supplies no brief at all (where there is nothing to lint).
 var errNoBriefLintWithoutBrief = errors.New("task add: --no-brief-lint needs a brief (--brief / --brief-file) to skip linting")
+
+// readBriefFile reads a brief off disk under the lint's own size cap. Every command that
+// reads a brief FILE goes through it: `ttorch brief-lint <file>`, and the --brief-file of
+// `task add` and of `spawn`. It used to be only the first of those, and the other two read
+// with a bare os.ReadFile, so the same 419,444,022-byte file cost 21,020,672 bytes of
+// resident memory through brief-lint and 1,278,476,288 through spawn. Lint refuses an
+// oversize brief either way, so the verdict was already right; the memory was spent before
+// it could say so.
+//
+// The cap is not lifted by --no-brief-lint. That flag skips the RULES, and this is the
+// read: the same file through `spawn --no-brief-lint` reached 1,705,967,616 bytes and
+// stored a 400 MB initial prompt. cmd names the calling subcommand, so the message reads
+// as that command's.
+func readBriefFile(cmd, path string) (string, error) {
+	// One byte past the cap. The extra byte is what distinguishes a file exactly at the cap
+	// from one over it, and there is no reason to pull a gigabyte in to learn that.
+	b, err := readCapped(path, brieflint.MaxBriefBytes+1)
+	if err != nil {
+		return "", lintError{fmt.Sprintf("%s: reading %s: %v", cmd, path, err), exitLintUsage}
+	}
+	if len(b) <= brieflint.MaxBriefBytes {
+		return string(b), nil
+	}
+	// Report the file's real size, not the size of the capped read.
+	size := int64(len(b))
+	if fi, statErr := os.Stat(path); statErr == nil {
+		size = fi.Size()
+	}
+	return "", lintError{fmt.Sprintf("%s: %s is %d bytes, over the %d byte limit, so it was not read: a brief that can only be read in part cannot be linted or stored as written", cmd, path, size, brieflint.MaxBriefBytes), exitLintIndeterminate}
+}
 
 // readCapped reads at most limit bytes of a file. A brief longer than the lint will accept
 // is refused by the lint itself, with the size in the message; this only keeps the reading

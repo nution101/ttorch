@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/nution101/ttorch/internal/brieflint"
+	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/paths"
 	"github.com/nution101/ttorch/internal/worktree"
 )
@@ -515,5 +517,62 @@ func TestCmdSpawnLintsTheBriefItStores(t *testing.T) {
 	// --no-brief-lint with nothing to lint is a loud error rather than a silent no-op.
 	if err := cmdSpawn([]string{"spawn-nobrief", repo, "--no-brief-lint"}); !errors.Is(err, errNoBriefLintWithoutBrief) {
 		t.Fatalf("want errNoBriefLintWithoutBrief, got %v", err)
+	}
+}
+
+// Every command that reads a brief FILE reads it under the cap, not only the standalone
+// one. `task add` and `spawn` went through resolveBrief's bare os.ReadFile, so the same
+// 419,444,022-byte file cost 21,020,672 bytes of resident memory through brief-lint and
+// 1,278,476,288 through spawn. The verdict was already right; the memory was spent before
+// Lint could say so.
+func TestEveryBriefFilePathReadsUnderTheCap(t *testing.T) {
+	repo := t.TempDir()
+	var projID int64
+	withSeedDB(t, func(ctx context.Context, s *db.Store) {
+		p, _ := s.UpsertProject(ctx, repo, "fixture")
+		projID = p.ID
+	})
+	t.Setenv("TTORCH_SKIP_SKILL_INSTALL", "1")
+	path := filepath.Join(t.TempDir(), "huge.md")
+	body := cleanBrief + strings.Repeat("filler text that says nothing. ", (brieflint.MaxBriefBytes/31)+64)
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name string
+		run  func() error
+	}{
+		{"brief-lint", func() error { return cmdBriefLint([]string{path, "--repo", repo, "--offline"}) }},
+		{"task add", func() error {
+			return cmdTaskAdd([]string{"r9-add", "--project", itoa(projID), "--brief-file", path})
+		}},
+		{"spawn", func() error {
+			return cmdSpawn([]string{"r9-spawn", repo, "--brief-file", path, "--brief-lint-offline"})
+		}},
+		// The escape hatch skips the RULES, not the read. It used to store a 400 MB initial
+		// prompt, at 1,705,967,616 bytes of resident memory, the worst of the three.
+		{"spawn --no-brief-lint", func() error {
+			return cmdSpawn([]string{"r9-spawn-skip", repo, "--brief-file", path, "--no-brief-lint"})
+		}},
+	}
+	for _, tc := range cases {
+		out, err := captureStdout(t, tc.run)
+		var le lintError
+		if !errors.As(err, &le) || le.code != exitLintIndeterminate {
+			t.Errorf("%s: an oversize brief must be refused as unevaluable (exit %d), got %v\n%s",
+				tc.name, exitLintIndeterminate, err, out)
+			continue
+		}
+		// The file's real size, not the size of the capped read.
+		if !strings.Contains(err.Error(), fmt.Sprint(len(body))) {
+			t.Errorf("%s: the refusal must state the file's real size (%d), got %v", tc.name, len(body), err)
+		}
+	}
+	// Nothing reached the store on any of the three storing paths.
+	for _, id := range []string{"r9-add", "r9-spawn", "r9-spawn-skip"} {
+		if _, statErr := os.Stat(paths.Default().BriefPath(id)); !os.IsNotExist(statErr) {
+			t.Errorf("%s: a refused brief must not be stored; stat err = %v", id, statErr)
+		}
 	}
 }
