@@ -7,7 +7,6 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
-	"math"
 	"os"
 	"os/exec"
 	"path"
@@ -85,8 +84,8 @@ var nonDecidingFiles = map[string]string{
 // therefore names five files instead.
 //
 // The figures are in docs/ARCHITECTURE.md and only there. This comment used to restate them
-// and drifted twice; the second time it said 54% where the measurement was 66.3%, which
-// understated the cost in the direction that made the boundary look better than it is.
+// and drifted twice; the second time it understated the cost, in the direction that made the
+// boundary look better than it is.
 // TestGateCostFiguresMatchTheDoc measures the doc, so a figure that lives only there cannot
 // go stale unnoticed, and one restated here can.
 //
@@ -188,7 +187,7 @@ func TestGateConfigCoversTheDecidingCode(t *testing.T) {
 //
 // Scoped to the guard, not to all of validate.go. That file also holds the gate RUNNER
 // (runGate, stagedGreen, validateCommitted), and pulling its tests in would mark
-// orchestrator_test.go a proof file at 43 of 196 commits, the boundary this branch has
+// orchestrator_test.go a proof file at the highest cost on the table, the boundary this branch has
 // repeatedly refused to cross.
 //
 // Limit worth stating: matching is by identifier NAME, not by resolved symbol, so a local
@@ -317,7 +316,10 @@ func guardClosure(t *testing.T) guardReach {
 	// someone checking the derivation still reaches the new name.
 	for _, list := range []string{"gateConfigFiles", "ttorchSourceFiles", "gateConfigPrefixes", "ttorchSourcePrefixes"} {
 		if !seen[list] {
-			t.Errorf("the guard closure does not reach %s, one of the four lists that "+
+			// Fatal, not Errorf. With Errorf this returns the incomplete symbol set and
+			// every caller carries on deriving proof files from it, so one broken
+			// traversal reports a second, unrelated-looking failure in each of them.
+			t.Fatalf("the guard closure does not reach %s, one of the four lists that "+
 				"define the covered set; a test asserting only on it reads as ordinary", list)
 		}
 	}
@@ -557,8 +559,8 @@ func TestMergeLocal_DecidingCodeChangeNeedsAllowGateChange(t *testing.T) {
 		// ~/.claude/skills via `npx skills add`, before every team launch and every worker
 		// spawn. No ttorch build and no ttorch install in between.
 		{"the recommended external skills", "internal/skills/skills.go", true},
-		// Still the control, and now deliberately so: internal/cli/ costs 32 of 196 commits,
-		// which would take the covered set to 116/196 = 59% — past the more-than-half line
+		// Still the control, and now deliberately so: covering internal/cli/ would take the
+		// covered set past the more-than-half line
 		// that is the stated reason internal/orchestrator/ is not covered wholesale. The
 		// bypass that ran through it is closed by installer.ApplyEmbedded instead.
 		{"CONTROL: ordinary source", "internal/cli/cli.go", false},
@@ -671,7 +673,7 @@ func TestOrchestratorFilesAreClassified(t *testing.T) {
 		if strings.HasSuffix(n, "_test.go") {
 			// Parsed, not grepped. A substring scan counts a guard name MENTIONED in a
 			// comment, which would have marked orchestrator_test.go a proof file for two
-			// passing references in prose and cost 43 of 196 commits to cover.
+			// passing references in prose and pulled in the most expensive file on the table.
 			isProof := proofs[n]
 			if isProof && !covered[rel] {
 				t.Errorf("%s references the guard but is not covered. A diff can then "+
@@ -1222,11 +1224,11 @@ func TestEmbeddedPayloadIsNotAssignable(t *testing.T) {
 // outside its own package choose the tree it installs.
 //
 // installer.Apply used to take an fs.FS and internal/cli picked it, which made the guard's
-// superset argument conditional on a file the gate deliberately does not cover (32 of 196
-// commits). Covering internal/cli/ instead would have taken the set to 116/196 = 59%, past
+// superset argument conditional on a file the gate deliberately does not cover. Covering
+// internal/cli/ instead would have taken the set past
 // the more-than-half line that is the stated reason internal/orchestrator/ is not covered
 // wholesale — so the fix was to unexport apply and add ApplyEmbedded, which picks
-// ttorch.Content inside the covered package. That costs 0 commits.
+// ttorch.Content inside the covered package, which was already covered and so costs nothing.
 //
 // If an exported function in internal/installer takes an fs.FS again, the parameter is back
 // and so is the bypass, so this fails.
@@ -1345,98 +1347,234 @@ func TestGateCostFiguresMatchTheDoc(t *testing.T) {
 	}
 	body := string(doc)
 
-	total := count()
-	for _, tc := range []struct {
-		what  string
-		want  string
-		extra []string
-	}{
-		{"the whole set", fmt.Sprintf("| **the whole set** | **%d / %d = %d%%** | |", total, len(shas), int(math.Round(100*float64(total)/float64(len(shas))))), nil},
-		{"+ internal/db/", fmt.Sprintf("| + `internal/db/` | %d | %.1f%% |", count("internal/db/"), 100*float64(count("internal/db/"))/float64(len(shas))), []string{"internal/db/"}},
-		{"+ orchestrator and review wholesale", fmt.Sprintf("| + `internal/orchestrator/**` and `internal/review/**` wholesale | %d | %.1f%% |",
-			count("internal/orchestrator/", "internal/review/"),
-			100*float64(count("internal/orchestrator/", "internal/review/"))/float64(len(shas))), nil},
-	} {
-		if !strings.Contains(body, tc.want) {
-			t.Errorf("docs/ARCHITECTURE.md does not contain the measured row for %s.\nmeasured: %s\nUpdate the doc, or explain the difference — do not adjust this test to match a transcribed figure.", tc.what, tc.want)
-		}
+	// Both columns come from the REAL matcher, by changing what it is given rather than by
+	// reimplementing what it does. "alone" empties the covered lists down to one entry;
+	// "marginal" removes that one entry and re-counts. A second implementation of the
+	// matching rules would be a second thing to keep in step, which is the whole disease
+	// being treated here.
+	restore := func(a, b, c, d, e []string) {
+		gateConfigFiles, ttorchSourceFiles = a, b
+		gateConfigPrefixes, ttorchSourcePrefixes = c, d
+		gateConfigBasenames = e
 	}
-	if n := len(shas); n != 196 {
-		t.Logf("the corpus is now %d commits, not the 196 the doc's prose cites; the table rows above are measured either way", n)
+	withLists := func(keep func([]string) []string, f func()) {
+		a, b, c, d, e := gateConfigFiles, ttorchSourceFiles, gateConfigPrefixes, ttorchSourcePrefixes, gateConfigBasenames
+		defer restore(a, b, c, d, e)
+		gateConfigFiles, ttorchSourceFiles = keep(a), keep(b)
+		gateConfigPrefixes, ttorchSourcePrefixes = keep(c), keep(d)
+		gateConfigBasenames = keep(e)
+		f()
 	}
-
-	// Pinning three table rows is what let this drift three times. The rows were updated
-	// and the PROSE around them was not, so ARCHITECTURE.md ended up contradicting itself
-	// about the same quantity, and SKILL.md — the copy that installs into every reviewer's
-	// ~/.claude — kept figures two boundary moves old. The accurate copy was not the
-	// installed one.
-	//
-	// So every figure in both publishing files is swept, wherever it appears, and each one
-	// has to BE a measured quantity. The candidates are derived: the paths the reviewer
-	// skill lists as deliberately not covered, and the covered set itself. Anything that
-	// is not one of those numbers is either stale or unverifiable, and the rule for an
-	// unverifiable figure is to delete it rather than publish it.
-	//
-	// It caught one the brief did not: internal/cli/ was published at +32 marginal and
-	// 127/196, which is 84 + 32 with the old base swapped for the new one. A marginal
-	// SHRINKS as the covered set grows, because commits that were cli-only become covered
-	// by other means. Measured two ways, it is +28 and 123/196.
-	own := func(p string) int {
+	alone := func(entry string) int {
 		var n int
-		for _, files := range touched {
-			for _, f := range files {
-				if f != "" && (f == p || strings.HasPrefix(f, p)) {
-					n++
-					break
+		withLists(func(xs []string) []string {
+			for _, x := range xs {
+				if x == entry {
+					return []string{entry}
 				}
 			}
-		}
+			return nil
+		}, func() { n = count() })
 		return n
 	}
-	candidates := readFence(t, notCoveredFence)
-	candidates = append(candidates, ttorchScope.files()...)
-	candidates = append(candidates, ttorchScope.prefixes()...)
-	allowed := map[int]bool{total: true, count("internal/orchestrator/", "internal/review/"): true}
-	for _, c := range candidates {
-		with := count(c)
-		allowed[own(c)] = true
-		allowed[with] = true
-		allowed[with-total] = true
-	}
-	allowedPct := map[string]bool{}
-	for n := range allowed {
-		pct := 100 * float64(n) / float64(len(shas))
-		allowedPct[fmt.Sprintf("%.1f%%", pct)] = true
-		allowedPct[fmt.Sprintf("%d%%", int(math.Round(pct)))] = true
+	without := func(entry string) int {
+		var n int
+		withLists(func(xs []string) []string {
+			out := make([]string, 0, len(xs))
+			for _, x := range xs {
+				if x != entry {
+					out = append(out, x)
+				}
+			}
+			return out
+		}, func() { n = count() })
+		return n
 	}
 
-	skillPath := filepath.Join(root, "content", "skills", "ttorch-review", "SKILL.md")
-	skill, err := os.ReadFile(skillPath)
+	total := count()
+	entries := append([]string{}, ttorchScope.files()...)
+	entries = append(entries, ttorchScope.prefixes()...)
+	entries = append(entries, gateConfigBasenames...)
+	sort.Strings(entries)
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s\n\n", costBlockOpen)
+	fmt.Fprintf(&b, "Measured over the %d non-merge commits reachable from `%s`, counting a commit\n", len(shas), gateCostBase)
+	fmt.Fprint(&b, "once if it touches any covered path.\n\n")
+	fmt.Fprint(&b, "| Covered entry | commits touching it | marginal, given the rest |\n|---|---|---|\n")
+	seenRow := map[string]bool{}
+	for _, e := range entries {
+		if seenRow[e] {
+			continue
+		}
+		seenRow[e] = true
+		fmt.Fprintf(&b, "| `%s` | %d | +%d |\n", e, alone(e), total-without(e))
+	}
+	fmt.Fprintf(&b, "| **the whole set** | **%d** | **%.1f%% of the corpus** |\n\n", total, 100*float64(total)/float64(len(shas)))
+	fmt.Fprint(&b, "Rejected, measured against that same set:\n\n")
+	fmt.Fprint(&b, "| Rejected | commits touching it | set would become | share |\n|---|---|---|---|\n")
+	rejected := append([]string{}, readFence(t, notCoveredFence)...)
+	sort.Strings(rejected)
+	for _, r := range rejected {
+		with := count(r)
+		fmt.Fprintf(&b, "| + `%s` | %d | %d | %.1f%% |\n", r, own(r, touched), with, 100*float64(with)/float64(len(shas)))
+	}
+	wholesale := count("internal/orchestrator/", "internal/review/")
+	fmt.Fprintf(&b, "| + `internal/orchestrator/**` and `internal/review/**` wholesale | %d | %d | %.1f%% |\n",
+		own("internal/orchestrator/", touched), wholesale, 100*float64(wholesale)/float64(len(shas)))
+	fmt.Fprintf(&b, "\n%s", costBlockClose)
+	want := b.String()
+
+	got, err := costBlockOf(body)
 	if err != nil {
-		t.Fatalf("reading SKILL.md: %v", err)
+		t.Fatalf("docs/ARCHITECTURE.md: %v", err)
 	}
-	fracRe := regexp.MustCompile(`(\d+)/` + fmt.Sprint(len(shas)))
-	pctRe := regexp.MustCompile(`\d+(?:\.\d+)?%`)
-	for _, pub := range []struct{ name, text string }{
-		{"docs/ARCHITECTURE.md", body},
-		{"content/skills/ttorch-review/SKILL.md", string(skill)},
-	} {
-		for _, m := range fracRe.FindAllStringSubmatch(pub.text, -1) {
-			var n int
-			fmt.Sscanf(m[1], "%d", &n)
-			if !allowed[n] {
-				t.Errorf("%s publishes %s, which is not a measured quantity. Re-measure it "+
-					"or delete it; a figure nobody can check is the reason these drifted "+
-					"three times.", pub.name, m[0])
+	if got != want {
+		out := filepath.Join(t.TempDir(), "gate-cost-block.md")
+		_ = os.WriteFile(out, []byte(want), 0o644)
+		t.Errorf("the generated cost block in docs/ARCHITECTURE.md is out of date.\n"+
+			"Replace everything between the markers with the block written to %s.\n\n%s", out, want)
+	}
+
+	if n := len(shas); n != 196 {
+		t.Logf("the corpus is now %d commits; every figure above is measured from it, so nothing needs editing", n)
+	}
+
+	// The anti-transcription rule, and the reason this test no longer sweeps for "figures
+	// that match a measured value". That sweep was widened twice and was behind a format
+	// both times: it matched N/196 and N%, so every bare commit count went unchecked, and
+	// five marginals in this very table were wrong while it passed. A sweep that lists the
+	// shapes it knows will always be one shape short.
+	//
+	// So the rule is inverted. There is exactly ONE place a cost figure may appear, the
+	// generated block above, and anywhere else a cost-figure shape is a failure regardless
+	// of whether the number happens to be right. Being right is not the property that was
+	// missing; being generated is.
+	// Strips the block that is IN the file, not the one just generated. When the two
+	// differ the block is already reported as out of date, and stripping the expected text
+	// would leave the actual rows in place to be re-reported one per figure.
+	assertNoHandWrittenFigures(t, root, got, len(shas))
+}
+
+// costBlockOpen and costBlockClose delimit the one place a cost figure may live.
+const (
+	costBlockOpen  = "<!-- gate-cost: generated by TestGateCostFiguresMatchTheDoc. Do not edit by hand. -->"
+	costBlockClose = "<!-- /gate-cost -->"
+)
+
+// costBlockOf returns the generated block, markers included.
+func costBlockOf(body string) (string, error) {
+	i := strings.Index(body, costBlockOpen)
+	if i < 0 {
+		return "", fmt.Errorf("the generated cost block is gone; it is the only place a cost figure may live, so removing it does not remove the requirement")
+	}
+	j := strings.Index(body[i:], costBlockClose)
+	if j < 0 {
+		return "", fmt.Errorf("the generated cost block has an opening marker and no closing one")
+	}
+	return body[i : i+j+len(costBlockClose)], nil
+}
+
+// own counts commits in the corpus that touch any path at or under p. It is the "alone"
+// column for a path that is NOT in the covered set, where emptying the lists down to it is
+// not available.
+func own(p string, touched [][]string) int {
+	var n int
+	for _, files := range touched {
+		for _, f := range files {
+			if f != "" && (f == p || strings.HasPrefix(f, p)) {
+				n++
+				break
 			}
 		}
-		for _, m := range pctRe.FindAllString(pub.text, -1) {
-			if !allowedPct[m] {
-				t.Errorf("%s publishes %s, which is not a measured percentage of the %d-commit "+
-					"corpus. Re-measure it or delete it.", pub.name, m, len(shas))
+	}
+	return n
+}
+
+// costFigureFor matches the SHAPE of a cost figure, not a known value.
+//
+// Deliberately loose. A hand-written figure can be a fraction, a percentage or a bare count
+// of commits, and the check this replaces knew only about the first two, which is why every
+// bare count went unswept and five marginals in the table were wrong while it passed.
+// Matching the shape catches a new one on arrival in a format nobody anticipated, and the
+// fix for a false positive is to phrase the sentence without a number, which is the outcome
+// being pushed for anyway.
+//
+// The one part that is not pure shape is the denominator: "x/y" is only read as a figure
+// when y is the corpus size, because "(1/2/101/...)" in a comment about ssh exit codes is
+// not a cost figure and rewording that sentence would make it worse. The corpus is commits
+// reachable from a fixed base, so that size does not drift. Percentages and counts stay
+// shape-only, and between them they cover the forms that have actually gone stale here.
+func costFigureFor(corpus int) *regexp.Regexp {
+	n := fmt.Sprint(corpus)
+	return regexp.MustCompile(`\d+\s*/\s*` + n + `|\d+ of (the )?` + n + `|[+-]?\d+(\.\d+)?%|[+-]?\d+ (commits?|marginal)|\(\d+ commits?\)`)
+}
+
+// assertNoHandWrittenFigures fails on a cost figure written anywhere but the generated block.
+//
+// The files it reads are DERIVED: the two published documents, plus every Go file in the
+// covered set. Go files are read as comments only, through the parser, so a format verb or
+// a real numeric constant is not mistaken for prose.
+func assertNoHandWrittenFigures(t *testing.T, root, block string, corpus int) {
+	t.Helper()
+	costFigure := costFigureFor(corpus)
+	check := func(name, text string) {
+		for _, m := range costFigure.FindAllString(text, -1) {
+			t.Errorf("%s writes the cost figure %q by hand. Figures live in the generated "+
+				"block in docs/ARCHITECTURE.md and nowhere else: delete it, or keep the "+
+				"argument and let the block carry the number.", name, strings.TrimSpace(m))
+		}
+	}
+	for _, rel := range []string{"docs/ARCHITECTURE.md", "content/skills/ttorch-review/SKILL.md"} {
+		b, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(rel)))
+		if err != nil {
+			t.Fatalf("reading %s: %v", rel, err)
+		}
+		check(rel, strings.Replace(string(b), block, "", 1))
+	}
+	fset := token.NewFileSet()
+	for _, rel := range coveredGoFiles(t) {
+		f, err := parser.ParseFile(fset, filepath.Join(root, filepath.FromSlash(rel)), nil, parser.ParseComments)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", rel, err)
+		}
+		for _, cg := range f.Comments {
+			check(rel, cg.Text())
+		}
+	}
+}
+
+// coveredGoFiles are the .go files the gate covers, derived from the covered set itself so
+// that a newly covered file is swept without anyone remembering to add it here.
+func coveredGoFiles(t *testing.T) []string {
+	t.Helper()
+	root := repoRootForGateConfig(t)
+	var out []string
+	for _, f := range ttorchScope.files() {
+		if strings.HasSuffix(f, ".go") {
+			if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(f))); err == nil {
+				out = append(out, f)
 			}
 		}
 	}
+	for _, p := range ttorchScope.prefixes() {
+		dir := filepath.Join(root, filepath.FromSlash(p))
+		_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") {
+				return nil
+			}
+			rel, rerr := filepath.Rel(root, path)
+			if rerr == nil {
+				out = append(out, filepath.ToSlash(rel))
+			}
+			return nil
+		})
+	}
+	if len(out) == 0 {
+		t.Fatal("no covered .go files found; the figure sweep is reading nothing")
+	}
+	sort.Strings(out)
+	return out
 }
 
 // notCoveredFence is the language tag on the machine-readable block in the reviewer skill.
@@ -1674,7 +1812,7 @@ func TestGateTestsSelectorCoversTheProofs(t *testing.T) {
 // with --allow-gate-change touches no guard symbol and reads as ordinary. One such test was
 // written, in orchestrator_test.go, and nothing swept it.
 //
-// Covering orchestrator_test.go wholesale costs 43 of 196 commits, so the fix is not to
+// Covering orchestrator_test.go wholesale is the most expensive option on the table, so the fix is not to
 // widen the covered set. It is to refuse to let an on-topic test live somewhere no sweep
 // reaches, and say where it should go instead.
 var onTopicTestName = regexp.MustCompile(`GateConfig|GateGuard|GateScope|GateCost|GateTests|AllowGateChange|GateInstruction|MatchesGateConfig`)
@@ -1787,7 +1925,7 @@ func TestGateLaneRunsTheEvidencePackages(t *testing.T) {
 // Moved here from orchestrator_test.go. These are the gate's own proofs, and a proof
 // that is not covered can be deleted in the same unflagged merge as the attack it
 // catches. Covering orchestrator_test.go where they used to live would have cost 43 of
-// 196 commits and taken the covered set to 110/196 = 56%, past the more-than-half line
+// taken the covered set past the more-than-half line
 // that is the stated reason internal/orchestrator/ is not covered wholesale. Moving them
 // into a file that is already covered costs 0.
 
