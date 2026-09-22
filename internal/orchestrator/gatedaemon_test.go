@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -425,15 +426,20 @@ func slowTmux(t *testing.T) {
 }
 
 // TestGateOnce_FailedLaunchBurnsNoAttempt is the other half of the chain: gateOnceAt's
-// contract that a dispatcher error costs no attempt, because nothing started. The test above
-// makes spawnReviewer report a timed-out probe as an error; this one shows that landing here.
+// contract that a launch which NEVER STARTED costs no attempt. The test below makes
+// spawnReviewer report a timed-out probe as an error; this one shows that landing here.
+//
+// The contract used to be "a dispatcher error costs no attempt", full stop. It is now by
+// error KIND, because a failure that will keep failing has to reach the ceiling rather than
+// retry forever (see errReviewerNotStarted), so the stub marks itself unstarted the way the
+// probe does.
 func TestGateOnce_FailedLaunchBurnsNoAttempt(t *testing.T) {
 	m, _ := trustedTaskWithSubstantialDiff(t, "gate-noburn", "nb1")
 	t.Cleanup(func() { _, _ = m.Teardown("nb1", true) })
 	prev := reviewerDispatcher
 	t.Cleanup(func() { reviewerDispatcher = prev })
 	reviewerDispatcher = func(m *Manager, taskID, dim, dir, head, repo, wt string) error {
-		return errors.New("probe timed out, nothing launched")
+		return fmt.Errorf("probe timed out, nothing launched: %w", errReviewerNotStarted)
 	}
 
 	if _, err := m.GateOnce("nb1"); err != nil {
@@ -444,6 +450,9 @@ func TestGateOnce_FailedLaunchBurnsNoAttempt(t *testing.T) {
 		if prog.Attempts[d] != 0 {
 			t.Errorf("dimension %s burned %d attempt(s) for a reviewer that never launched, want 0", d, prog.Attempts[d])
 		}
+	}
+	if prog.DispatchedAt != 0 {
+		t.Error("an unstarted launch must not start the stall clock either")
 	}
 }
 

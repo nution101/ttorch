@@ -1243,7 +1243,33 @@ type gateProgress struct {
 	Attempts     map[string]int `json:"attempts"`     // per-dimension reviewer (re)dispatch count
 	DispatchedAt int64          `json:"dispatchedAt"` // unix nano of the first reviewer dispatch (stall clock); 0 until dispatched
 	Outcome      string         `json:"outcome"`      // "" in flight | gateOutcomeRecorded | gateOutcomeBlocked
+	// LastDispatchError is the most recent CHARGED launch failure, carried so the block the
+	// attempt ceiling surfaces can say the reviewer never started rather than never reported.
+	// An unstarted failure does not set it: it costs no attempt, so it never reaches a block.
+	LastDispatchError string `json:"lastDispatchError,omitempty"`
 }
+
+// errReviewerNotStarted marks a dispatch failure where NOTHING WAS LAUNCHED and a retry is
+// genuinely likely to succeed, so gateOnceAt must not charge it an attempt.
+//
+// The dispatch loop has two failure kinds and they need opposite treatment. A launch that
+// fails for a standing reason, a mirror clone that cannot complete, a refused dimension, a
+// missing harness, fails identically every tick: uncharged it never reaches the attempt
+// ceiling, never starts the stall clock, and the gate spins on it silently for as long as the
+// task sits in the done set. A launch that never got far enough to fail, the tmux probe timing
+// out while the server is wedged, is the opposite: with maxReviewerAttempts at 2, charging it
+// spends the whole budget on reviewers that never started, during the exact hang the probe
+// deadline exists to survive.
+//
+// So the kind is decided where the error is CREATED, where it is known, and carried on the
+// error for errors.Is to test. The caller never re-derives it by matching message text, which
+// would make the classification a property of the wording.
+//
+// CHARGING IS THE DEFAULT. Only a failure explicitly marked as unstarted goes uncharged, so an
+// error nobody has classified escalates to a surfaced block rather than spinning invisibly. Of
+// the two ways to be wrong, a gate that blocks on a transient failure tells the manager
+// something and can be adjudicated; a gate that retries forever tells nobody anything.
+var errReviewerNotStarted = errors.New("reviewer launch not attempted")
 
 // reviewerDispatcher is the seam the daemon gate dispatches a reviewer through; production
 // wiring is (*Manager).spawnReviewer (a real tmux + harness launch). It is a package var so a
@@ -1392,7 +1418,12 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 			continue // its reviewer is still running
 		}
 		if prog.Attempts[dim] >= maxReviewerAttempts {
-			m.surfaceGateBlocked(taskID, head, fmt.Sprintf("reviewer %q produced no report after %d attempt(s)", dim, maxReviewerAttempts))
+			reason := fmt.Sprintf("reviewer %q produced no report after %d attempt(s)", dim, maxReviewerAttempts)
+			if prog.LastDispatchError != "" {
+				// Distinguish a reviewer that ran and said nothing from one that never started.
+				reason += "; last dispatch error: " + prog.LastDispatchError
+			}
+			m.surfaceGateBlocked(taskID, head, reason)
 			prog.Outcome = gateOutcomeBlocked
 			m.writeGateProgress(dir, prog)
 			m.teardownReviewers(taskID, unionDimensions(dims, dispatchedDimensions(prog)))
@@ -1402,18 +1433,27 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 	}
 
 	if len(toDispatch) > 0 {
-		dispatched := false
+		charged := false
 		for _, dim := range toDispatch {
 			if err := reviewerDispatcher(m, taskID, dim, dir, head, t.Project, t.Worktree); err != nil {
-				// A launch failure this tick is non-fatal and does not burn an attempt (nothing
-				// started): the next tick retries this dimension. Other dimensions still launch.
 				fmt.Fprintf(os.Stderr, "ttorch: gate could not dispatch reviewer %s/%s: %v\n", taskID, dim, err)
-				continue
+				if errors.Is(err, errReviewerNotStarted) {
+					// Nothing started and a retry is likely to work. Costs no attempt and does
+					// not start the stall clock, so a wedged tmux does not consume the budget
+					// that exists to outlast it.
+					continue
+				}
+				// A standing failure. Charged like a reviewer that started and never reported,
+				// so it reaches the ceiling and surfaces instead of retrying forever.
+				prog.LastDispatchError = fmt.Sprintf("%s: %v", dim, err)
 			}
 			prog.Attempts[dim]++
-			dispatched = true
+			charged = true
 		}
-		if dispatched && prog.DispatchedAt == 0 {
+		// The stall clock starts on the first attempt that COUNTED, whether it launched or
+		// failed for a standing reason. An unstarted launch leaves it alone for the same
+		// reason it leaves the attempt count alone.
+		if charged && prog.DispatchedAt == 0 {
 			prog.DispatchedAt = now.UnixNano()
 		}
 		m.writeGateProgress(dir, prog)
@@ -1774,7 +1814,10 @@ func (m *Manager) spawnReviewer(taskID, dim, inputsDir, head, repo, wt string) e
 	window := reviewerWindow(taskID, dim)
 	exists, err := tmux.WindowExistsErr(m.Session, window)
 	if errors.Is(err, tmux.ErrTimeout) {
-		return fmt.Errorf("could not tell whether reviewer window %q is already running: %w", window, err)
+		// A wedged tmux server: the window could not be inspected, so nothing was launched and
+		// nothing can be concluded about whether a launch would have worked. Marked unstarted
+		// so the retry budget survives the hang (see errReviewerNotStarted).
+		return fmt.Errorf("could not tell whether reviewer window %q is already running: %w: %w", window, err, errReviewerNotStarted)
 	}
 	if exists {
 		return nil // already running — idempotent

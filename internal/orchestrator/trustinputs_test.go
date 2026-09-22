@@ -3,6 +3,8 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -1039,4 +1041,103 @@ func TestGateOnce_ADimensionDroppedAfterPrepIsSurfaced(t *testing.T) {
 	if _, ok := m.TrustShow("dr1"); ok {
 		t.Fatal("no verdict may be recorded over a set that shrank mid-review")
 	}
+}
+
+// TestGateOnce_APersistentlyFailingLaunchIsCharged is the standing-failure half of the
+// attempt-charging split. A mirror clone that cannot complete fails the same way every tick.
+// Uncharged it never reaches the ceiling, never starts the stall clock, and never surfaces a
+// block, so the gate retries it silently for as long as the task sits in the done set: of the
+// failure modes here, the only one that produces no signal at all.
+//
+// The error is NOT marked unstarted, so it is charged and the episode terminates.
+func TestGateOnce_APersistentlyFailingLaunchIsCharged(t *testing.T) {
+	m, _ := trustedTaskWithSubstantialDiff(t, "gate-mirror", "mf1")
+	t.Cleanup(func() { _, _ = m.Teardown("mf1", true) })
+	prev := reviewerDispatcher
+	t.Cleanup(func() { reviewerDispatcher = prev })
+	reviewerDispatcher = func(m *Manager, taskID, dim, dir, head, repo, wt string) error {
+		return fmt.Errorf("mirror %s for review: %w: exit status 128", repo, errors.New("fatal: repository not found"))
+	}
+	now := time.Unix(1_700_000_000, 0)
+
+	if out, err := m.gateOnceAt("mf1", time.Minute, 1, time.Hour, now); err != nil || out != GateDispatched {
+		t.Fatalf("tick1 = (%q, %v), want dispatched", out, err)
+	}
+	prog := m.readGateProgress(m.P.ReviewInputsDir("mf1"))
+	for _, d := range m.ReviewersFor("mf1") {
+		if prog.Attempts[d] == 0 {
+			t.Errorf("dimension %s burned no attempt for a launch that will keep failing", d)
+		}
+	}
+	if prog.DispatchedAt == 0 {
+		t.Error("a charged failure must start the stall clock, or a wedged launch is unbounded in time too")
+	}
+
+	out, err := m.gateOnceAt("mf1", time.Minute, 1, time.Hour, now)
+	if err != nil {
+		t.Fatalf("gateOnceAt tick2: %v", err)
+	}
+	if out != GateBlocked {
+		t.Fatalf("outcome = %q, want %q: a launch that always fails must reach the ceiling", out, GateBlocked)
+	}
+	if !hasGateBlockedEvent(t, m, "mf1") {
+		t.Fatal("a reviewer that never launches must surface a gate_blocked event")
+	}
+	if _, ok := m.TrustShow("mf1"); ok {
+		t.Fatal("no verdict may be recorded when no reviewer ever ran")
+	}
+	if !gateBlockedEventMentions(t, m, "mf1", "last dispatch error") {
+		t.Error("the block should say the reviewer never started, not that it never reported")
+	}
+}
+
+// TestGateOnce_AnUnclassifiedLaunchFailureIsCharged pins the DEFAULT side of the split, which
+// is the part that decides what happens to every failure nobody has thought about yet.
+//
+// Charging is the default: only a failure explicitly marked errReviewerNotStarted goes
+// uncharged. The alternative default, not charging unless marked persistent, was rejected.
+// Both defaults are wrong sometimes, so the question is which way. A gate that blocks on a
+// transient failure has told the manager something and can be adjudicated in a minute; a gate
+// that retries forever has told nobody anything, and the round-8 finding this whole split
+// came from was exactly that invisible case. A new dispatch error added later inherits the
+// visible failure rather than the silent one.
+func TestGateOnce_AnUnclassifiedLaunchFailureIsCharged(t *testing.T) {
+	m, _ := trustedTaskWithSubstantialDiff(t, "gate-unknown", "uk1")
+	t.Cleanup(func() { _, _ = m.Teardown("uk1", true) })
+	prev := reviewerDispatcher
+	t.Cleanup(func() { reviewerDispatcher = prev })
+	reviewerDispatcher = func(m *Manager, taskID, dim, dir, head, repo, wt string) error {
+		// A bare error carrying no classification at all, which is what any future dispatch
+		// failure looks like until someone classifies it.
+		return errors.New("something nobody has classified went wrong")
+	}
+	now := time.Unix(1_700_000_000, 0)
+
+	if out, err := m.gateOnceAt("uk1", time.Minute, 1, time.Hour, now); err != nil || out != GateDispatched {
+		t.Fatalf("tick1 = (%q, %v), want dispatched", out, err)
+	}
+	prog := m.readGateProgress(m.P.ReviewInputsDir("uk1"))
+	for _, d := range m.ReviewersFor("uk1") {
+		if prog.Attempts[d] == 0 {
+			t.Errorf("dimension %s: an unclassified failure must be charged, not retried forever", d)
+		}
+	}
+	if out, err := m.gateOnceAt("uk1", time.Minute, 1, time.Hour, now); err != nil || out != GateBlocked {
+		t.Fatalf("tick2 = (%q, %v), want blocked: an unclassified failure must escalate", out, err)
+	}
+}
+
+// gateBlockedEventMentions reports whether any gate_blocked event for taskID contains want.
+func gateBlockedEventMentions(t *testing.T, m *Manager, taskID, want string) bool {
+	t.Helper()
+	evs, err := m.Store.EventsSince(context.Background(), 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range evs {
+		if e.EntityID == taskID && e.Type == db.EventGateBlocked && strings.Contains(e.Payload, want) {
+			return true
+		}
+	}
+	return false
 }
