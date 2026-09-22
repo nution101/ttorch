@@ -731,10 +731,15 @@ func TestRequiredDimensions_PoisonedOriginCannotLowerTheFloor(t *testing.T) {
 	if got, _ := diffFiles(wt, "origin/main", head); strings.Join(got, " ") != "NOTES.md" {
 		t.Fatalf("the poison must make the diff look docs-only, got %v", got)
 	}
-	// Two: lower the RECORDED half to match, which is the step 1a attack. Either alone is
-	// caught by the union. Together they defeat it, which is why the base has to hold on its
-	// own rather than leaning on reviewers.json.
+	// Two: lower the RECORDED half to match, which is the step 1a attack.
 	writeReviewersFile(t, dir, review.DimensionCorrectness, review.DimensionScope)
+	// Three: lower the STAMP to match as well. Without this the test passes for the wrong
+	// reason. The stamp is the spine of requiredDimensions, so it alone holds the set up, and
+	// the assertion below stays green with the derived floor deleted outright (verified by
+	// mutation). review.RequiredDimensions' own doc says a consistent edit to every record
+	// gets a clean verdict, so consistency is what the attacker has to be given here for the
+	// floor to be the only defence left standing.
+	lowerPrepStamp(t, dir, head, review.DimensionCorrectness, review.DimensionScope)
 
 	afterDims, _ := m.requiredDimensions(task, head)
 	after := strings.Join(afterDims, " ")
@@ -970,5 +975,68 @@ func TestSpawnReviewer_RefusesATraversingDimension(t *testing.T) {
 				t.Fatalf("dimension %q wrote %s into the reports dir anyway", dim, suffix)
 			}
 		}
+	}
+}
+
+// lowerPrepStamp rewrites the episode's stamp to name a shorter dimension set, modeling an
+// attacker who edits every record consistently rather than only reviewers.json. It preserves
+// the staged validate's outcome so the fold does not block on a disputed stamp instead of on
+// the thing under test.
+func lowerPrepStamp(t *testing.T, dir, head string, dims ...string) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(dir, review.StagedValidateFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var results []validate.Result
+	if err := json.Unmarshal(raw, &results); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := review.WritePrepStamp(dir, head, results, dims); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestGateOnce_ADimensionDroppedAfterPrepIsSurfaced is the stamp's own property, held
+// separately from the floor's.
+//
+// review.RequiredDimensions returns any dimension the stamp prepared that reviewers.json no
+// longer lists. A set that shrank between the review and the record means the inputs dir was
+// edited mid-review, which is the shape of hiding a blocking report, so the gate surfaces it
+// for the manager instead of quietly restoring the name via the union and carrying on.
+//
+// The union alone would make this invisible: security is back in the required set either way,
+// so without the dropped signal the episode just dispatches and nobody learns the file was
+// edited. That is what makes this distinguishable from the floor's property, and the
+// assertion is on the surfaced MESSAGE rather than on the set.
+func TestGateOnce_ADimensionDroppedAfterPrepIsSurfaced(t *testing.T) {
+	m, _ := trustedTaskWithSubstantialDiff(t, "gate-dropped", "dr1")
+	t.Cleanup(func() { _, _ = m.Teardown("dr1", true) })
+	recordingReviewer(t, false)
+
+	if out, err := m.GateOnce("dr1"); err != nil || out != GateDispatched {
+		t.Fatalf("tick1 = (%q, %v), want dispatched", out, err)
+	}
+	// Mid-review, the file loses a dimension the stamp prepared. The name is perfectly
+	// legal, so nothing else in the chain objects to it.
+	dir := m.P.ReviewInputsDir("dr1")
+	writeReviewersFile(t, dir, review.DimensionCorrectness, review.DimensionScope)
+
+	out, err := m.GateOnce("dr1")
+	if err != nil {
+		t.Fatalf("GateOnce: %v", err)
+	}
+	if out != GateBlocked {
+		t.Fatalf("outcome = %q, want %q: a set that shrank after prep must not just carry on", out, GateBlocked)
+	}
+	payload := gateBlockedPayload(t, m, "dr1")
+	if !strings.Contains(payload, "no longer lists") {
+		t.Fatalf("the manager must be told the inputs dir was edited after the prep; payload = %q", payload)
+	}
+	if !strings.Contains(payload, review.DimensionSecurity) {
+		t.Fatalf("the surfaced message must name the dropped dimension; payload = %q", payload)
+	}
+	if _, ok := m.TrustShow("dr1"); ok {
+		t.Fatal("no verdict may be recorded over a set that shrank mid-review")
 	}
 }
