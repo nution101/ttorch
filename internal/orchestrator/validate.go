@@ -71,12 +71,23 @@ func (m *Manager) Validate(taskID string) ([]validate.Result, error) {
 // classified either way. Neither can recognise a new deciding function inside an already-
 // classified non-deciding file; that remains a review responsibility and is stated as such.
 //
-// Makefile and content.go sit outside both packages and are here on the same delayed-diff
-// argument. .ttorch/validate.sh — the gate's validation authority, already covered — does
-// nothing but run `make lint` and `make test-fast`, so redefining those targets redefines
-// what green means without touching a covered script. content.go is the //go:embed that
-// decides which repo file becomes which installed reviewer definition; it costs 0 additional
-// commits, as does Makefile.
+// Makefile, go.work, go.work.sum and content.go sit outside both packages and are here on the
+// same delayed-diff argument. .ttorch/validate.sh — the gate's validation authority, already
+// covered — does nothing but run `make lint` and `make test-fast`, so anything that redefines
+// what those two commands compile or run redefines what green means without touching a
+// covered script:
+//
+//	Makefile      redefines the targets themselves
+//	go.work       the toolchain AUTO-DISCOVERS it at the repo root via GOWORK, and its
+//	              `replace` directives OVERRIDE go.mod, so a committed one silently redirects
+//	              what `go test` compiles (verified: a go.work replace swapped a dependency's
+//	              implementation while go.mod and the real source were untouched)
+//	go.work.sum   inert without go.work, covered alongside it so the pair cannot drift
+//
+// content.go is the //go:embed that decides which repo file becomes which installed reviewer
+// definition. All of these cost 0 additional commits: in 196 commits none has ever been
+// touched without something already covered being touched too, and go.work and vendor/ have
+// never been touched at all.
 var gateConfigFiles = []string{
 	".ttorch/validate.sh",
 	"AGENTS.md",
@@ -87,6 +98,8 @@ var gateConfigFiles = []string{
 	"internal/orchestrator/audit.go",
 	"Makefile",
 	"content.go",
+	"go.work",
+	"go.work.sum",
 }
 
 // gateConfigPrefixes define the gate by path prefix, where the covered unit is a directory
@@ -121,6 +134,12 @@ var gateConfigFiles = []string{
 // ttorch-worker.md is deliberately excluded) be installed as a reviewer instead, through the
 // same delayed diff channel. 3 commits.
 //
+// vendor/ is the third way to change what `go test` compiles without touching a covered
+// script: with a consistent vendor/modules.txt the toolchain builds from vendor/ rather than
+// the module cache, so committed bytes there replace a dependency's implementation (verified
+// the same way as go.work). It is a whole directory, so a prefix is the honest unit. 0
+// commits in 196.
+//
 // .github/workflows/ is here because .ttorch/validate.sh on this repo runs only the FAST lane
 // and says so in its own header: the full suite, including the orchestrator e2e tests, runs in
 // CI as the required check. CI is therefore half of what "validated" means for this repo, and
@@ -137,6 +156,7 @@ var gateConfigPrefixes = []string{
 	"internal/validate/",
 	"internal/projectinit/",
 	"internal/installer/",
+	"vendor/",
 	".github/workflows/",
 }
 

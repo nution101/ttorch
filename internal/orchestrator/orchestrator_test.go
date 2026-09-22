@@ -1918,6 +1918,8 @@ func TestMatchesGateConfig(t *testing.T) {
 		{"the approval token", "internal/approval/approval.go", true},
 		{"the check runner", "internal/validate/validate.go", true},
 		{"the delivery-mode parser", "internal/projectinit/projectinit.go", true},
+		{"a workspace file", "go.work", true},
+		{"a vendored dependency", "vendor/example.com/dep/d.go", true},
 		{"the full-suite CI authority", ".github/workflows/ci.yml", true},
 
 		// Case-folding: both sides are folded, so a differently-cased spelling of a covered
@@ -1947,6 +1949,8 @@ func TestMatchesGateConfig(t *testing.T) {
 		{"the land queue", "internal/orchestrator/landqueue.go", false},
 		{"ordinary source elsewhere", "internal/cli/cli.go", false},
 		{"a non-workflow github file", ".github/CODEOWNERS", false},
+		{"the module file, deliberately not covered", "go.mod", false},
+		{"a directory that merely starts like vendor", "vendored/x.go", false},
 		{"a package that merely starts the same", "internal/reviewer/x.go", false},
 
 		// Folding must not widen the match past a same-file respelling.

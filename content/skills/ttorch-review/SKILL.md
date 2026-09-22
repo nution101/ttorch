@@ -163,6 +163,8 @@ invalidates the verdict — re-prep, re-review, re-record.
   | `internal/orchestrator/{gate,merge,validate,validatecache}.go` | the Go code that resolves, enforces and caches the decision |
   | `.github/workflows/**` | the full suite: `.ttorch/validate.sh` runs only the fast lane and defers to CI by name |
   | `Makefile` | `.ttorch/validate.sh` does nothing but run `make lint` and `make test-fast` |
+  | `go.work`, `go.work.sum` | auto-discovered via `GOWORK`; `replace` directives there override `go.mod`, so a committed one redirects what `go test` compiles |
+  | `vendor/**` | a consistent `vendor/` makes the toolchain build from it instead of the module cache |
   | `content.go`, `internal/installer/**` | decide which embedded file becomes which installed reviewer definition |
   | `internal/orchestrator/audit.go` | the merge record a trusted merge refuses to proceed without |
 
@@ -230,7 +232,10 @@ invalidates the verdict — re-prep, re-review, re-record.
     refusal, not the control-character refusal. Same pre-existing hole as the first bullet.
   - `go.mod` and `go.sum` are not in the covered set on this branch or on step 6, and a
     `replace` or `toolchain` directive changes what `go test` compiles. Named here so it is
-    not mistaken for coverage; adding it belongs to whoever owns that decision.
+    not mistaken for coverage; adding it belongs to whoever owns that decision. `go.work`,
+    `go.work.sum` and `vendor/` ARE covered — same class, but none of them exists in this
+    repo, so covering them costs nothing and their appearance in a diff is the event worth
+    seeing.
   - Git will not tell you. `git clone` warns about a collision; `git worktree add --detach` —
     what the gate uses to build the checkout it validates — exits 0 with nothing on stderr and
     silently drops the losing entry. The gate's own collision check is load-bearing, not a

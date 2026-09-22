@@ -246,9 +246,10 @@ passing commit-pinned verdict plus a fresh green validate auto-mints the approva
   `internal/orchestrator/{gate,merge,validate,validatecache,audit}.go` (the Go code that
   decides, including the audit record a trusted merge refuses to proceed without),
   `internal/installer/**` and `content.go` (which decide which embedded file becomes which
-  installed reviewer definition), `Makefile` (which `.ttorch/validate.sh` does nothing but
-  invoke), and `.github/workflows/**` (the full suite, which `.ttorch/validate.sh` defers to
-  by name because it runs only the fast lane). On
+  installed reviewer definition), `Makefile`, `go.work`, `go.work.sum` and `vendor/**` (which
+  between them decide what `make lint` and `make test-fast` actually compile and run), and
+  `.github/workflows/**` (the full suite, which `.ttorch/validate.sh` defers to by name
+  because it runs only the fast lane). On
   a **gated** merge (trusted mode, or any mode with `--require-verdict`) a human approval does
   not wave it through either: it needs `ttorch approve <id> --allow-gate-change`, and the
   merge audit line names the file.
@@ -447,8 +448,8 @@ path has no non-ASCII spelling of its own, but it is *reachable by* one, which i
 `Makeﬁle` attack. The test passed while the property it named did not hold. It is replaced by
 the filesystem-measured test above.
 
-`Makefile`, `content.go` and `internal/orchestrator/audit.go` each cost **zero** additional
-commits — in 196 commits none has ever been touched without something already covered being
+`Makefile`, `go.work`, `go.work.sum`, `vendor/**`, `content.go` and
+`internal/orchestrator/audit.go` each cost **zero** additional commits — in 196 commits none has ever been touched without something already covered being
 touched too — and each decides the gate. `.ttorch/validate.sh` is covered but does nothing
 except run `make lint` and `make test-fast`, so redefining those targets redefines green
 without touching a covered script. `content.go` is the `//go:embed` that maps a repo file onto
@@ -457,6 +458,18 @@ itself: covering `content/agents/ttorch-reviewer-*` while leaving the mapping op
 deliberately excluded file such as `content/agents/ttorch-worker.md` be installed as a reviewer
 instead. `audit.go` holds the only `writeAudit`, and `MergeLocal` refuses to merge when it
 fails, so one line there strips the record from every trusted merge.
+
+`go.work` and `vendor/` are covered although neither exists in this repo, and that is the
+reason rather than an exception to it. `.ttorch/validate.sh` runs `make lint` and
+`make test-fast`, which run `go test`, and three committed files change what `go test`
+compiles without touching the script or the Makefile: the toolchain auto-discovers a `go.work`
+at the repo root via `GOWORK` and its `replace` directives override `go.mod`; `go.work.sum` is
+inert alone but covered so the pair cannot drift; and a consistent `vendor/` makes the
+toolchain build from it instead of the module cache. Both mechanisms were verified by
+building against a substituted dependency while `go.mod` and the real source stayed untouched.
+Since none of them exists here, their appearance in a diff is exactly the event worth seeing,
+and `absentByDesign` in the test file records that so the dead-coverage check does not demand
+they exist.
 
 `internal/db/` is the one genuine cost judgement left out. It holds `Store.GetVerdict`, the row
 the merge trusts for `Overall == pass`; covering it costs 16 more commits (23/196 on its own,

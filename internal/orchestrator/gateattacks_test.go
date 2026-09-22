@@ -475,3 +475,82 @@ func TestGateGuard_PreExistingCollisionDoesNotBlock(t *testing.T) {
 		t.Fatalf("a collision already on the default branch must not block unrelated work, or the repo can never land the rename that fixes it; got: %s", hit.Reason)
 	}
 }
+
+// TestGateGuard_ToolchainRedirectNeedsAllowGateChange covers the third route to substituting
+// what the gate validates, after the Makefile and the covered directories.
+//
+// .ttorch/validate.sh runs `make lint` and `make test-fast`, which run `go test`. Three
+// committed files change what `go test` compiles without touching the script or the Makefile:
+//
+//   - go.work — the toolchain AUTO-DISCOVERS it at the repo root via GOWORK and its `replace`
+//     directives OVERRIDE go.mod. Verified outside this test: adding a go.work with a replace
+//     swapped a dependency's implementation while go.mod and the real source stayed untouched.
+//   - go.work.sum — inert on its own, covered so the pair cannot drift apart.
+//   - vendor/ — with a consistent vendor/modules.txt the toolchain builds from vendor/ rather
+//     than the module cache, so committed bytes there replace a dependency.
+//
+// None of these exists in this repo and none is expected to, which is the point: their
+// appearance in a diff is the event being guarded. They are a gate CHANGE rather than a
+// blocking refusal — unlike a path collision, a lead can legitimately want to vendor
+// dependencies or add a workspace, so the flag exists and the audit names the file.
+func TestGateGuard_ToolchainRedirectNeedsAllowGateChange(t *testing.T) {
+	for _, path := range []string{"go.work", "go.work.sum", "vendor/example.com/dep/d.go"} {
+		t.Run(path, func(t *testing.T) {
+			m, repo := deliveryHarness(t, "toolchain")
+			commitGateScript(t, repo, "exit 0")
+			if _, err := projectinit.Init(repo, "trusted"); err != nil {
+				t.Fatal(err)
+			}
+			gitIn(t, repo, "add", "-A")
+			gitIn(t, repo, "commit", "-q", "-m", "init")
+			task, err := m.Spawn("tc1", repo, false, "sleep 60")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _, _ = m.Teardown("tc1", true) }()
+			wt := task.Worktree
+			if dir := filepath.Dir(filepath.FromSlash(path)); dir != "." {
+				if err := os.MkdirAll(filepath.Join(wt, dir), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(filepath.Join(wt, filepath.FromSlash(path)), []byte("redirected\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			gitIn(t, wt, "add", "-A")
+			gitIn(t, wt, "commit", "-q", "-m", "add "+path)
+			head := gitIn(t, wt, "rev-parse", "HEAD")
+			writeReviewReports(t, m.P.ReviewInputsDir("tc1"), head, nil)
+			if _, err := m.TrustRecord("tc1", "", time.Minute); err != nil {
+				t.Fatal(err)
+			}
+			if approval.Valid(m.P.ApprovalFile("tc1")) {
+				t.Fatalf("%s redirects what `go test` compiles; it must not auto-approve", path)
+			}
+			if err := m.Approve("tc1", time.Minute, false); err != nil {
+				t.Fatal(err)
+			}
+			defHead := gitIn(t, repo, "rev-parse", "HEAD")
+			_, err = m.MergeLocal("tc1", false)
+			if err == nil {
+				t.Fatalf("a plain approval must not authorize %s", path)
+			}
+			if !strings.Contains(err.Error(), path) {
+				t.Fatalf("the refusal must name %s, got: %v", path, err)
+			}
+			if gitIn(t, repo, "rev-parse", "HEAD") != defHead {
+				t.Fatalf("%s must not have merged", path)
+			}
+			// Unlike a collision, this IS something a lead can legitimately authorize.
+			if err := m.Approve("tc1", time.Minute, true); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := m.MergeLocal("tc1", false); err != nil {
+				t.Fatalf("--allow-gate-change should let %s merge: %v", path, err)
+			}
+			if b, _ := os.ReadFile(m.P.AuditLog()); !strings.Contains(string(b), "gate-change="+path) {
+				t.Fatalf("the merge audit line must name %s: %s", path, b)
+			}
+		})
+	}
+}

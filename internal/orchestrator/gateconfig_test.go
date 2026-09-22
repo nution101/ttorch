@@ -148,27 +148,73 @@ func TestGateConfigCoversTheDecidingCode(t *testing.T) {
 	}
 }
 
-// TestGateConfigFilesAreRealPaths guards the other direction: an entry that names nothing
-// is dead coverage that reads as protection. The two repo-local config entries are exempt —
-// .ttorch/validate.sh and AGENTS.md describe every managed repo, not this one, and a repo
-// legitimately may not have them yet.
+// absentByDesign are covered entries that do NOT exist in this repo and are not expected to.
+// Each is exempt from the dead-coverage check below for a stated reason, so the exemption is
+// a decision on the record rather than a quiet hole in it.
+var absentByDesign = map[string]string{
+	".ttorch/validate.sh": "describes every managed repo, not this one; a repo may not have one yet",
+	"AGENTS.md":           "same — the repo-local delivery-mode config",
+
+	// These three are covered PRECISELY BECAUSE they should not exist. Each silently changes
+	// what `go test` compiles, which is what .ttorch/validate.sh runs via `make test-fast`,
+	// so a worker introducing one substitutes the thing the gate validates against. Their
+	// appearance in a diff is the event being guarded, so requiring them to exist would
+	// invert the test.
+	"go.work":     "auto-discovered via GOWORK; its replace directives override go.mod",
+	"go.work.sum": "inert without go.work, covered alongside it so the pair cannot drift",
+	"vendor/":     "a consistent vendor/ makes the toolchain build from it instead of the module cache",
+}
+
+// TestGateConfigFilesAreRealPaths guards the other direction: an entry that names nothing is
+// dead coverage that reads as protection. Entries in absentByDesign are exempt, and the test
+// also fails if one of THOSE turns up — an entry justified as "should not exist" that now
+// exists needs its reason rechecked, not silently kept.
 func TestGateConfigFilesAreRealPaths(t *testing.T) {
 	root := repoRootForGateConfig(t)
+	exists := func(rel string) bool {
+		_, err := os.Stat(filepath.Join(root, filepath.FromSlash(strings.TrimSuffix(rel, "/"))))
+		return err == nil
+	}
 	for _, f := range gateConfigFiles {
-		if f == ".ttorch/validate.sh" || f == "AGENTS.md" {
+		if _, exempt := absentByDesign[f]; exempt {
 			continue
 		}
-		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(f))); err != nil {
-			t.Errorf("gateConfigFiles names %s, which does not exist: %v", f, err)
+		if !exists(f) {
+			t.Errorf("gateConfigFiles names %s, which does not exist. Either it is dead coverage, or it belongs in absentByDesign with a reason.", f)
 		}
 	}
 	for _, p := range gateConfigPrefixes {
+		if _, exempt := absentByDesign[p]; exempt {
+			continue
+		}
 		dir := p
 		if !strings.HasSuffix(p, "/") { // a filename prefix: check its directory
 			dir = path0Dir(p)
 		}
-		if fi, err := os.Stat(filepath.Join(root, filepath.FromSlash(strings.TrimSuffix(dir, "/")))); err != nil || !fi.IsDir() {
-			t.Errorf("gateConfigPrefixes names %s, whose directory does not exist: %v", p, err)
+		fi, err := os.Stat(filepath.Join(root, filepath.FromSlash(strings.TrimSuffix(dir, "/"))))
+		if err != nil || !fi.IsDir() {
+			t.Errorf("gateConfigPrefixes names %s, whose directory does not exist. Either it is dead coverage, or it belongs in absentByDesign with a reason.", p)
+		}
+	}
+	// Every exemption must still be a covered entry, and the three "should not exist" ones
+	// must still not exist.
+	covered := map[string]bool{}
+	for _, f := range gateConfigFiles {
+		covered[f] = true
+	}
+	for _, p := range gateConfigPrefixes {
+		covered[p] = true
+	}
+	for entry, why := range absentByDesign {
+		if !covered[entry] {
+			t.Errorf("absentByDesign exempts %s, which is not in the covered set at all", entry)
+			continue
+		}
+		if entry == ".ttorch/validate.sh" || entry == "AGENTS.md" {
+			continue // these two may legitimately exist here; they do
+		}
+		if exists(entry) {
+			t.Errorf("%s now exists in this repo, but it is covered on the grounds that it should not (%s). Recheck the reason before keeping the exemption.", entry, why)
 		}
 	}
 }
@@ -218,6 +264,9 @@ func TestMergeLocal_DecidingCodeChangeNeedsAllowGateChange(t *testing.T) {
 		{"the check runner", "internal/validate/validate.go", true},
 		{"the delivery-mode parser", "internal/projectinit/projectinit.go", true},
 		{"the full-suite CI authority", ".github/workflows/ci.yml", true},
+		{"a workspace file", "go.work", true},
+		{"the workspace checksums", "go.work.sum", true},
+		{"a vendored dependency", "vendor/example.com/dep/d.go", true},
 		{"CONTROL: ordinary source", "internal/cli/cli.go", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
