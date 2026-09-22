@@ -51,6 +51,15 @@ func (m *Manager) Validate(taskID string) ([]validate.Result, error) {
 // (whether the gate runs at all) and "CLAUDE.md" — exists in every ttorch-managed repo and
 // takes effect on the very next gate run.
 //
+// ".ttorch/validate.sh" is ALSO matched by the ".ttorch/" prefix, and the redundancy is
+// deliberate for the same reason AGENTS.md is named twice: it is the gate's validation
+// authority, and narrowing the prefix later must not silently drop it.
+//
+// "content.go" is a separate exact entry because the "content/" prefix does NOT match it —
+// no trailing slash means "content/" and "content.go" share no prefix relationship. It is
+// cited throughout as the reason the content/ tree is covered at all, so it must not be left
+// to look as though the prefix already covers it.
+//
 // CLAUDE.md is here because in a managed repo it is a SYMLINK to AGENTS.md, and the guard
 // matches the LINK's own path, not what it resolves to. A commit that deletes the symlink and
 // writes a real CLAUDE.md reports the changed path "CLAUDE.md", which is not "AGENTS.md" and
@@ -113,6 +122,8 @@ var gateConfigFiles = []string{
 	".ttorch/validate.sh",
 	"AGENTS.md",
 	"CLAUDE.md",
+	"docs/install.sh",
+	"docs/install.ps1",
 	"internal/orchestrator/gate.go",
 	"internal/orchestrator/merge.go",
 	"internal/orchestrator/validate.go",
@@ -159,6 +170,28 @@ var gateConfigFiles = []string{
 // ttorch-worker.md is deliberately excluded) be installed as a reviewer instead, through the
 // same delayed diff channel. 3 commits.
 //
+// .ttorch/ is a PREFIX rather than the single ".ttorch/validate.sh" it used to be, and this
+// inversion closes a class rather than a file. The channel that forced it:
+// .ttorch/learnings.jsonl is the per-repo lessons ledger, learnings.Apply renders it into
+// AGENTS.md between markers (learnings.go's writeBlock), Promoted admits any entry that is
+// pinned or has been seen twice, Render emits "- " + e.Text VERBATIM up to 20 entries, and
+// content/skills/ttorch-manager/SKILL.md has the manager run `ttorch learn` at every
+// delivery. So a committed ledger transplants attacker-chosen text into AGENTS.md — the one
+// file this guard treats as the gate's own configuration — on the merge alone, with no build
+// and no install. The ledger is not gitignored.
+//
+// Adding "learnings.jsonl" as a second exact path would have left the NEXT .ttorch/ file in
+// exactly the same position. An enumerated subset of content/ had already missed installed
+// files twice, and an enumerated subset of .ttorch/ then missed the ledger; covering the tree
+// covers everything under it, including files that do not exist yet. In 196 commits the only
+// .ttorch/ path ever committed is validate.sh, so the prefix costs 0 marginal. .ttorch/task —
+// the only other file that shows up locally — is gitignored so it cannot appear in a diff, and
+// that needed FIXING as part of this change: it was excluded only through .git/info/exclude,
+// which is local to a clone and does not travel. The manager writes that file into every
+// worker worktree, so in a fresh clone a worker's `git add -A` would have staged it and this
+// prefix would have refused the merge on every task. TestTtorchRuntimeFileIsIgnored holds the
+// .gitignore line so that false positive cannot come back quietly.
+//
 // .claude/ and .mcp.json are PROJECT-level agent configuration, and this is the strongest
 // version of the content/agents argument rather than a weaker one. A landed
 // .claude/agents/ttorch-reviewer-security.md REPLACES the security reviewer for every later
@@ -173,6 +206,19 @@ var gateConfigFiles = []string{
 // the module cache, so committed bytes there replace a dependency's implementation (verified
 // the same way as go.work). It is a whole directory, so a prefix is the honest unit. 0
 // commits in 196.
+//
+// docs/install.sh and docs/install.ps1 are in on a DIFFERENT argument from everything above,
+// named as such so the flag keeps one meaning. They do not decide how a change is reviewed or
+// validated. README publishes them by raw URL — `curl … /main/docs/install.sh | sh` and
+// `irm … /main/docs/install.ps1 | iex` — so a merge changes bytes that users pipe straight
+// into a shell, with no build, no install and no release step in between. That is the same
+// delayed out-of-band effect that justifies the rest of the set, with the most severe
+// consequence of any file in the repo, and covering one platform's installer but not the
+// other would be an obvious gap. Together they cost 3 commits.
+//
+// So the covered set answers two questions, not one: what decides how a change is REVIEWED or
+// VALIDATED, and what a merge PUBLISHES DIRECTLY to users. Anything outside both is not
+// covered however alarming it looks, which is what keeps the flag legible.
 //
 // .github/workflows/ is here because .ttorch/validate.sh on this repo runs only the FAST lane
 // and says so in its own header: the full suite, including the orchestrator e2e tests, runs in
@@ -192,6 +238,7 @@ var gateConfigPrefixes = []string{
 	"internal/installer/",
 	"vendor/",
 	".claude/",
+	".ttorch/",
 	".github/workflows/",
 }
 

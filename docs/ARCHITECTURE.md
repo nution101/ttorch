@@ -237,7 +237,7 @@ passing commit-pinned verdict plus a fresh green validate auto-mints the approva
   own gate), and a repo with **no checks detected is a hard block**, never a pass. Without
   the script, the trusted auto-merge is refused and a human `ttorch approve` is required.
 - A trusted auto-merge **cannot change a gate-definition file**; such a diff is refused. The
-  covered set is `.ttorch/validate.sh`, plus `AGENTS.md` and `CLAUDE.md` **at any depth** (the
+  covered set is `.ttorch/**`, plus `AGENTS.md` and `CLAUDE.md` **at any depth** (the
   repo-local gate config and the agent instructions, present in every managed repo),
   `.claude/**` and `.mcp.json` (project-level agent config), `go.mod`, `go.sum`,
   `content/skills/**` and `content/agents/ttorch-reviewer-*` (which
@@ -251,7 +251,8 @@ passing commit-pinned verdict plus a fresh green validate auto-mints the approva
   installed reviewer definition), `Makefile`, `go.work`, `go.work.sum` and `vendor/**` (which
   between them decide what `make lint` and `make test-fast` actually compile and run), and
   `.github/workflows/**` (the full suite, which `.ttorch/validate.sh` defers to by name
-  because it runs only the fast lane). On
+  because it runs only the fast lane), and `docs/install.sh` and `docs/install.ps1` (which
+  README tells users to pipe into a shell). On
   a **gated** merge (trusted mode, or any mode with `--require-verdict`) a human approval does
   not wave it through either: it needs `ttorch approve <id> --allow-gate-change`, and the
   merge audit line names the file.
@@ -275,8 +276,8 @@ rather than by what sounds prudent. Measured over the **196 non-merge commits re
 
 | Covered group | commits touching it | marginal, given the rest |
 |---|---|---|
-| `.ttorch/validate.sh`, `AGENTS.md` (the original guard) | 10 | +1 |
-| `content/skills/**`, `content/agents/ttorch-reviewer-*` | 36 | +25 |
+| `.ttorch/**`, `AGENTS.md` (the original guard, now a prefix) | 10 | +1 |
+| `content/skills/**`, `content/agents/ttorch-reviewer-*` | 36 | +23 |
 | `CLAUDE.md`, and `AGENTS.md`/`CLAUDE.md` at any depth | 9 | +0 |
 | `.claude/**`, `.mcp.json` | 0 | +0 |
 | `internal/review/**` | 7 | +4 |
@@ -289,12 +290,13 @@ rather than by what sounds prudent. Measured over the **196 non-merge commits re
 | `go.work`, `go.work.sum`, `vendor/**` | 0 | +0 |
 | `go.mod`, `go.sum` | 5 | +2 |
 | `.github/workflows/**` | 9 | +5 |
-| **the whole set** | **73 / 196 = 37%** | |
+| `docs/install.sh`, `docs/install.ps1` | 7 | +3 |
+| **the whole set** | **76 / 196 = 39%** | |
 
 Two columns because one number cannot carry it. "Commits touching it" is that group in
 isolation; "marginal" is what it adds *given everything else already covered*, which is the
 figure that matters when deciding whether to include something. They differ a lot —
-`content/skills/**` is 36 commits alone but +25 marginal, and `CLAUDE.md` is 9 alone but +0,
+`content/skills/**` is 36 commits alone but +23 marginal, and `CLAUDE.md` is 9 alone but +0,
 because every commit that touched it touched something else covered too. An earlier version of
 this table mixed two baselines row by row and was not coherent; these are all one definition.
 
@@ -302,15 +304,15 @@ Rejected, measured against that same set:
 
 | Rejected | commits | share |
 |---|---|---|
-| + `internal/db/` | 88 | 45% |
-| + `internal/orchestrator/**` and `internal/review/**` wholesale | 121 | 62% |
+| + `internal/db/` | 91 | 46% |
+| + `internal/orchestrator/**` and `internal/review/**` wholesale | 124 | 63% |
 
 (An earlier count of this corpus reported 9 and 43 for the first two groups; the difference is
 the root commit, which `git diff-tree` skips without `--root`. It changes no conclusion.)
 
 The second rejected row is the answer to "why not just cover the packages".
 `internal/orchestrator/` alone is 78 of the 196 commits — spawn, the land queue, the scheduler
-wiring, the overlap planner — and covering it wholesale puts **62% of every change** behind
+wiring, the overlap planner — and covering it wholesale puts **63% of every change** behind
 the flag. A flag that fires on most commits is not a signal; it is a formality, and it
 launders a real gate change through a habit. The five files that actually resolve, enforce,
 cache and record the decision are +5 marginal instead.
@@ -487,6 +489,40 @@ deliberately excluded file such as `content/agents/ttorch-worker.md` be installe
 instead. `audit.go` holds the only `writeAudit`, and `MergeLocal` refuses to merge when it
 fails, so one line there strips the record from every trusted merge.
 
+`.ttorch/**` is a **prefix**, not the single `.ttorch/validate.sh` it started as, and the
+inversion closes a class rather than a file. What forced it: `.ttorch/learnings.jsonl` is the
+per-repo lessons ledger, `learnings.Apply` renders it into `AGENTS.md` between markers,
+`Promoted` admits any entry that is pinned or has been seen twice, `Render` emits
+`"- " + e.Text` verbatim up to 20 entries, and the ttorch-manager skill has the manager run
+`ttorch learn` at **every delivery**. So a committed ledger transplants attacker-chosen text
+into `AGENTS.md` — the one file this guard treats as the gate's own configuration — on the
+merge alone, with no build and no install, and the ledger is not gitignored.
+
+Adding `learnings.jsonl` as a second exact path would have left the *next* `.ttorch/` file in
+exactly the same position. This is the third time an enumerated subset has been the bug:
+`content/` missed installed files twice, then `.ttorch/` missed the ledger. Covering the tree
+covers what is not there yet. In 196 commits the only `.ttorch/` path ever committed is
+`validate.sh`, so the prefix costs 0 marginal. `.ttorch/task` — the only other file that
+appears locally — is gitignored so it cannot reach a diff, and that had to be *fixed* here:
+it was excluded only through `.git/info/exclude`, which is local to a clone and does not
+travel. The manager writes that file into every worker worktree, so in a fresh clone a
+worker's `git add -A` would have staged it and this prefix would have refused the merge on
+every task. `TestTtorchRuntimeFileIsIgnored` holds the `.gitignore` line so the false
+positive cannot come back quietly.
+
+`docs/install.sh` and `docs/install.ps1` are in on a **different argument** from everything
+else, named as such so the flag keeps one meaning. They do not decide how a change is reviewed
+or validated. README publishes them by raw URL — `curl … /main/docs/install.sh | sh` and
+`irm … /main/docs/install.ps1 | iex` — so a merge changes bytes users pipe straight into a
+shell, with no build, no install and no release step in between. That is the same delayed
+out-of-band effect that justifies the rest of the set, carrying the most severe consequence of
+any file here, and covering one platform's installer but not the other would be an obvious
+gap. Together +3 commits.
+
+So the covered set answers **two** questions, not one: what decides how a change is reviewed
+or validated, and what a merge publishes directly to users. Anything outside both stays out
+however alarming it looks — that is what keeps the flag legible.
+
 `.claude/**` and `.mcp.json` are the strongest form of the `content/agents` argument rather
 than a weaker one. Claude Code loads **project-level** `.claude/agents/`, and project-level
 takes documented precedence over `~/.claude/agents/` on a name collision, so a landed
@@ -545,7 +581,7 @@ they exist.
 
 `internal/db/` is the one genuine cost judgement left out. It holds `Store.GetVerdict`, the row
 the merge trusts for `Overall == pass`; covering it costs 15 more commits (23/196 on its own,
-taking the set to 45%). Excluded on cost, recorded here and in the skill so it reads as a
+taking the set to 46%). Excluded on cost, recorded here and in the skill so it reads as a
 decision rather than an omission.
 
 `.github/workflows/**` is in for a different reason. The trusted gate never consults CI, which
@@ -555,7 +591,7 @@ CI as the required check. CI is therefore half of what "validated" means here, a
 `ci.yml` weakens every later change's validation through the same delayed diff channel that
 put the skills on the list. It costs 5 commits.
 
-What the numbers do not fix: at 37%, roughly one merge in three in this repo needs
+What the numbers do not fix: at 39%, roughly two merges in five in this repo need
 `--allow-gate-change`, and the flag is a boolean. A lead who passes it by reflex authorizes
 exactly as much as one who read the diff. The audit line naming the file survives either way,
 which is the guard's durable half. Making the flag take the expected paths — so a bare

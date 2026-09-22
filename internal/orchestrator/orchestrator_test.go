@@ -1900,6 +1900,10 @@ func TestMatchesGateConfig(t *testing.T) {
 		want bool
 	}{
 		{"the validate script", ".ttorch/validate.sh", true},
+		{"the learnings ledger, which writes into AGENTS.md", ".ttorch/learnings.jsonl", true},
+		{"anything else under .ttorch/", ".ttorch/offload/run.sh", true},
+		{"the published shell installer", "docs/install.sh", true},
+		{"the published powershell installer", "docs/install.ps1", true},
 		{"the delivery-mode config", "AGENTS.md", true},
 		{"the symlink to it that every session loads", "CLAUDE.md", true},
 		{"the gate procedure skill", "content/skills/ttorch-review/SKILL.md", true},
@@ -1955,6 +1959,10 @@ func TestMatchesGateConfig(t *testing.T) {
 		{"a file merely mentioning agents", "docs/AGENTS-guide.md", false},
 		{"a directory that merely starts like .claude", ".claude-backup/x.md", false},
 		{"a validate script somewhere else", "sub/.ttorch/validate.sh", false},
+		{"a ledger somewhere else", "sub/.ttorch/learnings.jsonl", false},
+		{"a directory that merely starts like .ttorch", ".ttorch-backup/x.sh", false},
+		{"ordinary docs prose", "docs/ONBOARDING.md", false},
+		{"a doc that merely mentions install", "docs/installing.md", false},
 		{"a directory that merely starts the same", "contents/skills/x.md", false},
 		{"ordinary orchestrator source", "internal/orchestrator/spawn.go", false},
 		{"the land queue", "internal/orchestrator/landqueue.go", false},

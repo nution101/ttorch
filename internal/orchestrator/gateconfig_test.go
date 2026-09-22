@@ -153,10 +153,11 @@ func TestGateConfigCoversTheDecidingCode(t *testing.T) {
 // absentByDesign are covered entries that do NOT exist in this repo and are not expected to.
 // Each is exempt from the dead-coverage check below for a stated reason, so the exemption is
 // a decision on the record rather than a quiet hole in it.
+//
+// It used to also carry .ttorch/validate.sh and AGENTS.md on the grounds that they "describe
+// every managed repo, not this one". Both are tracked HERE, so those exemptions were dead and
+// only weakened the check; they are gone and the dead-coverage test is stricter for it.
 var absentByDesign = map[string]string{
-	".ttorch/validate.sh": "describes every managed repo, not this one; a repo may not have one yet",
-	"AGENTS.md":           "same — the repo-local delivery-mode config",
-
 	// These three are covered PRECISELY BECAUSE they should not exist. Each silently changes
 	// what `go test` compiles, which is what .ttorch/validate.sh runs via `make test-fast`,
 	// so a worker introducing one substitutes the thing the gate validates against. Their
@@ -261,10 +262,6 @@ func TestGateConfigFilesAreRealPaths(t *testing.T) {
 		if !covered[entry] {
 			t.Errorf("absentByDesign exempts %q, which is not in the covered set at all", entry)
 			continue
-		}
-		switch entry {
-		case ".ttorch/validate.sh", "AGENTS.md":
-			continue // these two may legitimately exist here; they do
 		}
 		if covers(entry) {
 			t.Errorf("%q is now tracked in this repo, but it is covered on the grounds that it should not be (%s). Recheck the reason before keeping the exemption.", entry, why)
@@ -712,5 +709,41 @@ func TestTrailingNFDWouldBeAFalsePositive(t *testing.T) {
 		if filesCollide(t, dir, a, b) {
 			t.Errorf("the filesystem DOES collide %q/%q, so merging them would be correct and the comment is wrong", a, b)
 		}
+	}
+}
+
+// TestTtorchRuntimeFileIsIgnored is the false-positive bound on making .ttorch/ a prefix.
+//
+// The manager writes .ttorch/task into every worker worktree. It was excluded only through
+// .git/info/exclude, which is local to a clone and does not travel — so in a fresh clone a
+// worker's `git add -A` would stage it, and the .ttorch/ prefix would then refuse the merge as
+// a gate-config change, on every task. It is in .gitignore now so it cannot reach a diff.
+//
+// If someone removes that line, this fails rather than the guard starting to refuse ordinary
+// work for a reason nobody would connect to this change.
+func TestTtorchRuntimeFileIsIgnored(t *testing.T) {
+	root := repoRootForGateConfig(t)
+	// Read .gitignore directly rather than asking `git check-ignore`, which would also be
+	// satisfied by this clone's local .git/info/exclude — the very thing that misled us.
+	b, err := os.ReadFile(filepath.Join(root, ".gitignore"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, line := range strings.Split(string(b), "\n") {
+		if strings.TrimSpace(line) == ".ttorch/task" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error(".gitignore no longer ignores .ttorch/task. The manager writes it into every " +
+			"worker worktree, and matchesGateConfig covers .ttorch/ by prefix, so a worker's " +
+			"`git add -A` would stage it and the gate would refuse the merge as a gate-config " +
+			"change. Restore the line, or narrow the prefix and re-measure.")
+	}
+	// And the guard really would trip on it, which is why the ignore matters.
+	if !matchesGateConfig(".ttorch/task") {
+		t.Error(".ttorch/task is no longer covered by the guard; this test's premise is stale")
 	}
 }

@@ -152,12 +152,13 @@ invalidates the verdict — re-prep, re-review, re-record.
 
   | Covered | Why it is the gate |
   |---|---|
-  | `.ttorch/validate.sh` | what "green" means for this repo |
+  | `.ttorch/**` | `validate.sh` is what "green" means, and `learnings.jsonl` is rendered verbatim into `AGENTS.md` by `ttorch learn` at every delivery |
   | `AGENTS.md` | whether the gate runs at all (`projectinit.ReadMode`) |
   | `CLAUDE.md` | a **symlink** to `AGENTS.md`; replacing it with a real file reports only `CLAUDE.md`, and it is the instruction file every session loads, manager included |
   | `AGENTS.md` / `CLAUDE.md` **at any depth** | a nested one loads on demand for its directory, so it is an instruction file too |
   | `.claude/**`, `.mcp.json` | project-level agent config: a landed `.claude/agents/ttorch-reviewer-security.md` **replaces** the security reviewer, with no build and no install |
   | `go.mod`, `go.sum` | a `replace` redirects what `make test-fast` compiles — including `golang.org/x/text`, which the guard's own path folding now depends on |
+  | `docs/install.sh`, `docs/install.ps1` | README tells users to pipe these into a shell; a merge changes those bytes with no build and no release step |
   | `content/skills/**` | the ttorch-review, ttorch-manager and ttorch-validate procedures — **including this file** |
   | `content/agents/ttorch-reviewer-*` | the adversarial reviewers' own definitions |
   | `internal/review/**` | the findings contract, the severity-to-block rule, and the classifier that picks which reviewers run |
@@ -169,7 +170,7 @@ invalidates the verdict — re-prep, re-review, re-record.
   | `Makefile` | `.ttorch/validate.sh` does nothing but run `make lint` and `make test-fast` |
   | `go.work`, `go.work.sum` | auto-discovered via `GOWORK`; `replace` directives there override `go.mod`, so a committed one redirects what `go test` compiles |
   | `vendor/**` | a consistent `vendor/` makes the toolchain build from it instead of the module cache |
-  | `content.go`, `internal/installer/**` | decide which embedded file becomes which installed reviewer definition |
+  | `content.go`, `internal/installer/**` | decide which embedded file becomes which installed reviewer definition. `content.go` is a separate exact entry — the `content/` prefix does **not** match it |
   | `internal/orchestrator/audit.go` | the merge record a trusted merge refuses to proceed without |
 
   `content/skills/` and `content/agents/ttorch-reviewer-*` are embedded by `content.go` and
@@ -256,8 +257,11 @@ invalidates the verdict — re-prep, re-review, re-record.
     `TestOrchestratorFilesAreClassified` catches a NEW file nobody classified. Neither notices
     a new deciding function added inside a file already judged non-deciding. That stays a
     review responsibility.
-  - The flag is a boolean, so the cheapest way to defeat the guard is habit. 73 of this repo's
-    196 non-merge commits (37%) now trip it, and a lead who passes the flag without reading
+  - The covered set answers TWO questions, not one: what decides how a change is reviewed or
+    validated, and what a merge publishes directly to users (the two installers, and only
+    those). Anything outside both is not covered however alarming it looks.
+  - The flag is a boolean, so the cheapest way to defeat the guard is habit. 76 of this repo's
+    196 non-merge commits (39%) now trip it, and a lead who passes the flag without reading
     has given exactly the same authorization as one who read. What survives that is the audit
     line, which names the file either way. Making the flag take the expected paths, so a bare
     `--allow-gate-change` stops working, is the obvious next step and is not done here.

@@ -5,3 +5,9 @@
 *.out
 coverage.*
 .DS_Store
+
+# Per-worktree runtime file the manager writes into every worker checkout. It was only ever
+# excluded locally via .git/info/exclude, which does not travel with a clone — so in a fresh
+# clone `git add -A` in a worker stages it, and the trust gate's .ttorch/ guard then refuses
+# the merge as a gate-config change. Ignore it in-repo so that cannot happen.
+.ttorch/task
