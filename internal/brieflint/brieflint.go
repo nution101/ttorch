@@ -103,6 +103,10 @@ type Report struct {
 	// skipped is how many rules --offline skipped. Tracked apart from the project's
 	// disables so a summary line can name the real reason a rule did not run.
 	skipped int
+	// refused is set when the run stopped before any rule could run, for a reason that is
+	// not a project disable: today, a brief over MaxBriefBytes. Without it the summary
+	// attributed those rules to the project's config, which had disabled nothing.
+	refused bool
 }
 
 // Violations counts the StatusFail findings.
@@ -143,8 +147,11 @@ func (r Report) Evaluated() int { return r.evaluated }
 func (r Report) Total() int { return len(rules) }
 
 // Skipped is how many rules Options.Offline skipped. Total-Evaluated-Skipped is how many
-// the project disabled.
+// the project disabled, unless Refused, in which case no rule was reached at all.
 func (r Report) Skipped() int { return r.skipped }
+
+// Refused reports a run that stopped before any rule could run, for a reason of its own.
+func (r Report) Refused() bool { return r.refused }
 
 // MaxBriefBytes caps the text one run will read. A brief is untrusted input and the text
 // rules are linear in its size, so this is a bound on the work rather than a judgement about
@@ -291,11 +298,14 @@ func Lint(text string, opt Options) Report {
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	if len(text) > MaxBriefBytes {
-		return Report{Findings: []Finding{{
-			Rule:   RuleConfig,
-			Status: StatusIndeterminate,
-			Detail: fmt.Sprintf("the brief is %d bytes, over the %d byte limit, so nothing was checked: a lint that reads part of a brief cannot report on the whole of it", len(text), MaxBriefBytes),
-		}}}
+		return Report{
+			refused: true,
+			Findings: []Finding{{
+				Rule:   RuleConfig,
+				Status: StatusIndeterminate,
+				Detail: fmt.Sprintf("the brief is %d bytes or more, over the %d byte limit, so nothing was checked: a lint that reads part of a brief cannot report on the whole of it", len(text), MaxBriefBytes),
+			}},
+		}
 	}
 	b := parse(text)
 	var rep Report

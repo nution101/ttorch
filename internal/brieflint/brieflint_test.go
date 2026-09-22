@@ -1246,6 +1246,10 @@ func TestBriefOverTheSizeCapIsRefused(t *testing.T) {
 	if f := r.Findings[0]; !strings.Contains(f.Detail, "over the") || !strings.Contains(f.Detail, "nothing was checked") {
 		t.Errorf("the refusal must state the limit and that nothing ran: %q", f.Detail)
 	}
+	// And it must not be reported as a project disable: nothing was disabled.
+	if !r.Refused() {
+		t.Error("a size refusal must be distinguishable from a project disabling every rule")
+	}
 }
 
 // The text rules honour the budget they accept. They were given a context they never read,

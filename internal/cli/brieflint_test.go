@@ -2,6 +2,7 @@ package cli
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -401,5 +402,26 @@ func TestLintBriefForAddNamesNoWrongReason(t *testing.T) {
 	}
 	if !strings.Contains(out, "1 skipped for --offline") {
 		t.Errorf("the add note must carry the real reason:\n%s", out)
+	}
+}
+
+// A brief over the cap is refused with the FILE's size, not the size of the capped read, and
+// the coverage line must not blame a project that disabled nothing.
+func TestCmdBriefLintRefusesAnOversizeBrief(t *testing.T) {
+	repo := lintRepo(t)
+	path := filepath.Join(t.TempDir(), "big.md")
+	body := cleanBrief + strings.Repeat("filler text that says nothing. ", (brieflint.MaxBriefBytes/31)+2000)
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := captureStdout(t, func() error { return cmdBriefLint([]string{path, "--repo", repo}) })
+	if got := exitOf(t, err); got != exitLintIndeterminate {
+		t.Fatalf("an oversize brief must be unevaluable, got exit %d (%v)\n%s", got, err, out)
+	}
+	if !strings.Contains(err.Error(), fmt.Sprint(len(body))) {
+		t.Errorf("the refusal must state the file's real size (%d), got %v", len(body), err)
+	}
+	if strings.Contains(err.Error(), "disabled by project config") {
+		t.Errorf("a size refusal must not be reported as a project disable: %v", err)
 	}
 }

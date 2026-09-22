@@ -80,6 +80,15 @@ func cmdBriefLint(args []string) error {
 	if err != nil {
 		return lintError{fmt.Sprintf("brief-lint: reading %s: %v", path, err), exitLintUsage}
 	}
+	if len(text) > brieflint.MaxBriefBytes {
+		// Lint refuses this too, but it can only report the bytes it was handed, and this
+		// path hands it a truncated read. Report the file's real size.
+		size := int64(len(text))
+		if fi, statErr := os.Stat(path); statErr == nil {
+			size = fi.Size()
+		}
+		return lintError{fmt.Sprintf("brief-lint: %s is %d bytes, over the %d byte limit; nothing was checked, because a lint that reads part of a brief cannot report on the whole of it", path, size, brieflint.MaxBriefBytes), exitLintIndeterminate}
+	}
 	if strings.TrimSpace(string(text)) == "" {
 		return lintError{fmt.Sprintf("brief-lint: %s is empty", path), exitLintUsage}
 	}
@@ -163,6 +172,11 @@ func coverage(rep brieflint.Report) string {
 	s := fmt.Sprintf("%d of %d rules ran", rep.Evaluated(), rep.Total())
 	// Name the real reason. Reporting an --offline skip as a project disable would send a
 	// reader to an AGENTS.md that never mentioned the rule.
+	if rep.Refused() {
+		// Nothing was disabled and nothing was skipped: the run refused the brief before
+		// any rule was reached, and saying otherwise sends the reader to AGENTS.md.
+		return s + " (the brief was not checked)"
+	}
 	var why []string
 	if n := rep.Total() - rep.Evaluated() - rep.Skipped(); n > 0 {
 		why = append(why, fmt.Sprintf("%d disabled by project config", n))
