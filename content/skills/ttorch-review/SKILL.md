@@ -217,6 +217,43 @@ invalidates the verdict — re-prep, re-review, re-record.
   directory symlink can introduce files git never lists by path, and refusing all of them
   would fire on ordinary layout.
 
+- **The covered set is NOT the same in every repo.** Half of it is ttorch's own source, and
+  in your repo those paths mean something else. `content/` is the clearest: here it is
+  ttorch's embedded payload, but it is also where Hugo, Next and most CMS layouts keep
+  articles, so gating on it would demand `--allow-gate-change` for every ordinary change.
+  `internal/review/` and `internal/validate/` are ordinary Go package names.
+
+  `resolveGateScope` decides from the repository, not its name: a Go `//go:embed` rooted at
+  `content`, read from the BASE commit's raw blob so a worker's branch cannot change the
+  answer, and so no `.gitattributes` can change what git reports about it. It fails closed,
+  treating an unreadable repo as ttorch's own source.
+
+  ```gate-ttorch-source-only
+  content/
+  content.go
+  docs/install.sh
+  docs/install.ps1
+  internal/review/
+  internal/approval/
+  internal/validate/
+  internal/projectinit/
+  internal/installer/
+  internal/skills/
+  internal/orchestrator/gate.go
+  internal/orchestrator/merge.go
+  internal/orchestrator/validate.go
+  internal/orchestrator/validatecache.go
+  internal/orchestrator/audit.go
+  internal/orchestrator/gateattacks_test.go
+  internal/orchestrator/gateconfig_test.go
+  ```
+
+  Everything else in the covered table above is universal and applies wherever ttorch gates:
+  `.ttorch/**`, `AGENTS.md`, `CLAUDE.md` and both by basename, `.claude/**`, `.mcp.json`,
+  `.gitattributes`, `Makefile`, the `go.*` files, `vendor/**` and `.github/workflows/**`.
+  `TestNotCoveredListIsHonest` reconciles both fences against the live matcher in both
+  scopes, so this split cannot drift from the code.
+
 - **Paths this gate does NOT cover**, as a machine-readable list so the claim can be checked
   rather than trusted. `TestNotCoveredListIsHonest` reconciles every entry below against the
   live matcher and fails if any of them is in fact covered, so this block cannot quietly

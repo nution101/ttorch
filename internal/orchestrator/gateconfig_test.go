@@ -1194,6 +1194,70 @@ func TestGateCostFiguresMatchTheDoc(t *testing.T) {
 // notCoveredFence is the language tag on the machine-readable block in the reviewer skill.
 const notCoveredFence = "gate-not-covered"
 
+// ttorchSourceFence is the block listing entries covered ONLY in ttorch's own repository.
+const ttorchSourceFence = "gate-ttorch-source-only"
+
+// readFence extracts a fenced block's non-empty lines from the reviewer skill.
+func readFence(t *testing.T, tag string) []string {
+	t.Helper()
+	path := filepath.Join(repoRootForGateConfig(t), "content", "skills", "ttorch-review", "SKILL.md")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading the reviewer skill: %v", err)
+	}
+	text := string(b)
+	i := strings.Index(text, "```"+tag)
+	if i < 0 {
+		t.Fatalf("%s has no ```%s block. These lists must stay machine-readable so the "+
+			"honesty check stays wired to them; a missing fence is how a check gets unwired "+
+			"without anyone deciding to unwire it.", path, tag)
+	}
+	rest := text[i+len(tag)+3:]
+	j := strings.Index(rest, "```")
+	if j < 0 {
+		t.Fatalf("the ```%s block in %s is not closed", tag, path)
+	}
+	var out []string
+	for _, line := range strings.Split(rest[:j], "\n") {
+		if tok := strings.TrimSpace(line); tok != "" {
+			out = append(out, tok)
+		}
+	}
+	return out
+}
+
+// TestTtorchSourceListIsHonest reconciles the published tier split against the matcher.
+//
+// The reviewer skill INSTALLS into ~/.claude and instructs every reviewer in every gated
+// repo, and it listed content/** and the internal/** prefixes flat, with no hint that they
+// apply only to ttorch's own source. A reviewer in a Hugo repo reading it would expect
+// content/ to be gate config. docs/ARCHITECTURE.md had the split right, which is exactly
+// the shape of drift that keeps recurring: the accurate copy is not the installed one.
+//
+// Each entry must be covered in ttorch's scope AND uncovered outside it. Checking only the
+// first half is what let the old honesty test miss this entirely.
+func TestTtorchSourceListIsHonest(t *testing.T) {
+	entries := readFence(t, ttorchSourceFence)
+	if len(entries) == 0 {
+		t.Fatal("the ttorch-source list is empty; the tier split exists, so an empty list is false")
+	}
+	elsewhere := gateScope{}
+	for _, e := range entries {
+		probe := e
+		if strings.HasSuffix(e, "/") {
+			probe = e + "probe.go"
+		}
+		if !matchesGateConfig(probe, ttorchScope) {
+			t.Errorf("%s is published as ttorch-source coverage but is not covered even here", e)
+		}
+		if matchesGateConfig(probe, elsewhere) {
+			t.Errorf("%s is published as ttorch-source ONLY, but it is covered in every repo "+
+				"too. Either move it to the universal list in the skill, or narrow the set: "+
+				"as written the skill understates what a user's repo is gated on.", e)
+		}
+	}
+}
+
 // TestNotCoveredListIsHonest reconciles the published "not covered" list against the live
 // matcher, and it is deliberately SELF-CONTAINED: it reads this tree and nothing else.
 //
@@ -1209,28 +1273,7 @@ const notCoveredFence = "gate-not-covered"
 // reverse, a covered path missing from the list, is not detectable from the list alone and is
 // not claimed to be.
 func TestNotCoveredListIsHonest(t *testing.T) {
-	path := filepath.Join(repoRootForGateConfig(t), "content", "skills", "ttorch-review", "SKILL.md")
-	b, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("reading the reviewer skill: %v", err)
-	}
-	text := string(b)
-	open := "```" + notCoveredFence
-	i := strings.Index(text, open)
-	if i < 0 {
-		t.Fatalf("%s has no ```%s block.", path, notCoveredFence)
-	}
-	rest := text[i+len(open):]
-	j := strings.Index(rest, "```")
-	if j < 0 {
-		t.Fatalf("the ```%s block in %s is not closed", notCoveredFence, path)
-	}
-	var entries []string
-	for _, line := range strings.Split(rest[:j], "\n") {
-		if tok := strings.TrimSpace(line); tok != "" {
-			entries = append(entries, tok)
-		}
-	}
+	entries := readFence(t, notCoveredFence)
 	// Non-empty on purpose. internal/cli/ alone is a deliberate, measured exclusion at +32
 	// commits, so an empty list here would be false rather than an achievement.
 	if len(entries) == 0 {
