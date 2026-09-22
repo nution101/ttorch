@@ -155,6 +155,9 @@ invalidates the verdict — re-prep, re-review, re-record.
   | `.ttorch/validate.sh` | what "green" means for this repo |
   | `AGENTS.md` | whether the gate runs at all (`projectinit.ReadMode`) |
   | `CLAUDE.md` | a **symlink** to `AGENTS.md`; replacing it with a real file reports only `CLAUDE.md`, and it is the instruction file every session loads, manager included |
+  | `AGENTS.md` / `CLAUDE.md` **at any depth** | a nested one loads on demand for its directory, so it is an instruction file too |
+  | `.claude/**`, `.mcp.json` | project-level agent config: a landed `.claude/agents/ttorch-reviewer-security.md` **replaces** the security reviewer, with no build and no install |
+  | `go.mod`, `go.sum` | a `replace` redirects what `make test-fast` compiles — including `golang.org/x/text`, which the guard's own path folding now depends on |
   | `content/skills/**` | the ttorch-review, ttorch-manager and ttorch-validate procedures — **including this file** |
   | `content/agents/ttorch-reviewer-*` | the adversarial reviewers' own definitions |
   | `internal/review/**` | the findings contract, the severity-to-block rule, and the classifier that picks which reviewers run |
@@ -236,12 +239,10 @@ invalidates the verdict — re-prep, re-review, re-record.
   - Everything here is inside the `gated` branch of the merge, so a `local`/`validated` merge
     without `--require-verdict` gets none of it — not the name match, not the collision
     refusal, not the control-character refusal. Same pre-existing hole as the first bullet.
-  - `go.mod` and `go.sum` are not in the covered set on this branch or on step 6, and a
-    `replace` or `toolchain` directive changes what `go test` compiles. Named here so it is
-    not mistaken for coverage; adding it belongs to whoever owns that decision. `go.work`,
-    `go.work.sum` and `vendor/` ARE covered — same class, but none of them exists in this
-    repo, so covering them costs nothing and their appearance in a diff is the event worth
-    seeing.
+  - **Coordination note for step 6:** `go.mod` and `go.sum` ARE now covered by this branch.
+    Step 6's not-covered list still names them; that line should go when the two land
+    together, the same way the fold is coordinated. They cost 5/196 and 3/196 commits — the
+    same figure that justifies `.github/workflows/`.
   - Git will not tell you. `git clone` warns about a collision; `git worktree add --detach` —
     what the gate uses to build the checkout it validates — exits 0 with nothing on stderr and
     silently drops the losing entry. The gate's own collision check is load-bearing, not a
@@ -255,10 +256,11 @@ invalidates the verdict — re-prep, re-review, re-record.
     `TestOrchestratorFilesAreClassified` catches a NEW file nobody classified. Neither notices
     a new deciding function added inside a file already judged non-deciding. That stays a
     review responsibility.
-  - The flag is a boolean, so the cheapest way to defeat the guard is habit. About a third of
-    this repo's own commits now trip it, and a lead who passes the flag without reading has
-    given exactly the same authorization as one who read. What survives that is the audit
-    line, which names the file either way.
+  - The flag is a boolean, so the cheapest way to defeat the guard is habit. 73 of this repo's
+    196 non-merge commits (37%) now trip it, and a lead who passes the flag without reading
+    has given exactly the same authorization as one who read. What survives that is the audit
+    line, which names the file either way. Making the flag take the expected paths, so a bare
+    `--allow-gate-change` stops working, is the obvious next step and is not done here.
   - None of it is a barrier. Anything running as the lead can write the approval token with
     the `allow-gate-change` scope already in it. What the guard removes is the silent skip.
 

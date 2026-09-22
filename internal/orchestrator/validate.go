@@ -98,6 +98,12 @@ func (m *Manager) Validate(taskID string) ([]validate.Result, error) {
 //	              what `go test` compiles (verified: a go.work replace swapped a dependency's
 //	              implementation while go.mod and the real source were untouched)
 //	go.work.sum   inert without go.work, covered alongside it so the pair cannot drift
+//	go.mod        the authoritative version of the same trick: a `replace` redirects a
+//	              dependency, and a `toolchain` directive changes the compiler. Unlike
+//	              go.work it actually exists here — and since fsIdentityKey now depends on
+//	              golang.org/x/text, a replace on x/text redirects the guard's OWN Unicode
+//	              folding. 5 commits in 196, the same figure that justifies .github/workflows/
+//	go.sum        the hashes that make go.mod's choices verifiable; 3 commits
 //
 // content.go is the //go:embed that decides which repo file becomes which installed reviewer
 // definition. All of these cost 0 additional commits: in 196 commits none has ever been
@@ -116,6 +122,9 @@ var gateConfigFiles = []string{
 	"content.go",
 	"go.work",
 	"go.work.sum",
+	"go.mod",
+	"go.sum",
+	".mcp.json",
 }
 
 // gateConfigPrefixes define the gate by path prefix, where the covered unit is a directory
@@ -150,6 +159,15 @@ var gateConfigFiles = []string{
 // ttorch-worker.md is deliberately excluded) be installed as a reviewer instead, through the
 // same delayed diff channel. 3 commits.
 //
+// .claude/ and .mcp.json are PROJECT-level agent configuration, and this is the strongest
+// version of the content/agents argument rather than a weaker one. A landed
+// .claude/agents/ttorch-reviewer-security.md REPLACES the security reviewer for every later
+// gate run in the repo: Claude Code loads project-level .claude/agents/, and project-level
+// takes precedence over ~/.claude/agents/ on a name collision. content/agents/ttorch-reviewer-*
+// is already covered for the same effect, but that route needs a build and an install first;
+// this one takes effect on the merge. .mcp.json adds tools to those same sessions. Neither
+// exists in this repo, so both cost 0 commits and their appearance in a diff is the event.
+//
 // vendor/ is the third way to change what `go test` compiles without touching a covered
 // script: with a consistent vendor/modules.txt the toolchain builds from vendor/ rather than
 // the module cache, so committed bytes there replace a dependency's implementation (verified
@@ -173,6 +191,7 @@ var gateConfigPrefixes = []string{
 	"internal/projectinit/",
 	"internal/installer/",
 	"vendor/",
+	".claude/",
 	".github/workflows/",
 }
 
@@ -199,8 +218,18 @@ var gateConfigPrefixes = []string{
 //
 // There is deliberately NO trailing NFD. It was in an earlier version justified as insurance
 // against "folding producing characters that themselves decompose", which is not true of the
-// fold output; and once the orbit pass exists it stops being a no-op and starts being wrong,
-// collapsing 4 measured pairs the filesystem keeps apart. Measured, not reasoned.
+// fold output; and once the orbit pass exists it stops being a no-op and becomes wrong. It is
+// wrong on exactly two unordered pairs, named here rather than counted, because a bare count
+// in this comment has twice been the thing that turned out to be unverifiable:
+//
+//	U+1F9C  ᾜ            vs  U+1F28 U+038A  ἨΊ
+//	U+1F94  ᾔ            vs  U+1F28 U+038A  ἨΊ
+//
+// A trailing NFD merges each pair; the shipped pipeline separates them; and APFS keeps the
+// files apart, so merging them is a false positive. The effect needs TWO runes, which is why
+// an exhaustive single-rune search finds nothing — that search is reproduced as case (a) of
+// TestTrailingNFDWouldBeAFalsePositive, which also pins the pairs above against the real
+// filesystem so the claim cannot rot back into an unchecked number.
 //
 // Measurements behind those claims, all against real APFS by creating both files and reading
 // one back — 16,304 single-rune pairs covering the lower/upper/title/SimpleFold-orbit/NFC/NFD
@@ -238,9 +267,30 @@ func orbitMin(s string) string {
 	return b.String()
 }
 
+// gateConfigBasenames define the gate by FILENAME, at any depth. Claude Code loads a
+// CLAUDE.md or AGENTS.md from a subdirectory on demand when a session reads files in that
+// directory, so internal/orchestrator/CLAUDE.md is the root file's rationale applied one level
+// down: agent instructions that need no build and no install and take effect on the merge.
+//
+// Covering them by name rather than by enumerating the two that could plausibly exist today
+// is deliberate — the set of directories is open, and a list would go stale the first time
+// someone adds a package. It is why docs/AGENTS.md, which an earlier version of
+// TestMatchesGateConfig pinned as a near-miss that must stay OUT, is now correctly IN: a
+// session reading files under docs/ loads it, so it is an instruction file like any other.
+//
+// Never committed at a nested path in 196 commits, so this costs 0.
+//
+// This OVERLAPS gateConfigFiles, which also names AGENTS.md and CLAUDE.md, and the redundancy
+// is deliberate. The root AGENTS.md is the delivery-mode config — the single most important
+// entry in the whole set — and the root CLAUDE.md is the symlink to it. Leaving them to be
+// covered only as a side effect of a filename rule would mean that narrowing this rule later
+// (deciding nested instruction files are too broad, say) silently drops the gate's own mode
+// config. They stay named explicitly so that cannot happen.
+var gateConfigBasenames = []string{"AGENTS.md", "CLAUDE.md"}
+
 // matchesGateConfig reports whether a repository path names a gate-definition file. Matching
-// is exact against gateConfigFiles and by prefix against gateConfigPrefixes, with BOTH SIDES
-// reduced to foldKey first.
+// is exact against gateConfigFiles, by prefix against gateConfigPrefixes, and by filename at
+// any depth against gateConfigBasenames — with BOTH SIDES reduced to fsIdentityKey first.
 //
 // Folding both sides matters because "AGENTS.md" is the one entry that is not already
 // lowercase; folding only the incoming path would leave it unmatchable, which is the
@@ -268,6 +318,16 @@ func matchesGateConfig(name string) bool {
 	}
 	for _, p := range gateConfigPrefixes {
 		if strings.HasPrefix(folded, fsIdentityKey(p)) {
+			return true
+		}
+	}
+	// Folding never touches '/', so the basename of the folded path is the folded basename.
+	base := folded
+	if i := strings.LastIndexByte(folded, '/'); i >= 0 {
+		base = folded[i+1:]
+	}
+	for _, b := range gateConfigBasenames {
+		if base == fsIdentityKey(b) {
 			return true
 		}
 	}

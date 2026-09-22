@@ -237,9 +237,10 @@ passing commit-pinned verdict plus a fresh green validate auto-mints the approva
   own gate), and a repo with **no checks detected is a hard block**, never a pass. Without
   the script, the trusted auto-merge is refused and a human `ttorch approve` is required.
 - A trusted auto-merge **cannot change a gate-definition file**; such a diff is refused. The
-  covered set is `.ttorch/validate.sh`, `AGENTS.md` and `CLAUDE.md` (the repo-local gate
-  config, present in every managed repo), `content/skills/**` and
-  `content/agents/ttorch-reviewer-*` (which
+  covered set is `.ttorch/validate.sh`, plus `AGENTS.md` and `CLAUDE.md` **at any depth** (the
+  repo-local gate config and the agent instructions, present in every managed repo),
+  `.claude/**` and `.mcp.json` (project-level agent config), `go.mod`, `go.sum`,
+  `content/skills/**` and `content/agents/ttorch-reviewer-*` (which
   `content.go` embeds and the installer lays down under `~/.claude`, so they are the gate's
   live reviewer and manager instructions, not documentation about the gate), `internal/review/**`,
   `internal/approval/**`, `internal/validate/**`, `internal/projectinit/**` (which parses
@@ -272,33 +273,47 @@ The guard's cost is a flag on every merge that trips it, so the set is bounded b
 rather than by what sounds prudent. Measured over the **196 non-merge commits reachable from
 `b642ba6`**, counting a commit once if it touches any covered path:
 
-| Set | Commits | Share |
+| Covered group | commits touching it | marginal, given the rest |
 |---|---|---|
-| `.ttorch/validate.sh` + `AGENTS.md` (the original guard) | 10 | 5% |
-| + `content/skills/**`, `content/agents/ttorch-reviewer-*` | 44 | 22% |
-| + `internal/review/**` | 48 | 25% |
-| + `internal/approval/**` | 47 | 24% |
-| + `internal/validate/**` | 46 | 23% |
-| + `internal/projectinit/**` | 47 | 24% |
-| + `internal/installer/**` | 71 | 36% |
-| + `Makefile`, `content.go`, `internal/orchestrator/audit.go` (each 0 marginal) | 68 | 35% |
-| + `.github/workflows/**` | 49 | 25% |
-| + `internal/orchestrator/{gate,merge,validate,validatecache}.go` | 52 | 27% |
-| **the set above, all together** | **71** | **36%** |
-| ~~+ `internal/db/`, excluded on cost~~ | 87 | 44% |
-| ~~+ `internal/orchestrator/**` and `internal/review/**` wholesale~~ | 109 | 56% |
+| `.ttorch/validate.sh`, `AGENTS.md` (the original guard) | 10 | +1 |
+| `content/skills/**`, `content/agents/ttorch-reviewer-*` | 36 | +25 |
+| `CLAUDE.md`, and `AGENTS.md`/`CLAUDE.md` at any depth | 9 | +0 |
+| `.claude/**`, `.mcp.json` | 0 | +0 |
+| `internal/review/**` | 7 | +4 |
+| `internal/approval/**` | 6 | +1 |
+| `internal/validate/**` | 6 | +2 |
+| `internal/projectinit/**` | 9 | +4 |
+| `internal/installer/**` | 5 | +2 |
+| `internal/orchestrator/{gate,merge,validate,validatecache,audit}.go` | 10 | +5 |
+| `Makefile`, `content.go` | 4 | +0 |
+| `go.work`, `go.work.sum`, `vendor/**` | 0 | +0 |
+| `go.mod`, `go.sum` | 5 | +2 |
+| `.github/workflows/**` | 9 | +5 |
+| **the whole set** | **73 / 196 = 37%** | |
 
-(Each middle row is the landed 22% set plus that one addition, so the rows overlap and do not
-sum. An earlier count of the same corpus reported 9 and 43 for the first two rows; the
-difference is the root commit, which `git diff-tree` skips without `--root`. It changes no
-conclusion.)
+Two columns because one number cannot carry it. "Commits touching it" is that group in
+isolation; "marginal" is what it adds *given everything else already covered*, which is the
+figure that matters when deciding whether to include something. They differ a lot —
+`content/skills/**` is 36 commits alone but +25 marginal, and `CLAUDE.md` is 9 alone but +0,
+because every commit that touched it touched something else covered too. An earlier version of
+this table mixed two baselines row by row and was not coherent; these are all one definition.
 
-The last row is the answer to "why not just cover the packages". `internal/orchestrator/`
-alone is 78 of the 196 commits — spawn, the land queue, the scheduler wiring, the overlap
-planner — and covering it wholesale puts **more than half of every change** behind the flag. A
-flag that fires on most commits is not a signal; it is a formality, and it launders a real
-gate change through a habit. The four files that actually resolve, enforce and cache the
-decision cost 8 commits instead of 62.
+Rejected, measured against that same set:
+
+| Rejected | commits | share |
+|---|---|---|
+| + `internal/db/` | 88 | 45% |
+| + `internal/orchestrator/**` and `internal/review/**` wholesale | 121 | 62% |
+
+(An earlier count of this corpus reported 9 and 43 for the first two groups; the difference is
+the root commit, which `git diff-tree` skips without `--root`. It changes no conclusion.)
+
+The second rejected row is the answer to "why not just cover the packages".
+`internal/orchestrator/` alone is 78 of the 196 commits — spawn, the land queue, the scheduler
+wiring, the overlap planner — and covering it wholesale puts **62% of every change** behind
+the flag. A flag that fires on most commits is not a signal; it is a formality, and it
+launders a real gate change through a habit. The five files that actually resolve, enforce,
+cache and record the decision are +5 marginal instead.
 
 A file list over a package is brittle in a way a directory prefix is not: this package has
 already been re-split once (`140d2b91`), and a later split that moved `MergeLocal` into a new
@@ -388,8 +403,20 @@ help, because `fold(fold(x)) == x` is the problem itself.
 
 There is deliberately **no trailing NFD**. An earlier version had one, justified as insurance
 against folding producing characters that themselves decompose — which is not true of the fold
-output, and once the orbit pass exists the trailing NFD stops being a no-op and starts being
-wrong: it collapses 4 measured pairs the filesystem keeps apart and catches nothing extra.
+output. Once the orbit pass exists the pass stops being a no-op and becomes wrong, on exactly
+two unordered pairs:
+
+| shipped key separates | a trailing NFD merges |
+|---|---|
+| `U+1F9C` ᾜ | `U+1F28 U+038A` ἨΊ |
+| `U+1F94` ᾔ | `U+1F28 U+038A` ἨΊ |
+
+APFS keeps both pairs apart, so merging them is a false positive. The effect needs **two**
+runes, which is why an exhaustive single-rune search finds nothing — a reviewer ran exactly
+that search and could not reproduce the claim, and both results are correct.
+`TestTrailingNFDWouldBeAFalsePositive` now holds both halves: the single-rune search returning
+zero, and these pairs checked against the real filesystem. This comment has twice carried a
+number that could not be reproduced; the number is now executable.
 
 `TestFSIdentityKeySweep` keeps a bounded version of that sweep in the suite (~2,400 pairs,
 including the whole Cherokee block) and `TestFSIdentityKeyMatchesTheFilesystem` keeps the hand
@@ -460,7 +487,35 @@ deliberately excluded file such as `content/agents/ttorch-worker.md` be installe
 instead. `audit.go` holds the only `writeAudit`, and `MergeLocal` refuses to merge when it
 fails, so one line there strips the record from every trusted merge.
 
-`CLAUDE.md` is covered because the guard matches a symlink by its OWN path, never by what it
+`.claude/**` and `.mcp.json` are the strongest form of the `content/agents` argument rather
+than a weaker one. Claude Code loads **project-level** `.claude/agents/`, and project-level
+takes documented precedence over `~/.claude/agents/` on a name collision, so a landed
+`.claude/agents/ttorch-reviewer-security.md` replaces the security reviewer for every later
+gate run in that repo. `content/agents/ttorch-reviewer-*` is already covered for the same
+effect, but that route needs a build and an install first; this one takes effect on the merge.
+`.mcp.json` adds tools to those same sessions. Neither exists in this repo, so both cost 0
+commits — and worth recording, `.claude/` is not in `.gitignore` here, so nothing but this
+guard stands between a committed reviewer override and a merge.
+
+`go.mod` and `go.sum` are covered on the argument already carrying `go.work` and `vendor/`,
+and this branch sharpened it against itself: `fsIdentityKey` now depends on
+`golang.org/x/text`, so a `replace` on `x/text` redirects the guard's **own** Unicode folding.
+Unlike `go.work` these actually exist and are authoritative. They cost 5 and 3 commits in 196
+— 5/196 being the same figure that justifies `.github/workflows/`, so the cost argument never
+separated them. Step 6's not-covered list still names them; that line goes when the two land
+together.
+
+`AGENTS.md` and `CLAUDE.md` are matched by FILENAME at any depth, not only at the root. A
+nested one loads on demand when a session reads files in its directory, which is the root
+file's rationale one level down. Matching by name rather than enumerating the two paths that
+could exist today is deliberate: the set of directories is open and a list would go stale the
+first time someone adds a package. One consequence, recorded because it reverses an earlier
+call: `docs/AGENTS.md` was pinned in the match table as a near-miss that must stay OUT, and is
+now correctly IN — a session reading files under `docs/` loads it, so it is an instruction file
+like any other. No nested one has ever been committed, so this costs 0.
+
+`CLAUDE.md` is covered at the root for a second, separate reason: the guard matches a symlink
+by its OWN path, never by what it
 resolves to. In a managed repo `CLAUDE.md` is a symlink whose blob is the string `AGENTS.md`,
 so a commit that deletes the link and writes a real `CLAUDE.md` reports the changed path
 `CLAUDE.md` — which is not `AGENTS.md`, and matched nothing. It is the agent-instruction file
@@ -489,8 +544,8 @@ and `absentByDesign` in the test file records that so the dead-coverage check do
 they exist.
 
 `internal/db/` is the one genuine cost judgement left out. It holds `Store.GetVerdict`, the row
-the merge trusts for `Overall == pass`; covering it costs 16 more commits (23/196 on its own,
-taking the set to 44%). Excluded on cost, recorded here and in the skill so it reads as a
+the merge trusts for `Overall == pass`; covering it costs 15 more commits (23/196 on its own,
+taking the set to 45%). Excluded on cost, recorded here and in the skill so it reads as a
 decision rather than an omission.
 
 `.github/workflows/**` is in for a different reason. The trusted gate never consults CI, which
@@ -500,7 +555,7 @@ CI as the required check. CI is therefore half of what "validated" means here, a
 `ci.yml` weakens every later change's validation through the same delayed diff channel that
 put the skills on the list. It costs 5 commits.
 
-What the numbers do not fix: at 36%, roughly one merge in three in this repo needs
+What the numbers do not fix: at 37%, roughly one merge in three in this repo needs
 `--allow-gate-change`, and the flag is a boolean. A lead who passes it by reflex authorizes
 exactly as much as one who read the diff. The audit line naming the file survives either way,
 which is the guard's durable half. Making the flag take the expected paths — so a bare

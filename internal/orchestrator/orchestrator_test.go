@@ -1921,6 +1921,15 @@ func TestMatchesGateConfig(t *testing.T) {
 		{"the delivery-mode parser", "internal/projectinit/projectinit.go", true},
 		{"a workspace file", "go.work", true},
 		{"a vendored dependency", "vendor/example.com/dep/d.go", true},
+		{"the module file", "go.mod", true},
+		{"the module checksums", "go.sum", true},
+		{"a project-level reviewer definition", ".claude/agents/ttorch-reviewer-security.md", true},
+		{"project-level MCP servers", ".mcp.json", true},
+		{"a nested instruction file", "internal/orchestrator/CLAUDE.md", true},
+		{"a nested delivery-mode file", "internal/AGENTS.md", true},
+		// Reclassified deliberately: a session reading files under docs/ loads this, so it is
+		// an instruction file, not a copy of one. An earlier table pinned it as a near-miss.
+		{"an instruction file under docs", "docs/AGENTS.md", true},
 		{"the full-suite CI authority", ".github/workflows/ci.yml", true},
 
 		// Case-folding: both sides are folded, so a differently-cased spelling of a covered
@@ -1943,21 +1952,20 @@ func TestMatchesGateConfig(t *testing.T) {
 		{"a non-reviewer agent definition", "content/agents/golang-pro.md", false},
 		{"the worker agent definition", "content/agents/ttorch-worker.md", false},
 		{"an embedded command", "content/commands/ttorch.md", false},
-		{"a docs copy of the mode config", "docs/AGENTS.md", false},
-		{"a docs copy of the instruction file", "docs/CLAUDE.md", false},
+		{"a file merely mentioning agents", "docs/AGENTS-guide.md", false},
+		{"a directory that merely starts like .claude", ".claude-backup/x.md", false},
 		{"a validate script somewhere else", "sub/.ttorch/validate.sh", false},
 		{"a directory that merely starts the same", "contents/skills/x.md", false},
 		{"ordinary orchestrator source", "internal/orchestrator/spawn.go", false},
 		{"the land queue", "internal/orchestrator/landqueue.go", false},
 		{"ordinary source elsewhere", "internal/cli/cli.go", false},
 		{"a non-workflow github file", ".github/CODEOWNERS", false},
-		{"the module file, deliberately not covered", "go.mod", false},
 		{"a directory that merely starts like vendor", "vendored/x.go", false},
 		{"a package that merely starts the same", "internal/reviewer/x.go", false},
 
 		// Folding must not widen the match past a same-file respelling.
 		{"a mixed-case near-miss", "Contents/Skills/x.md", false},
-		{"a mixed-case docs copy", "Docs/Agents.md", false},
+		{"a mixed-case nested instruction file", "Docs/Agents.md", true},
 	} {
 		if got := matchesGateConfig(tc.path); got != tc.want {
 			t.Errorf("%s: matchesGateConfig(%q) = %v, want %v", tc.name, tc.path, got, tc.want)

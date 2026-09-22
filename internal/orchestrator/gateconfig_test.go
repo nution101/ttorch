@@ -5,6 +5,8 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"os/exec"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -163,41 +165,88 @@ var absentByDesign = map[string]string{
 	"go.work":     "auto-discovered via GOWORK; its replace directives override go.mod",
 	"go.work.sum": "inert without go.work, covered alongside it so the pair cannot drift",
 	"vendor/":     "a consistent vendor/ makes the toolchain build from it instead of the module cache",
+	".claude/":    "project-level agent config; a .claude/agents/ttorch-reviewer-*.md would REPLACE a gate reviewer",
+	".mcp.json":   "project-level MCP servers for those same sessions",
 }
 
 // TestGateConfigFilesAreRealPaths guards the other direction: an entry that names nothing is
 // dead coverage that reads as protection. Entries in absentByDesign are exempt, and the test
 // also fails if one of THOSE turns up — an entry justified as "should not exist" that now
 // exists needs its reason rechecked, not silently kept.
+//
+// It asks git for the TRACKED path list rather than stat-ing the working directory, because
+// that is the universe the guard actually inspects: diffTouchesGateConfig reads committed
+// objects. The distinction is not academic here — this worktree carries an untracked,
+// un-gitignored .claude/settings.local.json, so a stat-based check reported .claude/ as
+// "exists" and failed, while no .claude/ path has ever been committed. (That the directory is
+// committable and not ignored is itself part of why it is covered.)
 func TestGateConfigFilesAreRealPaths(t *testing.T) {
 	root := repoRootForGateConfig(t)
-	exists := func(rel string) bool {
-		_, err := os.Stat(filepath.Join(root, filepath.FromSlash(strings.TrimSuffix(rel, "/"))))
-		return err == nil
+	out, err := exec.Command("git", "-C", root, "ls-files", "-z").Output()
+	if err != nil {
+		t.Skipf("git ls-files: %v", err)
 	}
-	for _, f := range gateConfigFiles {
-		if _, exempt := absentByDesign[f]; exempt {
+	var tracked []string
+	for _, n := range strings.Split(string(out), "\x00") {
+		if n != "" {
+			tracked = append(tracked, n)
+		}
+	}
+	if len(tracked) == 0 {
+		t.Fatal("git reported no tracked files; the check would pass vacuously")
+	}
+	// Each set is checked under ITS OWN matching rule rather than a guessed one, so this
+	// cannot drift from what matchesGateConfig does.
+	exactCovers := func(entry string) bool {
+		for _, f := range tracked {
+			if f == entry {
+				return true
+			}
+		}
+		return false
+	}
+	prefixCovers := func(entry string) bool {
+		for _, f := range tracked {
+			if strings.HasPrefix(f, entry) {
+				return true
+			}
+		}
+		return false
+	}
+	baseCovers := func(entry string) bool {
+		for _, f := range tracked {
+			if path.Base(f) == entry {
+				return true
+			}
+		}
+		return false
+	}
+	covers := func(entry string) bool {
+		return exactCovers(entry) || prefixCovers(entry) || baseCovers(entry)
+	}
+	for _, entry := range gateConfigFiles {
+		if _, exempt := absentByDesign[entry]; exempt {
 			continue
 		}
-		if !exists(f) {
-			t.Errorf("gateConfigFiles names %s, which does not exist. Either it is dead coverage, or it belongs in absentByDesign with a reason.", f)
+		if !exactCovers(entry) {
+			t.Errorf("no tracked path equals the covered file %q. Either it is dead coverage, or it belongs in absentByDesign with a reason.", entry)
 		}
 	}
-	for _, p := range gateConfigPrefixes {
-		if _, exempt := absentByDesign[p]; exempt {
+	for _, entry := range gateConfigPrefixes {
+		if _, exempt := absentByDesign[entry]; exempt {
 			continue
 		}
-		dir := p
-		if !strings.HasSuffix(p, "/") { // a filename prefix: check its directory
-			dir = path0Dir(p)
-		}
-		fi, err := os.Stat(filepath.Join(root, filepath.FromSlash(strings.TrimSuffix(dir, "/"))))
-		if err != nil || !fi.IsDir() {
-			t.Errorf("gateConfigPrefixes names %s, whose directory does not exist. Either it is dead coverage, or it belongs in absentByDesign with a reason.", p)
+		if !prefixCovers(entry) {
+			t.Errorf("no tracked path starts with the covered prefix %q. Either it is dead coverage, or it belongs in absentByDesign with a reason.", entry)
 		}
 	}
-	// Every exemption must still be a covered entry, and the three "should not exist" ones
-	// must still not exist.
+	for _, entry := range gateConfigBasenames {
+		if !baseCovers(entry) {
+			t.Errorf("no tracked path is named %q. Either it is dead coverage, or it belongs in absentByDesign with a reason.", entry)
+		}
+	}
+	// Every exemption must still be a covered entry, and the should-not-exist ones must still
+	// match nothing tracked.
 	covered := map[string]bool{}
 	for _, f := range gateConfigFiles {
 		covered[f] = true
@@ -205,16 +254,20 @@ func TestGateConfigFilesAreRealPaths(t *testing.T) {
 	for _, p := range gateConfigPrefixes {
 		covered[p] = true
 	}
+	for _, b := range gateConfigBasenames {
+		covered[b] = true
+	}
 	for entry, why := range absentByDesign {
 		if !covered[entry] {
-			t.Errorf("absentByDesign exempts %s, which is not in the covered set at all", entry)
+			t.Errorf("absentByDesign exempts %q, which is not in the covered set at all", entry)
 			continue
 		}
-		if entry == ".ttorch/validate.sh" || entry == "AGENTS.md" {
+		switch entry {
+		case ".ttorch/validate.sh", "AGENTS.md":
 			continue // these two may legitimately exist here; they do
 		}
-		if exists(entry) {
-			t.Errorf("%s now exists in this repo, but it is covered on the grounds that it should not (%s). Recheck the reason before keeping the exemption.", entry, why)
+		if covers(entry) {
+			t.Errorf("%q is now tracked in this repo, but it is covered on the grounds that it should not be (%s). Recheck the reason before keeping the exemption.", entry, why)
 		}
 	}
 }
@@ -598,4 +651,66 @@ func filesCollide(t *testing.T, dir, a, b string) bool {
 		t.Fatal(err)
 	}
 	return string(got) == "B"
+}
+
+// TestTrailingNFDWouldBeAFalsePositive holds the claim in fsIdentityKey's comment about why
+// there is no trailing NFD pass. That comment has twice carried a quantitative statement that
+// turned out to be unverifiable, so the statement now lives here, executable, against the real
+// filesystem.
+//
+// Case (a) is the exhaustive single-rune search, which finds NOTHING — the same result a
+// reviewer got, and the reason the claim looked false. Case (b) shows why both results are
+// correct: the effect needs TWO runes, so no single-rune search can see it.
+func TestTrailingNFDWouldBeAFalsePositive(t *testing.T) {
+	withTrailingNFD := func(p string) string { return norm.NFD.String(fsIdentityKey(p)) }
+
+	// (a) Exhaustive over single runes: does a trailing NFD ever MERGE two paths the shipped
+	// key separates? It does not. Kept because its absence is what makes (b) surprising.
+	byTrailing := map[string]map[string]bool{}
+	for r := rune(0x20); r <= 0x10FFFF; r++ {
+		if (r >= 0xD800 && r <= 0xDFFF) || !unicode.IsPrint(r) {
+			continue
+		}
+		n := "x" + string(r) + ".t"
+		k := withTrailingNFD(n)
+		if byTrailing[k] == nil {
+			byTrailing[k] = map[string]bool{}
+		}
+		byTrailing[k][fsIdentityKey(n)] = true
+	}
+	singleRuneMerges := 0
+	for _, shippedKeys := range byTrailing {
+		if len(shippedKeys) > 1 {
+			singleRuneMerges++
+		}
+	}
+	if singleRuneMerges != 0 {
+		t.Errorf("(a) single-rune search found %d merges; fsIdentityKey's comment says the effect is multi-rune only", singleRuneMerges)
+	}
+
+	// (b) The two unordered pairs named in that comment. A trailing NFD merges each; the
+	// shipped key separates them; APFS keeps the files apart. So the pass would be a false
+	// positive, not insurance.
+	dir := t.TempDir()
+	folds := caseFoldingDir(t, dir)
+	for _, tc := range [][2]string{
+		{"qᾜ.t", "qἨΊ.t"},
+		{"qᾔ.t", "qἨΊ.t"},
+	} {
+		a, b := tc[0], tc[1]
+		if withTrailingNFD(a) != withTrailingNFD(b) {
+			t.Errorf("a trailing NFD no longer merges %q/%q; the comment's example is stale", a, b)
+			continue
+		}
+		if fsIdentityKey(a) == fsIdentityKey(b) {
+			t.Errorf("the shipped key now merges %q/%q too, so the pair no longer shows a difference", a, b)
+			continue
+		}
+		if !folds {
+			continue // a case-sensitive filesystem cannot adjudicate
+		}
+		if filesCollide(t, dir, a, b) {
+			t.Errorf("the filesystem DOES collide %q/%q, so merging them would be correct and the comment is wrong", a, b)
+		}
+	}
 }
