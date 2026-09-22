@@ -1,6 +1,7 @@
 package tmux
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -360,6 +361,64 @@ func TestWindowExists(t *testing.T) {
 	}
 	if WindowExists("s", "absent") {
 		t.Error("WindowExists absent = true")
+	}
+}
+
+// TestWindowExistsFoldsATimeoutToPresent pins the fold direction, and its limit.
+// Resume reads this bool and rebuilds a worker when it is false, so a timeout
+// folding to false would put a second agent in a worktree that already has one.
+// A definite negative must keep answering false, because `list-windows` against a
+// session that does not exist yet fails — and folding that to "present" refuses the
+// first spawn on a machine with no tmux session.
+func TestWindowExistsFoldsATimeoutToPresent(t *testing.T) {
+	installFakeTmux(t)
+
+	// A timeout: uncertainty, so assume present.
+	t.Setenv("FAKE_SLEEP", "5")
+	prevT, prevW := runTimeout, runWaitDelay
+	runTimeout, runWaitDelay = 250*time.Millisecond, 250*time.Millisecond
+	t.Cleanup(func() { runTimeout, runWaitDelay = prevT, prevW })
+	if !WindowExists("s", "anything") {
+		t.Error("WindowExists = false on a timeout, want true so Resume skips rather than rebuilds")
+	}
+	if _, err := WindowExistsErr("s", "anything"); !errors.Is(err, ErrTimeout) {
+		t.Errorf("WindowExistsErr should surface the timeout sentinel, got %v", err)
+	}
+
+	// A plain failure (no such session): a definite negative, so keep answering false.
+	t.Setenv("FAKE_SLEEP", "")
+	t.Setenv("FAKE_LIST_WINDOWS_EXIT", "1")
+	if WindowExists("s", "anything") {
+		t.Error("WindowExists = true on a definite negative, which would refuse the first spawn into a fresh session")
+	}
+	if ok, err := WindowExistsErr("s", "anything"); ok || err == nil {
+		t.Errorf("WindowExistsErr = (%v,%v), want (false, err) so the distinction survives", ok, err)
+	}
+}
+
+// TestRunTimeoutIsIdentifiable pins the sentinel. A timeout has to be
+// distinguishable from a negative answer anywhere a negative answer causes an
+// action, which is why WindowExists can fold it safely and why a caller that needs
+// to tell them apart can.
+func TestRunTimeoutIsIdentifiable(t *testing.T) {
+	installFakeTmux(t)
+	t.Setenv("FAKE_SLEEP", "5")
+	prevT, prevW := runTimeout, runWaitDelay
+	runTimeout, runWaitDelay = 250*time.Millisecond, 250*time.Millisecond
+	t.Cleanup(func() { runTimeout, runWaitDelay = prevT, prevW })
+
+	_, err := run("list-windows", "-t", "s")
+	if err == nil {
+		t.Fatal("run err = nil, want a timeout")
+	}
+	if !errors.Is(err, ErrTimeout) {
+		t.Errorf("timeout must be identifiable with errors.Is, got %v", err)
+	}
+	// A real negative answer must not look like a timeout.
+	t.Setenv("FAKE_SLEEP", "")
+	t.Setenv("FAKE_LIST_WINDOWS_EXIT", "1")
+	if _, err := run("list-windows", "-t", "s"); err == nil || errors.Is(err, ErrTimeout) {
+		t.Errorf("a plain tmux failure must not read as a timeout, got %v", err)
 	}
 }
 

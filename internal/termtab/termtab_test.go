@@ -1,6 +1,9 @@
 package termtab
 
 import (
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -382,5 +385,36 @@ func TestWarnWritableView(t *testing.T) {
 	}
 	if !strings.HasSuffix(got, "\n") {
 		t.Errorf("warning must be one terminated line, got %q", got)
+	}
+}
+
+// TestCloseGoesThroughTheTmuxPackage pins that Close no longer runs tmux itself.
+// It used to call exec.Command("tmux", "kill-session", ...) directly, which meant
+// it skipped both the deadline every other tmux call has and the binary lookup.
+// Close runs inside Teardown between killing the worker's window and returning its
+// worktree to the pool, so a hang here would strand a worktree. The assertion is
+// on the argv a fake tmux on PATH records.
+func TestCloseGoesThroughTheTmuxPackage(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Close is a no-op off macOS")
+	}
+	dir := t.TempDir()
+	log := filepath.Join(dir, "invocations.log")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >>\"$TTORCH_FAKE_LOG\"\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "tmux"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TTORCH_FAKE_LOG", log)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("TTORCH_WORKER_TABS", "")
+
+	Close("wk-42")
+
+	b, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatalf("Close ran no tmux command: %v", err)
+	}
+	if got := strings.TrimSpace(string(b)); got != "kill-session -t ttv-wk-42" {
+		t.Errorf("Close ran %q, want the view session killed through the tmux package", got)
 	}
 }

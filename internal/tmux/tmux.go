@@ -57,12 +57,36 @@ func bin() (string, error) {
 // control channel to a running agent is the worst outcome available here, and an
 // error the caller can report is strictly better than a goroutine parked forever.
 //
+// Two measured properties of that wedge, because both mislead someone debugging it:
+//
+// It is send-keys-specific, not a stuck server. With a send sitting blocked at a
+// wedged pane, display-message, list-windows, capture-pane, has-session,
+// new-session and kill-session all answered in 0.05s on the same server, and the
+// send was still blocked afterwards. So a healthy `tmux list-windows` says nothing
+// about whether a steer can land.
+//
+// Whether it blocks depends on the literal being sent. Re-wedging the pane before
+// each attempt, "continue" (what the scheduler and watcher send), "go ahead",
+// "TEST" and a bare "T" all blocked past 8s, while "RAW_WEDGE" and a bare "S"
+// returned rc=0 in 0.05s. The exact rule was not pinned down; the point is that one
+// literal returning does not mean the pane is steerable.
+//
 // 30s is chosen against measurement, not taste: the slowest legitimate call is a
 // capture-pane over a full scrollback, which takes 0.28s for 200,000 lines
 // (208MB) on this hardware, and the control commands are ~35ms. 30s is roughly
 // 100x that ceiling, so it cannot fire on a merely slow machine, while still
 // bounding a scheduler tick at 30s instead of forever.
 var runTimeout = 30 * time.Second
+
+// ErrTimeout marks a tmux command that ran past runTimeout, so a caller can tell
+// "tmux did not answer" from "tmux answered no". Wrapped into the error run()
+// returns, so test with errors.Is.
+//
+// It matters because the two are not interchangeable anywhere a negative answer
+// causes an action. WindowExists is the case: collapsing a timeout to "the window
+// is gone" would let Resume rebuild a second agent into a worktree that already
+// has one.
+var ErrTimeout = errors.New("tmux did not answer in time")
 
 // runWaitDelay bounds the wait AFTER the deadline kills the tmux client. Killing
 // the client does not close the output pipe if it left a child holding the write
@@ -82,7 +106,7 @@ func run(args ...string) (string, error) {
 	out, err := cmd.CombinedOutput()
 	s := strings.TrimRight(string(out), "\n")
 	if ctx.Err() == context.DeadlineExceeded {
-		return s, fmt.Errorf("tmux %s: no answer after %s, gave up; a pane left in copy-mode does this, so press Escape in the worker's pane (or 'tmux send-keys -X cancel') and retry", strings.Join(args, " "), runTimeout)
+		return s, fmt.Errorf("tmux %s: no answer after %s, gave up; a pane left in copy-mode does this, so press Escape in the worker's pane (or 'tmux send-keys -X cancel') and retry: %w", strings.Join(args, " "), runTimeout, ErrTimeout)
 	}
 	if err != nil {
 		return s, fmt.Errorf("tmux %s: %v: %s", strings.Join(args, " "), err, s)
@@ -146,10 +170,31 @@ func ListWindows(session string) ([]string, error) {
 	return strings.Split(out, "\n"), nil
 }
 
-// WindowExists reports whether a named window exists in the session.
+// WindowExists reports whether a named window exists in the session. A read that
+// TIMED OUT answers true; every other failure keeps answering false.
+//
+// The bool has nowhere to put "I could not tell", so an unanswered read has to fold
+// into one of the two answers, and they are not equally safe. Almost every caller is
+// shaped "if the window is not there, create it": Resume rebuilding a worker,
+// Restore rebuilding the manager window, Spawn's pre-flight, the gate's idempotent
+// reviewer launch. Folding a timeout to "gone" there starts a SECOND agent in a
+// worktree that already has one, which is the worst outcome in this package. Folding
+// it to "present" makes those callers skip, and makes the "refuse if absent" callers
+// (Peek, Send) attempt the real command and fail with tmux's own error, which is a
+// better message than a guess. It also matches how WindowExistsErr already treats a
+// duplicate name: a window it cannot rule out is present, never gone.
+//
+// Only a timeout folds that way. The other failures are DEFINITE negatives, not
+// uncertainty: `list-windows` against a session that does not exist yet fails, and
+// so does a missing tmux, and in both cases the window really is absent. Folding
+// those to "present" refused the first spawn on a machine with no tmux session —
+// caught by the orchestrator suite, not by reasoning.
+//
+// Callers that want the full picture use WindowExistsErr; a timeout there is
+// identifiable with errors.Is(err, ErrTimeout).
 func WindowExists(session, window string) bool {
-	exists, _ := WindowExistsErr(session, window)
-	return exists
+	exists, err := WindowExistsErr(session, window)
+	return exists || errors.Is(err, ErrTimeout)
 }
 
 // WindowExistsErr reports whether a named window exists, distinguishing a window that

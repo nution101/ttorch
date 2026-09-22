@@ -306,11 +306,17 @@ func shq(s string) string {
 // window so its watcher tab closes cleanly when the worker is torn down. It is a
 // no-op when the feature is disabled or off macOS; killing a non-existent session
 // is ignored. It never affects the worker, which lives in the source session.
+//
+// It goes through tmux.KillSession rather than running tmux itself, so it picks up
+// the same deadline every other tmux call has and resolves the binary the same way.
+// A kill-session has no reason to be the one call allowed to hang: this runs inside
+// Teardown, between killing the worker's window and returning its worktree to the
+// pool, so blocking here would strand a worktree.
 func Close(window string) {
 	if !enabled() || runtime.GOOS != "darwin" {
 		return
 	}
-	_ = exec.Command("tmux", "kill-session", "-t", viewName(window)).Run()
+	_ = tmux.KillSession(viewName(window))
 }
 
 // appleScript returns the AppleScript passed to `osascript -e`. For iTerm it
