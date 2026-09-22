@@ -1683,10 +1683,10 @@ func safePathComponent(s string) bool {
 		!strings.ContainsAny(s, `/\`) && !strings.ContainsRune(s, os.PathSeparator)
 }
 
-// reviewerCwd returns the directory a dimension's reviewer session runs in, and the bare mirror
-// it reads source from ("" when there is none). An isolated dimension gets a freshly
-// materialized scratch workspace (see prepareReviewWorkspace); every other dimension still runs
-// in the worker's worktree at the reviewed commit.
+// reviewerCwd returns the directory a dimension's reviewer session runs in and the bare mirror
+// it reads source from. EVERY dimension gets a freshly materialized scratch workspace outside
+// the worker's tree (see prepareReviewWorkspace); there is no longer a dimension that runs in
+// the worktree.
 func (m *Manager) reviewerCwd(taskID, dim, inputsDir, repo, wt, head string) (cwd, bare string, err error) {
 	ws := m.reviewWorkspaceDir(taskID, dim)
 	if ws == "" {
@@ -2038,7 +2038,12 @@ written, you are done — do not modify the repository.
 // the repository through a bare mirror at the reviewed commit instead. `git grep` over a
 // tree-ish recovers most of what a tree search gave (it takes a pattern, -n, and a pathspec),
 // which is why the cost of moving the session out of the tree is a worse review experience
-// rather than a blind one. It returns "" for a dimension that still runs in the worktree.
+// rather than a blind one.
+//
+// Every dispatched dimension now has a mirror, so the empty-bare branch is unreachable from
+// the gate. It is kept because the function is also called when composing a brief for
+// inspection, where there may be no workspace, and returning a section that points at nothing
+// would be worse than returning none.
 func bareSourceSection(bare, head string) string {
 	if bare == "" {
 		return ""

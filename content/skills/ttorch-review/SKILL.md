@@ -39,7 +39,9 @@ run it **by default** before proposing or delivering any worker. It reuses the s
 the security dimension:
 
 1. `ttorch security-review prep <id>` — materializes the same inputs dir as `trust prep`
-   (committed `diff.patch`, `brief.md`, `validate.json`, `head.txt`); refuses a dirty worktree.
+   (committed `diff.patch`, `brief.md`, `validate.json`, `head.txt`). It refuses a dirty
+   worktree when it has to materialize them; when a gate episode already covers the commit it
+   reuses those inputs instead, and does not re-prep or re-check.
 2. Dispatch the **`ttorch-reviewer-security`** agent over that dir + the commit in `head.txt`.
    Give it the report path `prep` printed: `advisory/reports/security.json` under the inputs
    dir. It follows the findings contract below.
@@ -74,7 +76,9 @@ change whose tests look thin or flaky. It reuses the same commit-pinned report m
 gate, folding **only** the QA dimension:
 
 1. `ttorch qa-review prep <id>` — materializes the same inputs dir as `trust prep`
-   (committed `diff.patch`, `brief.md`, `validate.json`, `head.txt`); refuses a dirty worktree.
+   (committed `diff.patch`, `brief.md`, `validate.json`, `head.txt`). It refuses a dirty
+   worktree when it has to materialize them; when a gate episode already covers the commit it
+   reuses those inputs instead, and does not re-prep or re-check.
 2. Dispatch the **`ttorch-reviewer-qa`** agent over that dir + the commit in `head.txt`.
    Give it the report path `prep` printed: `advisory/reports/qa.json` under the inputs dir. It
    follows the findings contract below.
