@@ -1,8 +1,8 @@
 package orchestrator
 
 import (
+	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -709,23 +709,54 @@ func TestGateGuard_SymlinkSwapNeedsAllowGateChange(t *testing.T) {
 // If someone adds another, this fails and the new link has to be classified the same way.
 func TestTreeHasNoUncoveredSymlinks(t *testing.T) {
 	root := repoRootForGateConfig(t)
-	// Fails rather than skips when the tree cannot be enumerated. This used to call
-	// t.Skipf, and the lane that skipped was the offloaded build host .ttorch/validate.sh
-	// runs on, which receives an rsync without .git and returns exit 128. A guard test that
-	// skips where the gate runs is not a guard, so an un-enumerable tree is a failure: this
-	// check is the only thing standing between a new uncovered symlink and the merge.
-	out, err := exec.Command("git", "-C", root, "ls-files", "-s").Output()
+	// Walks the filesystem rather than asking git, and never skips.
+	//
+	// It used to run `git ls-files -s` and t.Skipf on error. The lane that skipped was the
+	// offloaded build host .ttorch/validate.sh runs on, which receives an rsync WITHOUT
+	// .git, so git exits 128 there and this check did not run in the lane the gate uses.
+	// Turning that skip into a failure only moved the problem: the gate lane went red
+	// because the test still could not enumerate the tree. os.Lstat over a walk needs no
+	// git and works in both lanes.
+	//
+	// The walk can see untracked links a tracked-file listing would not. That is the safer
+	// direction for this question, since the gate validates a checked-out tree rather than
+	// an index.
+	var links []string
+	err := filepath.WalkDir(root, func(abs string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case ".git", "vendor", "node_modules", "bin", "dist":
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if d.Type()&fs.ModeSymlink == 0 {
+			return nil
+		}
+		rel, err := filepath.Rel(root, abs)
+		if err != nil {
+			return err
+		}
+		links = append(links, filepath.ToSlash(rel))
+		return nil
+	})
 	if err != nil {
 		t.Fatalf("cannot enumerate the tree to check for uncovered symlinks: %v.\n"+
 			"This check must not be skipped: it is what catches a symlink added outside the "+
 			"covered set, and every such link is the same trick as the CLAUDE.md swap.", err)
 	}
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		f := strings.Fields(line)
-		if len(f) < 4 || f[0] != "120000" {
-			continue
-		}
-		path := strings.Join(f[3:], " ")
+	// CLAUDE.md is a committed symlink in every ttorch-managed repo, so finding none means
+	// the walk is not seeing links at all (a copy that dereferenced them, say) and this
+	// test would pass while asserting nothing.
+	if len(links) == 0 {
+		t.Fatal("found no symlinks at all, not even CLAUDE.md, so this check is asserting " +
+			"nothing. Whatever produced this tree resolved links away; fix the enumeration " +
+			"rather than accepting the pass.")
+	}
+	for _, path := range links {
 		if !matchesGateConfig(path) {
 			t.Errorf("%s is a symlink and is NOT in the covered set. The guard sees the link's own path, "+
 				"not what it resolves to, so replacing it with a real file (or repointing it) changes "+
