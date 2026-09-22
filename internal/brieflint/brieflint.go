@@ -221,12 +221,15 @@ type Options struct {
 	// means defaultBudget. Whatever the budget does not cover is reported as unevaluable,
 	// naming what went unchecked — never passed over in silence.
 	//
-	// The budget covers the git work and the text phase both, and it is worth being exact
-	// about how, because this claim has been wrong twice. Git calls derive their deadline
-	// from it. Rules 2, 3 and 4 check it inside the loops that walk the brief, including
-	// the phase that collects the items before the rule reports on them, which is where
-	// rule 3 once overran a 45s budget by 11.9s: the loop that checked the clock ran after
-	// the expensive one. Rules 1 and 5 do work proportional to the brief and check it once.
+	// The budget covers the git work and the text phase both. The claim has been wrong
+	// three times, so here is what each rule does with it. Git calls derive their deadline
+	// from it. Rules 2, 3, 4 and 5 check it inside the loops they spend their time in,
+	// including the phase that collects the items before the rule reports on them: rule 3
+	// once overran a 45s budget by 11.9s because the loop reading the clock ran after the
+	// expensive one, and rule 5 read the clock once before a loop that scans the whole
+	// brief per declared pointer, where 40,000 pointers against a 1 MB brief measured
+	// 13.92s. Rule 1 checks once and is entitled to: it scans the brief a single time and
+	// then makes at most maxRemoteTargets git calls, each carrying the deadline itself.
 	//
 	// Every text rule is measured linear in the brief's size, and the size is capped, so
 	// the budget is a backstop there rather than the primary bound. It was git-only once,

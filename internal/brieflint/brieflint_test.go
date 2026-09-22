@@ -537,6 +537,48 @@ func TestOversizeConfigIsIndeterminateAndDisablesNothing(t *testing.T) {
 	}
 }
 
+// Rule 5 scans the whole brief once per declared pointer, and the pointer list comes out of
+// the repository's AGENTS.md, so its length is not the linter's to choose. The clock used to
+// be read once, before that loop, which let the budget watch the phase run over without
+// being able to stop it: 40,000 pointers against a 1 MB brief measured 13.92s.
+//
+// The other four rules are disabled so the whole budget belongs to rule 5 and the run cannot
+// arrive at it already expired. Arriving expired would trip the check at the top of
+// checkStandards instead, and prove nothing about the loop.
+func TestRuleStandardsHonoursTheBudgetInsideItsLoop(t *testing.T) {
+	const pointers = 200_000
+	cfg := Config{Source: "fixture", Disabled: map[RuleID]bool{
+		RuleTargetBranch: true, RuleFilePaths: true, RuleHardCounts: true, RuleProhibition: true,
+	}}
+	for i := 0; i < pointers; i++ {
+		cfg.Standards = append(cfg.Standards, fmt.Sprintf("docs/absent-%d.md", i))
+	}
+	// Big enough that one scan is not free, small enough to stay under MaxBriefBytes. No
+	// pointer appears in it, so every one of them scans the whole thing, and the filler
+	// repeats the pointers' own prefix so the scan does real comparison work rather than
+	// skipping on a first byte the brief never contains.
+	big := satisfying + strings.Repeat("docs/absent-x.md is not one of them. ", 13_000)
+	if len(big) > MaxBriefBytes {
+		t.Fatalf("fixture brief is %d bytes, over the %d byte cap", len(big), MaxBriefBytes)
+	}
+
+	const budget = 200 * time.Millisecond
+	start := time.Now()
+	r := Lint(big, Options{Config: cfg, Budget: budget})
+	elapsed := time.Since(start)
+
+	f := requireStatus(t, r, RuleStandards, StatusIndeterminate)
+	if !strings.Contains(f.Detail, "run budget") {
+		t.Fatalf("want the budget finding, got %q", f.Detail)
+	}
+	// The announced bound has to hold, not merely be announced. 50x the budget is slack for
+	// a loaded machine and still far short of what the unchecked loop costs: running every
+	// pointer against this brief is tens of seconds of scanning.
+	if limit := 50 * budget; elapsed > limit {
+		t.Fatalf("%d pointers took %s against a %s budget, over the %s the run may not exceed", pointers, elapsed, budget, limit)
+	}
+}
+
 // --- "could not evaluate" is distinct from a pass ---------------------------------------
 
 // failingGit stands in for a git that cannot answer: an unreachable remote, a missing

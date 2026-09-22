@@ -752,7 +752,15 @@ func checkStandards(ctx context.Context, b *brief, opt Options) ([]Finding, []st
 		}}, nil
 	}
 	if len(cfg.Standards) > 0 {
-		for _, p := range cfg.Standards {
+		// One scan of the whole brief per declared pointer, and the pointer list comes from
+		// the repository's AGENTS.md, so its length is not ours to choose. Measured against
+		// a 1,000,061-byte brief: 0.35 ms per pointer, flat, so 40,000 pointers took 13.92s
+		// and 130,000 would pass the whole 45s budget. The clock used to be read once,
+		// before the loop, which left the budget watching a phase it could not stop.
+		for i, p := range cfg.Standards {
+			if i%budgetCheckEvery == 0 && ctx.Err() != nil {
+				return []Finding{budgetFinding(RuleStandards)}, nil
+			}
 			if strings.Contains(b.lower, strings.ToLower(p)) {
 				return nil, []string{fmt.Sprintf("standards: the brief mentions the project's declared pointer %q (wording only: a mention, which the check cannot tell from one telling the worker to ignore it)", p)}
 			}
