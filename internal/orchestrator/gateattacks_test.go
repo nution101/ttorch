@@ -855,7 +855,7 @@ func TestGateGuard_ProjectConfigAndNestedInstructions(t *testing.T) {
 // leaving it implied by the absence of a failure.
 func TestGateGuard_OrdinaryChangeStillMergesAfterRound6(t *testing.T) {
 	for _, path := range []string{
-		"internal/cli/cli.go",            // 29% of this repo's commits, deliberately uncovered
+		"internal/cli/cli.go",            // deliberately uncovered, on cost
 		"internal/orchestrator/spawn.go", // classified non-deciding
 		"internal/db/store.go",           // the documented cost-based exclusion
 		"docs/ONBOARDING.md",             // ordinary prose
@@ -1085,7 +1085,7 @@ func TestGateGuard_PublishedInstallersNeedAllowGateChange(t *testing.T) {
 //     installer.desiredFiles walks the embedded tree rather than working from a list, so the
 //     file just leaves the install set.
 //   - internal/installer has exactly one non-test importer, internal/cli/cli.go, which is
-//     deliberately uncovered at 29% of commits. So a diff could move the whole package out of
+//     deliberately uncovered on cost grounds. So a diff could move the whole package out of
 //     coverage, fix that one import, compile, merge unflagged — and every later change to the
 //     package would be unflagged too.
 func TestGateGuard_RenameReportsBothSides(t *testing.T) {

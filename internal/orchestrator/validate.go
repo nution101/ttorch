@@ -116,11 +116,11 @@ func (m *Manager) Validate(taskID string) ([]validate.Result, error) {
 //	              dependency, and a `toolchain` directive changes the compiler. Unlike
 //	              go.work it actually exists here — and since fsIdentityKey now depends on
 //	              golang.org/x/text, a replace on x/text redirects the guard's OWN Unicode
-//	              folding. 5 commits in 196, the same figure that justifies .github/workflows/
-//	go.sum        the hashes that make go.mod's choices verifiable; 3 commits
+//	              folding. Cheap at the margin.
+//	go.sum        the hashes that make go.mod's choices verifiable
 //
 // content.go is the //go:embed that decides which repo file becomes which installed reviewer
-// definition. All of these cost 0 additional commits: in 196 commits none has ever been
+// definition. All of these cost nothing at the margin: no commit in the corpus has been
 // touched without something already covered being touched too, and go.work and vendor/ have
 // never been touched at all.
 var gateConfigFiles = []string{
@@ -188,11 +188,11 @@ var ttorchSourceFiles = []string{
 	// gate, uses none of its identifiers, AND is named for none of it. Once the symbol
 	// signal is gone the name is the only handle left, and nothing mechanical sees past
 	// it. The place such a test would most likely be written is orchestrator_test.go, and
-	// covering that file wholesale costs 43 of 196 commits, which is the trade being made
+	// covering that file wholesale is the most expensive option on the table, and that is the trade being made
 	// here rather than an oversight.
 	//
 	// The gate-config tests used to live in orchestrator_test.go too. Covering that file
-	// cost 43 of 196 commits and took the set to 110/196 = 56%, past the more-than-half
+	// have taken the set past the more-than-half
 	// line that is the stated reason internal/orchestrator/ is not covered wholesale, so
 	// the tests moved into a file that was already covered instead. Both files here cost 0
 	// commits: they exist only to hold these proofs.
@@ -238,7 +238,7 @@ var ttorchSourceFiles = []string{
 // under content/ matches, which gives derivation's safety property without the coupling.
 //
 // Cost: see docs/ARCHITECTURE.md. Widening from the two narrow prefixes to content/ added
-// 8 commits of 196.
+// Cheap at the margin.
 //
 // internal/review/ is the verdict itself: the findings contract, the severity-to-block rule,
 // and the diff-size classifier that decides WHICH reviewers run at all. internal/approval/ is
@@ -256,7 +256,7 @@ var ttorchSourceFiles = []string{
 // while leaving the mapping open would let a file from an uncovered subtree be installed as a
 // reviewer instead, through the same delayed diff channel; it is also what makes the "content/"
 // prefix a safe superset, since desiredFiles cannot install from outside content/ without a
-// change here. 3 commits.
+// change here.
 //
 // internal/skills/ is an install channel in its own right, and the one the covered set
 // missed for longest. Recommended() returns third-party skill refs, InstallCmd turns each
@@ -266,7 +266,7 @@ var ttorchSourceFiles = []string{
 // by a shorter route, since npx fetches at spawn time with no ttorch build or install in
 // between. The limits list used to name ~/.claude/skills only as an out-of-repo exposure no
 // diff-channel guard could see; that was an understatement once this route existed. It costs
-// 0 marginal commits of 196.
+// Nothing at the margin.
 //
 // .ttorch/ is a PREFIX rather than the single ".ttorch/validate.sh" it used to be, and this
 // inversion closes a class rather than a file. The channel that forced it:
@@ -281,8 +281,8 @@ var ttorchSourceFiles = []string{
 // Adding "learnings.jsonl" as a second exact path would have left the NEXT .ttorch/ file in
 // exactly the same position. An enumerated subset of content/ had already missed installed
 // files twice, and an enumerated subset of .ttorch/ then missed the ledger; covering the tree
-// covers everything under it, including files that do not exist yet. In 196 commits the only
-// .ttorch/ path ever committed is validate.sh, so the prefix costs 0 marginal. .ttorch/task —
+// covers everything under it, including files that do not exist yet. Across the corpus the
+// only .ttorch/ path ever committed is validate.sh, so the prefix costs nothing. .ttorch/task —
 // the only other file that shows up locally — is gitignored so it cannot appear in a diff, and
 // that needed FIXING as part of this change: it was excluded only through .git/info/exclude,
 // which is local to a clone and does not travel. The manager writes that file into every
@@ -297,7 +297,7 @@ var ttorchSourceFiles = []string{
 // takes precedence over ~/.claude/agents/ on a name collision. content/agents/ttorch-reviewer-*
 // is already covered for the same effect, but that route needs a build and an install first;
 // this one takes effect on the merge. .mcp.json adds tools to those same sessions. Neither
-// exists in this repo, so both cost 0 commits and their appearance in a diff is the event.
+// exists in this repo, so both cost nothing and their appearance in a diff is the event.
 //
 // vendor/ is the third way to change what `go test` compiles without touching a covered
 // script: with a consistent vendor/modules.txt the toolchain builds from vendor/ rather than
@@ -312,7 +312,7 @@ var ttorchSourceFiles = []string{
 // into a shell, with no build, no install and no release step in between. That is the same
 // delayed out-of-band effect that justifies the rest of the set, with the most severe
 // consequence of any file in the repo, and covering one platform's installer but not the
-// other would be an obvious gap. Together they cost 3 commits.
+// other would be an obvious gap, and together they are cheap.
 //
 // So the covered set answers two questions, not one: what decides how a change is REVIEWED or
 // VALIDATED, and what a merge PUBLISHES DIRECTLY to users. Anything outside both is not
@@ -324,7 +324,7 @@ var ttorchSourceFiles = []string{
 // a landed weakening of ci.yml weakens every later change's validation through exactly the
 // delayed diff channel that put the skills on this list. The trusted gate does not itself
 // consult CI, which is the argument against including it; it loses to the fact that the gate
-// script defers to CI by name. It costs 5 commits in 196, so the blast-radius argument that
+// script defers to CI by name. It is cheap at the margin, so the blast-radius argument that
 // keeps internal/orchestrator/ off the list does not apply.
 var gateConfigPrefixes = []string{
 	"vendor/",
@@ -355,8 +355,7 @@ var ttorchSourcePrefixes = []string{
 	// reproduces the .gitattributes critical, and it sat outside the covered set while
 	// internal/review/ and internal/validate/ were inside it on a thinner dependency.
 	// Whole package rather than the one file: all 18 of its commits touch worktree.go, so
-	// file-granularity buys nothing and decays. +11 commits, taking the set to 95/196 =
-	// 48.5%, which stays under the more-than-half line.
+	// file-granularity buys nothing and decays. It keeps the set under the more-than-half line.
 	"internal/worktree/",
 }
 
@@ -449,7 +448,7 @@ func orbitMin(s string) string {
 // TestMatchesGateConfig pinned as a near-miss that must stay OUT, is now correctly IN: a
 // session reading files under docs/ loads it, so it is an instruction file like any other.
 //
-// Never committed at a nested path in 196 commits, so this costs 0.
+// Never committed at a nested path anywhere in the corpus, so this costs nothing.
 //
 // This OVERLAPS gateConfigFiles, which also names AGENTS.md and CLAUDE.md, and the redundancy
 // is deliberate. The root AGENTS.md is the delivery-mode config — the single most important

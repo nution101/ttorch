@@ -35,7 +35,7 @@ type Result struct {
 //
 // The FS is chosen HERE, in a package the trust gate covers, rather than by the caller.
 // It used to be a parameter on an exported Apply, and internal/cli picked the tree —
-// deliberately uncovered at 32 of 196 commits. That made the gate guard's "the installer
+// deliberately uncovered on cost grounds. That made the gate guard's "the installer
 // has no file outside content/ to reach" conditional on an uncovered file, and the bypass
 // needed no covered path at all: a payload/content/ tree, a payload/embed.go carrying its
 // own `//go:embed all:content`, and one line in internal/cli handing that FS to Apply

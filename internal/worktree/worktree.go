@@ -874,6 +874,15 @@ type treeEntry struct {
 // `-z` here is on the OUTPUT, where it has been supported for as long as ls-tree has, and
 // it is what keeps a path containing a newline from splitting a record. It also hands back
 // each object's id, which is what lets CatBlobs read by id rather than by path.
+//
+// It reads through checkedGitRaw for the same reason TreeFiles does: a successful git
+// command that also wrote to stderr has said something, and dropping it loses the only
+// notice. To be exact about what that does NOT buy, since an earlier version of this
+// comment overclaimed it: ErrPathCollision is unreachable from here. Git emits the
+// collision warning from unpack_trees, so only the checkout family raises it, and ls-tree
+// never does. Nothing is misread either way, because ls-tree lists colliding paths as
+// separate records keyed by path and id. The collision refusal lives where the tree is
+// actually materialized, in AddDetached.
 func treeEntries(path, rev string) (map[string]treeEntry, error) {
 	out, err := checkedGitRaw("-C", path, "ls-tree", "-r", "-z", rev)
 	if err != nil {

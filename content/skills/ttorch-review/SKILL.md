@@ -276,9 +276,10 @@ invalidates the verdict — re-prep, re-review, re-record.
   ```
 
   The two that cost the most to leave out, with the measured reason:
-  `internal/cli/` is +28 commits, which would take the covered set to 123/196 = 62.8%, past
-  the more-than-half line that is the stated reason `internal/orchestrator/` is not covered
-  wholesale. `internal/db/` is +15, to 110/196 = 56.1%. `internal/worktree/` used to be here and is now COVERED: it holds `ChangedFiles`, the only
+  covering `internal/cli/` would take the set past the more-than-half line that is the stated
+  reason `internal/orchestrator/` is not covered wholesale, and `internal/db/` is the cheaper
+  of the two but still lands past half. The measured figures are generated into
+  `docs/ARCHITECTURE.md`; nothing restates them, here or anywhere else. `internal/worktree/` used to be here and is now COVERED: it holds `ChangedFiles`, the only
   input to the guard, plus the raw blob read the scope resolves from, so an incomplete list
   or a desynced read there makes the guard match nothing at all.
 
@@ -302,9 +303,9 @@ invalidates the verdict — re-prep, re-review, re-record.
     five, so the narrower list cannot decay into false coverage unnoticed.
   - `internal/cli/` wires the `--allow-gate-change` flag but is not covered, and
     `internal/db/` holds the verdict row the merge trusts for `Overall == pass`. Both are cost
-    judgements rather than oversights: +28 and +15 commits on a base of 95, taking the set to
-    62.8% and 56.1%. `internal/cli/` is the one that matters, because it also used to choose
-    the tree the installer walked — see `docs/ARCHITECTURE.md`, which holds the figures. An
+    judgements rather than oversights, and both land the set past half. `internal/cli/` is the
+    one that matters, because it also used to choose the tree the installer walked — see the
+    generated cost block in `docs/ARCHITECTURE.md`, which is where the figures live. An
     earlier version of this line said both "would roughly double the flag's frequency", which
     overstated the cost of the one package a real bypass ran through.
   - Filesystems whose folding rules differ from Unicode's. `fsIdentityKey` is measured
