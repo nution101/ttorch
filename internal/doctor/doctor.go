@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/nution101/ttorch/internal/termtab"
+	"github.com/nution101/ttorch/internal/tmux"
 )
 
 // Tool is an external dependency ttorch relies on.
@@ -33,6 +34,23 @@ func Tools() []Tool {
 		{Name: "gh", Bin: "gh", Why: "PR creation and merge-status checks", Required: false},
 		{Name: "claude", Bin: "claude", Why: "the coding agent ttorch orchestrates", Required: true,
 			Manual: "install Claude Code, e.g.  npm install -g @anthropic-ai/claude-code"},
+	}
+}
+
+// reportTmuxVersion prints the tmux version line, flagging a tmux too old for a
+// read-only worker view tab. An unreadable banner is reported as unknown rather
+// than as too old: ttorch assumes such a build is modern (tmux.SupportsReadOnlyView),
+// and saying "unknown" is honest about which of the two it is.
+func reportTmuxVersion(out io.Writer, banner string) {
+	switch {
+	case strings.TrimSpace(banner) == "":
+		fmt.Fprintln(out, "  tmux version: could not be read")
+	case tmux.BannerAtLeast(banner, 3, 2):
+		fmt.Fprintf(out, "  tmux version: %s\n", banner)
+	case tmux.BannerReadable(banner):
+		fmt.Fprintf(out, "  tmux version: %s — below %s, so worker view tabs open WRITABLE (typing in one goes to the worker); upgrade tmux, or set TTORCH_WORKER_TABS=0\n", banner, tmux.ReadOnlyViewFloor)
+	default:
+		fmt.Fprintf(out, "  tmux version: %s — unrecognized; ttorch assumes it is new enough for read-only worker view tabs (tmux %s+)\n", banner, tmux.ReadOnlyViewFloor)
 	}
 }
 
@@ -73,6 +91,13 @@ func Run(out io.Writer, in io.Reader, autoYes bool) error {
 			}
 			fmt.Fprintf(out, "  [%s] %-7s — %s\n", tag, t.Name, t.Why)
 		}
+	}
+
+	// tmux's version decides whether a worker view tab can be attached read-only.
+	// Below the floor the tab is a writable keyboard on a live agent, so report it
+	// here, where an operator goes to find out what their environment is missing.
+	if _, ok := d.Found["tmux"]; ok {
+		reportTmuxVersion(out, tmux.Version())
 	}
 
 	// iTerm2 is an optional macOS convenience: with it present, 'ttorch' opens the

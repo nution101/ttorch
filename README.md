@@ -458,11 +458,30 @@ alive). iTerm gets a new tab; Terminal.app gets a new window.
 
 **The view tab is read-only.** It shares the worker's actual pane rather than a copy of
 it, so a writable tab would be a second keyboard on a running agent with nothing on
-screen to say so. You can scroll the worker's history (`Ctrl-b PgUp`) and close the tab,
-but you cannot type into the worker from it. Steer a worker through the manager with
+screen to say so. You can close the tab and scroll the worker's history, but you cannot
+type into the worker from it. Steer a worker through the manager with
 `ttorch send <id> <text>`, which addresses the pane with no client at all so a view tab
-cannot intercept it. This needs tmux 3.2 or newer; on an older tmux the view tab stays
-writable, as before.
+cannot intercept it.
+
+This needs tmux 3.2 or newer, which is where read-only view clients arrive. On an older
+tmux the tab opens writable and ttorch prints a warning naming your version; `ttorch
+doctor` reports the same thing. If you would rather have no tab than a writable one, set
+`TTORCH_WORKER_TABS=0` and watch with `ttorch peek`.
+
+**Scrolling puts the worker's pane into copy-mode.** `Ctrl-b PgUp` in the view tab scrolls
+the shared pane, not a copy of it, so the worker's own pane enters copy-mode and stays
+there until you press `Escape`. While it is in copy-mode a steer cannot reach the agent, so
+`ttorch send` refuses with a message telling you to press Escape rather than reporting a
+success that never arrived. Scroll freely; just press `Escape` when you are done.
+
+**Read-only is an accident guard, not a security boundary.** It stops a stray keystroke in a
+watcher tab. It does not contain anyone: anybody with a shell on the machine can run `tmux
+attach -t ttv-wk-<TASK>` (or attach to the `ttorch` session itself) and get a writable
+client. Two further limits worth knowing. `ttorch send` deliberately bypasses the read-only
+check — that is what keeps steering working — so read-only says nothing about a
+*programmatic* steer; in particular a send that lands on a worker sitting at a numbered menu
+is still consumed as a menu selection and still reports success. And `ttv-` sessions created
+by a pre-fix ttorch persist writable until the worker is respawned.
 
 **iTerm2 is recommended** for the cleanest experience: it gives one window with a tab per
 worker. When iTerm2 is installed, running bare `ttorch` opens the **manager itself in a new

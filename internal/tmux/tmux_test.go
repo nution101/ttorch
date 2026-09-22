@@ -33,12 +33,24 @@ const fakeTmuxScript = `#!/bin/sh
 
 case "$1" in
 -V)              printf 'tmux %s\n' "${FAKE_VERSION:-3.5a}"; exit 0 ;;
+esac
+if [ -n "${FAKE_REJECT_EMPTY_CLIENT:-}" ]; then
+  prev=""
+  for a in "$@"; do
+    if [ "$prev" = "-c" ] && [ -z "$a" ]; then
+      printf "can't find client: "; exit 1
+    fi
+    prev="$a"
+  done
+fi
+[ -n "${FAKE_SLEEP:-}" ] && sleep "$FAKE_SLEEP"
+case "$1" in
 has-session)     exit "${FAKE_HAS_SESSION_EXIT:-0}" ;;
 list-windows)    printf '%s' "$FAKE_LIST_WINDOWS"; exit "${FAKE_LIST_WINDOWS_EXIT:-0}" ;;
 display-message) printf '%s' "$FAKE_DISPLAY";      exit "${FAKE_DISPLAY_EXIT:-0}" ;;
 list-panes)      printf '%s' "$FAKE_LIST_PANES";   exit "${FAKE_LIST_PANES_EXIT:-0}" ;;
 capture-pane)    printf '%s' "$FAKE_CAPTURE";      exit "${FAKE_CAPTURE_EXIT:-0}" ;;
-*)               exit "${FAKE_GENERIC_EXIT:-0}" ;;
+*)               printf '%s' "${FAKE_GENERIC_OUT:-}"; exit "${FAKE_GENERIC_EXIT:-0}" ;;
 esac
 `
 
@@ -396,6 +408,7 @@ func TestSendLine_PlainText(t *testing.T) {
 		t.Fatalf("SendLine: %v", err)
 	}
 	want := [][]string{
+		{"display-message", "-p", "-t", "s:w", "#{pane_in_mode}"},
 		{"send-keys", "-c", "", "-t", "s:w", "-l", "echo hi there"},
 		{"send-keys", "-c", "", "-t", "s:w", "Enter"},
 	}
@@ -417,6 +430,7 @@ func TestSendLine_SlashCommandUsesLongerSettle(t *testing.T) {
 		t.Errorf("slash-command settle = %v, want >= 1s", elapsed)
 	}
 	want := [][]string{
+		{"display-message", "-p", "-t", "s:w", "#{pane_in_mode}"},
 		{"send-keys", "-c", "", "-t", "s:w", "-l", "/clear"},
 		{"send-keys", "-c", "", "-t", "s:w", "Enter"},
 	}
@@ -432,9 +446,9 @@ func TestSendLine_FirstSendFails(t *testing.T) {
 	if err := SendLine("s", "w", "echo hi"); err == nil {
 		t.Fatal("SendLine err = nil, want failure")
 	}
-	// Enter must not be sent if the text send failed.
-	if got := readInvocations(t, log); len(got) != 1 {
-		t.Errorf("invocations = %v, want only the failed literal send", got)
+	// Enter must not be sent if the text send failed (the mode probe precedes it).
+	if got := readInvocations(t, log); len(got) != 2 {
+		t.Errorf("invocations = %v, want the mode probe and the failed literal send", got)
 	}
 }
 
@@ -450,7 +464,43 @@ func TestSendKey(t *testing.T) {
 	}
 }
 
-func TestVersionAtLeast(t *testing.T) {
+// TestSendLineRefusesAPaneInCopyMode pins the second half of the copy-mode defect.
+// The deadline stops a steer hanging forever, but it does not make the steer land:
+// once the deadline has killed the blocked client the server is unwedged, so later
+// attempts return success in milliseconds while copy-mode swallows the keys. A
+// steer that reports success and never arrived is the worst of the three outcomes,
+// so SendLine refuses and names the key that clears the mode.
+func TestSendLineRefusesAPaneInCopyMode(t *testing.T) {
+	log := installFakeTmux(t)
+	t.Setenv("FAKE_DISPLAY", "1")
+	err := SendLine("s", "w", "continue")
+	if err == nil {
+		t.Fatal("SendLine err = nil, want a refusal while the pane is in copy-mode")
+	}
+	for _, want := range []string{"copy-mode", "swallowed", "Escape"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q should mention %q", err, want)
+		}
+	}
+	if got := readInvocations(t, log); len(got) != 1 || got[0][0] != "display-message" {
+		t.Errorf("invocations = %v, want only the mode probe and no send", got)
+	}
+}
+
+// TestSendLineProceedsWhenTheModeProbeFails keeps the guard from becoming a new
+// way to lose the control channel: a broken diagnostic must not block steering.
+func TestSendLineProceedsWhenTheModeProbeFails(t *testing.T) {
+	log := installFakeTmux(t)
+	t.Setenv("FAKE_DISPLAY_EXIT", "1")
+	if err := SendLine("s", "w", "continue"); err != nil {
+		t.Fatalf("SendLine: %v", err)
+	}
+	if got := readInvocations(t, log); len(got) != 3 {
+		t.Errorf("invocations = %v, want the probe plus the text and Enter sends", got)
+	}
+}
+
+func TestBannerAtLeast(t *testing.T) {
 	cases := []struct {
 		banner string
 		want   bool
@@ -473,8 +523,8 @@ func TestVersionAtLeast(t *testing.T) {
 		{"3.5a", true},
 	}
 	for _, c := range cases {
-		if got := versionAtLeast(c.banner, 3, 2); got != c.want {
-			t.Errorf("versionAtLeast(%q, 3, 2) = %v, want %v", c.banner, got, c.want)
+		if got := BannerAtLeast(c.banner, 3, 2); got != c.want {
+			t.Errorf("BannerAtLeast(%q, 3, 2) = %v, want %v", c.banner, got, c.want)
 		}
 	}
 }
@@ -506,18 +556,90 @@ func TestSendKeysIsNotAttributedToAClient(t *testing.T) {
 	t.Fatalf("send-keys must pass an empty -c so no client is resolved, got %v", inv[0])
 }
 
-// TestSendKeysUnattributedOnlyWhenSupported is the other side of the gate: an
-// older tmux rejects an unfound client instead of ignoring it, so there the send
-// keeps its original form (and termtab leaves the view writable to match).
-func TestSendKeysUnattributedOnlyWhenSupported(t *testing.T) {
-	pinReadOnlyView(t, false)
+// TestSendKeysFallsBackWhenTmuxRejectsTheEmptyClient covers the tmux versions
+// before 3.1, which reject an unfound client instead of ignoring it. The steer
+// path must not depend on reading a version banner to get this right — a misread
+// banner would silently kill the control channel — so it reacts to what tmux
+// actually said and retries in the form that works there.
+func TestSendKeysFallsBackWhenTmuxRejectsTheEmptyClient(t *testing.T) {
 	log := installFakeTmux(t)
+	t.Setenv("FAKE_REJECT_EMPTY_CLIENT", "1")
 	if err := SendKey("s", "w", "C-c"); err != nil {
 		t.Fatalf("SendKey: %v", err)
 	}
-	want := []string{"send-keys", "-t", "s:w", "C-c"}
-	if inv := readInvocations(t, log); len(inv) != 1 || !reflect.DeepEqual(inv[0], want) {
-		t.Errorf("invocation = %v, want %v", inv, want)
+	want := [][]string{
+		{"send-keys", "-c", "", "-t", "s:w", "C-c"},
+		{"send-keys", "-t", "s:w", "C-c"},
+	}
+	if got := readInvocations(t, log); !reflect.DeepEqual(got, want) {
+		t.Errorf("invocations =\n%v\nwant\n%v", got, want)
+	}
+}
+
+// TestSendKeysDoesNotRetryOnOtherErrors keeps the fallback narrow: a send that
+// failed for any other reason must surface that failure, not be sent twice.
+func TestSendKeysDoesNotRetryOnOtherErrors(t *testing.T) {
+	log := installFakeTmux(t)
+	t.Setenv("FAKE_GENERIC_EXIT", "1")
+	t.Setenv("FAKE_GENERIC_OUT", "can't find window: w")
+	if err := SendKey("s", "w", "C-c"); err == nil {
+		t.Fatal("SendKey err = nil, want the failure surfaced")
+	}
+	if got := readInvocations(t, log); len(got) != 1 {
+		t.Errorf("invocations = %v, want only the first attempt", got)
+	}
+}
+
+func TestReadOnlyViewSupported(t *testing.T) {
+	cases := []struct {
+		banner string
+		want   bool
+	}{
+		{"tmux 3.2", true},
+		{"tmux 3.5a", true},
+		{"tmux 3.1c", false},
+		{"tmux 3.0a", false},
+		// An unreadable banner answers YES on purpose. Guessing yes on a too-old
+		// tmux costs a view tab that exits on the unknown flag, which is visible
+		// and leaves the worker alone; guessing no hands over a writable keyboard
+		// on a live agent that looks identical to the fixed tab.
+		{"tmux master", true},
+		{"tmux openbsd-7.4", true},
+		{"", true},
+	}
+	for _, c := range cases {
+		if got := readOnlyViewSupported(c.banner); got != c.want {
+			t.Errorf("readOnlyViewSupported(%q) = %v, want %v", c.banner, got, c.want)
+		}
+	}
+}
+
+// TestRunTimesOut pins the control-channel deadline. A tmux command can block
+// forever rather than fail — a pane left in copy-mode does it — and run() had no
+// deadline, so ttorch send, the scheduler's stall recovery, the watcher, the gate
+// and a spawn would all park indefinitely. The caller must get an error it can
+// report instead.
+func TestRunTimesOut(t *testing.T) {
+	installFakeTmux(t)
+	t.Setenv("FAKE_SLEEP", "5")
+	prevT, prevW := runTimeout, runWaitDelay
+	runTimeout, runWaitDelay = 250*time.Millisecond, 250*time.Millisecond
+	t.Cleanup(func() { runTimeout, runWaitDelay = prevT, prevW })
+
+	start := time.Now()
+	_, err := run("send-keys", "-t", "s:w", "x")
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("run err = nil, want a timeout")
+	}
+	if !strings.Contains(err.Error(), "no answer after") {
+		t.Errorf("error should name the timeout, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "copy-mode") {
+		t.Errorf("error should name the reachable cause so it is actionable, got %v", err)
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("run blocked %v, want it to give up near the deadline", elapsed)
 	}
 }
 
@@ -526,11 +648,11 @@ func TestSendKeysUnattributedOnlyWhenSupported(t *testing.T) {
 func TestSupportsReadOnlyViewProbesVersion(t *testing.T) {
 	log := installFakeTmux(t)
 	t.Setenv("FAKE_VERSION", "3.5a")
-	if !versionAtLeast(Version(), 3, 2) {
+	if !BannerAtLeast(Version(), 3, 2) {
 		t.Error("tmux 3.5a must support the read-only view")
 	}
 	t.Setenv("FAKE_VERSION", "3.0a")
-	if versionAtLeast(Version(), 3, 2) {
+	if BannerAtLeast(Version(), 3, 2) {
 		t.Error("tmux 3.0a must not be treated as supporting the read-only view")
 	}
 	inv := readInvocations(t, log)

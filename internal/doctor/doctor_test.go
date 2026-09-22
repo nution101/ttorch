@@ -1,6 +1,9 @@
 package doctor
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestWSLKind(t *testing.T) {
 	cases := []struct {
@@ -38,6 +41,38 @@ func TestITermInstallCmd(t *testing.T) {
 	for _, m := range []string{"apt-get", "dnf", "pacman", ""} {
 		if _, ok := itermInstallCmd(m); ok {
 			t.Errorf("iterm should not be installable via %q", m)
+		}
+	}
+}
+
+// TestReportTmuxVersion covers the floor report. tmux's version decides whether a
+// worker view tab can be attached read-only, and below the floor the tab is a live
+// keyboard on a running agent — so doctor, which is where an operator looks, has to
+// say which of the three situations they are in.
+func TestReportTmuxVersion(t *testing.T) {
+	cases := []struct {
+		banner string
+		want   []string
+		absent []string
+	}{
+		{"tmux 3.5a", []string{"tmux 3.5a"}, []string{"WRITABLE", "unrecognized"}},
+		{"tmux 3.0a", []string{"tmux 3.0a", "below 3.2", "WRITABLE", "TTORCH_WORKER_TABS=0"}, []string{"unrecognized"}},
+		{"tmux master", []string{"tmux master", "unrecognized"}, []string{"WRITABLE"}},
+		{"", []string{"could not be read"}, []string{"WRITABLE", "unrecognized"}},
+	}
+	for _, c := range cases {
+		var b strings.Builder
+		reportTmuxVersion(&b, c.banner)
+		got := b.String()
+		for _, w := range c.want {
+			if !strings.Contains(got, w) {
+				t.Errorf("reportTmuxVersion(%q) = %q, want it to mention %q", c.banner, got, w)
+			}
+		}
+		for _, a := range c.absent {
+			if strings.Contains(got, a) {
+				t.Errorf("reportTmuxVersion(%q) = %q, should not mention %q", c.banner, got, a)
+			}
 		}
 	}
 }

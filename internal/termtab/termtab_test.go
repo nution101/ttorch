@@ -364,3 +364,23 @@ func TestOpenManagerSessionGatedOff(t *testing.T) {
 		t.Error("expected no-op when inside iTerm")
 	}
 }
+
+// TestWarnWritableView pins the fail-open warning. The read-only attach needs a
+// tmux operand older tmux lacks, so there the tab opens writable — and a writable
+// tab is visually identical to a read-only one. Silence there is the worst case:
+// the operator has read that the guard exists and is holding a live keyboard on a
+// running agent. The warning has to name the version, say the tab can type into
+// the worker, and give a way out.
+func TestWarnWritableView(t *testing.T) {
+	var b strings.Builder
+	warnWritableView(&b, "wk-42", "tmux 3.0a")
+	got := b.String()
+	for _, want := range []string{"wk-42", "WRITABLE", "tmux 3.0a", "3.2", "goes to the running worker", "TTORCH_WORKER_TABS=0"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("warning %q missing %q", got, want)
+		}
+	}
+	if !strings.HasSuffix(got, "\n") {
+		t.Errorf("warning must be one terminated line, got %q", got)
+	}
+}

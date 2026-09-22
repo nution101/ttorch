@@ -24,6 +24,7 @@ package termtab
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -47,13 +48,34 @@ func Open(session, window string) error {
 	if term == "auto" {
 		term = detectTerminal()
 	}
-	tmuxCmd := viewCommand(session, window, tmux.SupportsReadOnlyView())
+	readOnly := tmux.SupportsReadOnlyView()
+	if !readOnly {
+		warnWritableView(os.Stderr, window, tmux.Version())
+	}
+	tmuxCmd := viewCommand(session, window, readOnly)
 	script := appleScript(term, tmuxCmd)
 	if err := exec.Command("osascript", "-e", script).Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "ttorch: could not open a terminal view for %s (workers still run in tmux; Ctrl-b w to navigate): %v\n", window, err)
 		return nil
 	}
 	return nil
+}
+
+// warnWritableView tells the lead, on the one path where it matters, that the tab
+// about to open can type into the worker.
+//
+// The read-only attach needs a tmux operand older tmux does not have, so on such a
+// tmux the tab opens writable — and looks exactly like a read-only one. Without
+// this line an operator who has read that the guard exists is holding a live
+// keyboard on a running agent and has no way to tell. A silent downgrade is worse
+// than no downgrade, so it is said out loud, with the version that caused it.
+//
+// It is only reached for a banner that parsed and came in below the floor; an
+// unreadable banner is assumed modern and attaches read-only (see
+// tmux.SupportsReadOnlyView), so there is no "unknown version" case to word.
+func warnWritableView(w io.Writer, window, banner string) {
+	fmt.Fprintf(w, "ttorch: the view tab for %s is WRITABLE — %s is below tmux %s, which is where read-only view clients arrive. Anything you type in that tab goes to the running worker. Upgrade tmux, or set TTORCH_WORKER_TABS=0 and watch with 'ttorch peek'.\n",
+		window, banner, tmux.ReadOnlyViewFloor)
 }
 
 // Enabled reports whether native-terminal behavior (worker views and the

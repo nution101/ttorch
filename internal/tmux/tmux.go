@@ -3,6 +3,7 @@
 package tmux
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -46,13 +47,43 @@ func bin() (string, error) {
 	return p, nil
 }
 
+// runTimeout bounds every tmux control command below. It is a var so a test can
+// shorten it; nothing changes it at runtime.
+//
+// A tmux command can block forever rather than fail. The reachable case is a pane
+// left in copy-mode: a `send-keys` at that pane never returns, so a steer through
+// SendLine hangs, and with it whatever called it — ttorch send, the scheduler's
+// stall recovery, the watcher's liveness read, the gate, a spawn. Losing the
+// control channel to a running agent is the worst outcome available here, and an
+// error the caller can report is strictly better than a goroutine parked forever.
+//
+// 30s is chosen against measurement, not taste: the slowest legitimate call is a
+// capture-pane over a full scrollback, which takes 0.28s for 200,000 lines
+// (208MB) on this hardware, and the control commands are ~35ms. 30s is roughly
+// 100x that ceiling, so it cannot fire on a merely slow machine, while still
+// bounding a scheduler tick at 30s instead of forever.
+var runTimeout = 30 * time.Second
+
+// runWaitDelay bounds the wait AFTER the deadline kills the tmux client. Killing
+// the client does not close the output pipe if it left a child holding the write
+// end, and CombinedOutput reads until EOF — so without this the deadline would be
+// no deadline at all. It only ever applies on the timeout path.
+var runWaitDelay = 2 * time.Second
+
 func run(args ...string) (string, error) {
 	b, err := bin()
 	if err != nil {
 		return "", err
 	}
-	out, err := exec.Command(b, args...).CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, b, args...)
+	cmd.WaitDelay = runWaitDelay
+	out, err := cmd.CombinedOutput()
 	s := strings.TrimRight(string(out), "\n")
+	if ctx.Err() == context.DeadlineExceeded {
+		return s, fmt.Errorf("tmux %s: no answer after %s, gave up; a pane left in copy-mode does this, so press Escape in the worker's pane (or 'tmux send-keys -X cancel') and retry", strings.Join(args, " "), runTimeout)
+	}
 	if err != nil {
 		return s, fmt.Errorf("tmux %s: %v: %s", strings.Join(args, " "), err, s)
 	}
@@ -267,21 +298,44 @@ func Version() string {
 	return strings.TrimSpace(out)
 }
 
-// versionAtLeast reports whether a tmux version banner is at least major.minor.
-// It accepts the forms tmux emits — "tmux 3.5a", "tmux 3.4", "tmux next-3.6" —
-// and returns false for anything it cannot parse ("tmux master", a portable
-// fork's own string, an empty banner). False is the safe answer: every caller
-// falls back to behavior that works on any tmux.
-func versionAtLeast(banner string, major, minor int) bool {
+// ReadOnlyViewFloor is the tmux version that introduced `new-session -f read-only`,
+// which is what makes a worker view tab a view rather than a second keyboard.
+// 'ttorch doctor' reports a tmux below it.
+const ReadOnlyViewFloor = "3.2"
+
+// BannerReadable reports whether a version banner is in a form ttorch can read a
+// version out of. It separates "older than the floor" from "no idea", which
+// callers answer differently: doctor reports an unreadable banner as unknown
+// rather than as too old, and the view tab assumes such a build is modern.
+func BannerReadable(banner string) bool {
+	_, ok := parseVersion(banner)
+	return ok
+}
+
+// BannerAtLeast reports whether a tmux version banner is at least major.minor.
+// It accepts the forms tmux emits ("tmux 3.5a", "tmux 3.4", "tmux next-3.6") and
+// answers false for anything it cannot read ("tmux master", a portable fork's own
+// string, an empty banner), so a caller that needs a definite yes does not get one
+// from a guess.
+func BannerAtLeast(banner string, major, minor int) bool {
+	got, ok := parseVersion(banner)
+	if !ok {
+		return false
+	}
+	return got[0] > major || (got[0] == major && got[1] >= minor)
+}
+
+// parseVersion pulls major and minor out of a tmux version banner.
+func parseVersion(banner string) ([2]int, bool) {
 	v := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(banner), "tmux"))
 	v = strings.TrimPrefix(strings.TrimSpace(v), "next-")
 	maj, rest, ok := strings.Cut(v, ".")
 	if !ok {
-		return false
+		return [2]int{}, false
 	}
 	gotMaj, err := strconv.Atoi(maj)
 	if err != nil {
-		return false
+		return [2]int{}, false
 	}
 	// The patch suffix is a letter ("3.5a"), so take the leading digits of the
 	// minor field and drop the rest.
@@ -291,23 +345,40 @@ func versionAtLeast(banner string, major, minor int) bool {
 	}
 	gotMin, err := strconv.Atoi(rest[:end])
 	if err != nil {
-		return false
+		return [2]int{}, false
 	}
-	return gotMaj > major || (gotMaj == major && gotMin >= minor)
+	return [2]int{gotMaj, gotMin}, true
 }
 
 // readOnlyViewSupport answers SupportsReadOnlyView. It probes once — the tmux on
 // PATH cannot change under a running ttorch — and is a package var so a test can
 // pin the answer rather than assert against whatever tmux the machine has.
-var readOnlyViewSupport = sync.OnceValue(func() bool { return versionAtLeast(Version(), 3, 2) })
+var readOnlyViewSupport = sync.OnceValue(func() bool { return readOnlyViewSupported(Version()) })
 
-// SupportsReadOnlyView reports whether this tmux understands both operands the
-// read-only worker view needs: `new-session -f read-only` (package termtab) and
-// the empty `send-keys -c` that keeps the read-only view client from blocking a
-// steer (sendKeys below). Both arrived in tmux 3.2, and they must be gated
-// together — a read-only view on a tmux that rejects the empty -c would make
-// every 'ttorch send' fail whenever the lead's focus sat on a view tab. On an
-// older tmux both are skipped and behavior is unchanged.
+// readOnlyViewSupported decides, from a version banner, whether to ask tmux for a
+// read-only view client.
+//
+// An unreadable banner ("tmux master", a distro's own string) answers YES, which
+// is the opposite of what a capability check usually does. The two outcomes are
+// not symmetric. Guessing yes on a tmux too old for the flag costs a view tab that
+// exits on the unknown flag: visible immediately, and the worker is untouched
+// because it lives in the shared session. Guessing no hands the operator a
+// writable second keyboard on a live agent that looks exactly like the fixed one.
+// The only banners that answer no are the ones that parse and fall below the
+// floor, where we positively know the flag is absent.
+//
+// This is safe to be generous about only because the steer path no longer depends
+// on the same answer: sendKeys reacts to what tmux actually says rather than to a
+// version guess.
+func readOnlyViewSupported(banner string) bool {
+	if !BannerReadable(banner) {
+		return true
+	}
+	return BannerAtLeast(banner, 3, 2)
+}
+
+// SupportsReadOnlyView reports whether to attach worker view tabs with
+// `new-session -f read-only` (package termtab). See readOnlyViewSupported.
 func SupportsReadOnlyView() bool { return readOnlyViewSupport() }
 
 // sendKeys sends keys to a pane without attributing them to any tmux client.
@@ -319,22 +390,47 @@ func SupportsReadOnlyView() bool { return readOnlyViewSupport() }
 // exactly when the lead was watching a worker, and fail always once the view tabs
 // were the only clients left. An empty -c resolves to no client at all, so the
 // keys reach the pane and nothing about which tab has focus can intercept them.
+//
+// tmux tolerates an unfound client here from 3.1 on; before that it rejects the
+// send outright. Rather than guess from a version banner — which would make a
+// misread banner silently kill the control channel — this tries the empty -c and
+// falls back to the plain form on the one error that means the older behavior.
+// On a modern tmux the fallback never runs.
 func sendKeys(args ...string) error {
-	if SupportsReadOnlyView() {
-		args = append([]string{"send-keys", "-c", ""}, args...)
-	} else {
-		args = append([]string{"send-keys"}, args...)
+	out, err := run(append([]string{"send-keys", "-c", ""}, args...)...)
+	if err != nil && strings.Contains(out, "can't find client") {
+		_, err = run(append([]string{"send-keys"}, args...)...)
 	}
-	_, err := run(args...)
 	return err
+}
+
+// paneInMode reports whether a window's pane is in a tmux mode — copy-mode is the
+// one that happens in practice, entered by anyone scrolling the pane. A diagnostic
+// failure answers false: a broken check must not be able to block steering.
+func paneInMode(session, window string) bool {
+	out, err := run("display-message", "-p", "-t", target(session, window), "#{pane_in_mode}")
+	return err == nil && strings.TrimSpace(out) == "1"
 }
 
 // SendLine types a line into a window then presses Enter. The text and the Enter
 // are sent separately (a combined send can submit before a TUI has rendered the
 // input); a short settle delay precedes Enter, longer for slash-commands which may
 // open a completion popup.
+//
+// It refuses outright when the pane is in copy-mode, because a steer aimed at such
+// a pane does not reach the agent and does not say so. The first attempt blocks
+// until the run() deadline kills it; killing the client unwedges the server, so
+// every attempt after that returns success in milliseconds while copy-mode eats the
+// keys. Measured: after the deadline fired, a retry returned err=nil in 0.3s and the
+// worker's stdin stayed empty. A steer that reports success and never arrived is how
+// a worker quietly stops being steerable, so this fails loudly instead and names the
+// key that fixes it. SendKey is deliberately not guarded — sending Escape is the way
+// out of the mode.
 func SendLine(session, window, text string) error {
 	t := target(session, window)
+	if paneInMode(session, window) {
+		return fmt.Errorf("%s is in copy-mode, so a steer would be swallowed rather than reach the agent; press Escape in that pane (or run: tmux send-keys -X -t %s cancel) and retry", t, t)
+	}
 	if err := sendKeys("-t", t, "-l", text); err != nil {
 		return err
 	}
