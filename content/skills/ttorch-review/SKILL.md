@@ -172,6 +172,7 @@ invalidates the verdict — re-prep, re-review, re-record.
   | `vendor/**` | a consistent `vendor/` makes the toolchain build from it instead of the module cache |
   | `content.go`, `internal/installer/**` | decide which embedded file becomes which installed file. `content.go` is a separate exact entry — the `content/` prefix does **not** match it, since the two share no prefix relationship |
   | `internal/orchestrator/audit.go` | the merge record a trusted merge refuses to proceed without |
+  | `internal/skills/**` | `Recommended()` → `npx skills add <ref>` → `~/.claude/skills`, run before every team launch and every worker spawn: third-party code into the directory `content/skills/` is covered to protect, with no ttorch build in between |
 
   `content/` is the whole tree, not a list of subtrees. `desiredFiles` walks it rather than
   naming files, so an enumerated subset kept missing installed ones — the last version covered
@@ -212,7 +213,9 @@ invalidates the verdict — re-prep, re-review, re-record.
   - `~/.claude/agents/ttorch-reviewer-*.md` and `~/.claude/skills/` as they exist ON DISK. The
     guard sees a diff; these files live outside any repo and anything running as the lead can
     overwrite them directly. No diff-channel guard can ever see that. Covering the repo copies
-    under `content/` narrows the channel; it does not close it.
+    under `content/` narrows the channel; it does not close it. This bullet used to be the
+    whole story for `~/.claude/skills/`, which was an understatement: `internal/skills/` is a
+    diff-channel route into that directory and is now covered.
   - **The rest of `internal/orchestrator/`** — `spawn.go`, `landqueue.go`, `autostart.go`,
     `overlap.go` and the others. A deliberate, measured exclusion: covering the whole package
     would put most of this repo's commits behind `--allow-gate-change` and the flag would stop

@@ -320,6 +320,10 @@ func TestMergeLocal_DecidingCodeChangeNeedsAllowGateChange(t *testing.T) {
 		{"a workspace file", "go.work", true},
 		{"the workspace checksums", "go.work.sum", true},
 		{"a vendored dependency", "vendor/example.com/dep/d.go", true},
+		// One line in Recommended() installs arbitrary third-party code into
+		// ~/.claude/skills via `npx skills add`, before every team launch and every worker
+		// spawn. No ttorch build and no ttorch install in between.
+		{"the recommended external skills", "internal/skills/skills.go", true},
 		{"CONTROL: ordinary source", "internal/cli/cli.go", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

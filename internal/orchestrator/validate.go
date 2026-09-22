@@ -195,6 +195,16 @@ var gateConfigFiles = []string{
 // prefix a safe superset, since desiredFiles cannot install from outside content/ without a
 // change here. 3 commits.
 //
+// internal/skills/ is an install channel in its own right, and the one the covered set
+// missed for longest. Recommended() returns third-party skill refs, InstallCmd turns each
+// into `npx skills add <ref>`, and EnsureInstalled runs it before EVERY team launch and
+// EVERY worker spawn. So one line there fetches and installs arbitrary third-party code
+// into ~/.claude/skills — the same directory content/skills/ is covered to protect, reached
+// by a shorter route, since npx fetches at spawn time with no ttorch build or install in
+// between. The limits list used to name ~/.claude/skills only as an out-of-repo exposure no
+// diff-channel guard could see; that was an understatement once this route existed. It costs
+// 0 marginal commits of 196.
+//
 // .ttorch/ is a PREFIX rather than the single ".ttorch/validate.sh" it used to be, and this
 // inversion closes a class rather than a file. The channel that forced it:
 // .ttorch/learnings.jsonl is the per-repo lessons ledger, learnings.Apply renders it into
@@ -260,6 +270,7 @@ var gateConfigPrefixes = []string{
 	"internal/validate/",
 	"internal/projectinit/",
 	"internal/installer/",
+	"internal/skills/",
 	"vendor/",
 	".claude/",
 	".ttorch/",

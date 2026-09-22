@@ -248,7 +248,9 @@ passing commit-pinned verdict plus a fresh green validate auto-mints the approva
   `internal/orchestrator/{gate,merge,validate,validatecache,audit}.go` (the Go code that
   decides, including the audit record a trusted merge refuses to proceed without),
   `internal/installer/**` and `content.go` (which decide which embedded file becomes which
-  installed reviewer definition), `Makefile`, `go.work`, `go.work.sum` and `vendor/**` (which
+  installed reviewer definition), `internal/skills/**` (which turns one line into
+  `npx skills add <ref>` into `~/.claude/skills` before every worker spawn),
+  `Makefile`, `go.work`, `go.work.sum` and `vendor/**` (which
   between them decide what `make lint` and `make test-fast` actually compile and run), and
   `.github/workflows/**` (the full suite, which `.ttorch/validate.sh` defers to by name
   because it runs only the fast lane), and `docs/install.sh` and `docs/install.ps1` (which
@@ -372,6 +374,17 @@ installer's. That test reports `35 of 42` against the old prefixes, which is the
 hand-maintained list never had.
 
 Cost: +8 commits, 76 → 84 of 196 (39% → 43%).
+
+### The skills channel
+
+**`internal/skills/` installs third-party code into `~/.claude/skills`.** `Recommended()`
+returns refs, `InstallCmd` turns each into `npx skills add <ref>`, and `EnsureInstalled` runs
+before every team launch and every worker spawn. One line there fetches and installs arbitrary
+third-party skills into the same directory `content/skills/` is covered to protect, by a
+shorter route — npx fetches at spawn time, with no ttorch build or install in between. It
+costs 0 marginal commits. The limits list used to name `~/.claude/skills` only as an
+out-of-repo exposure no diff-channel guard could see, which stopped being true once this route
+existed.
 
 ### The input set is the part that keeps being wrong
 
