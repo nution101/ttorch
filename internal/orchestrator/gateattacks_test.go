@@ -3,7 +3,6 @@ package orchestrator
 import (
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -1644,24 +1643,64 @@ func TestGateScope_ContentOnlyGatesTheRepoThatEmbedsIt(t *testing.T) {
 	}
 }
 
-// TestTtorchRepoIsScopedIn resolves the scope against THIS tree. If the detection ever stops
-// recognising ttorch's own source, content/ and the deciding Go code quietly leave the
-// covered set, which is the expensive direction of the round-12 split.
+// TestTtorchRepoIsScopedIn checks that this repository resolves as ttorch's own source. If
+// it ever stops doing so, content/ and every internal/ prefix quietly leave the covered set,
+// which is the expensive direction of the round-12 scope split.
+//
+// Uses NO git. An earlier version called `git rev-parse HEAD` and failed with exit 128 in
+// the offloaded build-host lane .ttorch/validate.sh runs in, which receives an rsync without
+// .git. That is the third test in this round with the same defect, written after the commit
+// message that named it, so the rule is worth stating flatly: a guard test reads the
+// filesystem, because the lane that gates cannot be assumed to have a git repository.
 func TestTtorchRepoIsScopedIn(t *testing.T) {
 	root := repoRootForGateConfig(t)
-	base, err := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()
+
+	// The substantive check: the signal resolveGateScope looks for is present on disk. This
+	// is what makes the scope resolve, and it is readable without git.
+	body, err := os.ReadFile(filepath.Join(root, "content.go"))
 	if err != nil {
-		t.Fatalf("resolving HEAD: %v", err)
+		t.Fatalf("reading content.go: %v", err)
 	}
-	sc := resolveGateScope(root, strings.TrimSpace(string(base)))
-	if !sc.TtorchSource {
-		t.Fatal("this repository must resolve as ttorch's own source: it carries " +
-			"//go:embed all:content in content.go. If that moved, update resolveGateScope, " +
-			"because content/ and every internal/ prefix are uncovered until it does.")
+	var found bool
+	for _, line := range strings.Split(string(body), "\n") {
+		rest, ok := strings.CutPrefix(strings.TrimSpace(line), "//go:embed ")
+		if !ok {
+			continue
+		}
+		for _, pat := range strings.Fields(rest) {
+			if _, after, cut := strings.Cut(pat, ":"); cut {
+				pat = after
+			}
+			if top, _, _ := strings.Cut(strings.Trim(pat, `"`), "/"); top == "content" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatal("content.go no longer carries a //go:embed rooted at content, which is the " +
+			"signal resolveGateScope uses. Until that is restored or resolveGateScope is " +
+			"updated, content/ and every internal/ prefix are uncovered in this repo.")
+	}
+
+	// The behavioural check, true in both lanes for different reasons: where git works the
+	// directive is found, and where git does not the resolver fails closed. Both must give
+	// TtorchSource, and a resolver that returned false here would be the regression.
+	if sc := resolveGateScope(root, "HEAD"); !sc.TtorchSource {
+		t.Fatal("resolveGateScope must report ttorch's own source for this repository, " +
+			"whether it reads the directive or fails closed")
 	}
 	for _, p := range []string{"content/skills/ttorch-review/SKILL.md", "internal/review/size.go", "content.go"} {
-		if !matchesGateConfig(p, sc) {
+		if !matchesGateConfig(p, ttorchScope) {
 			t.Errorf("%s must be covered in ttorch's own repo", p)
 		}
+	}
+}
+
+// TestGateScopeFailsClosed pins the direction the resolver errs in. A repository git cannot
+// read at all must still be treated as ttorch's own source, because leaving the deciding
+// code uncovered is the expensive mistake and an unnecessary --allow-gate-change is not.
+func TestGateScopeFailsClosed(t *testing.T) {
+	if sc := resolveGateScope(t.TempDir(), "HEAD"); !sc.TtorchSource {
+		t.Fatal("resolveGateScope must fail CLOSED when it cannot read the repository")
 	}
 }
