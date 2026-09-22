@@ -242,10 +242,17 @@ invalidates the verdict — re-prep, re-review, re-record.
     the tree the installer walked — see `docs/ARCHITECTURE.md`, which holds the figures. An
     earlier version of this line said both "would roughly double the flag's frequency", which
     overstated the cost of the one package a real bypass ran through.
-  - Filesystems whose folding rules differ from Unicode's. `fsIdentityKey` models APFS and
-    NTFS, and `TestFSIdentityKeySweep` measures it against the real filesystem rather than
-    against a reading of the tables. A filesystem that collapses something Unicode does not
-    would still be missed.
+  - Filesystems whose folding rules differ from Unicode's. `fsIdentityKey` is measured
+    against **APFS only**, by `TestFSIdentityKeySweep` creating both files and reading one
+    back, which beats reading the Unicode tables but says nothing about any other
+    filesystem. An earlier version of this line claimed NTFS too; that was never measured,
+    and Win32 path normalization strips a trailing dot and a trailing space, so `AGENTS.md.`
+    would open the covered file on Windows while folding to a distinct key here. That last
+    point is documented Win32 behaviour, not something measured: `AGENTS.md` and
+    `AGENTS.md.` were confirmed to be two separate files on APFS, which is the half that
+    can be checked from here. Anyone gating a repo on Windows should treat the name
+    match as unproven; the collision check and the control-character refusal do not depend
+    on the fold.
   - Substitutions that never produce two entries in one tree. The collision check detects two
     entries resolving to one path; that is a narrower claim than "any substitution is
     observable", which this document wrongly made for two rounds. Replacing the `CLAUDE.md`
