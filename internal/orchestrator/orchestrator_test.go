@@ -1911,6 +1911,15 @@ func TestMatchesGateConfig(t *testing.T) {
 		{"the validate skill", "content/skills/ttorch-validate/SKILL.md", true},
 		{"a reviewer definition", "content/agents/ttorch-reviewer-security.md", true},
 		{"another reviewer definition", "content/agents/ttorch-reviewer-scope.md", true},
+		// Every file under content/ is installed into ~/.claude by installer.desiredFiles,
+		// which walks the tree rather than working from a list. These four were pinned as
+		// NOT covered on the argument that the gate dispatches only the reviewers; that was
+		// the wrong criterion, and it left 35 of the 42 embedded files open.
+		{"the worker agent definition", "content/agents/ttorch-worker.md", true},
+		{"a curated agent profile", "content/agents/golang-pro.md", true},
+		{"the /ttorch entry point", "content/commands/ttorch.md", true},
+		{"the global AGENTS.md source", "content/assets/AGENTS.global.md", true},
+		{"the hook that runs on every prompt", "content/hooks/prompt-reminders.sh", true},
 
 		// The deciding Go code. The four orchestrator files are named exactly; the three
 		// supporting packages are covered wholesale because each is small and single-purpose.
@@ -1950,12 +1959,14 @@ func TestMatchesGateConfig(t *testing.T) {
 		{"U+017F long s for AGENTS.md", "agent\u017f.md", true},
 		{"U+017F long s in a covered prefix", "content/skill\u017f/x.md", true},
 		{"U+017F in the validate script", ".ttorch/validate.\u017fh", true},
-		{"U+212A kelvin sign", "content/\u212Askills/x.md", false},
+		{"U+212A under the content tree", "content/\u212Askills/x.md", true},
 		{"U+212A where a k is covered", "content/agents/ttorch-reviewer-\u212A.md", true},
+		// U+212A inside a prefix that is still narrow, so the fold is doing real work here
+		// rather than being subsumed by "content/". Both of these used to be carried by the
+		// content/skills/ entry, which no longer distinguishes them.
+		{"U+212A in a narrow covered prefix", ".github/wor\u212Aflows/ci.yml", true},
+		{"U+212A must not widen past that prefix", ".github/wor\u212Aflow/ci.yml", false},
 
-		{"a non-reviewer agent definition", "content/agents/golang-pro.md", false},
-		{"the worker agent definition", "content/agents/ttorch-worker.md", false},
-		{"an embedded command", "content/commands/ttorch.md", false},
 		{"a file merely mentioning agents", "docs/AGENTS-guide.md", false},
 		{"a directory that merely starts like .claude", ".claude-backup/x.md", false},
 		{"a validate script somewhere else", "sub/.ttorch/validate.sh", false},

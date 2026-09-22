@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path"
@@ -16,6 +17,8 @@ import (
 
 	"golang.org/x/text/cases"
 	"golang.org/x/text/unicode/norm"
+
+	ttorchembed "github.com/nution101/ttorch"
 
 	"github.com/nution101/ttorch/internal/approval"
 	"github.com/nution101/ttorch/internal/projectinit"
@@ -603,10 +606,15 @@ func TestMatchesGateConfig_FullFoldSpellings(t *testing.T) {
 		{"internal/in\ufb06aller/installer.go", "U+FB06 in a covered prefix"},
 		{"internal/orche\ufb06rator/gate.go", "U+FB06 in a covered deciding file"},
 		{"agent\u017f.md", "U+017F: the delivery-mode config"},
-		{"content/skill\ufb06/x.md", "U+FB06 does not appear in 'skills'; must NOT match"},
+		// The fold must not MANUFACTURE a prefix match. U+FB06 folds to "st", so this
+		// becomes "contentst/skills/x.md", which shares no prefix relationship with
+		// "content/". Before the prefix was widened to "content/" this case read
+		// "content/skill\ufb06/x.md" and relied on "skills" not containing "st"; that stopped
+		// testing anything once the covered unit became the whole tree.
+		{"content\ufb06/skills/x.md", "U+FB06 folds to 'st', making 'contentst/'; must NOT match"},
 	} {
 		got := matchesGateConfig(tc.path)
-		want := tc.path != "content/skill\ufb06/x.md"
+		want := tc.path != "content\ufb06/skills/x.md"
 		if got != want {
 			t.Errorf("%s: matchesGateConfig(%q) = %v, want %v", tc.why, tc.path, got, want)
 		}
@@ -745,5 +753,80 @@ func TestTtorchRuntimeFileIsIgnored(t *testing.T) {
 	// And the guard really would trip on it, which is why the ignore matters.
 	if !matchesGateConfig(".ttorch/task") {
 		t.Error(".ttorch/task is no longer covered by the guard; this test's premise is stale")
+	}
+}
+
+// TestEveryInstalledContentFileIsCovered walks the REAL embedded payload — the same
+// embed.FS the shipped binary carries and installer.desiredFiles walks — and asserts the
+// guard covers every file in it.
+//
+// This is the answer to "derive the content/ subtree list from desiredFiles instead of
+// maintaining it by hand". Deriving it at runtime would couple the guard to installer
+// internals, so that editing desiredFiles narrows what the guard covers; internal/installer/
+// is in the covered set precisely because that mapping is worth attacking. Asserting the
+// superset in a test gives the same safety property — a new content/ subtree cannot be
+// installed without the guard covering it — and leaves the guard's rule independent of the
+// installer's.
+//
+// The prefix is a superset by construction rather than by luck: content.go embeds
+// `all:content` and nothing else, so desiredFiles has no file outside content/ to install.
+//
+// This test is what a hand-maintained list failed at three times. With "content/skills/" and
+// the filename prefix "content/agents/ttorch-reviewer-" it reported 7 covered and 35
+// uncovered: all 32 non-reviewer agent definitions, assets/AGENTS.global.md (merged into the
+// global AGENTS.md every session on the machine reads), commands/ttorch.md (the /ttorch entry
+// point) and hooks/prompt-reminders.sh (runs on every prompt).
+func TestEveryInstalledContentFileIsCovered(t *testing.T) {
+	var files []string
+	if err := fs.WalkDir(ttorchembed.Content, "content", func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			files = append(files, p)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("walking the embedded content tree: %v", err)
+	}
+	if len(files) == 0 {
+		t.Fatal("the embedded content tree is empty; this test is asserting nothing")
+	}
+
+	var uncovered []string
+	for _, f := range files {
+		if !matchesGateConfig(f) {
+			uncovered = append(uncovered, f)
+		}
+	}
+	if len(uncovered) > 0 {
+		t.Errorf("%d of %d embedded content files are not covered by the gate guard.\n"+
+			"Every file under content/ is installed into ~/.claude by installer.desiredFiles,\n"+
+			"so a landed change to any of them alters what the gate does on its next run.\n"+
+			"uncovered:\n  %s", len(uncovered), len(files), strings.Join(uncovered, "\n  "))
+	}
+}
+
+// TestContentPrefixCoversWhatDesiredFilesInstalls pins the structural claim the prefix rests
+// on: the installer can only ever install from content/, so covering content/ covers every
+// install channel. content.go embeds `all:content` and nothing else. If a second embed
+// directive appears at the repo root, the prefix stops being a superset and this fails.
+func TestContentPrefixCoversWhatDesiredFilesInstalls(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join(repoRootForGateConfig(t), "content.go"))
+	if err != nil {
+		t.Fatalf("reading content.go: %v", err)
+	}
+	var embeds []string
+	for _, line := range strings.Split(string(src), "\n") {
+		line = strings.TrimSpace(line)
+		if rest, ok := strings.CutPrefix(line, "//go:embed "); ok {
+			embeds = append(embeds, strings.TrimSpace(rest))
+		}
+	}
+	if want := []string{"all:content"}; len(embeds) != 1 || embeds[0] != want[0] {
+		t.Errorf("content.go embeds %v, want exactly %v.\n"+
+			"gateConfigPrefixes covers \"content/\" on the grounds that installer.desiredFiles\n"+
+			"has nothing outside content/ to install. A second embedded tree breaks that, and\n"+
+			"needs its own entry in the covered set.", embeds, want)
 	}
 }

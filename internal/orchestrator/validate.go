@@ -141,17 +141,41 @@ var gateConfigFiles = []string{
 // gateConfigPrefixes define the gate by path prefix, where the covered unit is a directory
 // (or a filename family) rather than a named file.
 //
-// content/skills/ and content/agents/ttorch-reviewer- are the gate's own INSTRUCTIONS — not
-// documentation about the gate, but the text the gate executes on. content.go embeds the
-// whole content/ tree and installer.desiredFiles lays it down under ~/.claude: content/skills/
-// becomes ~/.claude/skills (the ttorch-review procedure the manager follows, the ttorch-manager
-// instructions, the ttorch-validate procedure) and content/agents/ttorch-reviewer-*.md becomes
-// ~/.claude/agents (the adversarial reviewers' own definitions, including the security
-// reviewer). A landed change to any of them alters what the gate does on the NEXT run, for
-// every repo on the machine, with no further review — the same delayed diff-channel effect
-// AGENTS.md has, which is why they belong alongside it. "content/agents/ttorch-reviewer-" is a
-// FILENAME prefix and deliberately does not cover the other agent definitions in that
-// directory, which the gate does not dispatch.
+// content/ is the gate's own INSTRUCTIONS — not documentation about the gate, but the text
+// the gate executes on. content.go embeds the whole tree and installer.desiredFiles lays it
+// down under ~/.claude, so a landed change to any installed file alters what the gate does on
+// the NEXT run, for every repo on the machine, with no further review. That is the same
+// delayed diff-channel effect AGENTS.md has, which is why these belong alongside it.
+//
+// This used to be two narrower prefixes, "content/skills/" and the FILENAME prefix
+// "content/agents/ttorch-reviewer-", on the argument that the gate dispatches the reviewers
+// and nothing else under content/agents/. That criterion was wrong, and it is the THIRD time
+// an enumerated subset of this tree has missed installed files. The right criterion is what
+// installer.desiredFiles INSTALLS, because anything it writes into ~/.claude is loaded by the
+// sessions that run and adjudicate the gate:
+//
+//	assets/AGENTS.global.md    merged into the GLOBAL ~/.claude/AGENTS.md managed block, which
+//	                           every Claude Code session on the machine reads — including the
+//	                           manager session that adjudicates gates
+//	commands/ttorch.md         installs as the /ttorch entry point
+//	hooks/prompt-reminders.sh  installs to ~/.claude/hooks and runs on EVERY PROMPT, which is
+//	                           the most direct execution channel in the tree
+//	agents/*.md                ALL of them, not just ttorch-reviewer-*: desiredFiles walks the
+//	                           directory, so ttorch-worker.md and the 31 curated profiles are
+//	                           installed the same way the reviewers are
+//
+// With the two narrow prefixes, 35 of the 42 installed files were uncovered and 7 covered
+// (measured through the real matcher). The prefix "content/" is a superset of everything
+// desiredFiles can install, so it closes all 35 and every subtree added later.
+//
+// It is a PREFIX rather than a list derived from desiredFiles at runtime. Deriving it would
+// couple the guard to installer internals — a change to desiredFiles would silently change
+// what the guard covers, and internal/installer/ is covered precisely because that mapping is
+// attackable. The prefix is a superset, so it cannot be narrowed by editing installer code.
+// TestEveryInstalledContentFileIsCovered walks the real embedded tree and asserts every file
+// under content/ matches, which gives derivation's safety property without the coupling.
+//
+// Cost: 84/196 commits, up from 76 with the narrow prefixes (+8). See docs/ARCHITECTURE.md.
 //
 // internal/review/ is the verdict itself: the findings contract, the severity-to-block rule,
 // and the diff-size classifier that decides WHICH reviewers run at all. internal/approval/ is
@@ -165,10 +189,11 @@ var gateConfigFiles = []string{
 // file list does.
 //
 // internal/installer/ maps the embedded content/ tree onto ~/.claude — it decides WHICH
-// embedded file becomes ~/.claude/agents/ttorch-reviewer-security.md. Covering the reviewer
-// definitions while leaving the mapping open would let an uncovered file (content/agents/
-// ttorch-worker.md is deliberately excluded) be installed as a reviewer instead, through the
-// same delayed diff channel. 3 commits.
+// embedded file becomes ~/.claude/agents/ttorch-reviewer-security.md. Covering the content
+// while leaving the mapping open would let a file from an uncovered subtree be installed as a
+// reviewer instead, through the same delayed diff channel; it is also what makes the "content/"
+// prefix a safe superset, since desiredFiles cannot install from outside content/ without a
+// change here. 3 commits.
 //
 // .ttorch/ is a PREFIX rather than the single ".ttorch/validate.sh" it used to be, and this
 // inversion closes a class rather than a file. The channel that forced it:
@@ -229,8 +254,7 @@ var gateConfigFiles = []string{
 // script defers to CI by name. It costs 5 commits in 196, so the blast-radius argument that
 // keeps internal/orchestrator/ off the list does not apply.
 var gateConfigPrefixes = []string{
-	"content/skills/",
-	"content/agents/ttorch-reviewer-",
+	"content/",
 	"internal/review/",
 	"internal/approval/",
 	"internal/validate/",
@@ -697,8 +721,7 @@ func diffTouchesGateConfig(repo, base, rev string) (*gateConfigHit, error) {
 // The whole covered directory vanishes from the bytes the gate validates, git warns about
 // nothing, and because a missing .github/workflows/ breaks no Go build the validate then goes
 // green against a checkout that is not the tree — which is the exact outcome running this
-// guard before the validate exists to prevent. content/skills/ and content/agents/ go the
-// same way. The spelling has to sort after the directory's entries for the blob to win, which
+// guard before the validate exists to prevent. content/ and .claude/ go the same way. The spelling has to sort after the directory's entries for the blob to win, which
 // plain ASCII cannot do ('/' sorts low) but a non-ASCII spelling does for free.
 //
 // So the keyed set is every blob plus every ancestor directory those blobs imply. Git stores

@@ -159,8 +159,7 @@ invalidates the verdict — re-prep, re-review, re-record.
   | `.claude/**`, `.mcp.json` | project-level agent config: a landed `.claude/agents/ttorch-reviewer-security.md` **replaces** the security reviewer, with no build and no install |
   | `go.mod`, `go.sum` | a `replace` redirects what `make test-fast` compiles — including `golang.org/x/text`, which the guard's own path folding now depends on |
   | `docs/install.sh`, `docs/install.ps1` | README tells users to pipe these into a shell; a merge changes those bytes with no build and no release step |
-  | `content/skills/**` | the ttorch-review, ttorch-manager and ttorch-validate procedures — **including this file** |
-  | `content/agents/ttorch-reviewer-*` | the adversarial reviewers' own definitions |
+  | `content/**` | everything `content.go` embeds and `installer.desiredFiles` lays down under `~/.claude`: the skills (**this file included**), all the agent definitions, `commands/ttorch.md` (the `/ttorch` entry point), `assets/AGENTS.global.md` (merged into the global `AGENTS.md` every session reads) and `hooks/prompt-reminders.sh` (**runs on every prompt**) |
   | `internal/review/**` | the findings contract, the severity-to-block rule, and the classifier that picks which reviewers run |
   | `internal/approval/**` | the approval token the `--allow-gate-change` scope rides on |
   | `internal/validate/**` | what counts as a passing check |
@@ -171,12 +170,13 @@ invalidates the verdict — re-prep, re-review, re-record.
   | `Makefile` | `.ttorch/validate.sh` does nothing but run `make lint` and `make test-fast` |
   | `go.work`, `go.work.sum` | auto-discovered via `GOWORK`; `replace` directives there override `go.mod`, so a committed one redirects what `go test` compiles |
   | `vendor/**` | a consistent `vendor/` makes the toolchain build from it instead of the module cache |
-  | `content.go`, `internal/installer/**` | decide which embedded file becomes which installed reviewer definition. `content.go` is a separate exact entry — the `content/` prefix does **not** match it |
+  | `content.go`, `internal/installer/**` | decide which embedded file becomes which installed file. `content.go` is a separate exact entry — the `content/` prefix does **not** match it, since the two share no prefix relationship |
   | `internal/orchestrator/audit.go` | the merge record a trusted merge refuses to proceed without |
 
-  `content/skills/` and `content/agents/ttorch-reviewer-*` are embedded by `content.go` and
-  installed to `~/.claude`, so a landed edit changes what the gate does on the next run for
-  every repo on the machine. The Go entries take effect one step later — they change the next
+  `content/` is the whole tree, not a list of subtrees. `desiredFiles` walks it rather than
+  naming files, so an enumerated subset kept missing installed ones — the last version covered
+  7 of the 42 embedded files. A landed edit to any of them changes what the gate does on the
+  next run for every repo on the machine. The Go entries take effect one step later — they change the next
   binary, after a build and an install — which is a real difference but a thin one, since the
   maintainer self-updates routinely.
 

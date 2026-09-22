@@ -240,9 +240,9 @@ passing commit-pinned verdict plus a fresh green validate auto-mints the approva
   covered set is `.ttorch/**`, plus `AGENTS.md` and `CLAUDE.md` **at any depth** (the
   repo-local gate config and the agent instructions, present in every managed repo),
   `.claude/**` and `.mcp.json` (project-level agent config), `go.mod`, `go.sum`,
-  `content/skills/**` and `content/agents/ttorch-reviewer-*` (which
-  `content.go` embeds and the installer lays down under `~/.claude`, so they are the gate's
-  live reviewer and manager instructions, not documentation about the gate), `internal/review/**`,
+  `content/**` (every file `content.go` embeds and the installer lays down
+  under `~/.claude` — the gate's live reviewer, manager, command and hook
+  instructions, not documentation about the gate), `internal/review/**`,
   `internal/approval/**`, `internal/validate/**`, `internal/projectinit/**` (which parses
   `AGENTS.md` into the delivery mode) and
   `internal/orchestrator/{gate,merge,validate,validatecache,audit}.go` (the Go code that
@@ -277,26 +277,26 @@ rather than by what sounds prudent. Measured over the **196 non-merge commits re
 | Covered group | commits touching it | marginal, given the rest |
 |---|---|---|
 | `.ttorch/**`, `AGENTS.md` (the original guard, now a prefix) | 10 | +1 |
-| `content/skills/**`, `content/agents/ttorch-reviewer-*` | 36 | +23 |
+| `content/**` | 46 | +31 |
 | `CLAUDE.md`, and `AGENTS.md`/`CLAUDE.md` at any depth | 9 | +0 |
 | `.claude/**`, `.mcp.json` | 0 | +0 |
 | `internal/review/**` | 7 | +4 |
 | `internal/approval/**` | 6 | +1 |
 | `internal/validate/**` | 6 | +2 |
-| `internal/projectinit/**` | 9 | +4 |
-| `internal/installer/**` | 5 | +2 |
+| `internal/projectinit/**` | 9 | +3 |
+| `internal/installer/**` | 5 | +1 |
 | `internal/orchestrator/{gate,merge,validate,validatecache,audit}.go` | 10 | +5 |
 | `Makefile`, `content.go` | 4 | +0 |
 | `go.work`, `go.work.sum`, `vendor/**` | 0 | +0 |
 | `go.mod`, `go.sum` | 5 | +2 |
 | `.github/workflows/**` | 9 | +5 |
 | `docs/install.sh`, `docs/install.ps1` | 7 | +3 |
-| **the whole set** | **76 / 196 = 39%** | |
+| **the whole set** | **84 / 196 = 43%** | |
 
 Two columns because one number cannot carry it. "Commits touching it" is that group in
 isolation; "marginal" is what it adds *given everything else already covered*, which is the
 figure that matters when deciding whether to include something. They differ a lot —
-`content/skills/**` is 36 commits alone but +23 marginal, and `CLAUDE.md` is 9 alone but +0,
+`content/**` is 46 commits alone but +31 marginal, and `CLAUDE.md` is 9 alone but +0,
 because every commit that touched it touched something else covered too. An earlier version of
 this table mixed two baselines row by row and was not coherent; these are all one definition.
 
@@ -332,6 +332,46 @@ Neither notices a new deciding function added inside a file already classified a
 non-deciding. That stays a review responsibility. An earlier version of this section claimed
 the anchor test "fails if any deciding function lands in a file `gateConfigFiles` does not
 name", which was not true of what the test does.
+
+### Why `content/` is one prefix, and why it is not derived from the installer
+
+`content/` was two narrower entries for most of this wave: the prefix `content/skills/` and
+the *filename* prefix `content/agents/ttorch-reviewer-`. The argument was that the gate
+dispatches those reviewers and nothing else in that directory, so the rest of `content/agents/`
+was excluded on purpose.
+
+That criterion was wrong. The question is not what the gate dispatches, it is what
+`installer.desiredFiles` **installs**, because everything it writes into `~/.claude` is loaded
+by the sessions that run and adjudicate the gate. And `desiredFiles` does not work from a
+list — it walks the embedded tree with `fs.WalkDir` and has a case per subdirectory. Measured
+through the real matcher, the two narrow prefixes covered **7 of the 42 embedded files** and
+left 35 open:
+
+| Left open | Installs as | Effect |
+|---|---|---|
+| `content/hooks/prompt-reminders.sh` | `~/.claude/hooks/` | runs on **every prompt** |
+| `content/assets/AGENTS.global.md` | merged into the global `~/.claude/AGENTS.md` managed block | read by every session on the machine, the manager that adjudicates gates included |
+| `content/commands/ttorch.md` | `~/.claude/commands/` | the `/ttorch` entry point |
+| `content/agents/*.md` × 32 | `~/.claude/agents/` | `ttorch-worker.md` and the 31 curated profiles, installed exactly the way the reviewers are |
+
+This was the third time an enumerated subset of this tree missed installed files, so the fix
+is the same inversion already applied to `.ttorch/`: cover the tree. `content/` is a superset
+of everything `desiredFiles` can install, and it is a superset *by construction* rather than
+by coincidence — `content.go` embeds `all:content` and nothing else, so the installer has no
+file outside `content/` to install. `TestContentPrefixCoversWhatDesiredFilesInstalls` fails if
+a second embed directive appears.
+
+Deriving the list from `desiredFiles` at runtime was considered and rejected. It would couple
+the guard to installer internals in the wrong direction: editing `desiredFiles` would then
+change what the guard covers, and `internal/installer/**` is in the covered set precisely
+because that mapping is worth attacking. A prefix cannot be narrowed by editing installer
+code. `TestEveryInstalledContentFileIsCovered` walks the real `embed.FS` and asserts every
+file under `content/` matches, which buys derivation's safety property — a new subtree cannot
+be installed without the guard covering it — while leaving the guard's rule independent of the
+installer's. That test reports `35 of 42` against the old prefixes, which is the check the
+hand-maintained list never had.
+
+Cost: +8 commits, 76 → 84 of 196 (39% → 43%).
 
 ### The input set is the part that keeps being wrong
 
@@ -419,7 +459,7 @@ checkout: .github/workflowſ is a 7-byte file; .github/workflows/ is GONE
 The whole covered directory vanishes from the bytes the gate validates, git warns about
 nothing, and since a missing `.github/workflows/` breaks no Go build the validate then goes
 green against a checkout that is not the tree — the exact outcome that running the guard
-before the validate exists to prevent. `content/skills/`, `content/agents/` and
+before the validate exists to prevent. `content/`, `.claude/` and
 `internal/installer/` go the same way. The hostile spelling has to sort after the directory's
 own entries to win the checkout, which plain ASCII cannot do (`/` sorts below every letter)
 but a non-ASCII spelling does for free. The keyed set is therefore every blob plus every
@@ -533,8 +573,8 @@ touched too — and each decides the gate. `.ttorch/validate.sh` is covered but 
 except run `make lint` and `make test-fast`, so redefining those targets redefines green
 without touching a covered script. `content.go` is the `//go:embed` that maps a repo file onto
 an installed reviewer definition, and `internal/installer/**` (3 commits) is the mapping
-itself: covering `content/agents/ttorch-reviewer-*` while leaving the mapping open would let a
-deliberately excluded file such as `content/agents/ttorch-worker.md` be installed as a reviewer
+itself: covering the content while leaving the mapping open would let a file from an
+uncovered subtree be installed as a reviewer
 instead. `audit.go` holds the only `writeAudit`, and `MergeLocal` refuses to merge when it
 fails, so one line there strips the record from every trusted merge.
 
@@ -572,11 +612,11 @@ So the covered set answers **two** questions, not one: what decides how a change
 or validated, and what a merge publishes directly to users. Anything outside both stays out
 however alarming it looks — that is what keeps the flag legible.
 
-`.claude/**` and `.mcp.json` are the strongest form of the `content/agents` argument rather
+`.claude/**` and `.mcp.json` are the strongest form of the `content/` argument rather
 than a weaker one. Claude Code loads **project-level** `.claude/agents/`, and project-level
 takes documented precedence over `~/.claude/agents/` on a name collision, so a landed
 `.claude/agents/ttorch-reviewer-security.md` replaces the security reviewer for every later
-gate run in that repo. `content/agents/ttorch-reviewer-*` is already covered for the same
+gate run in that repo. `content/agents/ttorch-reviewer-*.md` is already covered for the same
 effect, but that route needs a build and an install first; this one takes effect on the merge.
 `.mcp.json` adds tools to those same sessions. Neither exists in this repo, so both cost 0
 commits — and worth recording, `.claude/` is not in `.gitignore` here, so nothing but this
@@ -640,7 +680,7 @@ CI as the required check. CI is therefore half of what "validated" means here, a
 `ci.yml` weakens every later change's validation through the same delayed diff channel that
 put the skills on the list. It costs 5 commits.
 
-What the numbers do not fix: at 39%, roughly two merges in five in this repo need
+What the numbers do not fix: at 43%, a bit over two merges in five in this repo need
 `--allow-gate-change`, and the flag is a boolean. A lead who passes it by reflex authorizes
 exactly as much as one who read the diff. The audit line naming the file survives either way,
 which is the guard's durable half. Making the flag take the expected paths — so a bare
