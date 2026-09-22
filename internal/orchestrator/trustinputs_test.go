@@ -1612,3 +1612,62 @@ func TestAdvisoryPrep_GuardDoesNotRestOnAWorkerWritableFile(t *testing.T) {
 		t.Error("the advisory prep re-stamped the gate's episode instead of leaving it alone")
 	}
 }
+
+// TestGateOnce_TheEpisodeBudgetRunsFromTheEpisodeNotTheDispatch pins the boundary the stall
+// clock actually enforces, which nothing else states.
+//
+// THE BOUNDARY: a reviewer has until StartedAt+reviewerTimeout to report, not
+// dispatchedAt+reviewerTimeout. The clock never resets, so any delay INSIDE the episode — a
+// wedge that recovers, a slow mirror clone, a retry after a failed launch — is spent out of
+// the same budget the reviewer then has left. An episode whose reviewers only start at
+// +25m of a 30m budget gets 5 minutes, not 30.
+//
+// That is deliberate and it is the direction that is safe: the cost is a false gate_blocked
+// on a slow-but-healthy episode, which a manager adjudicates, rather than an episode that
+// renews its own bound by failing to make progress, which is what a per-dispatch clock gives
+// and what the wedge probes exploited. Worth stating because the failure it produces looks
+// like a flaky reviewer rather than a budget decision.
+func TestGateOnce_TheEpisodeBudgetRunsFromTheEpisodeNotTheDispatch(t *testing.T) {
+	m, _ := trustedTaskWithSubstantialDiff(t, "gate-budget", "bg1")
+	t.Cleanup(func() { _, _ = m.Teardown("bg1", true) })
+	const stall = 30 * time.Minute
+	start := time.Unix(1_700_000_000, 0)
+
+	// The episode opens, then every launch fails to start for 25 minutes.
+	prev := reviewerDispatcher
+	t.Cleanup(func() { reviewerDispatcher = prev })
+	reviewerDispatcher = func(m *Manager, taskID, dim, dir, head, repo, wt string) error {
+		return fmt.Errorf("wedged: %w", errReviewerNotStarted)
+	}
+	if _, err := m.gateOnceAt("bg1", time.Minute, 5, stall, start); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.gateOnceAt("bg1", time.Minute, 5, stall, start.Add(25*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	// The wedge clears and the reviewers launch, 25 minutes into a 30 minute budget.
+	rec := recordingReviewer(t, true)
+	if out, err := m.gateOnceAt("bg1", time.Minute, 5, stall, start.Add(25*time.Minute+time.Second)); err != nil {
+		t.Fatalf("after the wedge clears: %v", err)
+	} else if out != GateDispatched {
+		t.Fatalf("outcome = %q, want %q once launches succeed", out, GateDispatched)
+	}
+	if rec.calls[review.DimensionSecurity] == 0 {
+		t.Fatal("the harness needs the reviewers to actually launch after the wedge clears")
+	}
+
+	// Four minutes later they are still inside the budget.
+	if out, err := m.gateOnceAt("bg1", time.Minute, 5, stall, start.Add(29*time.Minute)); err != nil || out != GateWaiting {
+		t.Fatalf("at +29m = (%q, %v), want waiting: the episode budget has not run out yet", out, err)
+	}
+	// Past 30 minutes FROM THE EPISODE they are out of it, even though they launched at +25m.
+	// A per-dispatch clock would still have 25 minutes left here.
+	out, err := m.gateOnceAt("bg1", time.Minute, 5, stall, start.Add(31*time.Minute))
+	if err != nil {
+		t.Fatalf("at +31m: %v", err)
+	}
+	if out != GateBlocked {
+		t.Fatalf("outcome = %q at +31m, want %q: the budget runs from the episode, not the dispatch", out, GateBlocked)
+	}
+}
