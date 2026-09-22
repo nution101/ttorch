@@ -100,6 +100,11 @@ var recountSignal = stemRe(
 	"find the actual", "find the true",
 )
 
+// hedgedAt needs no stop-unit narrowing, and that is a decision rather than an omission: its
+// scope is the BLOCK holding the count and the block after it, which is wider than a
+// sentence either way. Splitting a merged span into sentences cannot change which blocks
+// those are, so capitalisation does not move this answer.
+//
 // hedgedAt reports whether the hard count in sents[i] carries a hedge attached to it:
 // something in reach saying the figure is not to be trusted, or telling the reader to
 // establish it again.
@@ -121,10 +126,16 @@ func hedgedAt(sents []span, i int) bool {
 	return false
 }
 
+// reportsTheNumber reports whether some sentence pairs a reporting verb with a number word.
+// Per sentence, and a merged span carries more than one: "note the results. 21 files are
+// stale" is two sentences and pairs nothing.
 func reportsTheNumber(b *brief) bool {
 	for _, s := range sentences(b.raw) {
-		if reportSignal.MatchString(s.text) && numberSignal.MatchString(s.text) {
-			return true
+		for _, u := range stopUnits(s.text) {
+			part := s.text[u[0]:u[1]]
+			if reportSignal.MatchString(part) && numberSignal.MatchString(part) {
+				return true
+			}
 		}
 	}
 	return false
@@ -161,6 +172,13 @@ func clauses(text string) [][2]int {
 // bounded "do not commit anything at all", and a brief banning everything outright was
 // reported as bounded.
 func boundedBan(text string, ban []int) bool {
+	// Per sentence first. A merged span holds more than one, and a bound in the first
+	// sentence has no business covering a ban in the second.
+	u := unitAround(text, ban[0])
+	return boundedInSentence(text[u[0]:u[1]], []int{ban[0] - u[0], ban[1] - u[0]})
+}
+
+func boundedInSentence(text string, ban []int) bool {
 	cl := clauses(text)
 	for i, c := range cl {
 		part := text[c[0]:c[1]]
@@ -484,19 +502,51 @@ func wordAt(fields []string, i int) string {
 	return strings.ToLower(strings.Trim(fields[i], ".,;:()[]\"'`"))
 }
 
-// crossesAStop reports whether text contains a full stop that reads as ending a sentence:
-// a dot followed by whitespace that is not part of an operand abbreviation. "e.g." and
-// "approx." do not count, which is what keeps "Add e.g. <path>" governed.
-func crossesAStop(text string) bool {
+// sentenceStops returns the offsets of the full stops inside text that read as ending a
+// sentence: a dot followed by whitespace that is not part of an operand abbreviation.
+//
+// The splitter deliberately keeps these inside one span, because the word after them is
+// lowercase and a lowercase word is usually a continuation rather than a new sentence. That
+// is the right call for segmenting and the wrong one for any rule that then asks a question
+// about "this sentence", so every such rule narrows its scope with these offsets. Without
+// that, the same brief passes or fails on capitalisation alone.
+func sentenceStops(text string) []int {
+	var out []int
 	for i := 0; i < len(text); i++ {
 		if text[i] != '.' || i+1 >= len(text) || !isSpace(text[i+1]) {
 			continue
 		}
 		if abbrevKind(text, i) != abbrevOperand {
-			return true
+			out = append(out, i)
 		}
 	}
-	return false
+	return out
+}
+
+// crossesAStop reports whether a full stop separates the two ends of text.
+func crossesAStop(text string) bool { return len(sentenceStops(text)) > 0 }
+
+// stopUnits splits text into the sentences the splitter merged: the units every
+// within-sentence question must be asked about.
+func stopUnits(text string) [][2]int {
+	var out [][2]int
+	start := 0
+	for _, i := range sentenceStops(text) {
+		out = append(out, [2]int{start, i})
+		start = i + 1
+	}
+	return append(out, [2]int{start, len(text)})
+}
+
+// unitAround returns the stop unit containing the byte at pos.
+func unitAround(text string, pos int) [2]int {
+	units := stopUnits(text)
+	for _, u := range units {
+		if pos >= u[0] && pos < u[1] {
+			return u
+		}
+	}
+	return units[len(units)-1]
 }
 
 func governedByCreate(sent string, pathStart int) bool {

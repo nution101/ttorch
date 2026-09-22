@@ -242,10 +242,14 @@ Some details that matter in practice:
     limits the ban.
   - `file-paths` skips its existence check where a create verb governs the mention, which is
     also a wording judgement, so a path that reads as being created is never looked for.
+  - `standards` looks for the project's declared pointer, or for standards-shaped wording
+    where no pointer is declared. It cannot tell a reference from a dismissal: "ignore the
+    house conventions for this spike" mentions the conventions and passes.
 
   Each of these catches the bare form it was written for: a count stated with nothing around
-  it, a blanket ban with nothing qualifying it, a path nobody asked for. None of them certifies
-  the brief is well written, and every note they print says wording rather than meaning.
+  it, a blanket ban with nothing qualifying it, a path nobody asked for, a brief that never
+  mentions standards at all. None of them certifies the brief is well written, and every note
+  they print says wording rather than meaning.
 
 - **Which ref a citation is resolved against.** A cited path *without* a line number is about the
   work's base, so it is resolved at `--ref` (the declared target by default). A `file:line`

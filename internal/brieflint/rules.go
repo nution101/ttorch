@@ -333,7 +333,10 @@ func checkFilePaths(ctx context.Context, b *brief, opt Options) ([]Finding, []st
 			Detail: fmt.Sprintf("cannot resolve cited paths: ref %s does not resolve in %s (fetch it, or pass an explicit ref)", ref, opt.Repo),
 		}}, nil
 	}
-	notes := []string{fmt.Sprintf("file-paths: cited paths resolved at %s", ref)}
+	// "resolved against", not "resolved at": this is printed before anything is checked, so
+	// it says which ref the question was put to, not that the answer was yes. It used to sit
+	// next to a finding reporting that a path did not resolve there.
+	notes := []string{fmt.Sprintf("file-paths: cited paths resolved against %s", ref)}
 	var findings []Finding
 	if len(cites) > maxCitations {
 		surplus := cites[maxCitations:]
@@ -594,22 +597,31 @@ func checkProhibition(_ context.Context, b *brief, _ Options) ([]Finding, []stri
 	if len(bans) == 0 {
 		return nil, []string{"prohibition: no prohibition on push/merge/commit/PR was recognised in the brief"}
 	}
-	// Per sentence, and per ban inside it. Two things used to widen this. A bound anywhere
-	// in the sentence counted, which soft-wrap joining turned into "anywhere in the
-	// paragraph"; and one bounded ban set a flag that suppressed the report for every bare
-	// one in the brief, so a single "do not push to main" covered a later "do not commit
-	// anything at all".
+	// Per sentence, and per ban inside it. Three things used to widen this. A bound
+	// anywhere in the SPAN counted, which soft-wrap joining turned into "anywhere in the
+	// paragraph"; one bounded ban set a flag that suppressed the report for every bare one
+	// in the brief; and a span holds more than one sentence whenever the splitter merged
+	// them, so an all-lowercase brief was judged as a single sentence while the same words
+	// capitalised were judged as three.
 	var findings []Finding
+	banCount := 0
 	for _, s := range bans {
+		reported := map[int]bool{} // one finding per sentence, not per ban inside it
 		for _, ban := range prohibitionRe.FindAllStringIndex(s.text, -1) {
+			banCount++
 			if boundedBan(s.text, ban) {
 				continue
 			}
+			u := unitAround(s.text, ban[0])
+			if reported[u[0]] {
+				continue
+			}
+			reported[u[0]] = true
+			unit := span{text: s.text[u[0]:u[1]], off: s.off + u[0]}
 			findings = append(findings, Finding{
-				Rule: RuleProhibition, Status: StatusFail, Quote: s.trim(), Line: b.lineAt(s.off),
+				Rule: RuleProhibition, Status: StatusFail, Quote: unit.trim(), Line: b.lineAt(unit.off),
 				Detail: fmt.Sprintf("blanket prohibition %q: state the invariant it protects (for example: no changes to a product branch, no PR) rather than banning the machinery outright", strings.TrimSpace(s.text[ban[0]:ban[1]])),
 			})
-			break // one finding per sentence; the quote is the sentence either way
 		}
 	}
 	if !endStateSignal.MatchString(b.raw) {
@@ -619,7 +631,7 @@ func checkProhibition(_ context.Context, b *brief, _ Options) ([]Finding, []stri
 		})
 	}
 	if len(findings) == 0 {
-		return nil, []string{fmt.Sprintf("prohibition: %d prohibition(s), each with bounding wording in reach of the ban (its own clause, or a clause at the edge of the sentence that opens with the bound), and an allowed end state stated somewhere in the brief (wording only: the check cannot tell whether the bound it found actually limits the ban)", len(bans))}
+		return nil, []string{fmt.Sprintf("prohibition: %d prohibition(s), each with bounding wording in reach of the ban (its own clause, or a clause at the edge of the sentence that opens with the bound), and an allowed end state stated somewhere in the brief (wording only: the check cannot tell whether the bound it found actually limits the ban)", banCount)}
 	}
 	return findings, nil
 }
@@ -656,7 +668,7 @@ func checkStandards(_ context.Context, b *brief, opt Options) ([]Finding, []stri
 	if len(cfg.Standards) > 0 {
 		for _, p := range cfg.Standards {
 			if strings.Contains(b.lower, strings.ToLower(p)) {
-				return nil, []string{fmt.Sprintf("standards: the brief mentions the project's declared pointer %q", p)}
+				return nil, []string{fmt.Sprintf("standards: the brief mentions the project's declared pointer %q (wording only: a mention, which the check cannot tell from one telling the worker to ignore it)", p)}
 			}
 		}
 		return []Finding{{
@@ -664,7 +676,7 @@ func checkStandards(_ context.Context, b *brief, opt Options) ([]Finding, []stri
 			Detail: fmt.Sprintf("the brief cites none of the standards pointer(s) this project declares (%s, from %s %s); point the worker at them", strings.Join(quoteAll(cfg.Standards), ", "), cfg.Source, standardsKey),
 		}}, nil
 	}
-	notes := []string{fmt.Sprintf("standards: no project pointer declared (%s), so any explicit standards reference is accepted", standardsKey)}
+	notes := []string{fmt.Sprintf("standards: no project pointer declared (%s), so any explicit standards reference is accepted (wording only: a standards-shaped phrase, which the check cannot tell from one telling the worker to ignore the conventions)", standardsKey)}
 	if standardsSignal.MatchString(b.raw) {
 		return nil, notes
 	}

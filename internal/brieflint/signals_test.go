@@ -377,3 +377,51 @@ func TestCreateVerbDoesNotReachAcrossAFullStop(t *testing.T) {
 		}
 	}
 }
+
+// Every rule that asks a question about one sentence must ask it of the sentences the
+// splitter merged, not of the merged span. These are the consumers that need the narrowing;
+// hedgedAt is block-scoped and deliberately does not.
+func TestWithinSentenceScopesRespectAMergedStop(t *testing.T) {
+	t.Run("a bound does not cross a stop", func(t *testing.T) {
+		const text = "do not push to main. do not commit anything at all."
+		var bare int
+		for _, s := range sentences(text) {
+			for _, ban := range prohibitionRe.FindAllStringIndex(s.text, -1) {
+				if !boundedBan(s.text, ban) {
+					bare++
+				}
+			}
+		}
+		if bare != 1 {
+			t.Errorf("want the second ban unbounded, got %d bare ban(s) in %q", bare, text)
+		}
+	})
+
+	t.Run("a create verb does not cross a stop", func(t *testing.T) {
+		if _, exempt := firstCitationExempt(t, "i already created the shim. internal/x/ghost.go is the one to change."); exempt {
+			t.Error("a create verb reached a path in the next sentence")
+		}
+	})
+
+	t.Run("a reporting verb does not pair across a stop", func(t *testing.T) {
+		// "let me know" carries no number word and "the total is stale" carries no
+		// reporting verb, so the pair exists only if the stop between them is ignored.
+		if reportsTheNumber(&brief{raw: "let me know how it goes. the total is stale."}) {
+			t.Error("a reporting verb paired with a number word in the next sentence")
+		}
+		if !reportsTheNumber(&brief{raw: "report the number you actually find."}) {
+			t.Error("a reporting verb and its number in one sentence must still pair")
+		}
+	})
+
+	t.Run("a hedge still reaches across a stop, by block scope", func(t *testing.T) {
+		sents := sentences("there are 21 occurrences. that figure may be wrong.")
+		counts := hardCounts(sents)
+		if len(counts) != 1 {
+			t.Fatalf("want one hard count, got %d", len(counts))
+		}
+		if !hedgedAt(sents, counts[0]) {
+			t.Error("hedgedAt is block-scoped and must not be narrowed to the sentence")
+		}
+	})
+}

@@ -457,12 +457,13 @@ These properties are load-bearing:
   to the same path is checked even if an earlier mention asked for it to be written, and the
   exemption covers existence only, so a cited line is still bounded whenever the file is there.
 - **Two rules check a fact; the rest match wording, and say so.** `target-branch` and
-  `file-paths` are answered by git. `hard-counts`, `prohibition` and the create exemption inside
-  `file-paths` are answered by vocabulary, and each carries a false accept that extending the
+  `file-paths` are answered by git. `hard-counts`, `prohibition`, `standards` and the create exemption
+  inside `file-paths` are answered by vocabulary, and each carries a false accept that extending the
   vocabulary cannot remove, because the wording that satisfies the rule is the same wording that
   defeats it. A sentence forbidding a recount is built from the words of a hedge. A bound in the
   ban's clause may qualify something else in that clause. A create verb governing a mention may
-  be describing a file that already exists. Each rule stops the bare form it was written for,
+  be describing a file that already exists. A brief that mentions the standards may be telling
+  the worker to ignore them. Each rule stops the bare form it was written for,
   and every note says wording rather than meaning, because a reader who takes "bounded" as a
   finding about the brief has been told something the check never established.
 

@@ -1154,3 +1154,42 @@ func TestGitDiagnosticsAreCapped(t *testing.T) {
 		}
 	}
 }
+
+// The same brief must get the same verdict whether or not its sentences are capitalised.
+//
+// The splitter keeps a lowercase continuation inside one span on purpose, so every rule that
+// then asks a question about "this sentence" has to narrow its scope back. When one of them
+// does not, capitalisation alone decides whether a brief passes, and agent-authored briefs
+// are written in lowercase.
+func TestCapitalisationDoesNotDecideTheVerdict(t *testing.T) {
+	repo, _ := fixture(t)
+	const rules = "No changes to any product branch and no PR until I have reviewed the work. Commit on your\nown branch, leave the worktree clean, and report the sha."
+	cases := map[string][2]string{
+		"three bare bans": {
+			"do not push to main. do not commit anything at all. do not merge anything either. commit on your own branch, leave the worktree clean, and report the sha.",
+			"Do not push to main. Do not commit anything at all. Do not merge anything either. Commit on your own branch, leave the worktree clean, and report the sha.",
+		},
+		"all bounded": {
+			"do not push to main. do not merge without my approval. commit on your own branch, leave the worktree clean, and report the sha.",
+			"Do not push to main. Do not merge without my approval. Commit on your own branch, leave the worktree clean, and report the sha.",
+		},
+	}
+	for name, tc := range cases {
+		lo := Lint(strings.Replace(satisfying, rules, tc[0], 1), Options{Repo: repo})
+		up := Lint(strings.Replace(satisfying, rules, tc[1], 1), Options{Repo: repo})
+		if got, want := len(lo.Findings), len(up.Findings); got != want {
+			t.Errorf("%s: lowercase produced %d finding(s), capitalised %d\nlower: %v\nupper: %v",
+				name, got, want, lo.Findings, up.Findings)
+			continue
+		}
+		for i := range lo.Findings {
+			l, u := lo.Findings[i], up.Findings[i]
+			if l.Rule != u.Rule || l.Status != u.Status || !strings.EqualFold(l.Detail, u.Detail) {
+				t.Errorf("%s: finding %d differs by case alone:\nlower: %+v\nupper: %+v", name, i, l, u)
+			}
+		}
+		if !strings.EqualFold(strings.Join(lo.Notes, "|"), strings.Join(up.Notes, "|")) {
+			t.Errorf("%s: notes differ by case alone:\nlower: %v\nupper: %v", name, lo.Notes, up.Notes)
+		}
+	}
+}
