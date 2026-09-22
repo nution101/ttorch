@@ -26,6 +26,13 @@ import (
 	"github.com/nution101/ttorch/internal/projectinit"
 )
 
+// ttorchScope is the scope for ttorch's own source repository, where content/ is the
+// embedded payload and internal/ holds the code that decides a merge. Tests that assert
+// against this repo's paths pass it explicitly, so the dependency on the repo's identity is
+// visible in the call rather than assumed. TestGateScope_ContentOnlyGatesTheRepoThatEmbedsIt
+// covers the other scope.
+var ttorchScope = gateScope{TtorchSource: true}
+
 // decidingFunctions names every function in this package that participates in deciding
 // whether a change may merge: resolving what the gate is, running it, caching its result,
 // minting and reading the approval that authorizes a merge, and the gate-config guard
@@ -144,8 +151,11 @@ func TestGateConfigCoversTheDecidingCode(t *testing.T) {
 		}
 	}
 
+	// Asks the resolved scope rather than gateConfigFiles alone. The deciding orchestrator
+	// files are ttorch-source tier, covered only in this repository, so reading one list
+	// would report them uncovered and read as a hole that is not there.
 	covered := map[string]bool{}
-	for _, f := range gateConfigFiles {
+	for _, f := range ttorchScope.files() {
 		covered[f] = true
 	}
 	for _, fn := range decidingFunctions {
@@ -155,7 +165,7 @@ func TestGateConfigCoversTheDecidingCode(t *testing.T) {
 			continue
 		}
 		if !covered[file] {
-			t.Errorf("%s now lives in %s, which gateConfigFiles does not name: a diff rewriting it would merge without --allow-gate-change. Move it back, or add %s to gateConfigFiles and re-measure the blast radius.", fn, file, file)
+			t.Errorf("%s now lives in %s, which the covered set does not name: a diff rewriting it would merge without --allow-gate-change. Move it back, or add %s to the covered set and re-measure the blast radius.", fn, file, file)
 		}
 	}
 }
@@ -258,8 +268,11 @@ func TestGateConfigFilesAreRealPaths(t *testing.T) {
 	}
 	// Every exemption must still be a covered entry, and the should-not-exist ones must still
 	// match nothing tracked.
+	// Asks the resolved scope rather than gateConfigFiles alone. The deciding orchestrator
+	// files are ttorch-source tier, covered only in this repository, so reading one list
+	// would report them uncovered and read as a hole that is not there.
 	covered := map[string]bool{}
-	for _, f := range gateConfigFiles {
+	for _, f := range ttorchScope.files() {
 		covered[f] = true
 	}
 	for _, p := range gateConfigPrefixes {
@@ -425,8 +438,11 @@ func TestOrchestratorFilesAreClassified(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Asks the resolved scope rather than gateConfigFiles alone. The deciding orchestrator
+	// files are ttorch-source tier, covered only in this repository, so reading one list
+	// would report them uncovered and read as a hole that is not there.
 	covered := map[string]bool{}
-	for _, f := range gateConfigFiles {
+	for _, f := range ttorchScope.files() {
 		covered[f] = true
 	}
 	for _, e := range entries {
@@ -628,10 +644,10 @@ func TestMatchesGateConfig_FullFoldSpellings(t *testing.T) {
 		// testing anything once the covered unit became the whole tree.
 		{"content\ufb06/skills/x.md", "U+FB06 folds to 'st', making 'contentst/'; must NOT match"},
 	} {
-		got := matchesGateConfig(tc.path)
+		got := matchesGateConfig(tc.path, ttorchScope)
 		want := tc.path != "content\ufb06/skills/x.md"
 		if got != want {
-			t.Errorf("%s: matchesGateConfig(%q) = %v, want %v", tc.why, tc.path, got, want)
+			t.Errorf("%s: matchesGateConfig(%q, ttorchScope) = %v, want %v", tc.why, tc.path, got, want)
 		}
 	}
 }
@@ -766,7 +782,7 @@ func TestTtorchRuntimeFileIsIgnored(t *testing.T) {
 			"change. Restore the line, or narrow the prefix and re-measure.")
 	}
 	// And the guard really would trip on it, which is why the ignore matters.
-	if !matchesGateConfig(".ttorch/task") {
+	if !matchesGateConfig(".ttorch/task", ttorchScope) {
 		t.Error(".ttorch/task is no longer covered by the guard; this test's premise is stale")
 	}
 }
@@ -810,7 +826,7 @@ func TestEveryInstalledContentFileIsCovered(t *testing.T) {
 
 	var uncovered []string
 	for _, f := range files {
-		if !matchesGateConfig(f) {
+		if !matchesGateConfig(f, ttorchScope) {
 			uncovered = append(uncovered, f)
 		}
 	}
@@ -1075,7 +1091,7 @@ func TestGateCostFiguresMatchTheDoc(t *testing.T) {
 				if f == "" {
 					continue
 				}
-				hit := matchesGateConfig(f)
+				hit := matchesGateConfig(f, ttorchScope)
 				for _, p := range extra {
 					hit = hit || strings.HasPrefix(f, p)
 				}

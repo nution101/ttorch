@@ -715,6 +715,25 @@ func ChangedLinks(path, base, rev string) ([]ChangedLink, error) {
 	return links, nil
 }
 
+// GrepTree returns the lines in rev's committed tree matching a fixed string, restricted to
+// paths matching pathspec. It reads the TREE, not the working directory, so a worker's
+// uncommitted edits cannot influence the answer.
+//
+// Used to resolve which repository the gate is running in from the repository's own content
+// rather than from its name. A non-zero exit with no output means "no matches", which git
+// signals with exit code 1; that is not an error.
+func GrepTree(path, rev, fixed, pathspec string) (string, error) {
+	out, errOut, err := gitRaw("-C", path, "grep", "-h", "--no-color", "-F", "-e", fixed, rev, "--", pathspec)
+	if err != nil {
+		// git grep exits 1 for "no matches". Anything on stderr means a real failure.
+		if strings.TrimSpace(errOut) == "" && strings.TrimSpace(out) == "" {
+			return "", nil
+		}
+		return "", fmt.Errorf("git grep in %s: %v: %s", rev, err, strings.TrimSpace(errOut))
+	}
+	return out, nil
+}
+
 // TreeFiles returns every path in rev's committed tree, NUL-separated and unquoted.
 //
 // The gate-config guard needs the WHOLE tree, not just the diff. The collision attack adds

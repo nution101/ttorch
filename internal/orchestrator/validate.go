@@ -122,6 +122,20 @@ var gateConfigFiles = []string{
 	".ttorch/validate.sh",
 	"AGENTS.md",
 	"CLAUDE.md",
+	"Makefile",
+	"go.work",
+	"go.work.sum",
+	"go.mod",
+	"go.sum",
+	".mcp.json",
+}
+
+// ttorchSourceFiles are covered ONLY in the repository that is ttorch's own source. They are
+// paths in THIS codebase: the Go that decides a merge, and the installers README publishes.
+// In any other repository these names mean something else entirely, and gating on them would
+// demand --allow-gate-change for an unrelated change. See gateScope.
+var ttorchSourceFiles = []string{
+	"content.go",
 	"docs/install.sh",
 	"docs/install.ps1",
 	"internal/orchestrator/gate.go",
@@ -129,13 +143,6 @@ var gateConfigFiles = []string{
 	"internal/orchestrator/validate.go",
 	"internal/orchestrator/validatecache.go",
 	"internal/orchestrator/audit.go",
-	"Makefile",
-	"content.go",
-	"go.work",
-	"go.work.sum",
-	"go.mod",
-	"go.sum",
-	".mcp.json",
 }
 
 // gateConfigPrefixes define the gate by path prefix, where the covered unit is a directory
@@ -265,6 +272,21 @@ var gateConfigFiles = []string{
 // script defers to CI by name. It costs 5 commits in 196, so the blast-radius argument that
 // keeps internal/orchestrator/ off the list does not apply.
 var gateConfigPrefixes = []string{
+	"vendor/",
+	".claude/",
+	".ttorch/",
+	".github/workflows/",
+}
+
+// ttorchSourcePrefixes are covered ONLY in ttorch's own source repository, for the same
+// reason as ttorchSourceFiles.
+//
+// "content/" is the one that forced this split. It is ttorch's embedded payload here, but it
+// is also the conventional content directory for Hugo, Next and most CMS layouts, so an
+// unscoped rule demanded --allow-gate-change from every user whose repo happens to have one.
+// The internal/ entries are the same mistake one step quieter: internal/validate/ and
+// internal/review/ are ordinary names for ordinary Go packages.
+var ttorchSourcePrefixes = []string{
 	"content/",
 	"internal/review/",
 	"internal/approval/",
@@ -272,10 +294,6 @@ var gateConfigPrefixes = []string{
 	"internal/projectinit/",
 	"internal/installer/",
 	"internal/skills/",
-	"vendor/",
-	".claude/",
-	".ttorch/",
-	".github/workflows/",
 }
 
 // fsIdentityKey is the key under which two repository paths are THE SAME FILE on a
@@ -376,6 +394,82 @@ func orbitMin(s string) string {
 // config. They stay named explicitly so that cannot happen.
 var gateConfigBasenames = []string{"AGENTS.md", "CLAUDE.md"}
 
+// gateScope is the covered set resolved for ONE repository. The set is not universal: some
+// of it is ttorch's own source.
+//
+// gateConfigPrefixes used to be a package-level list consulted with no idea which repo it was
+// in, and "content/" was in it. In this repository content/ is the embedded payload, so
+// covering it is right. In a Hugo, Next or any CMS-shaped repository content/ is where the
+// articles live, so the same rule demanded --allow-gate-change for every ordinary change.
+// internal/review/ and internal/validate/ are the same error in quieter clothes.
+type gateScope struct {
+	// TtorchSource says this repository is ttorch's own source, so the paths that decide a
+	// merge HERE are the paths ttorch's Go code lives at.
+	TtorchSource bool
+}
+
+func (sc gateScope) files() []string {
+	if !sc.TtorchSource {
+		return gateConfigFiles
+	}
+	return append(append([]string{}, gateConfigFiles...), ttorchSourceFiles...)
+}
+
+func (sc gateScope) prefixes() []string {
+	if !sc.TtorchSource {
+		return gateConfigPrefixes
+	}
+	return append(append([]string{}, gateConfigPrefixes...), ttorchSourcePrefixes...)
+}
+
+// resolveGateScope decides whether repo is ttorch's own source, reading BASE and never rev.
+//
+// The signal is a Go //go:embed directive whose pattern is rooted at "content". That is the
+// property that makes content/ load-bearing in the first place: installer.apply walks
+// embedRoot ("content") in the embedded FS, so a repo embedding content/ as a Go payload is a
+// repo where content/ IS the thing the installer lays into ~/.claude. A repo that merely has
+// a content/ directory of articles has no such directive and is not scoped in. Detected from
+// the repository rather than from its name or remote URL, both of which are cosmetic.
+//
+// WHY A WORKER'S DIFF CANNOT SPOOF IT, which is the question worth answering rather than
+// assuming: the directive is read from BASE, the default-branch tree, never from rev. This is
+// the same rule resolveGateDefinition already applies to the gate script, and for the same
+// reason. A worker cannot widen the scope, and more importantly cannot NARROW it: deleting
+// content.go on its branch does not change what base says, so content/ stays covered for that
+// merge. Reading rev instead would have been the hole, since a diff could drop the directive
+// and un-cover content/ in the same commit that rewrites it.
+//
+// Two backstops if the signal is ever wrong. Scoping in wrongly costs an --allow-gate-change
+// on a merge that did not need one, the same over-match the fold already accepts. Scoping out
+// wrongly in THIS repo is caught by TestTtorchRepoIsScopedIn, which resolves the scope against
+// this very tree.
+//
+// Fails CLOSED: a git error returns TtorchSource=true, because the expensive mistake is
+// leaving ttorch's own deciding code uncovered.
+func resolveGateScope(repo, base string) gateScope {
+	out, err := worktree.GrepTree(repo, base, "//go:embed", "*.go")
+	if err != nil {
+		return gateScope{TtorchSource: true}
+	}
+	for _, line := range strings.Split(out, "\n") {
+		_, rest, ok := strings.Cut(line, "//go:embed ")
+		if !ok {
+			continue
+		}
+		for _, pat := range strings.Fields(rest) {
+			// Strip an "all:" style prefix, then take the first path element.
+			if _, after, found := strings.Cut(pat, ":"); found {
+				pat = after
+			}
+			pat = strings.Trim(pat, `"`)
+			if top, _, _ := strings.Cut(pat, "/"); top == "content" {
+				return gateScope{TtorchSource: true}
+			}
+		}
+	}
+	return gateScope{}
+}
+
 // matchesGateConfig reports whether a repository path names a gate-definition file. Matching
 // is exact against gateConfigFiles, by prefix against gateConfigPrefixes, and by filename at
 // any depth against gateConfigBasenames — with BOTH SIDES reduced to fsIdentityKey first.
@@ -397,14 +491,14 @@ var gateConfigBasenames = []string{"AGENTS.md", "CLAUDE.md"}
 // must anticipate every spelling a filesystem might collapse onto a covered name. That is a
 // race the guard loses eventually. diffTouchesGateConfig therefore also refuses any changed
 // path that COLLIDES with another path in the resulting tree, whatever either is called.
-func matchesGateConfig(name string) bool {
+func matchesGateConfig(name string, sc gateScope) bool {
 	folded := fsIdentityKey(name)
-	for _, g := range gateConfigFiles {
+	for _, g := range sc.files() {
 		if folded == fsIdentityKey(g) {
 			return true
 		}
 	}
-	for _, p := range gateConfigPrefixes {
+	for _, p := range sc.prefixes() {
 		fp := fsIdentityKey(p)
 		if strings.HasPrefix(folded, fp) {
 			return true
@@ -728,14 +822,15 @@ func diffTouchesGateConfig(repo, base, rev string) (*gateConfigHit, error) {
 			}, nil
 		}
 	}
-	if hit, err := linksOverGateConfig(repo, base, rev); err != nil || hit != nil {
+	sc := resolveGateScope(repo, base)
+	if hit, err := linksOverGateConfig(repo, base, rev, sc); err != nil || hit != nil {
 		return hit, err
 	}
 	if hit, err := collidesInTree(repo, base, rev); err != nil || hit != nil {
 		return hit, err
 	}
 	for _, n := range changed {
-		if matchesGateConfig(n) {
+		if matchesGateConfig(n, sc) {
 			return &gateConfigHit{Path: n, Reason: fmt.Sprintf("changes a gate-definition file (%s)", n)}, nil
 		}
 	}
@@ -771,13 +866,13 @@ func diffTouchesGateConfig(repo, base, rev string) (*gateConfigHit, error) {
 // refused, even though any directory symlink can introduce files git never lists by path.
 // Refusing all of them would fire on ordinary repository layout, and the basename rule makes
 // "could a nested AGENTS.md appear under it" true of every directory in the tree.
-func linksOverGateConfig(repo, base, rev string) (*gateConfigHit, error) {
+func linksOverGateConfig(repo, base, rev string, sc gateScope) (*gateConfigHit, error) {
 	links, err := worktree.ChangedLinks(repo, base, rev)
 	if err != nil {
 		return nil, err
 	}
 	for _, l := range links {
-		if !linkShadowsGateConfig(l.Path) {
+		if !linkShadowsGateConfig(l.Path, sc) {
 			continue
 		}
 		kind := "a symlink"
@@ -799,17 +894,17 @@ func linksOverGateConfig(repo, base, rev string) (*gateConfigHit, error) {
 }
 
 // linkShadowsGateConfig reports whether a link at p stands at, or above, covered ground.
-func linkShadowsGateConfig(p string) bool {
-	if matchesGateConfig(p) {
+func linkShadowsGateConfig(p string, sc gateScope) bool {
+	if matchesGateConfig(p, sc) {
 		return true
 	}
 	under := fsIdentityKey(p) + "/"
-	for _, f := range gateConfigFiles {
+	for _, f := range sc.files() {
 		if strings.HasPrefix(fsIdentityKey(f), under) {
 			return true
 		}
 	}
-	for _, pre := range gateConfigPrefixes {
+	for _, pre := range sc.prefixes() {
 		if strings.HasPrefix(fsIdentityKey(pre), under) {
 			return true
 		}

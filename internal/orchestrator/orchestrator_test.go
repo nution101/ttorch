@@ -1004,6 +1004,34 @@ func skipIfShort(t *testing.T) {
 // deliveryHarness spins up a Manager against a fresh main-branch repo and a unique
 // tmux session, registering teardown. It mirrors the inline setup the other
 // delivery tests use.
+// seedTtorchSourceMarker makes a fixture repository resolve as ttorch's own source.
+//
+// The covered set has two tiers: paths every ttorch-gated repo shares, and paths that are
+// only gate config in ttorch's own repository (content/, the deciding internal/ packages,
+// the published installers). resolveGateScope tells them apart by looking for a Go
+// //go:embed rooted at content in the DEFAULT-BRANCH tree.
+//
+// The gate attack tests assert that ttorch-source paths are covered, so their fixtures have
+// to be repositories where that is true. Seeding the marker makes the fixture represent what
+// the test claims it represents, rather than passing because the matcher ignores scope.
+// TestGateScope_ContentOnlyGatesTheRepoThatEmbedsIt builds its own repos, with and without
+// the marker, and is where the unscoped case is covered.
+func seedTtorchSourceMarker(t *testing.T, repo string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(repo, "content"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "content", ".keep"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	marker := "package p\n\nimport \"embed\"\n\n//go:embed all:content\nvar payload embed.FS\n"
+	if err := os.WriteFile(filepath.Join(repo, "content.go"), []byte(marker), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "-A")
+	gitIn(t, repo, "commit", "-q", "-m", "seed: repo resolves as ttorch source")
+}
+
 func deliveryHarness(t *testing.T, tag string) (*Manager, string) {
 	t.Helper()
 	skipIfShort(t)
@@ -1011,6 +1039,7 @@ func deliveryHarness(t *testing.T, tag string) (*Manager, string) {
 		t.Skip("tmux not installed")
 	}
 	repo := newRepoMain(t)
+	seedTtorchSourceMarker(t, repo)
 	session := fmt.Sprintf("ttorch-%s-%d", tag, os.Getpid())
 	t.Setenv("TTORCH_HOME", t.TempDir())
 	t.Setenv("TTORCH_TMUX_SESSION", session)
@@ -1986,8 +2015,8 @@ func TestMatchesGateConfig(t *testing.T) {
 		{"a mixed-case near-miss", "Contents/Skills/x.md", false},
 		{"a mixed-case nested instruction file", "Docs/Agents.md", true},
 	} {
-		if got := matchesGateConfig(tc.path); got != tc.want {
-			t.Errorf("%s: matchesGateConfig(%q) = %v, want %v", tc.name, tc.path, got, tc.want)
+		if got := matchesGateConfig(tc.path, ttorchScope); got != tc.want {
+			t.Errorf("%s: matchesGateConfig(%q, ttorchScope) = %v, want %v", tc.name, tc.path, got, tc.want)
 		}
 	}
 }

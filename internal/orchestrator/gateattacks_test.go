@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -433,8 +434,8 @@ func TestGateGuard_BlobErasesCoveredDirectory(t *testing.T) {
 			if fsIdentityKey(tc.blob) != fsIdentityKey(tc.dir) {
 				t.Fatalf("setup: %q does not fold onto %q, so it is not this attack", tc.blob, tc.dir)
 			}
-			if got := matchesGateConfig(tc.blob); got != tc.nameMatch {
-				t.Fatalf("setup: matchesGateConfig(%q) = %v, want %v — see nameMatch above", tc.blob, got, tc.nameMatch)
+			if got := matchesGateConfig(tc.blob, ttorchScope); got != tc.nameMatch {
+				t.Fatalf("setup: matchesGateConfig(%q, ttorchScope) = %v, want %v — see nameMatch above", tc.blob, got, tc.nameMatch)
 			}
 
 			hit, err := diffTouchesGateConfig(repo, worktree.DefaultBranch(repo), head)
@@ -757,7 +758,7 @@ func TestTreeHasNoUncoveredSymlinks(t *testing.T) {
 			"rather than accepting the pass.")
 	}
 	for _, path := range links {
-		if !matchesGateConfig(path) {
+		if !matchesGateConfig(path, ttorchScope) {
 			t.Errorf("%s is a symlink and is NOT in the covered set. The guard sees the link's own path, "+
 				"not what it resolves to, so replacing it with a real file (or repointing it) changes "+
 				"whatever it stands for while reporting only %q. Cover it or record why it is harmless.", path, path)
@@ -1567,5 +1568,100 @@ func TestGateGuard_LinksOverCoveredGround(t *testing.T) {
 				t.Fatalf("the refusal must name %q, got: %s", tc.link, hit.Reason)
 			}
 		})
+	}
+}
+
+// TestGateScope_ContentOnlyGatesTheRepoThatEmbedsIt is the round-12 HIGH.
+//
+// gateConfigPrefixes was a package-level list with no idea which repository it was being
+// consulted for, and "content/" was in it. That is right here, where content/ is the
+// embedded payload the installer lays into ~/.claude. It is wrong everywhere else:
+// content/ is the conventional articles directory for Hugo, Next and most CMS layouts, so
+// every ordinary change in a user's site repo demanded --allow-gate-change. A guard that
+// fires on everything is as useless as one that never fires.
+//
+// Two fixtures, same path, opposite verdicts. The difference is a Go //go:embed rooted at
+// content, which is the property that makes content/ load-bearing rather than the name.
+func TestGateScope_ContentOnlyGatesTheRepoThatEmbedsIt(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		embed   string // content of an embedding .go file, "" for none
+		want    bool
+		explain string
+	}{
+		{
+			name:    "a site repo that merely has content/",
+			embed:   "",
+			want:    false,
+			explain: "content/ here is articles. Gating on it regresses every Hugo and Next user.",
+		},
+		{
+			name:    "a repo that embeds content/ as its payload",
+			embed:   "package p\n\nimport \"embed\"\n\n//go:embed all:content\nvar payload embed.FS\n",
+			want:    true,
+			explain: "content/ here is what the installer walks into ~/.claude, so it is gate config.",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := t.TempDir()
+			gitIn(t, repo, "init", "-q", "-b", "main")
+			gitIn(t, repo, "config", "user.email", "t@example.com")
+			gitIn(t, repo, "config", "user.name", "t")
+			if err := os.MkdirAll(filepath.Join(repo, "content", "posts"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(repo, "content", "posts", "hello.md"), []byte("# hi\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if tc.embed != "" {
+				if err := os.WriteFile(filepath.Join(repo, "payload.go"), []byte(tc.embed), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			gitIn(t, repo, "add", "-A")
+			gitIn(t, repo, "commit", "-q", "-m", "init")
+
+			sc := resolveGateScope(repo, "main")
+			if sc.TtorchSource != tc.want {
+				t.Fatalf("resolveGateScope = %+v, want TtorchSource=%v. %s", sc, tc.want, tc.explain)
+			}
+			if got := matchesGateConfig("content/posts/hello.md", sc); got != tc.want {
+				t.Fatalf("matchesGateConfig(content/posts/hello.md, ttorchScope) = %v, want %v. %s", got, tc.want, tc.explain)
+			}
+			// The universal half is unaffected either way: a ttorch-gated repo's own
+			// delivery-mode config is gate config wherever it lives.
+			if !matchesGateConfig("AGENTS.md", sc) {
+				t.Error("AGENTS.md must be covered in every repo, scoped or not")
+			}
+			if !matchesGateConfig(".ttorch/validate.sh", sc) {
+				t.Error(".ttorch/validate.sh must be covered in every repo, scoped or not")
+			}
+			// internal/validate/ is an ordinary package name. Same split.
+			if got := matchesGateConfig("internal/validate/validate.go", sc); got != tc.want {
+				t.Errorf("matchesGateConfig(internal/validate/validate.go, ttorchScope) = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTtorchRepoIsScopedIn resolves the scope against THIS tree. If the detection ever stops
+// recognising ttorch's own source, content/ and the deciding Go code quietly leave the
+// covered set, which is the expensive direction of the round-12 split.
+func TestTtorchRepoIsScopedIn(t *testing.T) {
+	root := repoRootForGateConfig(t)
+	base, err := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("resolving HEAD: %v", err)
+	}
+	sc := resolveGateScope(root, strings.TrimSpace(string(base)))
+	if !sc.TtorchSource {
+		t.Fatal("this repository must resolve as ttorch's own source: it carries " +
+			"//go:embed all:content in content.go. If that moved, update resolveGateScope, " +
+			"because content/ and every internal/ prefix are uncovered until it does.")
+	}
+	for _, p := range []string{"content/skills/ttorch-review/SKILL.md", "internal/review/size.go", "content.go"} {
+		if !matchesGateConfig(p, sc) {
+			t.Errorf("%s must be covered in ttorch's own repo", p)
+		}
 	}
 }

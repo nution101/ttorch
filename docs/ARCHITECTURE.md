@@ -448,6 +448,50 @@ from the guard. Its limit is the corpus: it needs the 196 non-merge commits reac
 skips and only a full clone exercises it. Raising `fetch-depth` would fix that but changes a
 covered file; it is a deliberate open item rather than an oversight.
 
+### The covered set is not universal
+
+`gateConfigPrefixes` was a package-level list, and `diffTouchesGateConfig` never asked which
+repository it was gating. That is fine for entries every ttorch-managed repo shares, and
+wrong for the ones that are ttorch's own source.
+
+`content/` is the clearest case. Here it is the embedded payload the installer lays into
+`~/.claude`, so covering it is right. It is also the conventional content directory for Hugo,
+Next and most CMS layouts, so the unscoped rule demanded `--allow-gate-change` for every
+ordinary change in a user's site repo. `internal/review/` and `internal/validate/` are the
+same error more quietly: they are ordinary names for ordinary Go packages.
+
+The set is now two tiers.
+
+| Tier | Entries | Applies |
+|---|---|---|
+| universal | `.ttorch/**`, `AGENTS.md`, `CLAUDE.md` (and both by basename), `.claude/**`, `.mcp.json`, `Makefile`, `go.mod`, `go.sum`, `go.work`, `go.work.sum`, `vendor/**`, `.github/workflows/**` | every ttorch-gated repo |
+| ttorch source | `content/**`, `content.go`, `docs/install.sh`, `docs/install.ps1`, `internal/{review,approval,validate,projectinit,installer,skills}/**`, the five deciding `internal/orchestrator/*.go` | only ttorch's own repository |
+
+`resolveGateScope` decides which applies, from the repository rather than from its name or
+remote URL. The signal is a Go `//go:embed` directive rooted at `content`, which is the
+property that makes `content/` load-bearing in the first place: `installer.apply` walks
+`embedRoot` ("content") in the embedded FS, so a repo that embeds `content/` as a Go payload
+is a repo where `content/` is what gets installed. A site repo with articles in `content/`
+has no such directive.
+
+**Why a worker's diff cannot spoof it.** The directive is read from BASE, the default-branch
+tree, and never from `rev`. That is the rule `resolveGateDefinition` already applies to the
+gate script, for the same reason. A worker cannot narrow the scope: deleting `content.go` on
+its branch does not change what base says, so `content/` stays covered for that merge.
+Reading `rev` would have been the hole, since one commit could drop the directive and
+un-cover `content/` while rewriting it.
+
+Detection fails **closed**: a git error returns `TtorchSource: true`, because the expensive
+mistake is leaving ttorch's own deciding code uncovered. Scoping in wrongly costs one
+unnecessary `--allow-gate-change`, the same over-match the case fold already accepts.
+`TestTtorchRepoIsScopedIn` resolves the scope against this very tree, so the cheap direction
+cannot regress silently, and
+`TestGateScope_ContentOnlyGatesTheRepoThatEmbedsIt` builds both fixture repos and asserts
+opposite verdicts on the same path.
+
+This changes no figure in the cost table: ttorch's own repo is scoped in, so the covered set
+measured over this history is what it was.
+
 ### The input set is the part that keeps being wrong
 
 Five separate bypasses of this guard have now been defects in the **list of paths handed to the
