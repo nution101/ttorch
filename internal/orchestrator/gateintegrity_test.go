@@ -624,6 +624,11 @@ func TestNoUnvalidatedDimensionSink(t *testing.T) {
 	// is still scanned and any edit to this one has to be looked at.
 	allowed := map[string]string{
 		"internal/review/prep.go": "return filepath.Join(inputsDir, ReportsDirName, dim+suffix), nil",
+		// The isolated reviewer's scratch workspace is rooted OUTSIDE the review-inputs dir
+		// on purpose, so InputPath cannot build it: that constructor resolves inside the
+		// inputs dir and injects the reports subdirectory. The line validates the dimension
+		// with ValidDimensionName, the same predicate InputPath enforces, immediately above.
+		"internal/orchestrator/gate.go": "return filepath.Join(m.P.ReviewWorkspaceDir(taskID), dim)",
 	}
 	root := filepath.Join("..", "..")
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {

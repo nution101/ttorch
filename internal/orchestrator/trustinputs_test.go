@@ -577,18 +577,23 @@ func shrunkSetHarness(t *testing.T, id string) (*Manager, string, string) {
 }
 
 // TestFoldDimensions_IgnoresTheAdvisoryAudits is the constraint that decides HOW the extras are
-// found. The standalone security audit and the qa audit write into the same review-inputs dir
-// as the trust gate, and both are advisory by design: neither may ever gate a merge. So the
-// extras must come from what the gate episode actually dispatched, never from "whatever report
-// files exist" — a qa.json sitting in the dir, blocking findings and all, must be invisible to
-// the trust fold.
+// found: from what the gate episode actually dispatched, never from "whatever report files
+// exist". A report sitting in the gate's own reports dir, blocking findings and all, must be
+// invisible to the trust fold unless the gate asked for that dimension.
+//
+// The advisory audits now fold their own episode under advisory/, so they can no longer put a
+// file here at all. This keeps testing the rule rather than the route, because the rule is what
+// stops the NEXT writer of a stray report from being folded.
 func TestFoldDimensions_IgnoresTheAdvisoryAudits(t *testing.T) {
 	m, _, wt := trustHarness(t, "fd1", "trusted", "exit 0")
 	head := commitCodeFiles(t, wt)
 	dir := m.P.ReviewInputsDir("fd1")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(review.ReportsDir(dir), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// Reports are folded against the episode's stamp, so the episode has to exist and the
+	// report has to be newer than it, or this asserts nothing about folding.
+	stageGreenPrep(t, dir, head)
 	b, err := json.Marshal(review.Report{
 		Dimension: review.DimensionQA, ReviewedSHA: head,
 		Findings: []review.Finding{{Dimension: review.DimensionQA, Severity: review.SeverityCritical, Summary: "no tests"}},

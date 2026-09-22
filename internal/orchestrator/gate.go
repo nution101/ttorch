@@ -1517,8 +1517,13 @@ var isolatedReviewDimensions = map[string]bool{review.DimensionSecurity: true}
 // mirror and the episode teardown can drop it wholesale. The root is paths.ReviewWorkspaceDir
 // and NOT the review-inputs dir, because a session's cwd ancestors are on its configuration
 // path, and the inputs dir is the directory whose CONTENT the gate cannot vouch for.
+// The dimension is checked with review.ValidDimensionName, the same predicate
+// review.InputPath enforces, so both sinks accept exactly the same names. InputPath itself
+// cannot serve here: it resolves inside the review-INPUTS dir and injects the reports
+// subdirectory, and this path is deliberately rooted somewhere else (see above). The join is
+// exempted by name in TestNoUnvalidatedDimensionSink for that reason.
 func (m *Manager) reviewWorkspaceDir(taskID, dim string) string {
-	if !safePathComponent(taskID) || !safePathComponent(dim) {
+	if !safePathComponent(taskID) || !review.ValidDimensionName(dim) {
 		return ""
 	}
 	return filepath.Join(m.P.ReviewWorkspaceDir(taskID), dim)
