@@ -962,6 +962,18 @@ notification and never stdin or a keystroke, a watcher firing cannot disturb an 
 *worker* window with a plain "continue" to recover it from an API stall — but never the
 manager.)
 
+The watcher's stale/gone net, and `ttorch status`, decide whether a worker is mid-turn from
+two signals: the text on its pane, and a record its harness's own lifecycle hooks write. A
+Claude Code worker's worktree-local settings wire `UserPromptSubmit`, `Stop`, `StopFailure`
+and `SessionEnd` to `ttorch hook <event>`, which records turn-started, turn-ended or
+session-ended in `~/.ttorch/state/tasks/<id>/hook.json`. `livestate.Reconcile` combines the
+two in a fixed order. Busy text on the pane always reads as busy, and stall text always
+leaves the decision to the pane. Otherwise a turn-started record less than 30 minutes old
+reads as busy whatever the pane shows, so a change to the harness's screen format no longer
+makes a working worker look idle, and a turn-ended record reads as idle. With no record, a
+corrupt one, or a harness that has no lifecycle hooks, the pane-only reading is unchanged.
+The full precedence table, and why each row is there, is on `Reconcile`.
+
 - **`ttorch await-lead`** sets a flag that keeps a running watcher **silent** while a
   decision sits with the lead, so the manager isn't pulled off a pending question. Arming
   `watch` clears the flag (the manager is back in the loop).
@@ -1148,6 +1160,7 @@ These properties are load-bearing:
   manifest.json         sha256 ledger of managed files (clobber-safety)
   state.db              the SQLite store (single source of truth)
   state/                watch.pid, scheduler.pid, per-task approval tokens
+  state/tasks/<id>/     a worker's hook liveness record (hook.json)
   data/<id>/            a task's stored brief.md and review inputs
   worktrees/            the per-repository worktree pool
   audit.log             approvals + merges
