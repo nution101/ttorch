@@ -1395,11 +1395,11 @@ func TestEveryTextRuleIsLinearInTheBrief(t *testing.T) {
 		rule RuleID
 		unit string
 		n    int    // repetitions of unit in the larger brief
-		was  string // measured at 0e5f11b, the sha that carried the defect
+		was  string // the defect this case guards against, measured on the code that carried it
 	}{
-		{"rule 4, bans", RuleProhibition, "do not push ", 4000, "17s at 4000 before cf73928"},
-		{"rule 3, counts", RuleHardCounts, "there are 21 occurrences. ", 16000, "8.5s at 16000 before this round"},
-		{"rule 2, citations", RuleFilePaths, "see internal/pkg/file.go and internal/pkg/other.go ", 4000, "44s at 8000 tokens before this round"},
+		{"rule 4, bans", RuleProhibition, "do not push ", 4000, "15.9x growth, 17s at 4000, before b121cdf"},
+		{"rule 3, counts", RuleHardCounts, "there are 21 occurrences. ", 16000, "15.1x growth, 8.5s at 16000, at 294d607"},
+		{"rule 2, citations", RuleFilePaths, "see internal/pkg/file.go and internal/pkg/other.go ", 4000, "15.9x growth, 44s at 8000 tokens, at 294d607"},
 	}
 	for _, tc := range cases {
 		// Only the rule under test runs, so its time is not diluted by the git work of the
