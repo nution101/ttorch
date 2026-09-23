@@ -637,6 +637,13 @@ overwrite a file you edited** — your version is kept and the new one is parked
 distinguishes "ttorch wrote this and it's unchanged" from "you changed it". Your task state
 under `~/.ttorch/state.db` and `~/.ttorch/data` is never touched.
 
+The `model:` and `effort:` keys in a managed agent's frontmatter (`~/.claude/agents/*.md`)
+are yours. If they are the only thing you changed, the update installs the new agent in
+place and carries over the values you set (a `model` must be one `--model` accepts, an
+`effort` one of the `--effort` levels; an invalid value is not carried). Any other change,
+including `tools:`, `description:` or a body line, still keeps your file and writes
+`<name>.ttorch-new`.
+
 ## What gets installed
 
 ```
