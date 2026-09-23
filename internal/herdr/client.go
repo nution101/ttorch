@@ -308,7 +308,8 @@ func readLine(r *bufio.Reader, max int) ([]byte, error) {
 // ioError classifies a read or write failure. A deadline error is reported as
 // the context's error (a Timeout-derived deadline shows up as
 // context.DeadlineExceeded); a reset or broken pipe means the server went
-// away mid-call.
+// away mid-call, and a locally closed connection means the same to the
+// reader.
 func ioError(ctx context.Context, method string, err error) error {
 	switch {
 	case errors.Is(err, ErrConnectionClosed), errors.Is(err, ErrMalformedResponse):
@@ -319,7 +320,7 @@ func ioError(ctx context.Context, method string, err error) error {
 		}
 		// The conn deadline can fire a hair before the context records it.
 		return fmt.Errorf("herdr: %s: %w", method, context.DeadlineExceeded)
-	case errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.EPIPE):
+	case errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.EPIPE), errors.Is(err, net.ErrClosed):
 		return fmt.Errorf("herdr: %s: %w: %v", method, ErrConnectionClosed, err)
 	}
 	return fmt.Errorf("herdr: %s: %w", method, err)
