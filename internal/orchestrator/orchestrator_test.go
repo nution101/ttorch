@@ -987,9 +987,6 @@ func TestMergeLocal_ApprovalBinding(t *testing.T) {
 	_, _ = m.Teardown("b1", true)
 }
 
-// deliveryHarness spins up a Manager against a fresh main-branch repo and a unique
-// tmux session, registering teardown. It mirrors the inline setup the other
-// delivery tests use.
 // seedTtorchSourceMarker makes a fixture repository resolve as ttorch's own source.
 //
 // The covered set has two tiers: paths every ttorch-gated repo shares, and paths that are
@@ -1018,6 +1015,9 @@ func seedTtorchSourceMarker(t *testing.T, repo string) {
 	gitIn(t, repo, "commit", "-q", "-m", "seed: repo resolves as ttorch source")
 }
 
+// deliveryHarness spins up a Manager against a fresh main-branch repo and a unique
+// tmux session, registering teardown. It mirrors the inline setup the other
+// delivery tests use.
 func deliveryHarness(t *testing.T, tag string) (*Manager, string) {
 	t.Helper()
 	skipIfShort(t)
