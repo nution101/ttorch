@@ -118,6 +118,13 @@ func (p Paths) SchedulerPIDFile() string { return filepath.Join(p.StateDir(), "s
 // ~/.ttorch, NEVER the manager pane (no TTY injection).
 func (p Paths) SchedulerLog() string { return filepath.Join(p.Home, "scheduler.log") }
 
+// HookRecordFile is where a worker's harness lifecycle hooks (`ttorch hook`) record the
+// last turn event they saw, in the task's own state directory. The watcher and `ttorch
+// status` read it beside the pane text (livestate.Reconcile).
+func (p Paths) HookRecordFile(id string) string {
+	return filepath.Join(p.StateDir(), "tasks", id, "hook.json")
+}
+
 // ApprovalFile holds a short-lived approval token authorizing a merge for a task.
 // The adversarial-review VERDICT it sits beside is no longer a file — it is durable,
 // content-pinned SQLite state (the verdicts table), so a merge is never forced to

@@ -107,6 +107,8 @@ func Main(args []string) int {
 		return run(cmdReport(rest))
 	case "stop-hook":
 		return run(cmdStopHook(os.Stdin, os.Stdout))
+	case "hook":
+		return run(cmdHook(rest, os.Stdin))
 	case "stage":
 		return run(cmdStage(rest))
 	case "note":
