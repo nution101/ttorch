@@ -2,16 +2,12 @@
 -- Moves the daemon gate's per-episode state out of the review-inputs directory and
 -- into the store.
 --
--- The record decides what a gate episode must still wait for: which dimensions it
--- dispatched, how many launch attempts each has cost, and when the episode opened,
--- which is what bounds it. It lived beside the review inputs, in the one directory
--- the gate explicitly does not vouch for, so a worker could rewrite it. A parseable
--- record naming no dimensions erased the memory that a security reviewer had been
--- dispatched and let an already-pinned critical finding fall out of the fold; zeroing
--- the start time held the stall bound open indefinitely; making the file unwritable
--- stopped the bound accumulating at all. Validating the file harder was the wrong
--- answer, since each shape needed its own check. This is the same move the reviewer's
--- cwd already made for the same reason.
+-- The record holds which dimensions an episode dispatched, how many launch attempts
+-- each has cost, and when the episode opened. It lived beside the review inputs as a
+-- file. Here it is a row in a database owned by the same uid the worker runs as, so a
+-- process running as the lead can still rewrite it with a sqlite3 shell. The gate does
+-- not rest a verdict on it for that reason: it folds the reports rather than this
+-- row's dimensions, and cross-checks started_at against evidence the row does not hold.
 PRAGMA foreign_keys = ON;
 
 -- One row per task, replaced in place each tick and removed with the task (CASCADE, so

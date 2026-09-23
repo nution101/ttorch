@@ -1235,9 +1235,9 @@ func TestGateOnce_AWedgedTmuxStillEscalates(t *testing.T) {
 // costs the episode its scheduling state and nothing else. A row the gate cannot parse may
 // surface as an error instead, because refusing to tick is fail-closed.
 //
-// Until this round these probes deleted and truncated gate-progress.json, a file nothing had
-// read since the record moved into the store, so they passed without touching the code. They
-// act on the store row now.
+// These probes used to delete and truncate gate-progress.json, a file nothing had read since
+// the record moved into the store, so they passed without touching the code. They act on the
+// store row now.
 func TestGateOnce_ALostProgressRecordFailsClosed(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -1505,8 +1505,8 @@ func TestGateOnce_AForgedEpisodeRecordCannotErasePriorDispatch(t *testing.T) {
 // standing and requires the episode to escalate on that one alone. A fresh Manager over the
 // same store stands in for a daemon restart, which is what drops this process's memory.
 //
-// Until this round the probe zeroed startedAt in gate-progress.json, which nothing had read
-// since the record moved into the store, so it passed without touching the clock.
+// This probe used to zero startedAt in gate-progress.json, which nothing had read since the
+// record moved into the store, so it passed without touching the clock.
 func TestGateOnce_AResetEpisodeClockStillEscalates(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -1565,10 +1565,10 @@ func TestGateOnce_AResetEpisodeClockStillEscalates(t *testing.T) {
 // never accumulates, and the gate re-preps and relaunches every reviewer for as long as the
 // task sits there. The failure needs no attacker at all.
 //
-// Until this round it chmodded gate-progress.json, which nothing had read since the record
-// moved into the store. Re-pointed at the row it was GREEN against the unchanged code: the
-// start is written when the episode opens, before the trigger goes in, so the clock still
-// has it. It is kept because it is the only probe of an unwritable row.
+// It used to chmod gate-progress.json, which nothing had read since the record moved into the
+// store. Pointed at the row, it passes even without the stall clock's cross-check: the start
+// is written when the episode opens, before the trigger goes in, so the clock still has it.
+// It is kept because it is the only probe of an unwritable row.
 func TestGateOnce_AnUnpersistableEpisodeClockStillEscalates(t *testing.T) {
 	m, _ := trustedTaskWithSubstantialDiff(t, "gate-nowrite", "nw1")
 	t.Cleanup(func() { _, _ = m.Teardown("nw1", true) })

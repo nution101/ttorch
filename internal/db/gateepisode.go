@@ -10,12 +10,12 @@ import (
 // gates, the reviewer set it decided at the boundary, what each dimension's launches have
 // cost, and when it opened.
 //
-// It lives here rather than beside the review inputs because every gate decision depends on
-// it and the worker can write that directory. A parseable record naming no dimensions erased
-// the memory that a security reviewer had been dispatched, which let an already-pinned
-// critical finding fall out of the fold and minted an approval over it. Zeroing the start
-// time held the stall bound open; making the file unwritable stopped the bound accumulating.
-// Each shape needed its own check, which is why the record moved instead.
+// It used to be a file beside the review inputs. Moving it here took it out of that
+// directory, not out of the worker's reach: this database belongs to the same uid the
+// worker runs as, and a sqlite3 shell can rewrite a row as easily as a file. The gate
+// therefore does not rest a verdict on it. It folds the reports rather than the dimensions
+// recorded here, and cross-checks StartedAt against evidence the row does not hold (see the
+// orchestrator's foldDimensions and episodeStart).
 //
 // Dims and Attempts are JSON and opaque here, the same way a verdict's findings are: the
 // store owns durability and ownership, the orchestrator owns their meaning.

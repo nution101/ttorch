@@ -1291,15 +1291,18 @@ const (
 // start time held the stall bound open indefinitely. Making the file unwritable stopped the
 // bound accumulating at all, and needed no attacker.
 //
-// Each shape wanted its own validity check, and the checks kept arriving one finding at a
-// time. The reviewer's cwd had already been moved out of that directory on exactly this
-// reasoning; this is the same move for the state the decision rests on. See
-// db.GateEpisode.
+// Moving it into the store took it out of the review-inputs dir. It did not take it out of
+// the worker's reach: the store belongs to the same uid the worker runs as, and a sqlite3
+// shell reproduced the emptied-record critical and the refreshed clock against the row. So
+// the decisions that matter no longer rest on it. The fold reads the reports
+// (foldDimensions), the stall clock is cross-checked against this process's own memory and
+// an append-only marker (episodeStart), and the advisory guard against the marker
+// (AdvisoryPrep). What the record is still trusted for is listed in foldDimensions.
 
 // gateProgressFile is where the episode record USED to live, beside the review inputs. Nothing
-// reads or writes it now: the record moved into the store because a worker can write that
-// directory (see db.GateEpisode). The name survives so the archive sweep still recognises a
-// leftover from an older build as a control file rather than mistaking it for a report.
+// reads or writes it now; the record is a store row (see db.GateEpisode). The name survives so
+// the archive sweep still recognises a leftover from an older build as a control file rather
+// than mistaking it for a report.
 const gateProgressFile = "gate-progress.json"
 
 // gate-progress terminal outcomes (the Outcome field). An empty Outcome means the episode for
@@ -1473,8 +1476,8 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 
 	dir := m.P.ReviewInputsDir(taskID)
 	// A store failure is not "no episode in flight". Surface it and leave the task where it
-	// is; the next tick retries. Recording anything over an episode the gate cannot read is
-	// exactly what moving this record out of the worker's directory was for.
+	// is; the next tick retries. Reading a failed load as "nothing outstanding" is how a lost
+	// record once let a verdict through.
 	prog, _, err := m.readGateProgress(taskID)
 	if err != nil {
 		return GateSkipped, err
@@ -1545,8 +1548,9 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 	// on an unanswered reviewer rather than wedging on one.
 	required, dropped := m.requiredDimensions(t, head)
 	dims := unionDimensions(required, dispatchedDimensions(prog))
-	// VALIDATE BEFORE COMPOSING ANYTHING FOR THE MANAGER. Both records these names come from
-	// are files in the review inputs dir, and the gate_blocked payload below is the channel
+	// VALIDATE BEFORE COMPOSING ANYTHING FOR THE MANAGER. These names come from reviewers.json
+	// and the prep stamp in the review-inputs dir and from the episode row, all of which a
+	// process running as the lead can write, and the gate_blocked payload below is the channel
 	// the manager acts on, so an unusable name must be caught here rather than quoted into a
 	// sentence about something else. The fold would block on it anyway; this is about what
 	// reaches the manager and in what words.
@@ -1990,9 +1994,9 @@ func (m *Manager) readGateProgress(taskID string) (gateProgress, bool, error) {
 	if !row.DispatchedAt.IsZero() {
 		p.DispatchedAt = row.DispatchedAt.UnixNano()
 	}
-	// A row whose JSON will not parse is a store-side corruption, not worker input. Report it
-	// rather than silently continuing with an empty set, which is the failure this move exists
-	// to remove.
+	// A row whose JSON will not parse is reported rather than read as an empty set, whoever
+	// wrote it. A process running as the same user can write this row, so an unparseable one
+	// is not proof of a store fault; refusing to tick over it is fail-closed either way.
 	if err := json.Unmarshal([]byte(row.Dims), &p.Dims); err != nil {
 		return gateProgress{Attempts: map[string]int{}}, true, fmt.Errorf("gate episode for %q has unreadable dims: %w", taskID, err)
 	}
