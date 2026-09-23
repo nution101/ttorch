@@ -1527,10 +1527,21 @@ func (m *Manager) GateOnce(taskID string) (GateOutcome, error) {
 }
 
 // gateOnceAt is the testable core: one tick of the daemon gate for taskID. now and the
-// tunables are injected so a test can drive the stall clock deterministically. It returns the
-// tick's GateOutcome and a hard error only for a board-read failure (which aborts the pass);
-// every per-task obstruction (a prep refusal, a blocking verdict, a stalled reviewer) is
-// surfaced via a gate_blocked event and returned as GateBlocked, never as an error.
+// tunables are injected so a test can drive the stall clock deterministically.
+//
+// Every per-task obstruction (a prep refusal, a blocking verdict, a stalled reviewer, an
+// unreadable reports listing) is surfaced via a gate_blocked event and returned as
+// GateBlocked. The error is for store faults, and it can accompany any outcome:
+//
+//   - reading the task, its verdict or its episode fails: GateSkipped with the error
+//   - opening an episode cannot save the row or append its marker: GateSkipped with the error
+//   - a prep refusal cannot save its blocked outcome: GateBlocked with the error
+//   - a dispatch cannot save its attempt counts: GateDispatched with the error
+//   - any terminal outcome cannot be saved (endEpisode): GateBlocked or GateRecorded with the
+//     error, after the gate_blocked event or the verdict has already been written
+//
+// The scheduler logs an error and leaves the task for the next tick; it does not abort the
+// pass over the other tasks.
 func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttempts int, reviewerTimeout time.Duration, now time.Time) (GateOutcome, error) {
 	ctx := context.Background()
 	t, ok, err := m.Store.GetTask(ctx, taskID)
