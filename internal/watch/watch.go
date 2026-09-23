@@ -322,7 +322,8 @@ func (w *Watcher) Run(ctx context.Context) (Result, error) {
 	defer releaseFlock(lock, w.P.WatchPIDFile())
 
 	since := w.Since
-	if since < 0 {
+	fromWatermark := since < 0
+	if fromWatermark {
 		m, _, err := w.Store.GetManager(ctx)
 		if err != nil {
 			return Result{}, err
@@ -384,6 +385,21 @@ func (w *Watcher) Run(ctx context.Context) (Result, error) {
 			// Absorb a burst before surfacing, then re-read as the definitive batch.
 			if err := w.wait(ctx, w.coalesce()); err != nil {
 				return Result{}, err
+			}
+			if fromWatermark {
+				// Take the batch and advance the watermark in one transaction, so an update
+				// `ttorch inbox` consumed while this watcher was armed is never surfaced twice.
+				c, err := w.Store.ConsumeActionable(ctx, since)
+				if err != nil {
+					return Result{}, err
+				}
+				if len(c.Events) == 0 {
+					since = c.Watermark // another consumer took them; keep watching past it
+					continue
+				}
+				batch := dedupeByEntity(c.Events)
+				w.printBatch(c.Since, c.Watermark, batch)
+				return Result{Fired: true, Watermark: c.Watermark, Batch: batch}, nil
 			}
 			rows, err = w.Store.EventsSince(ctx, since, true)
 			if err != nil {
