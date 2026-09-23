@@ -1469,6 +1469,12 @@ func (c *episodeClocks) firstSeen(taskID, head string, now time.Time) time.Time 
 // takes a daemon kill inside every reviewerTimeout, and it only stops an episode escalating.
 // It cannot produce a verdict, which still needs every required report pinned and clean.
 //
+// A restart is not the only way. All three anchors are keyed on the head, so a worker that
+// moves HEAD inside every reviewerTimeout opens a new episode each time, with a fresh sighting,
+// a fresh row and a marker for the new head. That too keeps gate_blocked from being surfaced,
+// and it cannot produce a verdict either: every new head is re-prepped and reviewed from
+// scratch.
+//
 // Earliest errs toward escalating early. An anchor that is too early costs a gate_blocked on a
 // healthy episode, which the manager adjudicates; one that is too late costs the bound.
 func (m *Manager) episodeStart(taskID, head string, prog gateProgress, now time.Time) time.Time {
