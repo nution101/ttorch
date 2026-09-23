@@ -115,6 +115,12 @@ func (s *Server) Answer(ctx context.Context, taskID string, questionID int64, te
 	if !ok {
 		return Result{}, inputError{fmt.Sprintf("unknown task %q", taskID)}
 	}
+	// A cc task is the lead's own ad-hoc Claude session, not a worker. The page never lists
+	// one, so an answer naming it did not come from a question the board showed, and the
+	// board does not type into the lead's own sessions.
+	if t.Kind == db.KindCC {
+		return Result{}, inputError{fmt.Sprintf("%s is an ad-hoc session, not a worker; use ttorch send if you mean to type into it", t.ID)}
+	}
 	if t.Status != db.StatusNeedsInput && t.Status != db.StatusBlocked {
 		return Result{Message: fmt.Sprintf("%s is %s now, not waiting on an answer; nothing sent", t.ID, t.Status)}, nil
 	}

@@ -294,3 +294,18 @@ func TestFailedGatePrepCanBeRetried(t *testing.T) {
 		t.Fatalf("retry after a refused prep: %+v", res)
 	}
 }
+
+// TestAnswerRefusesAnAdHocSession: a cc session is the lead's own ad-hoc Claude session. The
+// page never lists one, so the board has no business typing into it.
+func TestAnswerRefusesAnAdHocSession(t *testing.T) {
+	h := newHarness(t)
+	h.addTask(db.Task{ID: "cc-1", Kind: db.KindCC, Window: "cc-1", Status: db.StatusActive})
+	q := h.ask("cc-1", "anything?")
+	r := h.action("/api/answer", answerForm("cc-1", q, "hello"))
+	if r.code != http.StatusBadRequest || decode(t, r).OK {
+		t.Fatalf("answer to a cc session: %d %q", r.code, r.body)
+	}
+	if n := h.fleet.sendCount(); n != 0 {
+		t.Fatalf("typed into an ad-hoc session (%d sends)", n)
+	}
+}
