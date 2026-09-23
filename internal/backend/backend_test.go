@@ -1,9 +1,46 @@
 package backend
 
 import (
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
+
+// TestSessionCallersDoNotImportTmux keeps the seam whole. The orchestrator and the
+// watcher reach their session only through a Backend, so no non-test file in either
+// package may import package tmux: one direct call would be a call site a second backend
+// silently skips. Tests may still import it to drive a real tmux.
+func TestSessionCallersDoNotImportTmux(t *testing.T) {
+	const tmuxPkg = "github.com/nution101/ttorch/internal/tmux"
+	for _, dir := range []string{"../orchestrator", "../watch"} {
+		files, err := filepath.Glob(filepath.Join(dir, "*.go"))
+		if err != nil || len(files) == 0 {
+			t.Fatalf("no Go files under %s (err = %v)", dir, err)
+		}
+		for _, path := range files {
+			if strings.HasSuffix(path, "_test.go") {
+				continue
+			}
+			src, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f, err := parser.ParseFile(token.NewFileSet(), path, src, parser.ImportsOnly)
+			if err != nil {
+				t.Fatalf("parsing %s: %v", path, err)
+			}
+			for _, imp := range f.Imports {
+				if p, _ := strconv.Unquote(imp.Path.Value); p == tmuxPkg {
+					t.Errorf("%s imports %s; call the session through its Backend instead", path, tmuxPkg)
+				}
+			}
+		}
+	}
+}
 
 // TestResolve pins which names select a backend. Unset and "tmux" give tmux; anything
 // else is refused with an error that names the variable and the value, so the lead can
