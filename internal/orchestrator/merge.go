@@ -828,7 +828,7 @@ func (m *Manager) landPrep(t db.Task, spec landSpec, fetchMu *sync.Mutex) (landP
 	// (3) Validate the REBASED tree. Must be green; no checks detected is a hard block. This
 	// green gates the land, so it goes through validateForAuthority — a result this process
 	// produced, never one read back from the on-disk cache.
-	green, results, _, err := validateForAuthority(spec.repo, rebasedHead)
+	green, results, reused, err := validateForAuthority(spec.repo, rebasedHead)
 	if err != nil {
 		return zero, fmt.Errorf("land: could not validate the rebased tree for %q: %w", spec.taskID, err)
 	}
@@ -843,7 +843,14 @@ func (m *Manager) landPrep(t db.Task, spec landSpec, fetchMu *sync.Mutex) (landP
 	// The gated merge no longer READS this pair as its green (see validateForAuthority); it does
 	// not re-run the suite either, because the run just above memoized the green for this exact
 	// tree, so the validate cost still stays here, off the serialized fast-forward.
-	if spec.gated {
+	//
+	// Only a run is staged. A reused green is the memo, which keeps each check's pass/fail and
+	// drops its output (memoShape), so staging it would write a record with every log blank over
+	// the one the run that produced it staged. That is the usual trusted path: prep ran the
+	// suite for this commit and staged the output, and a land with nothing to rebase reuses that
+	// run. Leaving the pair alone there keeps prep's record, which describes the same tree. On
+	// any other reuse the pair stays as the last run to stage it wrote it.
+	if spec.gated && !reused {
 		if err := m.stagePrepValidate(spec.taskID, rebasedHead, results); err != nil {
 			return zero, fmt.Errorf("land: could not stage the rebased validate for %q: %w", spec.taskID, err)
 		}

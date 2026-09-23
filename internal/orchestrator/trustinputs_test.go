@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -392,6 +393,101 @@ func TestProcessValidate_MemoDropsCheckOutput(t *testing.T) {
 	if err != nil || !green || !reused {
 		t.Fatalf("the memoized green must still authorize on reuse: green=%v reused=%v err=%v", green, reused, err)
 	}
+}
+
+// TestLandPrep_AMemoHitLeavesTheStagedValidateIntact is the other half of that bound. TrustPrep
+// runs the suite for the reviewed commit, stages the full output as validate.json, and memoizes
+// the green without it. A land of that same commit has nothing to rebase, so its validate reuses
+// the memo, and landPrep used to stage what came back: the same checks with every Output blank,
+// written over the record prep had staged. Pass/fail stayed right and the evidence was gone.
+//
+// The second land rebases onto an advanced default, so the tree is new and the suite runs again.
+// That run must still be staged, pinned to the rebased commit, or a fix that stopped staging
+// altogether would pass the first half.
+func TestLandPrep_AMemoHitLeavesTheStagedValidateIntact(t *testing.T) {
+	const marker = "gate-check-output"
+	m, repo, wt := trustHarness(t, "lp1", "trusted", "printf '"+marker+"'\nexit 0")
+	head := commitCodeFiles(t, wt)
+
+	dir, err := m.TrustPrep("lp1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStaged := func(when, sha string) {
+		t.Helper()
+		if got, _ := os.ReadFile(filepath.Join(dir, "head.txt")); strings.TrimSpace(string(got)) != sha {
+			t.Fatalf("%s: the staged validate must be pinned to %s, head.txt says %q", when, short(sha), strings.TrimSpace(string(got)))
+		}
+		raw, err := os.ReadFile(filepath.Join(dir, review.StagedValidateFile))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var results []validate.Result
+		if err := json.Unmarshal(raw, &results); err != nil {
+			t.Fatal(err)
+		}
+		if len(results) == 0 {
+			t.Fatalf("%s: the staged validate has no checks", when)
+		}
+		for _, r := range results {
+			if !strings.Contains(r.Output, marker) {
+				t.Fatalf("%s: check %q was staged without its output (%q)", when, r.Name, r.Output)
+			}
+		}
+	}
+	assertStaged("after prep", head)
+
+	for _, dim := range requiredReviewers {
+		writeCleanReport(t, dir, dim, head)
+	}
+	v, err := m.TrustRecord("lp1", head, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Overall != review.Pass {
+		t.Fatalf("three clean reports over a green validate must pass: %q (%+v)", v.Overall, v.Findings)
+	}
+	// The premise: this process already ran the suite for this tree, so the land reuses it.
+	_, key, keyed := gateContentKey(repo, head)
+	if _, ok := loadProcessValidate(key); !keyed || !ok {
+		t.Fatal("prep's run must be memoized, or the land runs the suite fresh and this proves nothing")
+	}
+
+	task, _, err := m.Store.GetTask(context.Background(), "lp1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := m.resolveLandSpec(task, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !spec.gated {
+		t.Fatal("a trusted land must be gated, or nothing is staged at all")
+	}
+	// Completing is what shows the land got past validating and staging.
+	lp, err := m.landPrep(task, spec, &sync.Mutex{})
+	if err != nil {
+		t.Fatalf("the land of the reviewed commit must complete: %v", err)
+	}
+	if lp.rebasedHead != head {
+		t.Fatalf("nothing to rebase, so the land must validate the reviewed commit, got %s", short(lp.rebasedHead))
+	}
+	assertStaged("after a land that reused prep's run", head)
+
+	if err := os.WriteFile(filepath.Join(repo, "other.txt"), []byte("concurrent\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", "other.txt")
+	gitIn(t, repo, "commit", "-q", "-m", "concurrent landing")
+	gitIn(t, repo, "push", "-q", "origin", "main")
+	lp, err = m.landPrep(task, spec, &sync.Mutex{})
+	if err != nil {
+		t.Fatalf("a clean rebase must carry the verdict and complete: %v", err)
+	}
+	if lp.rebasedHead == head {
+		t.Fatal("the default advanced, so the land must have rebased")
+	}
+	assertStaged("after a land that ran the suite on the rebased tree", lp.rebasedHead)
 }
 
 // TestGateOnce_HonoursADispatchedReviewerAfterTheSetShrinks is the red proof for a defect an
