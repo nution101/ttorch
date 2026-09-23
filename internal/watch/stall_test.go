@@ -404,6 +404,10 @@ func TestStallPolicyFromEnv(t *testing.T) {
 		{"off", "", "0", stallPolicy{After: 0, Repeat: defaultStallRepeat, Reraises: 0}},
 		{"0", "", "", stallPolicy{After: 0, Repeat: defaultStallRepeat, Reraises: defaultStallReraises}},
 		{"soon", "-1m", "-2", def},
+		// Below the one-minute floor: clamped up, so a stalled update cannot fire every poll.
+		{"1s", "1ns", "", stallPolicy{After: time.Minute, Repeat: time.Minute, Reraises: defaultStallReraises}},
+		{"59s", "59s", "", stallPolicy{After: time.Minute, Repeat: time.Minute, Reraises: defaultStallReraises}},
+		{"1m", "1m", "", stallPolicy{After: time.Minute, Repeat: time.Minute, Reraises: defaultStallReraises}},
 	}
 	for _, c := range cases {
 		t.Setenv("TTORCH_STALL_AFTER", c.after)
@@ -477,5 +481,18 @@ func TestCommitterTime(t *testing.T) {
 		if ok != c.ok || (ok && got.Unix() != c.want) {
 			t.Errorf("%s: committerTime = %v, %v; want %d, %v", c.name, got.Unix(), ok, c.want, c.ok)
 		}
+	}
+}
+
+// TestStall_TinyEnvIntervalsCannotWakeEveryPoll: TTORCH_STALL_REPEAT=1ns must not turn
+// every one-second poll into a stalled row and a manager wake.
+func TestStall_TinyEnvIntervalsCannotWakeEveryPoll(t *testing.T) {
+	t.Setenv("TTORCH_STALL_AFTER", "1s")
+	t.Setenv("TTORCH_STALL_REPEAT", "1ns")
+	w, s, clk, start := stallFixture(t, "tiny")
+	w.stall = newStallTracker() // re-read the environment set above
+	sweepUntil(t, w, clk, start.Add(5*time.Minute), time.Second)
+	if n := len(stallRaises(t, s, "tiny")); n != 5 {
+		t.Fatalf("5 minutes idle at the one-minute floor should give 5 updates, got %d", n)
 	}
 }

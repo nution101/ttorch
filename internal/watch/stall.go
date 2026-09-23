@@ -46,6 +46,11 @@ const (
 // does not match the clock.
 const stallClockGap = time.Minute
 
+// minStallInterval is the floor for TTORCH_STALL_AFTER and TTORCH_STALL_REPEAT. A smaller
+// value is raised to it: without a floor, REPEAT=1ns writes a stalled row and wakes the
+// manager on every poll.
+const minStallInterval = time.Minute
+
 // Ladder levels, carried in the stalled payload.
 const (
 	stallLevelStalled = "stalled"
@@ -72,7 +77,8 @@ func newStallTracker() stallTracker {
 }
 
 // stallPolicyFromEnv reads the ladder thresholds. A missing or invalid value falls back
-// to its default; TTORCH_STALL_AFTER set to 0/off/false/no disables the ladder.
+// to its default, a positive duration under minStallInterval is raised to it, and
+// TTORCH_STALL_AFTER set to 0/off/false/no disables the ladder.
 func stallPolicyFromEnv() stallPolicy {
 	p := stallPolicy{After: defaultStallAfter, Repeat: defaultStallRepeat, Reraises: defaultStallReraises}
 	if v := strings.ToLower(strings.TrimSpace(os.Getenv("TTORCH_STALL_AFTER"))); v != "" {
@@ -81,13 +87,13 @@ func stallPolicyFromEnv() stallPolicy {
 			p.After = 0
 		default:
 			if d, err := time.ParseDuration(v); err == nil && d > 0 {
-				p.After = d
+				p.After = max(d, minStallInterval)
 			}
 		}
 	}
 	if v := strings.TrimSpace(os.Getenv("TTORCH_STALL_REPEAT")); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			p.Repeat = d
+			p.Repeat = max(d, minStallInterval)
 		}
 	}
 	if v := strings.TrimSpace(os.Getenv("TTORCH_STALL_RERAISES")); v != "" {
