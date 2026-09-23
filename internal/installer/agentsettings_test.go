@@ -350,14 +350,12 @@ func TestApply_CarriedSettingsRoundTrip(t *testing.T) {
 	}
 }
 
-// A ledger written before normalized hashes were recorded only has the whole-file sha of
-// what was last shipped. When the shipped settings did not change, that is still enough.
-func TestApply_LegacyLedgerWithoutNormalizedHash(t *testing.T) {
-	p := sandbox(t)
-	if _, err := apply(withAgent(agentV1), p, "0.1.0"); err != nil {
-		t.Fatal(err)
-	}
-	b, err := os.ReadFile(p.ManifestFile())
+// stripLedgerSettings rewrites the saved manifest into the shape an older ttorch wrote: no
+// top-level "settings" map, only the whole-file shas. It fails if there was nothing to strip,
+// so the caller cannot end up testing the current-format path by accident.
+func stripLedgerSettings(t *testing.T, manifestFile, dest string) {
+	t.Helper()
+	b, err := os.ReadFile(manifestFile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -365,19 +363,81 @@ func TestApply_LegacyLedgerWithoutNormalizedHash(t *testing.T) {
 	if err := json.Unmarshal(b, &raw); err != nil {
 		t.Fatal(err)
 	}
-	delete(raw, "normalized")
-	b, _ = json.Marshal(raw)
-	writeFile(t, p.ManifestFile(), string(b))
-
-	dest := agentPath(t, p.ClaudeAgents())
-	writeFile(t, dest, setSettings(agentV1, "model: opus\n"))
-	if _, err := apply(withAgent(agentV2), p, "0.2.0"); err != nil {
+	if _, ok := raw["settings"]; !ok {
+		t.Fatalf("manifest has no top-level settings key to strip: %s", b)
+	}
+	delete(raw, "settings")
+	b, err = json.Marshal(raw)
+	if err != nil {
 		t.Fatal(err)
+	}
+	writeFile(t, manifestFile, string(b))
+
+	m := manifest.Load(manifestFile)
+	if len(m.Settings) != 0 {
+		t.Fatalf("ledger still has settings entries: %+v", m.Settings)
+	}
+	if m.Files[dest] == "" {
+		t.Fatal("stripping settings lost the whole-file sha the legacy path relies on")
+	}
+}
+
+// A ledger written before settings were recorded only has the whole-file sha of what was last
+// shipped. When the shipped settings did not change, that is still enough to carry.
+func TestApply_LegacyLedgerWithoutNormalizedHash(t *testing.T) {
+	p := sandbox(t)
+	if _, err := apply(withAgent(agentV1), p, "0.1.0"); err != nil {
+		t.Fatal(err)
+	}
+	dest := agentPath(t, p.ClaudeAgents())
+	stripLedgerSettings(t, p.ManifestFile(), dest)
+
+	writeFile(t, dest, setSettings(agentV1, "model: opus\n"))
+	res, err := apply(withAgent(agentV2), p, "0.2.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The ledger has no settings entry for dest and the file differs from its recorded sha,
+	// so a carry here can only have come from the legacy branch.
+	if act, note := actionFor(res.Report, dest); act != manifest.Updated || note != "your settings kept" {
+		t.Fatalf("action = %q (%q), want updated via the settings path", act, note)
 	}
 	if want := setSettings(agentV2, "model: opus\n"); read(t, dest) != want {
 		t.Fatalf("file = %q\nwant %q", read(t, dest), want)
 	}
 	noParked(t, dest)
+}
+
+// Under a legacy ledger the installer can only prove "settings-only" when the last shipped
+// settings equal the new ones. When the shipped default changed between versions it cannot,
+// and must fail closed.
+func TestApply_LegacyLedgerShippedDefaultChangedConflicts(t *testing.T) {
+	v1 := setSettings(agentV1, "model: sonnet\n")
+	v2 := setSettings(agentV2, "model: haiku\n")
+	for name, lines := range map[string]string{
+		"user set effort": "effort: max\n",
+		"user set model":  "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := sandbox(t)
+			if _, err := apply(withAgent(v1), p, "0.1.0"); err != nil {
+				t.Fatal(err)
+			}
+			dest := agentPath(t, p.ClaudeAgents())
+			stripLedgerSettings(t, p.ManifestFile(), dest)
+
+			mine := setSettings(v1, lines)
+			if lines == "" {
+				mine = strings.Replace(v1, "model: sonnet", "model: opus", 1)
+			}
+			writeFile(t, dest, mine)
+			res, err := apply(withAgent(v2), p, "0.2.0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertConflict(t, res.Report, dest, mine, v2)
+		})
+	}
 }
 
 // Every shipped agent's settings must parse and validate, or the ledger records no settings
