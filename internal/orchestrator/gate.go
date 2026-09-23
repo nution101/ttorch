@@ -261,8 +261,7 @@ func dispatchedDimensions(prog gateProgress) []string {
 }
 
 // foldDimensions returns the dimensions review.Aggregate must fold for head: every REQUIRED
-// dimension, plus any dimension this episode DISPATCHED that is no longer required but has
-// left a report pinned to head.
+// dimension, plus any dimension that has left a report pinned to head.
 //
 // The required set can shrink mid-episode. requiredDimensions fails closed to all three when
 // it cannot resolve the review base, so a transient git failure on one tick dispatches a
@@ -276,21 +275,39 @@ func dispatchedDimensions(prog gateProgress) []string {
 // polls it and Aggregate is never asked to require it. Folding is therefore monotone — it can
 // add findings, never drop a requirement.
 //
-// The extras come from the episode's own dispatch record and never from "whatever report files
-// happen to exist". That bounds which dimensions may be folded; it does not by itself keep an
-// advisory report out, and this comment used to claim it did. The advisory audits dispatch the
-// same reviewer agents over the same inputs, so their reports have the same filenames, and the
-// gate would have folded one for any dimension it had also dispatched. They are kept out by
-// living in a different directory (AdvisoryInputsDir): the gate aggregates the inputs dir and
-// the audits aggregate the subdirectory, so neither can read the other's artifact.
-func (m *Manager) foldDimensions(dir, head string, required, dispatched []string) []string {
+// The extras come from the reports on disk, not from the episode record. The record is a row
+// in the store, and the store belongs to the same uid the worker runs as, so anything that
+// consults the record as an authority can be rewritten from a shell: `UPDATE gate_episodes SET
+// dims='[]', attempts='{}'` erased the memory that security had been dispatched, dropped its
+// already-pinned critical report out of the fold, and minted an approval over it.
+//
+// Reading the reports does not authenticate them. Any process running as the lead can write a
+// report pinned to head, and a forged report for a REQUIRED dimension still satisfies it; that
+// is the open report-authentication problem ReviewersFor describes, and nothing here changes
+// it. What reading them does buy is narrower and it holds: an extra can only add findings to
+// Aggregate, never satisfy or remove a requirement, so a report that is on disk is folded
+// whoever wrote it and whatever the record says. No edit to the record can take a finding
+// that is already on disk back out of the verdict.
+//
+// What the record is still trusted for: attempt counts, the dispatch timestamp, the last
+// dispatch error, which reviewer windows to tear down, and which dispatched dimensions the
+// gate keeps waiting on after they drop out of the required set. The last one is a residual.
+// Emptying the record ends the wait for such a reviewer, so if it has not reported yet, its
+// finding arrives after the verdict. The wait never falls below the required set, which is
+// re-derived from the committed diff every tick, so this can only lose a dimension the diff
+// itself does not call for.
+//
+// Advisory reports are kept out by living in a different directory (AdvisoryInputsDir): the
+// gate scans the inputs dir's reports and the audits scan the subdirectory's, so neither
+// reads the other's artifact.
+func (m *Manager) foldDimensions(dir, head string, required []string) []string {
 	out := append([]string(nil), required...)
 	have := make(map[string]bool, len(required))
 	for _, d := range required {
 		have[d] = true
 	}
-	for _, d := range dispatched {
-		if have[d] || !m.reviewReportPinned(dir, d, head) {
+	for _, d := range review.PinnedReportDimensions(dir, head) {
+		if have[d] {
 			continue
 		}
 		have[d] = true
@@ -755,25 +772,14 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 	if err := review.ValidateDimensionSet(required); err != nil {
 		return zero, err
 	}
-	// The set is widened by any dimension the daemon's gate episode for THIS sha dispatched
-	// that is no longer required but reported anyway (foldDimensions). Without that, a manager
-	// running `ttorch trust record` by hand after the daemon blocked on such a reviewer would
-	// record a pass and discard its findings; the two paths must fold the identical set. A
-	// task with no gate episode (the manual flow throughout) has no extras.
+	// The set is widened by every dimension with a report pinned to THIS sha that is not
+	// already required (foldDimensions). Without that, a manager running `ttorch trust record`
+	// by hand after the daemon blocked on such a reviewer would record a pass and discard its
+	// findings, so the two paths fold the identical set and read it the same way, off the
+	// reports. The manual path used to take its extras from the episode record, so the one
+	// rewrite that fooled the daemon fooled `ttorch trust record` too.
 	inputs := m.P.ReviewInputsDir(taskID)
-	// The manual path folds the same extras as the daemon, and it reads them the same way.
-	// A store failure here is NOT "no episode": read that way, a record the gate could not
-	// load would silently drop a dispatched dimension out of the fold, which is the defect
-	// this record was moved into the store to end.
-	prog, found, err := m.readGateProgress(taskID)
-	if err != nil {
-		return zero, fmt.Errorf("trust record %q: could not read the gate episode: %w", taskID, err)
-	}
-	var dispatched []string
-	if found && prog.Head == sha {
-		dispatched = dispatchedDimensions(prog)
-	}
-	dims := m.foldDimensions(inputs, sha, required, dispatched)
+	dims := m.foldDimensions(inputs, sha, required)
 	verdict, err := review.Aggregate(inputs, sha, dims)
 	if err != nil {
 		return zero, err
@@ -1570,12 +1576,12 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 	}
 
 	// Every required dimension has a report pinned to head. Aggregate to decide pass vs block,
-	// over the required set PLUS any dimension this episode dispatched that is no longer
-	// required but reported anyway (see foldDimensions) — a blocking finding from a reviewer
-	// the gate itself asked for is never discarded because the set shrank under it.
-	// review.Aggregate is the SAME deterministic fold the manager's `trust record` uses, and
-	// TrustRecord derives the same extras, so the daemon does not fork the decision.
-	fold := m.foldDimensions(dir, head, dims, dispatchedDimensions(prog))
+	// over the required set PLUS every other dimension with a report pinned to head (see
+	// foldDimensions), so a blocking finding already on disk is never discarded because the
+	// set shrank under it or because the episode record forgot it. review.Aggregate is the
+	// SAME deterministic fold the manager's `trust record` uses, and TrustRecord derives the
+	// same extras the same way, so the daemon does not fork the decision.
+	fold := m.foldDimensions(dir, head, dims)
 	v, err := review.Aggregate(dir, head, fold)
 	if err != nil {
 		// Only a stale-sha mismatch makes Aggregate error, which reviewReportPinned already

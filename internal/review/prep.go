@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -264,6 +265,38 @@ func InputPath(inputsDir, dim, suffix string) (string, error) {
 // write into it.
 func ReportsDir(inputsDir string) string {
 	return filepath.Join(inputsDir, ReportsDirName)
+}
+
+// PinnedReportDimensions returns every dimension that has a report in inputsDir's reports
+// directory pinned to sha and current for the episode (ReportCurrent). The trust gate folds
+// these whether or not its own records say the dimension was dispatched.
+//
+// A pinned report is not proof of who wrote it: any process that can write the directory can
+// write one. It does not need to be, for the use it is put to. A report found here is only
+// ever ADDED to the fold, where it can contribute findings but cannot satisfy or remove a
+// requirement.
+//
+// Only plain "<dimension>.json" children count, and only ones ValidDimensionName accepts, so
+// a file dropped into the directory under any other name is ignored rather than turned into
+// a dimension. A missing directory is not an error: it means no reviewer has reported yet.
+func PinnedReportDimensions(inputsDir, sha string) []string {
+	entries, err := os.ReadDir(ReportsDir(inputsDir))
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ReportSuffix) {
+			continue
+		}
+		dim := strings.TrimSuffix(e.Name(), ReportSuffix)
+		if !ValidDimensionName(dim) || !ReportCurrent(inputsDir, dim, sha) {
+			continue
+		}
+		out = append(out, dim)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // prepState is the episode the reports in an inputs dir are folded against: the marker's

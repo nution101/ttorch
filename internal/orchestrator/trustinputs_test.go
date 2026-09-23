@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,8 @@ import (
 	"github.com/nution101/ttorch/internal/review"
 	"github.com/nution101/ttorch/internal/validate"
 	"github.com/nution101/ttorch/internal/worktree"
+
+	_ "modernc.org/sqlite" // the store's driver, so a probe can reach the database the way a same-uid process does
 )
 
 // trustHarness stands up the trust gate's real inputs — a git repo whose DEFAULT BRANCH
@@ -578,15 +581,22 @@ func shrunkSetHarness(t *testing.T, id string) (*Manager, string, string) {
 	return m, dir, head
 }
 
-// TestFoldDimensions_IgnoresTheAdvisoryAudits is the constraint that decides HOW the extras are
-// found: from what the gate episode actually dispatched, never from "whatever report files
-// exist". A report sitting in the gate's own reports dir, blocking findings and all, must be
-// invisible to the trust fold unless the gate asked for that dimension.
+// TestFoldDimensions_ReadsTheReportsNotTheRecord pins the rule that decides HOW the extras
+// are found, and it is the REVERSE of what this test asserted before. It used to require that
+// a report be invisible to the fold unless the episode record said that dimension had been
+// dispatched. That made the record authority over whether a finding counted, and the record
+// is a row this process writes under the same uid the worker runs as: clearing its dims and
+// attempts together dropped an already-pinned critical security report out of the fold and
+// minted an approval over it.
 //
-// The advisory audits now fold their own episode under advisory/, so they can no longer put a
-// file here at all. This keeps testing the rule rather than the route, because the rule is what
-// stops the NEXT writer of a stray report from being folded.
-func TestFoldDimensions_IgnoresTheAdvisoryAudits(t *testing.T) {
+// So the extras now come from the reports. Folding a report the gate did not ask for is safe
+// in the only direction that matters, because an extra can add findings to Aggregate but
+// never satisfy or remove a requirement.
+//
+// What keeps the advisory audits out is not the record and never really was: it is that they
+// fold their own episode under advisory/, which the gate does not scan. Both halves are
+// asserted here, because dropping the record left the second one carrying all the weight.
+func TestFoldDimensions_ReadsTheReportsNotTheRecord(t *testing.T) {
 	m, _, wt := trustHarness(t, "fd1", "trusted", "exit 0")
 	head := commitCodeFiles(t, wt)
 	dir := m.P.ReviewInputsDir("fd1")
@@ -596,34 +606,48 @@ func TestFoldDimensions_IgnoresTheAdvisoryAudits(t *testing.T) {
 	// Reports are folded against the episode's stamp, so the episode has to exist and the
 	// report has to be newer than it, or this asserts nothing about folding.
 	stageGreenPrep(t, dir, head)
-	b, err := json.Marshal(review.Report{
-		Dimension: review.DimensionQA, ReviewedSHA: head,
-		Findings: []review.Finding{{Dimension: review.DimensionQA, Severity: review.SeverityCritical, Summary: "no tests"}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	rpath, err := review.InputPath(dir, review.DimensionQA, review.ReportSuffix)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(review.ReportsDir(dir), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(rpath, b, 0o644); err != nil {
-		t.Fatal(err)
-	}
 
 	required := []string{review.DimensionCorrectness, review.DimensionScope, review.DimensionSecurity}
-	got := m.foldDimensions(dir, head, required, nil)
-	if strings.Join(got, " ") != strings.Join(required, " ") {
-		t.Fatalf("an advisory qa.json must not enter the trust fold, got %v", got)
+	if got := m.foldDimensions(dir, head, required); strings.Join(got, " ") != strings.Join(required, " ") {
+		t.Fatalf("with no extra report present the fold is just the required set, got %v", got)
 	}
-	// It is folded only when the gate itself dispatched that dimension.
-	got = m.foldDimensions(dir, head, required, []string{review.DimensionQA})
+
+	// A report in the gate's own reports dir, pinned to head, is folded — with nothing in the
+	// episode record saying that dimension was ever dispatched.
+	writeFindingReport(t, dir, review.DimensionQA, head, []review.Finding{{
+		Dimension: review.DimensionQA, Severity: review.SeverityCritical, Summary: "no tests",
+	}})
+	got := m.foldDimensions(dir, head, required)
 	if len(got) != len(required)+1 {
-		t.Fatalf("a dimension the gate dispatched and that reported must be folded, got %v", got)
+		t.Fatalf("a report pinned to head must be folded whatever the record says, got %v", got)
 	}
+
+	// The same report in the advisory episode is invisible to the gate.
+	adv := m.AdvisoryInputsDir("fd1")
+	if err := os.MkdirAll(review.ReportsDir(adv), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stageGreenPrep(t, adv, head)
+	writeFindingReport(t, adv, review.DimensionQA, head, []review.Finding{{
+		Dimension: review.DimensionQA, Severity: review.SeverityCritical, Summary: "no tests",
+	}})
+	if err := os.Remove(mustReportPath(t, dir, review.DimensionQA)); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.foldDimensions(dir, head, required); strings.Join(got, " ") != strings.Join(required, " ") {
+		t.Fatalf("an advisory report must not enter the trust fold, got %v", got)
+	}
+}
+
+// mustReportPath is a dimension's report path inside an episode, for a test that has to move
+// or remove the file rather than write it.
+func mustReportPath(t *testing.T, dir, dim string) string {
+	t.Helper()
+	p, err := review.InputPath(dir, dim, review.ReportSuffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
 }
 
 // TestRequiredDimensions_MixedCaseHarnessConfigStillDerivesSecurity is the end-to-end form of
@@ -1202,32 +1226,35 @@ func TestGateOnce_AWedgedTmuxStillEscalates(t *testing.T) {
 	}
 }
 
-// TestGateOnce_ALostProgressRecordFailsClosed is security's probe. The shrinking-set defence
-// rests on the episode's dispatch record, and that record is a file in the review-inputs dir,
-// which is the one directory this branch refuses to root a reviewer's cwd under because it
-// cannot vouch for its contents.
+// TestGateOnce_ALostProgressRecordFailsClosed: losing the episode record must not lose a
+// finding. The record used to be the only memory that a security reviewer had been dispatched
+// over a docs-only diff, so deleting it dropped that reviewer's pinned critical report out of
+// the fold, the verdict passed, and trusted mode minted an approval over it.
 //
-// Both halves of the defence read it. The union that keeps a dispatched dimension required
-// takes its set from there, and foldDimensions, the intended backstop, takes its dispatched
-// argument from the same place. So losing the record does not degrade the defence, it removes
-// it: a critical security report pinned to head goes unfolded, the verdict passes, and in
-// trusted mode an approval is minted over it.
+// The fold now reads the reports rather than the record (foldDimensions), so a deleted row
+// costs the episode its scheduling state and nothing else. A row the gate cannot parse may
+// surface as an error instead, because refusing to tick is fail-closed.
 //
-// A truncated write lands in the same state as an rm, and writeGateProgress is best-effort, so
-// this does not need an attacker. An unreadable record must mean "we cannot prove nothing was
-// outstanding", which blocks, rather than "nothing was dispatched", which passes.
+// Until this round these probes deleted and truncated gate-progress.json, a file nothing had
+// read since the record moved into the store, so they passed without touching the code. They
+// act on the store row now.
 func TestGateOnce_ALostProgressRecordFailsClosed(t *testing.T) {
 	for _, tc := range []struct {
 		name string
-		lose func(t *testing.T, path string)
+		lose func(t *testing.T, m *Manager, id string)
 	}{
-		{"deleted", func(t *testing.T, path string) {
-			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		{"deleted", func(t *testing.T, m *Manager, id string) {
+			if err := m.Store.DeleteGateEpisode(context.Background(), id); err != nil {
 				t.Fatal(err)
 			}
 		}},
-		{"truncated", func(t *testing.T, path string) {
-			if err := os.WriteFile(path, []byte("{\"head\":"), 0o644); err != nil {
+		{"corrupted", func(t *testing.T, m *Manager, id string) {
+			row, _, err := m.Store.GetGateEpisode(context.Background(), id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			row.Dims = "{not json"
+			if err := m.Store.SaveGateEpisode(context.Background(), row); err != nil {
 				t.Fatal(err)
 			}
 		}},
@@ -1241,9 +1268,12 @@ func TestGateOnce_ALostProgressRecordFailsClosed(t *testing.T) {
 			// Lose the record, then let the gate tick. Losing it makes the episode look
 			// unopened, so this tick re-preps and re-stamps, which is already the damage:
 			// the episode that dispatched a security reviewer has been forgotten.
-			tc.lose(t, filepath.Join(dir, gateProgressFile))
+			tc.lose(t, m, id)
+			// A record the gate cannot parse at all is allowed to surface as an error
+			// instead: refusing to tick is fail-closed, and no verdict can follow.
 			if _, err := m.gateOnceAt(id, time.Minute, 2, time.Hour, time.Now()); err != nil {
-				t.Fatalf("gateOnceAt after the loss: %v", err)
+				t.Logf("the gate refused to tick over the lost record: %v", err)
+				return
 			}
 
 			// The reviewers of the forgotten episode report into the new one. The diff is
@@ -1390,57 +1420,79 @@ func TestAdvisoryPrep_DoesNotDisturbALiveGateEpisode(t *testing.T) {
 	}
 }
 
-// TestGateOnce_AForgedEpisodeRecordCannotErasePriorDispatch is the probe deletion and
-// truncation missed. Those two make the record UNREADABLE, which is the case the fail-closed
-// read handles. A well-formed record does not go near that path: it parses, so readable is
-// true, lostEpisodeRecord never fires, and if its head matches the current head the episode
-// reset is skipped too. Writing one with an empty dimension set therefore erases the memory
-// that security was dispatched, and the pinned critical report falls out of the fold.
+// TestGateOnce_AForgedEpisodeRecordCannotErasePriorDispatch is the probe both reviewers ran
+// against the store: one statement, `UPDATE gate_episodes SET dims='[]', attempts='{}'`, which
+// recorded a pass and minted an approval over a pinned CRITICAL security report. A well-formed
+// row parses, so no fail-closed read fires, and its head matches, so the episode is not reset.
 //
-// One deliberate write, no race and no corruption, which is why the answer is to move the
-// record rather than add a fourth check to it.
+// Moving the record out of the review-inputs dir did not stop that, because the worker runs as
+// the same uid that owns the store. What stops it is that the fold no longer asks the record: a
+// report pinned to head is folded whatever the row says was dispatched. The "statement" case is
+// the reviewers' SQL verbatim; the other two reach the same row through writeGateProgress.
 func TestGateOnce_AForgedEpisodeRecordCannotErasePriorDispatch(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		forged func(head string) string
+	forges := []struct {
+		name  string
+		forge func(t *testing.T, m *Manager, id, head string)
 	}{
-		{"emptied", func(head string) string {
-			return fmt.Sprintf(`{"head":%q,"dims":[],"attempts":{},"startedAt":1}`, head)
+		{"statement", func(t *testing.T, m *Manager, id, head string) {
+			execStateDB(t, m, `UPDATE gate_episodes SET dims='[]', attempts='{}' WHERE task_id = ?`, id)
 		}},
-		{"substituted", func(head string) string {
-			return fmt.Sprintf(`{"head":%q}`, head)
+		{"emptied", func(t *testing.T, m *Manager, id, head string) {
+			mustWriteEpisode(t, m, id, gateProgress{Head: head, Dims: nil, Attempts: map[string]int{}})
 		}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			id := "forged-" + tc.name
-			m, dir, head := shrunkSetHarness(t, id)
-			t.Cleanup(func() { _, _ = m.Teardown(id, true) })
-			recordingReviewer(t, false)
-			writeCleanReport(t, dir, review.DimensionCorrectness, head)
-			writeCleanReport(t, dir, review.DimensionScope, head)
-			writeFindingReport(t, dir, review.DimensionSecurity, head, []review.Finding{{
-				Dimension: review.DimensionSecurity, Severity: review.SeverityCritical,
-				Reviewer: "ttorch-reviewer-security", Summary: "unauthenticated path traversal in the new handler",
-			}})
-
-			if err := os.WriteFile(filepath.Join(dir, gateProgressFile), []byte(tc.forged(head)), 0o644); err != nil {
-				t.Fatal(err)
-			}
-
+		{"substituted", func(t *testing.T, m *Manager, id, head string) {
+			mustWriteEpisode(t, m, id, gateProgress{Head: head})
+		}},
+	}
+	// Both paths fold, and both used to take their extras from the record, so each is probed
+	// on its own. The daemon path alone cannot see a manual-path regression: when its own
+	// aggregate blocks it never reaches TrustRecord.
+	paths := []struct {
+		name string
+		run  func(m *Manager, id, head string) (recorded bool, err error)
+	}{
+		{"daemon", func(m *Manager, id, head string) (bool, error) {
 			out, err := m.gateOnceAt(id, time.Minute, 2, time.Hour, time.Now())
-			if err != nil {
-				t.Fatalf("gateOnceAt: %v", err)
-			}
-			if out == GateRecorded {
-				t.Fatal("a verdict was recorded from a forged episode record")
-			}
-			if v, ok, _ := m.Store.GetVerdict(context.Background(), id); ok && v.Overall == review.Pass {
-				t.Fatalf("a PASS was recorded over a pinned critical report: %+v", v)
-			}
-			if _, err := os.Stat(m.P.ApprovalFile(id)); err == nil {
-				t.Fatal("an approval was minted over a pinned critical report")
-			}
-		})
+			return out == GateRecorded, err
+		}},
+		{"manual", func(m *Manager, id, head string) (bool, error) {
+			v, err := m.TrustRecord(id, head, time.Minute)
+			return err == nil && v.Overall == review.Pass, err
+		}},
+	}
+	for _, fc := range forges {
+		for _, pc := range paths {
+			t.Run(fc.name+"/"+pc.name, func(t *testing.T) {
+				id := "forged-" + fc.name + "-" + pc.name
+				m, dir, head := shrunkSetHarness(t, id)
+				t.Cleanup(func() { _, _ = m.Teardown(id, true) })
+				recordingReviewer(t, false)
+				writeCleanReport(t, dir, review.DimensionCorrectness, head)
+				writeCleanReport(t, dir, review.DimensionScope, head)
+				writeFindingReport(t, dir, review.DimensionSecurity, head, []review.Finding{{
+					Dimension: review.DimensionSecurity, Severity: review.SeverityCritical,
+					Reviewer: "ttorch-reviewer-security", Summary: "unauthenticated path traversal in the new handler",
+				}})
+
+				// Forge the episode where the code actually reads it. Tampering with
+				// gate-progress.json proved nothing once the record moved into the store.
+				fc.forge(t, m, id, head)
+
+				recorded, err := pc.run(m, id, head)
+				if err != nil {
+					t.Logf("%s path returned: %v", pc.name, err)
+				}
+				if recorded {
+					t.Fatal("a pass was recorded from a forged episode record")
+				}
+				if v, ok, _ := m.Store.GetVerdict(context.Background(), id); ok && v.Overall == review.Pass {
+					t.Fatalf("a PASS was recorded over a pinned critical report: %+v", v)
+				}
+				if _, err := os.Stat(m.P.ApprovalFile(id)); err == nil {
+					t.Fatal("an approval was minted over a pinned critical report")
+				}
+			})
+		}
 	}
 }
 
@@ -1557,6 +1609,22 @@ func mustWriteEpisode(t *testing.T, m *Manager, taskID string, p gateProgress) {
 	}
 	if err := m.writeGateProgress(taskID, p); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// execStateDB runs one statement against the state database over a second connection, the way
+// a process running as the same user reaches it with the sqlite3 CLI. It is how a probe
+// reproduces a reviewer's SQL verbatim rather than an approximation of it through the store's
+// own API.
+func execStateDB(t *testing.T, m *Manager, stmt string, args ...any) {
+	t.Helper()
+	conn, err := sql.Open("sqlite", "file:"+m.P.StateDB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Exec(stmt, args...); err != nil {
+		t.Fatalf("%s: %v", stmt, err)
 	}
 }
 
