@@ -1877,7 +1877,7 @@ func (m *Manager) reviewerCwd(taskID, dim, inputsDir, repo, wt, head string) (cw
 	if ws == "" {
 		return "", "", fmt.Errorf("refusing to build a review workspace for task %q dimension %q: not a single safe path component", taskID, dim)
 	}
-	if err := checkReviewWorkspaceAncestors(m.P.Home, ws); err != nil {
+	if err := checkReviewWorkspaceAncestors(m.P.Home, filepath.Dir(m.P.ReviewWorkspaceDir(taskID)), ws); err != nil {
 		return "", "", err
 	}
 	return prepareReviewWorkspace(ws, inputsDir, repo, wt, head)
@@ -1889,7 +1889,7 @@ func (m *Manager) reviewerCwd(taskID, dim, inputsDir, repo, wt, head string) (cw
 var reviewerConfigNames = []string{"CLAUDE.md", "CLAUDE.local.md", ".claude"}
 
 // checkReviewWorkspaceAncestors refuses a review workspace whose ancestors, up to and
-// including the ttorch home, hold session configuration.
+// including the ttorch home, hold session configuration, or which resolves somewhere else.
 //
 // A Claude session walks up from its cwd reading CLAUDE.md in every ancestor. The workspace
 // leaf is rebuilt on every dispatch, but its parents persist: the per-task directory,
@@ -1899,23 +1899,51 @@ var reviewerConfigNames = []string{"CLAUDE.md", "CLAUDE.local.md", ".claude"}
 // store, so they are checked instead, and a hit fails the dispatch as a standing error that
 // reaches the attempt ceiling and surfaces as gate_blocked naming the file.
 //
-// Names are compared case-insensitively, because on a case-insensitive filesystem a file
-// written as claude.md is read as CLAUDE.md. The walk stops at the home: above it is the
-// user's own configuration, which every session on the machine reads, and it is not the
-// gate's to police.
+// The walk is over the RESOLVED path, because a session's cwd is the physical directory and
+// its configuration path is that directory's ancestors. Walking the logical path let a
+// symlinked review-workspaces/ or <task>/ point the session at a directory whose parent held
+// a CLAUDE.md the walk never saw. So the per-task directory is created, resolved, and refused
+// unless it lies inside the resolved review-workspaces root, and the walk runs from there up
+// to the resolved home, refusing if the home is not on the way.
 //
-// This runs at dispatch. A file planted after the check and before the session starts is
-// still read; that race is the same-uid process channel, and it is not closed here.
-func checkReviewWorkspaceAncestors(home, ws string) error {
-	home = filepath.Clean(home)
-	dir := filepath.Dir(filepath.Clean(ws))
+// Names are compared case-insensitively, because on a case-insensitive filesystem a file
+// written as claude.md is read as CLAUDE.md.
+//
+// The walk stops at the home. Above it is the lead's own configuration: ~/CLAUDE.md,
+// ~/.claude/settings.json and its hooks, and ~/.claude/agents/ttorch-reviewer-<dim>.md, the
+// subagent the reviewer brief dispatches. Refusing on those would refuse every review. A
+// process running as the lead can rewrite that reviewer definition or add a hook there, and
+// this check does not and cannot stop it. That is the same-uid residual design step 3 leaves
+// open.
+//
+// This runs at dispatch. A file planted, or a directory swapped for a symlink, after the check
+// and before the session starts is still read; that race is the same-uid process channel too.
+func checkReviewWorkspaceAncestors(home, root, ws string) error {
+	parent := filepath.Dir(filepath.Clean(ws))
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		return fmt.Errorf("could not create the review workspace directory %s: %w", parent, err)
+	}
+	realHome, err := filepath.EvalSymlinks(home)
+	if err != nil {
+		return fmt.Errorf("could not resolve the ttorch home %s: %w", home, err)
+	}
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return fmt.Errorf("could not resolve the review workspace root %s: %w", root, err)
+	}
+	dir, err := filepath.EvalSymlinks(parent)
+	if err != nil {
+		return fmt.Errorf("could not resolve the review workspace directory %s: %w", parent, err)
+	}
+	if !pathWithin(realRoot, dir) {
+		return fmt.Errorf("refusing to launch a reviewer under %s: it resolves to %s, outside the review workspace root %s", parent, dir, realRoot)
+	}
 	for {
-		rel, err := filepath.Rel(home, dir)
-		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return fmt.Errorf("review workspace %s is not under the ttorch home %s", ws, home)
+		if !pathWithin(realHome, dir) {
+			return fmt.Errorf("refusing to launch a reviewer under %s: it resolves outside the ttorch home %s", parent, realHome)
 		}
 		entries, err := os.ReadDir(dir)
-		if err != nil && !os.IsNotExist(err) {
+		if err != nil {
 			return fmt.Errorf("could not inspect %s on the reviewer's configuration path: %w", dir, err)
 		}
 		for _, e := range entries {
@@ -1926,11 +1954,18 @@ func checkReviewWorkspaceAncestors(home, ws string) error {
 				}
 			}
 		}
-		if rel == "." {
+		if dir == realHome {
 			return nil
 		}
 		dir = filepath.Dir(dir)
 	}
+}
+
+// pathWithin reports whether path is base or lies beneath it. Both must already be clean and
+// resolved; this compares names, it does not touch the filesystem.
+func pathWithin(base, path string) bool {
+	rel, err := filepath.Rel(base, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
 }
 
 // prepareReviewWorkspace materializes the scratch cwd an isolated reviewer runs in and returns
