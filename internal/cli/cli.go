@@ -142,6 +142,8 @@ func Main(args []string) int {
 		return run(cmdWatch(rest))
 	case "board":
 		return run(cmdBoard(rest))
+	case "inbox":
+		return run(cmdInbox(rest))
 	case "await-lead":
 		return run(cmdAwaitLead(rest))
 	case "watchdog":
@@ -2439,6 +2441,9 @@ Supervision:
                           URL) of pending decisions, live workers, recent completions
                           and backlog; it can answer a needs-input worker, dispatch a
                           backlog task and re-run gate prep, and never approves or merges
+  inbox                   print the manager's unread actionable updates and advance the
+                            watermark past them (idempotent; what the manager runs when
+                            the scheduler wakes it). Also clears awaiting-lead
   await-lead [--clear]    mark the manager as awaiting the lead (the watcher stays
                           silent and never surfaces); --clear when the lead returns
   watchdog                external manager-liveness net: re-poke a STALLED manager that
