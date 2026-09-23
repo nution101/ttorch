@@ -798,25 +798,9 @@ func (sc *Scheduler) RunOnce(ctx context.Context) (int, error) {
 		return free[repo]
 	}
 
-	// Per-repo footprints already "occupied" — owned by a worker that is, or is about to be,
-	// on those files. A snapshot task occupies its footprint when it is EITHER status=active
-	// (a claim, with or without a window yet) OR tmux-live (snap.Live — a live window of any
-	// non-terminal status), then the set is extended with each task claimed THIS tick. This is
-	// the SAME union the old per-task gate produced: the active arm catches a claim that has
-	// not yet materialized a window (invisible to a liveness-gated check — a prior tick's slow
-	// dispatch, a second scheduler instance, or this tick before its window comes up), and the
-	// snap.Live arm catches every live-windowed worker (the contribution the old liveness-gated
-	// CheckOverlap made), now answered in memory from the one snapshot instead of a per-pair
-	// `tmux list-windows` subprocess. cc sessions and empty footprints never occupy.
-	occupied := map[string][][]string{}
-	for _, t := range live {
-		if t.Kind == db.KindCC || len(t.Footprint) == 0 {
-			continue
-		}
-		if t.Status == db.StatusActive || snap.Live(t) {
-			occupied[t.Project] = append(occupied[t.Project], t.Footprint)
-		}
-	}
+	// Per-repo footprints already "occupied" by the live fleet (see occupiedFootprints), then
+	// extended with each task claimed THIS tick.
+	occupied := occupiedFootprints(snap)
 
 	dispatched := 0
 	govCapHit := false
