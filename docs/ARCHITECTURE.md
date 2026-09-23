@@ -997,6 +997,19 @@ row is there, is on `Reconcile`.
   repository's config. The clock and the ladder are events in the store, so they carry
   across watcher re-arms. The ladder only reports: lease expiry and recovery are unchanged.
   `TTORCH_STALL_AFTER=0` turns it off.
+- **Agent fingerprints.** A present window does not prove a live worker: the agent can exit
+  and leave the pane's shell behind, or the window can end up running something else. At
+  spawn, once the launch has taken over the pane, ttorch records the agent process's pid,
+  start time and a hash of its command line in `data/<id>/agent.fingerprint`. The agent is
+  the pane shell's child that leads the terminal's foreground process group; it is read
+  with `ps` on macOS and from `/proc` on Linux. `ttorch status` and the watcher's liveness
+  sweep compare it with what is running now: the same pid, start time and command, still a
+  child of the pane, is alive. Anything else is `agent-exited` in `ttorch status` and an
+  actionable `agent_exited` watch update, and a pid with a different start time counts as a
+  different process. A read that fails is `unknown`, never exited or alive. A task with no
+  fingerprint (spawned before fingerprints, or rebuilt by `ttorch resume`, which does not
+  wait for its agent) keeps window-presence liveness. The scheduler does not reclaim on
+  `agent_exited`; the manager decides.
 
 ## 7. Worktrees, footprints, and isolation
 
@@ -1167,7 +1180,7 @@ These properties are load-bearing:
   state.db              the SQLite store (single source of truth)
   state/                watch.pid, scheduler.pid, per-task approval tokens
   state/tasks/<id>/     a worker's hook liveness record (hook.json)
-  data/<id>/            a task's stored brief.md and review inputs
+  data/<id>/            a task's stored brief.md, review inputs and agent.fingerprint
   worktrees/            the per-repository worktree pool
   audit.log             approvals + merges
   scheduler.log         the auto-started daemon's output
