@@ -198,6 +198,16 @@ The flow is `trust prep` → reviewer subagents → `trust record`:
    (`git diff <default>...<head>`, so it contains only the branch's own changes), the
    brief, a fresh validate of the committed sha, the reviewed HEAD, and the scaled
    dimension set — refusing a dirty worktree or a stale base.
+
+   A re-prep of the same commit supersedes the earlier reviews: they are archived under
+   `superseded/`, and a report older than the new episode stamp counts as unreviewed, so stale
+   clean reviews can never form a pass. One exception keeps a re-prep from loosening the
+   verdict. A report pinned to the commit being prepped that carries a blocking finding (high,
+   critical, or a severity the aggregator does not recognise) is carried into the new episode
+   and still blocks. To clear one on an unchanged head, the manager moves the report out of
+   `reports/` by hand and records why (`ttorch note --task <id> …`), or the worker pushes a new
+   commit. The manual move is the same file operation a process running as the lead could
+   perform, so it is a procedure, not a control.
 2. **Reviewers** read statically, trust the green validate rather than re-running the
    suite, and each emit per-dimension JSON findings. Any **high or critical** finding
    blocks; low/medium are advisory.

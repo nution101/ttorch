@@ -102,6 +102,14 @@ an automatic block.
    that will fast-forward — a worker cannot show a benign working tree while a different
    commit merges. Commit (or discard) all changes before prep.
 
+   Re-running prep on the same commit supersedes the earlier reviews, with one exception: a
+   report pinned to that commit with a blocking finding (high, critical, or an unrecognised
+   severity) is carried into the new episode and still blocks. A re-prep can make the verdict
+   stricter, never looser. To clear such a finding after adjudicating it, move the report out
+   of `reports/` by hand and record why (`ttorch note --task <id> …`), or have the worker push
+   a new commit. That move is the same file operation a worker running as the lead could make,
+   so it is a procedure, not a control.
+
 2. **Fan out the reviewers for this diff — in parallel, one per dimension.** The gate
    **scales the reviewer set to the change size**, so spawn exactly the dimensions `trust
    prep` named (it prints them, and records them in `reviewers.json` in the inputs dir):
