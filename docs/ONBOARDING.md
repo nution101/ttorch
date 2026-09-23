@@ -288,6 +288,7 @@ fallback) opens a separate window per worker. Toggle with `TTORCH_WORKER_TABS` a
 | `TTORCH_AGENTS_DIR` | `~/.agents` | vendor-neutral skill mirror |
 | `TTORCH_BIN_DIR` | `~/.local/bin` | directory for the PATH symlink |
 | `TTORCH_TMUX_SESSION` | `ttorch` | tmux session name |
+| `TTORCH_BACKEND` | `tmux` | the program that hosts worker, reviewer and manager sessions; `tmux` is the only one today, and any other value is refused at startup |
 | `TTORCH_SCHEDULER_AUTOSTART` | enabled | the scheduler auto-starts with the manager (dispatch + gate + land + supervise); set `0`/`off`/`false`/`no` to disable and drive dispatch/gate/land/recovery by hand |
 | `TTORCH_MAX_WORKTREES` | `16` | worktree pool size per repository (the dispatch capacity) |
 | `TTORCH_EFFORT` | `high` | worker + `ttorch cc` reasoning effort (`ultracode` = xhigh + workflow orchestration, opt-in; or a fixed `--effort` level; or `off`) |
