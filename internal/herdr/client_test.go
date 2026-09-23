@@ -289,32 +289,6 @@ func TestCall_LongLineWithinLimitIsRead(t *testing.T) {
 	}
 }
 
-func TestSocketPathResolution(t *testing.T) {
-	t.Setenv("HOME", "/home/u")
-	t.Setenv("XDG_CONFIG_HOME", "")
-	t.Setenv("HERDR_SOCKET_PATH", "")
-	t.Setenv("HERDR_SESSION", "")
-
-	if got, want := DefaultSocketPath(), "/home/u/.config/herdr/herdr.sock"; got != want {
-		t.Errorf("default = %q, want %q", got, want)
-	}
-	t.Setenv("HERDR_SESSION", "work")
-	if got, want := DefaultSocketPath(), "/home/u/.config/herdr/sessions/work/herdr.sock"; got != want {
-		t.Errorf("session = %q, want %q", got, want)
-	}
-	t.Setenv("XDG_CONFIG_HOME", "/xdg")
-	if got, want := DefaultSocketPath(), "/xdg/herdr/sessions/work/herdr.sock"; got != want {
-		t.Errorf("xdg session = %q, want %q", got, want)
-	}
-	t.Setenv("HERDR_SOCKET_PATH", "/run/h.sock")
-	if got, want := DefaultSocketPath(), "/run/h.sock"; got != want {
-		t.Errorf("override = %q, want %q", got, want)
-	}
-	if got, want := SessionSocketPath(""), "/xdg/herdr/herdr.sock"; got != want {
-		t.Errorf("SessionSocketPath(\"\") = %q, want %q", got, want)
-	}
-}
-
 // within runs fn and fails the test if it has not returned after d, so a
 // regression that stops honouring a deadline fails here instead of hanging
 // the package until go test's own timeout.

@@ -1,0 +1,128 @@
+package herdr
+
+import (
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"syscall"
+)
+
+var (
+	// ErrNoConfigDir means no per-user config directory could be found to
+	// hold the default socket: neither XDG_CONFIG_HOME nor HOME is set.
+	ErrNoConfigDir = errors.New("herdr: no per-user config directory (XDG_CONFIG_HOME and HOME are unset)")
+	// ErrUnsafeSocket means the socket path could have been planted by
+	// another user. The error is an *UnsafeSocketError naming the path and
+	// the reason.
+	ErrUnsafeSocket = errors.New("herdr: refusing unsafe socket")
+)
+
+// UnsafeSocketError is returned, without dialling, when the socket or its
+// directory is not safe to trust. It matches ErrUnsafeSocket.
+type UnsafeSocketError struct {
+	Path   string
+	Reason string
+}
+
+func (e *UnsafeSocketError) Error() string {
+	return fmt.Sprintf("herdr: refusing socket %s: %s", e.Path, e.Reason)
+}
+
+func (e *UnsafeSocketError) Is(target error) bool { return target == ErrUnsafeSocket }
+
+// DefaultSocketPath resolves the socket the way the herdr CLI does when no
+// --session flag is given: HERDR_SOCKET_PATH, then HERDR_SESSION, then the
+// default session.
+func DefaultSocketPath() (string, error) {
+	if p := os.Getenv("HERDR_SOCKET_PATH"); p != "" {
+		return p, nil
+	}
+	return SessionSocketPath(os.Getenv("HERDR_SESSION"))
+}
+
+// SessionSocketPath is the socket of the named Herdr session, or of the
+// default session when name is empty. Herdr keeps sessions under its config
+// directory: $XDG_CONFIG_HOME/herdr when set, otherwise ~/.config/herdr.
+func SessionSocketPath(name string) (string, error) {
+	dir, err := configDir()
+	if err != nil {
+		return "", err
+	}
+	if name != "" {
+		dir = filepath.Join(dir, "sessions", name)
+	}
+	return filepath.Join(dir, "herdr.sock"), nil
+}
+
+func configDir() (string, error) {
+	if d := os.Getenv("XDG_CONFIG_HOME"); d != "" {
+		return filepath.Join(d, "herdr"), nil
+	}
+	if h := os.Getenv("HOME"); h != "" {
+		return filepath.Join(h, ".config", "herdr"), nil
+	}
+	// There is deliberately no shared fallback such as the temp directory:
+	// a predictable name there can be created first by another user.
+	return "", ErrNoConfigDir
+}
+
+// checkSocket refuses a socket path another local user could have planted,
+// before anything is dialled. The socket must be a real socket (not a
+// symlink) owned by this process's uid, and its directory must be owned by
+// this uid and not group- or world-writable, so no other user can have put
+// the socket there or can swap it for their own afterwards. A missing socket
+// is ErrNoSocket, as before. The check runs on every path, whether it came
+// from HERDR_SOCKET_PATH, XDG_CONFIG_HOME, HOME or the caller.
+func (c *Client) checkSocket() error {
+	path := c.socketPath
+	owner := c.owner
+	if owner == nil {
+		owner = statOwner
+	}
+	uid := uint32(os.Getuid())
+	refuse := func(format string, args ...any) error {
+		return &UnsafeSocketError{Path: path, Reason: fmt.Sprintf(format, args...)}
+	}
+
+	fi, err := os.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("%w: %s", ErrNoSocket, path)
+	}
+	if err != nil {
+		return fmt.Errorf("herdr: stat socket %s: %w", path, err)
+	}
+	if fi.Mode()&fs.ModeSocket == 0 {
+		return refuse("not a socket (mode %s)", fi.Mode())
+	}
+	if got, ok := owner(fi); !ok {
+		return refuse("cannot read the socket's owner")
+	} else if got != uid {
+		return refuse("socket is owned by uid %d, not %d", got, uid)
+	}
+
+	dir := filepath.Dir(path)
+	di, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("herdr: stat socket directory %s: %w", dir, err)
+	}
+	if got, ok := owner(di); !ok {
+		return refuse("cannot read the owner of directory %s", dir)
+	} else if got != uid {
+		return refuse("directory %s is owned by uid %d, not %d", dir, got, uid)
+	}
+	if perm := di.Mode().Perm(); perm&0o022 != 0 {
+		return refuse("directory %s is group- or world-writable (mode %04o)", dir, perm)
+	}
+	return nil
+}
+
+// statOwner reads the owning uid from a Unix stat result.
+func statOwner(fi fs.FileInfo) (uint32, bool) {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return st.Uid, true
+}

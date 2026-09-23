@@ -11,9 +11,9 @@
 //   - The session itself. A Herdr session is a running server with its own
 //     socket, started by the herdr binary (optionally with --session name),
 //     not something the socket API creates. A worker backend would own one
-//     named session per ttorch instance and address it with
-//     New(SessionSocketPath(name)); Ping confirms it is up and reports the
-//     version and protocol.
+//     named session per ttorch instance and pass the path SessionSocketPath
+//     returns for it to New; Ping confirms it is up and reports the version
+//     and protocol.
 //   - Spawn. CreateWorkspace with Cwd set to the worker's worktree, Label to
 //     the task id and Env to the worker's environment gives the worker its
 //     own workspace and root pane; CreateTab or SplitPane place further
@@ -39,9 +39,15 @@
 //     pushed stream instead of polling.
 //   - Teardown. ClosePane ends the worker's pane and its process.
 //
+// Before dialling, every call checks that the socket is a real socket owned
+// by the current user in a directory that user owns and no one else can
+// write, and refuses it with an *UnsafeSocketError otherwise, so a socket
+// another local user planted never receives a request.
+//
 // Every request/response call is bounded by the earlier of the context's
 // deadline and Client.Timeout; WaitAgent is bounded by its own timeout plus
-// WaitGrace. Failures are typed: ErrNoSocket, ErrUnknownMethod,
-// ErrMismatchedID, ErrMalformedResponse, ErrConnectionClosed, ErrWaitTimeout,
-// and *APIError for any other error Herdr returns.
+// WaitGrace. Failures are typed: ErrNoSocket, ErrUnsafeSocket,
+// ErrNoConfigDir, ErrUnknownMethod, ErrMismatchedID, ErrMalformedResponse,
+// ErrConnectionClosed, ErrWaitTimeout, and *APIError for any other error
+// Herdr returns.
 package herdr

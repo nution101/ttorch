@@ -8,9 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -95,6 +95,10 @@ type Client struct {
 
 	maxResponseBytes int
 	nextID           atomic.Uint64
+
+	// owner reports the uid that owns a file. Tests replace it to simulate a
+	// socket or directory belonging to another user; nil means statOwner.
+	owner func(fs.FileInfo) (uid uint32, ok bool)
 }
 
 // New returns a client for the server listening at socketPath. It does not
@@ -105,37 +109,6 @@ func New(socketPath string) *Client {
 
 // SocketPath is the socket this client dials.
 func (c *Client) SocketPath() string { return c.socketPath }
-
-// DefaultSocketPath resolves the socket the way the herdr CLI does when no
-// --session flag is given: HERDR_SOCKET_PATH, then HERDR_SESSION, then the
-// default session.
-func DefaultSocketPath() string {
-	if p := os.Getenv("HERDR_SOCKET_PATH"); p != "" {
-		return p
-	}
-	return SessionSocketPath(os.Getenv("HERDR_SESSION"))
-}
-
-// SessionSocketPath is the socket of the named Herdr session, or of the
-// default session when name is empty. Herdr keeps sessions under its config
-// directory: $XDG_CONFIG_HOME/herdr when set, otherwise ~/.config/herdr.
-func SessionSocketPath(name string) string {
-	dir := configDir()
-	if name != "" {
-		dir = filepath.Join(dir, "sessions", name)
-	}
-	return filepath.Join(dir, "herdr.sock")
-}
-
-func configDir() string {
-	if d := os.Getenv("XDG_CONFIG_HOME"); d != "" {
-		return filepath.Join(d, "herdr")
-	}
-	if h := os.Getenv("HOME"); h != "" {
-		return filepath.Join(h, ".config", "herdr")
-	}
-	return filepath.Join(os.TempDir(), "herdr")
-}
 
 // Pong is the ping result.
 type Pong struct {
@@ -181,6 +154,9 @@ func (c *Client) call(ctx context.Context, bound time.Duration, method string, p
 }
 
 func (c *Client) dial(ctx context.Context) (net.Conn, error) {
+	if err := c.checkSocket(); err != nil {
+		return nil, err
+	}
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "unix", c.socketPath)
 	if err == nil {
