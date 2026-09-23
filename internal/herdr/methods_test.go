@@ -312,3 +312,18 @@ func TestSendLiteral_SendsPlainTextAndKeysTogether(t *testing.T) {
 	}
 	wantParams(t, s, "pane.send_input", `{"pane_id":"w1:p1","text":"continue with the plan, café ✓","keys":["enter"]}`)
 }
+
+// Only agent.wait's timeout is a wait timeout; the same code from another
+// method is a plain server error.
+func TestErrWaitTimeout_OnlyForAgentWait(t *testing.T) {
+	s := newFakeServer(t)
+	s.handle("pane.read", func(c *fakeConn, req fakeRequest) { c.fail(req.ID, "timeout", "read timed out") })
+	_, err := s.client().ReadPane(context.Background(), PaneReadRequest{PaneID: "w1:p1", Source: ReadRecent})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "timeout" {
+		t.Fatalf("err = %v, want *APIError with code timeout", err)
+	}
+	if errors.Is(err, ErrWaitTimeout) {
+		t.Fatalf("pane.read's timeout matched ErrWaitTimeout: %v", err)
+	}
+}

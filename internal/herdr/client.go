@@ -70,14 +70,15 @@ func (e *APIError) Error() string {
 // Is maps server error codes onto the package's sentinels. An unknown method
 // is only matched when the message names this call's method, so an unknown
 // enum value inside params (reported with the same code and wording) stays a
-// plain invalid_request.
+// plain invalid_request. Likewise a timeout is only ErrWaitTimeout when it is
+// agent.wait's.
 func (e *APIError) Is(target error) bool {
 	switch target {
 	case ErrUnknownMethod:
 		return e.Code == "invalid_request" &&
 			strings.Contains(e.Message, "unknown variant `"+e.Method+"`")
 	case ErrWaitTimeout:
-		return e.Code == "timeout"
+		return e.Code == "timeout" && e.Method == "agent.wait"
 	}
 	return false
 }
