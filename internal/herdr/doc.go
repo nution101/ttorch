@@ -25,11 +25,14 @@
 //     (the agent binary and its flags, never text taken from a task or
 //     brief), sent with SendLiteral(pane, line, "enter"). The brief itself
 //     is not typed: it is written to a file in the worktree that the agent
-//     is told to read. A short nudge that must be typed also goes through
-//     SendLiteral, which refuses CR, LF, ESC and other control characters
-//     and sends the text and its enter in one request so another writer
-//     cannot land between them. SendText, SendInput and SendKeys pass input
-//     through unfiltered and are for input ttorch fully controls.
+//     is told to read. A short nudge that must be typed is a fixed string
+//     ttorch chose, also sent with SendLiteral, which sends the text and its
+//     enter in one request so another writer cannot land between them.
+//     SendLiteral only refuses control characters (CR, LF, ESC and the
+//     rest). It does not make task or agent text safe to type, since the
+//     agent interprets what it receives (a leading "!" or "/" is a shell or
+//     slash command in Claude Code). SendText, SendInput and SendKeys pass
+//     input through unfiltered.
 //   - Peek. ReadPane with ReadRecent (or ReadRecentUnwrapped for logs)
 //     returns the scrollback the manager shows as a worker's recent output.
 //   - Liveness and state. Agent returns the pane's semantic status (idle,

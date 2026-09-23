@@ -181,7 +181,8 @@ func (c *Client) SplitPane(ctx context.Context, p PaneSplit) (PaneInfo, error) {
 // The text reaches the pane's terminal unfiltered: a CR or LF in it submits
 // whatever precedes it, and ESC or other control characters act as terminal
 // control. Never pass text that came from a task, a brief or another agent
-// here; use SendLiteral, which refuses control characters.
+// here. SendLiteral refuses control characters but, as its doc says, that
+// does not make such text safe either.
 func (c *Client) SendText(ctx context.Context, paneID, text string) error {
 	p := struct {
 		PaneID string `json:"pane_id"`
@@ -204,8 +205,7 @@ func (c *Client) SendKeys(ctx context.Context, paneID string, keys ...string) er
 // so a prompt and its submitting "enter" cannot be split by another writer.
 //
 // As with SendText, the text is unfiltered: CR or LF submits and ESC acts as
-// terminal control. For text that did not come from ttorch itself, use
-// SendLiteral.
+// terminal control. It is for text ttorch built itself.
 func (c *Client) SendInput(ctx context.Context, paneID, text string, keys ...string) error {
 	p := struct {
 		PaneID string   `json:"pane_id"`
@@ -219,13 +219,17 @@ func (c *Client) SendInput(ctx context.Context, paneID, text string, keys ...str
 // character the terminal would act on rather than display.
 var ErrControlCharacter = errors.New("herdr: text contains a control character")
 
-// SendLiteral is SendInput for text that must arrive as plain characters.
-// It refuses, without sending anything, text that is not valid UTF-8 or
-// contains a C0 control character (including tab, CR and LF), DEL, or a C1
-// control character, so the text can neither submit itself early nor emit a
-// control sequence. The keys, such as a final "enter", are sent after the
-// text in the same request; they are the caller's explicit intent and are
-// not filtered.
+// SendLiteral is SendInput with one guard: it refuses, without sending
+// anything, text that is not valid UTF-8 or contains a C0 control character
+// (including tab, CR and LF), DEL, or a C1 control character. That stops the
+// text submitting itself partway or emitting a terminal control sequence,
+// and nothing more. It is not safe for untrusted text: the agent in the pane
+// still interprets whatever is submitted, and in Claude Code, for example, a
+// leading "!" runs a shell command and a leading "/" runs a slash command.
+// Only send text ttorch built itself, or text whose meaning to the agent you
+// have otherwise constrained. The keys, such as a final "enter", are sent
+// after the text in the same request; they are the caller's explicit intent
+// and are not filtered.
 func (c *Client) SendLiteral(ctx context.Context, paneID, text string, keys ...string) error {
 	if err := literalText(text); err != nil {
 		return err
