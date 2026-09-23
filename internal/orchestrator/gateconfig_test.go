@@ -95,6 +95,7 @@ var decidingFunctions = []string{
 var nonDecidingFiles = map[string]string{
 	"internal/orchestrator/autostart.go":    "starts the scheduler daemon; every gate check still runs inside MergeLocal",
 	"internal/orchestrator/landqueue.go":    "serializes WHEN tasks land, not WHETHER; each land re-enters MergeLocal",
+	"internal/orchestrator/livesignal.go":   "reads a worker's hook record for `ttorch status`; only TaskState calls it",
 	"internal/orchestrator/orchestrator.go": "Manager construction, task CRUD and status",
 	"internal/orchestrator/overlap.go":      "plans dispatch order from file footprints",
 	"internal/orchestrator/spawn.go":        "launches worker sessions",

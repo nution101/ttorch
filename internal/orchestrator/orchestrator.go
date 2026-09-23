@@ -206,14 +206,15 @@ func DeriveState(live bool, pane string) string {
 	return "idle"
 }
 
-// TaskState reports a worker's live state for `ttorch status` (see DeriveState).
-// A live pane that can't be captured falls back to "idle".
+// TaskState reports a worker's live state for `ttorch status` (see DeriveState). A live
+// worker is read from its hook record and its pane together (liveState). A live pane that
+// can't be captured falls back to "idle" unless the hook record says a turn is running.
 func (m *Manager) TaskState(t db.Task) string {
 	if !m.backend().WindowExists(m.Session, t.Window) {
 		return DeriveState(false, "")
 	}
 	out, _ := m.backend().CapturePane(m.Session, t.Window, 6)
-	return DeriveState(true, out)
+	return liveState(m.P, t, out, time.Now())
 }
 
 // Peek returns the last n lines of a worker's pane.
