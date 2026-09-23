@@ -32,6 +32,8 @@ type Manager struct {
 	Session string
 	Store   *db.Store
 	Pool    worktree.Pool
+
+	clocks episodeClocks // the gate's own sightings of each episode; see episodeStart
 }
 
 // New builds a Manager from the standard paths. It opens the SQLite state store

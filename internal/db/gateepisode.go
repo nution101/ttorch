@@ -116,3 +116,38 @@ func (s *Store) DeleteGateEpisode(ctx context.Context, taskID string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM gate_episodes WHERE task_id = ?`, taskID)
 	return err
 }
+
+// GateEpisodeOpenedAt returns when the daemon gate first opened an episode for head in the
+// task's current run of that head: the earliest gate_episode_opened event for head that is
+// newer than the task's latest such event for any OTHER head. A worker that moves A to B and
+// back to A therefore starts A's clock again rather than inheriting the first A episode's,
+// while re-opening the same head after its episode row was deleted keeps the first opening.
+//
+// Earliest is by id, not by ts. Ids are assigned in commit order (§1.4); ts is RFC3339Nano,
+// which trims trailing zeros, so its strings do not sort as times.
+//
+// Nothing in this package updates or deletes an events row. That is a property of this code,
+// not of the file: a process running as the same user can delete the marker with the sqlite3
+// CLI, which is why the gate treats it as one anchor among several rather than the clock.
+func (s *Store) GateEpisodeOpenedAt(ctx context.Context, taskID, head string) (time.Time, bool, error) {
+	var ts string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT ts FROM events
+		WHERE entity_type = 'task' AND entity_id = ? AND type = ? AND payload = ?
+		  AND id > COALESCE((
+			SELECT MAX(id) FROM events
+			WHERE entity_type = 'task' AND entity_id = ? AND type = ? AND payload <> ?), 0)
+		ORDER BY id LIMIT 1`,
+		taskID, EventGateEpisodeOpened, head, taskID, EventGateEpisodeOpened, head).Scan(&ts)
+	if err == sql.ErrNoRows {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	t, err := parseTime(ts)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	return t, true, nil
+}

@@ -50,6 +50,11 @@ const (
 	EventTaskFailed       = "task_failed"      // a reclaimed task hit the retry ceiling ⇒ terminal 'failed' (§roadmap 2); actor=system, actionable
 	EventWorkerReclaimed  = "worker_reclaimed" // a window-gone (crashed) worker's task was reclaimed to pending for retry by the supervisor (§roadmap A phase 3); actor=system, actionable
 	EventGateBlocked      = "gate_blocked"     // the daemon gate-pass could not pass a done task hands-off (a blocking reviewer finding, a prep refusal, or a stalled reviewer) and surfaced it for the manager to adjudicate (§roadmap A1); actor=system, actionable; the daemon NEVER records a failing verdict — it only emits this so the manager decides
+
+	// EventGateEpisodeOpened marks the daemon gate opening a review episode for a head:
+	// payload=head, actor=system, not actionable. The stall clock reads it as one of its
+	// anchors; see Store.GateEpisodeOpenedAt.
+	EventGateEpisodeOpened = "gate_episode_opened"
 )
 
 // Task kinds (§1.1 CHECK; = state.Task.Kind).

@@ -1497,34 +1497,66 @@ func TestGateOnce_AForgedEpisodeRecordCannotErasePriorDispatch(t *testing.T) {
 }
 
 // TestGateOnce_AResetEpisodeClockStillEscalates: the stall bound is only a bound if the thing
-// it counts from cannot be moved. StartedAt is re-stamped whenever it reads zero, so a worker
-// zeroing it on every tick keeps the episode permanently young and the gate never escalates.
+// it counts from cannot be kept young. The probe security ran against the store refreshed
+// started_at to the coming tick's time before every tick, and 24 ticks over 24 simulated
+// hours never escalated.
+//
+// episodeStart takes the earliest of three anchors, so each case leaves exactly one of them
+// standing and requires the episode to escalate on that one alone. A fresh Manager over the
+// same store stands in for a daemon restart, which is what drops this process's memory.
+//
+// Until this round the probe zeroed startedAt in gate-progress.json, which nothing had read
+// since the record moved into the store, so it passed without touching the clock.
 func TestGateOnce_AResetEpisodeClockStillEscalates(t *testing.T) {
-	m, _ := trustedTaskWithSubstantialDiff(t, "gate-clockreset", "cr1")
-	t.Cleanup(func() { _, _ = m.Teardown("cr1", true) })
-	prev := reviewerDispatcher
-	t.Cleanup(func() { reviewerDispatcher = prev })
-	reviewerDispatcher = func(m *Manager, taskID, dim, dir, head, repo, wt string) error {
-		return fmt.Errorf("tmux is wedged: %w", errReviewerNotStarted)
-	}
-	dir := m.P.ReviewInputsDir("cr1")
-	start := time.Unix(1_700_000_000, 0)
-	const stall = 10 * time.Minute
+	for _, tc := range []struct {
+		name      string
+		restart   bool // tick on a fresh Manager, losing the in-memory sighting
+		refresh   bool // rewrite started_at to the coming tick's time
+		dropMarks bool // delete the gate_episode_opened markers
+		standing  string
+	}{
+		{name: "row refreshed", refresh: true, standing: "memory and marker"},
+		{name: "row refreshed and marker deleted", refresh: true, dropMarks: true, standing: "memory"},
+		{name: "row refreshed across restarts", restart: true, refresh: true, standing: "marker"},
+		{name: "marker deleted across restarts", restart: true, dropMarks: true, standing: "row"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := "cr-" + strings.ReplaceAll(tc.name, " ", "-")
+			m, _ := trustedTaskWithSubstantialDiff(t, "gate-clockreset", id)
+			t.Cleanup(func() { _, _ = m.Teardown(id, true) })
+			prev := reviewerDispatcher
+			t.Cleanup(func() { reviewerDispatcher = prev })
+			reviewerDispatcher = func(m *Manager, taskID, dim, dir, head, repo, wt string) error {
+				return fmt.Errorf("tmux is wedged: %w", errReviewerNotStarted)
+			}
+			start := time.Unix(1_700_000_000, 0)
+			const stall = 10 * time.Minute
 
-	var out GateOutcome
-	for i := range 15 {
-		at := start.Add(time.Duration(i) * time.Hour)
-		var err error
-		if out, err = m.gateOnceAt("cr1", time.Minute, 2, stall, at); err != nil {
-			t.Fatalf("tick %d: %v", i+1, err)
-		}
-		if out == GateBlocked {
-			break
-		}
-		zeroEpisodeClock(t, dir)
-	}
-	if out != GateBlocked {
-		t.Fatalf("outcome = %q after 15 ticks over 15 simulated hours; a bound a worker can reset is not a bound", out)
+			var out GateOutcome
+			gm := m
+			for i := range 15 {
+				at := start.Add(time.Duration(i) * time.Hour)
+				if tc.restart {
+					gm = &Manager{P: m.P, Session: m.Session, Store: m.Store, Pool: m.Pool}
+				}
+				var err error
+				if out, err = gm.gateOnceAt(id, time.Minute, 2, stall, at); err != nil {
+					t.Fatalf("tick %d: %v", i+1, err)
+				}
+				if out == GateBlocked {
+					break
+				}
+				if tc.refresh {
+					refreshEpisodeClock(t, m, id, at.Add(time.Hour))
+				}
+				if tc.dropMarks {
+					execStateDB(t, m, `DELETE FROM events WHERE entity_id = ? AND type = ?`, id, db.EventGateEpisodeOpened)
+				}
+			}
+			if out != GateBlocked {
+				t.Fatalf("outcome = %q after 15 ticks over 15 simulated hours with only the %s standing; a bound a worker can reset is not a bound", out, tc.standing)
+			}
+		})
 	}
 }
 
@@ -1532,6 +1564,11 @@ func TestGateOnce_AResetEpisodeClockStillEscalates(t *testing.T) {
 // start cannot be written back — chmod 000, a read-only filesystem, a full disk — the bound
 // never accumulates, and the gate re-preps and relaunches every reviewer for as long as the
 // task sits there. The failure needs no attacker at all.
+//
+// Until this round it chmodded gate-progress.json, which nothing had read since the record
+// moved into the store. Re-pointed at the row it was GREEN against the unchanged code: the
+// start is written when the episode opens, before the trigger goes in, so the clock still
+// has it. It is kept because it is the only probe of an unwritable row.
 func TestGateOnce_AnUnpersistableEpisodeClockStillEscalates(t *testing.T) {
 	m, _ := trustedTaskWithSubstantialDiff(t, "gate-nowrite", "nw1")
 	t.Cleanup(func() { _, _ = m.Teardown("nw1", true) })
@@ -1540,7 +1577,6 @@ func TestGateOnce_AnUnpersistableEpisodeClockStillEscalates(t *testing.T) {
 	reviewerDispatcher = func(m *Manager, taskID, dim, dir, head, repo, wt string) error {
 		return fmt.Errorf("tmux is wedged: %w", errReviewerNotStarted)
 	}
-	dir := m.P.ReviewInputsDir("nw1")
 	start := time.Unix(1_700_000_000, 0)
 	const stall = 10 * time.Minute
 
@@ -1548,54 +1584,60 @@ func TestGateOnce_AnUnpersistableEpisodeClockStillEscalates(t *testing.T) {
 	if _, err := m.gateOnceAt("nw1", time.Minute, 2, stall, start); err != nil {
 		t.Fatal(err)
 	}
-	// Make the legacy artifact unwritable. Before the record moved into the store this made
-	// the episode start unpersistable and the bound never accumulated; now it is an inert
-	// file and the bound is held somewhere the worker cannot reach at all.
-	path := filepath.Join(dir, gateProgressFile)
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		if err := os.WriteFile(path, []byte(`{"head":"","startedAt":0}`), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := os.Chmod(path, 0o000); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+	// Make the episode unpersistable where it now lives. A trigger that aborts every write to
+	// the row is the store-level equivalent of the chmod that used to sit on the file.
+	failEpisodeWrites(t, m)
 
+	// Bounded means one of two things, and both are acceptable: the episode escalates, or
+	// the write failure is surfaced to the caller. What must not happen is 24 silent
+	// GateDispatched ticks with the bound never accumulating.
 	var out GateOutcome
+	bounded := false
 	for i := 1; i < 24; i++ {
 		var err error
-		if out, err = m.gateOnceAt("nw1", time.Minute, 2, stall, start.Add(time.Duration(i)*time.Hour)); err != nil {
-			t.Fatalf("tick %d: %v", i+1, err)
+		out, err = m.gateOnceAt("nw1", time.Minute, 2, stall, start.Add(time.Duration(i)*time.Hour))
+		if err != nil {
+			bounded = true
+			t.Logf("tick %d surfaced the write failure: %v", i+1, err)
+			break
 		}
 		if out == GateBlocked {
+			bounded = true
 			break
 		}
 	}
-	if out != GateBlocked {
-		t.Fatalf("outcome = %q after 24 ticks over 24 simulated hours; an unwritable record must not mean an unbounded episode", out)
+	if !bounded {
+		t.Fatalf("outcome = %q after 24 ticks over 24 simulated hours with no error surfaced; an unwritable record must not mean an unbounded episode", out)
 	}
 }
 
-// zeroEpisodeClock rewrites the on-disk episode record with its start time cleared, leaving
-// everything else intact — the single write a worker needs to keep the bound from accruing.
-func zeroEpisodeClock(t *testing.T, dir string) {
+// failEpisodeWrites makes the gate_episodes row unwritable while leaving the rest of the
+// store working, which is the store-level equivalent of the chmod 000 the legacy record
+// used to be probed with: reads still succeed, persistence does not. A trigger is used
+// rather than closing the store so the failure is scoped to the episode row and every
+// other read the tick performs behaves normally.
+func failEpisodeWrites(t *testing.T, m *Manager) {
 	t.Helper()
-	path := filepath.Join(dir, gateProgressFile)
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return // nothing persisted to tamper with
+	for _, op := range []string{"INSERT", "UPDATE"} {
+		execStateDB(t, m, fmt.Sprintf(
+			`CREATE TRIGGER fail_episode_%s BEFORE %s ON gate_episodes BEGIN SELECT RAISE(ABORT, 'episode row is unwritable'); END`,
+			strings.ToLower(op), op))
 	}
-	var raw map[string]any
-	if err := json.Unmarshal(b, &raw); err != nil {
+}
+
+// refreshEpisodeClock rewrites the stored episode's start to the given time and leaves
+// everything else intact, the single write that used to keep the bound from accruing.
+func refreshEpisodeClock(t *testing.T, m *Manager, id string, to time.Time) {
+	t.Helper()
+	row, found, err := m.Store.GetGateEpisode(context.Background(), id)
+	if err != nil {
 		t.Fatal(err)
 	}
-	raw["startedAt"] = 0
-	out, err := json.Marshal(raw)
-	if err != nil {
-		t.Fatal(err)
+	if !found {
+		return
 	}
-	if err := os.WriteFile(path, out, 0o644); err != nil {
+	row.StartedAt = to
+	if err := m.Store.SaveGateEpisode(context.Background(), row); err != nil {
 		t.Fatal(err)
 	}
 }

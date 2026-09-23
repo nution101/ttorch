@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nution101/ttorch/internal/approval"
@@ -1313,6 +1314,76 @@ type gateProgress struct {
 	LastDispatchError string
 }
 
+// episodeClocks is this process's own memory of when it first saw each task's current
+// episode. It is the one input to the stall clock a worker cannot write (see episodeStart),
+// and it is lost when the process exits.
+type episodeClocks struct {
+	mu   sync.Mutex
+	seen map[string]episodeSighting // by task id
+}
+
+// episodeSighting is one task's entry: the head whose episode this process saw, and when.
+type episodeSighting struct {
+	head string
+	at   time.Time
+}
+
+// firstSeen returns when this process first saw taskID's episode for head, recording now if
+// it has not. A different head replaces the entry, because that is a different episode.
+func (c *episodeClocks) firstSeen(taskID, head string, now time.Time) time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if s, ok := c.seen[taskID]; ok && s.head == head {
+		return s.at
+	}
+	if c.seen == nil {
+		c.seen = map[string]episodeSighting{}
+	}
+	c.seen[taskID] = episodeSighting{head: head, at: now}
+	return now
+}
+
+// episodeStart is when the stall clock for taskID's episode over head started: the EARLIEST
+// of three anchors, each of which bounds the episode on its own.
+//
+//   - this process's first sighting of the episode (episodeClocks)
+//   - the record's StartedAt
+//   - the gate_episode_opened marker for this run of head (db.Store.GateEpisodeOpenedAt)
+//
+// The record alone was refreshable. StartedAt is one scalar in a row the gate rewrites every
+// tick, in a store owned by the uid the worker runs as, so `UPDATE gate_episodes SET
+// started_at=<now>` before each tick kept the episode permanently young and the bound never
+// fired. Taking the earliest means a refreshed or deleted anchor is ignored rather than
+// believed.
+//
+// Only the first anchor is out of the worker's reach. The other two are rows in the same
+// store, so a same-uid process can refresh the row and delete the marker, but it cannot reach
+// this process's memory, so the bound holds for as long as the daemon that saw the episode
+// keeps running. The residual is a restart: a new daemon has no sighting, so a worker that
+// kills the daemon and rewrites both rows before every restart keeps the episode open. That
+// takes a daemon kill inside every reviewerTimeout, and it only stops an episode escalating.
+// It cannot produce a verdict, which still needs every required report pinned and clean.
+//
+// Earliest errs toward escalating early. An anchor that is too early costs a gate_blocked on a
+// healthy episode, which the manager adjudicates; one that is too late costs the bound.
+func (m *Manager) episodeStart(taskID, head string, prog gateProgress, now time.Time) time.Time {
+	start := m.clocks.firstSeen(taskID, head, now)
+	if prog.StartedAt != 0 {
+		if t := time.Unix(0, prog.StartedAt); t.Before(start) {
+			start = t
+		}
+	}
+	opened, found, err := m.Store.GateEpisodeOpenedAt(context.Background(), taskID, head)
+	if err != nil {
+		// The marker can only move the start earlier. Without it the other two still bound
+		// the episode, so this degrades the cross-check rather than removing the bound.
+		fmt.Fprintf(os.Stderr, "ttorch: gate %s could not read its episode marker: %v\n", taskID, err)
+	} else if found && opened.Before(start) {
+		start = opened
+	}
+	return start
+}
+
 // errReviewerNotStarted marks a dispatch failure where NOTHING WAS LAUNCHED and a retry is
 // genuinely likely to succeed, so gateOnceAt must not charge it an attempt.
 //
@@ -1412,13 +1483,19 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 			return GateBlocked, nil
 		}
 		episodeDims, _ := m.requiredDimensions(t, head)
-		// The episode's start is stamped here and nowhere else. It used to be normalized on
-		// every tick from a zero value, which made the bound resettable by anything that
-		// could zero it; the record is manager-owned now, so the boundary is the one place
-		// that decides when an episode began.
+		// The episode's start is stamped here and nowhere else, and the same boundary appends
+		// a gate_episode_opened marker to the events spine. Neither is trusted alone: both
+		// sit in a store the worker's uid can write, so episodeStart cross-checks them against
+		// this process's own sighting and takes the earliest.
 		prog = gateProgress{Head: head, Dims: episodeDims, Attempts: map[string]int{}, StartedAt: now.UnixNano()}
 		if werr := m.writeGateProgress(taskID, prog); werr != nil {
 			return GateSkipped, werr
+		}
+		if _, aerr := m.Store.AppendEvent(ctx, db.Event{
+			EntityType: db.EntityTypeTask, EntityID: taskID, Type: db.EventGateEpisodeOpened,
+			Actor: db.ActorSystem, TS: now, Payload: head,
+		}); aerr != nil {
+			return GateSkipped, fmt.Errorf("gate %q: could not record the episode marker: %w", taskID, aerr)
 		}
 	}
 
@@ -1525,7 +1602,10 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 	//
 	// Running it from the episode leaves the charging split alone, which is the point: a
 	// transient wedge still burns no retries, because the fix is not to start charging for it.
-	if !allReady && reviewerTimeout > 0 && prog.StartedAt != 0 && now.Sub(time.Unix(0, prog.StartedAt)) > reviewerTimeout {
+	//
+	// What it runs from is episodeStart, the earliest of three anchors, because the record's
+	// StartedAt on its own could be refreshed by anything that can write the store.
+	if !allReady && reviewerTimeout > 0 && now.Sub(m.episodeStart(taskID, head, prog, now)) > reviewerTimeout {
 		// DispatchedAt still earns its place here: it separates "reviewers ran and went
 		// quiet" from "nothing ever got off the ground", which are different problems for
 		// whoever picks this up.
