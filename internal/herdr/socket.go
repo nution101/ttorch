@@ -17,6 +17,8 @@ var (
 	// another user. The error is an *UnsafeSocketError naming the path and
 	// the reason.
 	ErrUnsafeSocket = errors.New("herdr: refusing unsafe socket")
+	// ErrInvalidSessionName means a session name is not one herdr accepts.
+	ErrInvalidSessionName = errors.New("herdr: invalid session name")
 )
 
 // UnsafeSocketError is returned, without dialling, when the socket or its
@@ -39,21 +41,53 @@ func DefaultSocketPath() (string, error) {
 	if p := os.Getenv("HERDR_SOCKET_PATH"); p != "" {
 		return p, nil
 	}
-	return SessionSocketPath(os.Getenv("HERDR_SESSION"))
-}
-
-// SessionSocketPath is the socket of the named Herdr session, or of the
-// default session when name is empty. Herdr keeps sessions under its config
-// directory: $XDG_CONFIG_HOME/herdr when set, otherwise ~/.config/herdr.
-func SessionSocketPath(name string) (string, error) {
+	if name := os.Getenv("HERDR_SESSION"); name != "" {
+		return SessionSocketPath(name)
+	}
 	dir, err := configDir()
 	if err != nil {
 		return "", err
 	}
-	if name != "" {
-		dir = filepath.Join(dir, "sessions", name)
-	}
 	return filepath.Join(dir, "herdr.sock"), nil
+}
+
+// maxSessionName is herdr's own limit on a session name, in bytes.
+const maxSessionName = 64
+
+// SessionSocketPath is the socket of the named Herdr session. Herdr keeps
+// sessions under its config directory: $XDG_CONFIG_HOME/herdr when set,
+// otherwise ~/.config/herdr. The name becomes a path component, so it must
+// be one herdr itself accepts: 1 to 64 ASCII letters, digits, '.', '_' or
+// '-', and not "." or "..". Anything else is ErrInvalidSessionName.
+func SessionSocketPath(name string) (string, error) {
+	if err := validSessionName(name); err != nil {
+		return "", err
+	}
+	dir, err := configDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "sessions", name, "herdr.sock"), nil
+}
+
+func validSessionName(name string) error {
+	switch {
+	case name == "":
+		return fmt.Errorf("%w: empty", ErrInvalidSessionName)
+	case len(name) > maxSessionName:
+		return fmt.Errorf("%w: longer than %d bytes", ErrInvalidSessionName, maxSessionName)
+	case name == "." || name == "..":
+		return fmt.Errorf("%w: %q", ErrInvalidSessionName, name)
+	}
+	for i := 0; i < len(name); i++ {
+		b := name[i]
+		ok := b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' ||
+			b == '.' || b == '_' || b == '-'
+		if !ok {
+			return fmt.Errorf("%w: %q may only contain ASCII letters, digits, '.', '_' and '-'", ErrInvalidSessionName, name)
+		}
+	}
+	return nil
 }
 
 func configDir() (string, error) {

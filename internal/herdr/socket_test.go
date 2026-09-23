@@ -235,3 +235,35 @@ func TestSocketPathResolution(t *testing.T) {
 	t.Setenv("HERDR_SOCKET_PATH", "/run/h.sock")
 	check("override", "/run/h.sock")
 }
+
+// Session names become a path component, so anything that could leave the
+// sessions directory or smuggle control bytes is refused. The accepted set
+// is the one herdr itself enforces.
+func TestSessionSocketPath_RejectsUnsafeNames(t *testing.T) {
+	t.Setenv("HOME", "/home/u")
+	t.Setenv("XDG_CONFIG_HOME", "")
+	for _, name := range []string{
+		"", ".", "..", "../x", "a/b", "/abs", "a\\b", "a\x00b", "a\nb", "a\x1bb", "a b",
+		"café", strings.Repeat("a", 65),
+	} {
+		if p, err := SessionSocketPath(name); !errors.Is(err, ErrInvalidSessionName) {
+			t.Errorf("SessionSocketPath(%q) = %q, %v; want ErrInvalidSessionName", name, p, err)
+		}
+	}
+	for _, name := range []string{"work", "a.b_c-1", "..x", strings.Repeat("a", 64)} {
+		p, err := SessionSocketPath(name)
+		if err != nil || p != "/home/u/.config/herdr/sessions/"+name+"/herdr.sock" {
+			t.Errorf("SessionSocketPath(%q) = %q, %v", name, p, err)
+		}
+	}
+}
+
+func TestDefaultSocketPath_RejectsUnsafeSessionEnv(t *testing.T) {
+	t.Setenv("HOME", "/home/u")
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HERDR_SOCKET_PATH", "")
+	t.Setenv("HERDR_SESSION", "../../tmp/evil")
+	if p, err := DefaultSocketPath(); !errors.Is(err, ErrInvalidSessionName) {
+		t.Fatalf("DefaultSocketPath = %q, %v; want ErrInvalidSessionName", p, err)
+	}
+}
