@@ -1390,6 +1390,54 @@ func TestTrustRecord_AnUnlistableReportsDirBlocks(t *testing.T) {
 	}
 }
 
+// TestTrustRecord_AnUnreadableExtraReportBlocks is the same failure one level down. The
+// directory lists, but the extra's report cannot be read (mode 000), and ReportCurrent read that
+// as no report, so the critical finding in it dropped out of the fold on both paths and an
+// approval was minted over it. BlockingReportsPinnedTo already refused prep over the same file.
+func TestTrustRecord_AnUnreadableExtraReportBlocks(t *testing.T) {
+	for _, path := range []string{"manual", "daemon"} {
+		t.Run(path, func(t *testing.T) {
+			id := "unreadable-" + path
+			m, dir, head := shrunkSetHarness(t, id)
+			t.Cleanup(func() { _, _ = m.Teardown(id, true) })
+			recordingReviewer(t, false)
+			writeCleanReport(t, dir, review.DimensionCorrectness, head)
+			writeCleanReport(t, dir, review.DimensionScope, head)
+			writeFindingReport(t, dir, review.DimensionSecurity, head, []review.Finding{{
+				Dimension: review.DimensionSecurity, Severity: review.SeverityCritical,
+				Reviewer: "ttorch-reviewer-security", Summary: "unauthenticated path traversal in the new handler",
+			}})
+			report := mustReportPath(t, dir, review.DimensionSecurity)
+			if err := os.Chmod(report, 0o000); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(report, 0o644) })
+
+			if path == "manual" {
+				v, err := m.TrustRecord(id, head, time.Minute)
+				if err == nil && v.Overall == review.Pass {
+					t.Fatal("a pass was recorded over an extra's report that could not be read")
+				}
+				if err == nil && !verdictMentions(v, "could not read the security review report") {
+					t.Errorf("the block must name the report it could not read; findings = %+v", v.Findings)
+				}
+			} else {
+				execStateDB(t, m, `UPDATE gate_episodes SET dims='[]', attempts='{}' WHERE task_id = ?`, id)
+				out, err := m.gateOnceAt(id, time.Minute, 2, time.Hour, time.Now())
+				if out == GateRecorded {
+					t.Fatalf("the gate recorded a verdict over an extra's report that could not be read (err %v)", err)
+				}
+				if out != GateBlocked || !gateBlockedEventMentions(t, m, id, "could not read the security review report") {
+					t.Errorf("outcome = %q; the gate must block and name the report it could not read", out)
+				}
+			}
+			if _, err := os.Stat(m.P.ApprovalFile(id)); err == nil {
+				t.Fatal("an approval was minted over an extra's report that could not be read")
+			}
+		})
+	}
+}
+
 // TestGateOnce_AWedgedTmuxStillEscalates closes the gap between the two bounds. An episode
 // that makes no progress at all must end, and before this it could run forever.
 //

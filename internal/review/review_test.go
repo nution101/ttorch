@@ -341,3 +341,50 @@ func TestPinnedReportDimensions_AMissingDirectoryIsNoExtras(t *testing.T) {
 		t.Fatalf("PinnedReportDimensions over a missing reports dir = (%v, %v), want (nil, nil)", got, err)
 	}
 }
+
+// TestPinnedReportDimensions_AnUnreadableReportIsAnError is the per-file half of failing closed.
+// A report that is listed but cannot be read used to be skipped as absent, so an extra made
+// unreadable dropped its finding out of the fold while BlockingReportsPinnedTo refused prep over
+// the same file.
+func TestPinnedReportDimensions_AnUnreadableReportIsAnError(t *testing.T) {
+	const sha = "0123456789abcdef"
+	dir := t.TempDir()
+	stagePrep(t, dir, sha, greenValidate())
+	writeReport(t, dir, "security", sha, []Finding{{Severity: SeverityCritical, Summary: "x"}})
+	if got, err := PinnedReportDimensions(dir, sha); err != nil || strings.Join(got, " ") != "security" {
+		t.Fatalf("the readable report must count first, got (%v, %v)", got, err)
+	}
+
+	path, err := InputPath(dir, "security", ReportSuffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+	got, err := PinnedReportDimensions(dir, sha)
+	if err == nil {
+		t.Fatalf("an unreadable pinned report must be an error, not absent; got %v", got)
+	}
+	if !strings.Contains(err.Error(), "security") {
+		t.Fatalf("the error must name the report it could not read, got %v", err)
+	}
+}
+
+// TestPinnedReportDimensions_AReportGoneBeforeItIsReadIsAbsent is the must-not-trip half: a name
+// the listing returns that no longer resolves (ENOENT, here a dangling link) is absent, as a
+// deleted report is, and does not stop the readable reports beside it counting.
+func TestPinnedReportDimensions_AReportGoneBeforeItIsReadIsAbsent(t *testing.T) {
+	const sha = "0123456789abcdef"
+	dir := t.TempDir()
+	stagePrep(t, dir, sha, greenValidate())
+	writeReport(t, dir, "convention", sha, nil)
+	if err := os.Symlink(filepath.Join(dir, "nowhere.json"), filepath.Join(ReportsDir(dir), "security"+ReportSuffix)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := PinnedReportDimensions(dir, sha)
+	if err != nil || strings.Join(got, " ") != "convention" {
+		t.Fatalf("a report gone before it is read must read as absent, got (%v, %v)", got, err)
+	}
+}

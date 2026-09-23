@@ -282,6 +282,11 @@ func ReportsDir(inputsDir string) string {
 // Any other listing error is returned. Folding it to "no extras" hid a pinned extra behind a
 // directory mode that still let the required reports open by name (0300), so a caller must
 // block on it rather than read it as an empty set.
+//
+// The same holds one level down. A listed report that cannot be read is returned as an error,
+// not skipped as absent: ReportCurrent reads a failed read as "no report", so a report made
+// unreadable (mode 000) dropped out of the fold while BlockingReportsPinnedTo refused prep over
+// the same file. A report gone by the time it is read (ENOENT) is absent, as a deleted one is.
 func PinnedReportDimensions(inputsDir, sha string) ([]string, error) {
 	entries, err := os.ReadDir(ReportsDir(inputsDir))
 	if os.IsNotExist(err) {
@@ -296,7 +301,16 @@ func PinnedReportDimensions(inputsDir, sha string) ([]string, error) {
 			continue
 		}
 		dim := strings.TrimSuffix(e.Name(), ReportSuffix)
-		if !ValidDimensionName(dim) || !ReportCurrent(inputsDir, dim, sha) {
+		if !ValidDimensionName(dim) {
+			continue
+		}
+		if _, err := os.ReadFile(filepath.Join(ReportsDir(inputsDir), e.Name())); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("could not read the %s review report in %s: %w", dim, inputsDir, err)
+		}
+		if !ReportCurrent(inputsDir, dim, sha) {
 			continue
 		}
 		out = append(out, dim)

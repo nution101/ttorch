@@ -311,9 +311,9 @@ func dispatchedDimensions(prog gateProgress) []string {
 // gate scans the inputs dir's reports and the audits scan the subdirectory's, so neither
 // reads the other's artifact.
 //
-// A listing error is returned with the required set alone. The caller must block on it: the
-// extras are exactly what the listing is for, so without it a pinned report outside the
-// required set cannot be ruled out.
+// A listing error, or a listed report that cannot be read, is returned with the required set
+// alone. The caller must block on it: the extras are exactly what the listing is for, so
+// without it a pinned report outside the required set cannot be ruled out.
 func (m *Manager) foldDimensions(dir, head string, required []string) ([]string, error) {
 	out := append([]string(nil), required...)
 	pinned, err := review.PinnedReportDimensions(dir, head)
@@ -335,11 +335,12 @@ func (m *Manager) foldDimensions(dir, head string, required []string) ([]string,
 }
 
 // unlistedReportsFinding is the blocking finding a verdict carries when the reports directory
-// could not be listed, so the extras foldDimensions adds could not be established.
+// could not be listed, or a report in it could not be read, so the extras foldDimensions adds
+// could not be established.
 func unlistedReportsFinding(err error) review.Finding {
 	return review.Finding{
 		Dimension: "review", Severity: review.SeverityHigh, Reviewer: "ttorch",
-		Summary: fmt.Sprintf("the review reports could not be listed (%v), so a pinned report outside the required set cannot be ruled out; the verdict blocks until the directory can be read", err),
+		Summary: fmt.Sprintf("the review reports could not be listed or read (%v), so a pinned report outside the required set cannot be ruled out; the verdict blocks until they can be read", err),
 	}
 }
 
