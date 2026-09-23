@@ -94,6 +94,8 @@ type Watcher struct {
 	resetGrace     time.Duration      // override for resetAcquireGrace (0 ⇒ default)
 
 	lastPRCheck time.Time // PR-poll rate-limit clock
+
+	stall stallTracker // the stall ladder's policy + commit-time seam (stall.go)
 }
 
 // Result reports how the watch loop ended, for the CLI and the tests.
@@ -128,6 +130,7 @@ func New(store *db.Store, p paths.Paths, be backend.Backend, session string) *Wa
 	w.now = time.Now
 	w.wait = realWait
 	w.lockRetry = 50 * time.Millisecond
+	w.stall = newStallTracker()
 	w.capture = func(window string) paneObservation {
 		// Only a genuinely-absent window (exists==false, no read error) is gone.
 		// tmux being unavailable or a list-windows hiccup is "can't observe" — skip,
@@ -459,7 +462,9 @@ func (w *Watcher) pollArmedPRs(ctx context.Context) error {
 // the count, so a worker mid-turn is never flagged regardless of the dwell. As a fast
 // path, an idle pane carrying one of the harness's recoverable API-stall errors
 // (livestate.Stalled) is auto-resumed with a "continue" nudge once stable, instead of
-// waiting out the dwell — see the inline note where it fires.
+// waiting out the dwell — see the inline note where it fires. Every captured pane also
+// feeds the stall ladder (trackStall, stall.go), ahead of the already-surfaced gate so a
+// worker keeps being re-raised after its first flag.
 func (w *Watcher) pollLiveness(ctx context.Context) error {
 	tasks, err := w.Store.ListTasks(ctx, db.TaskFilter{
 		Status:      []string{db.StatusActive},
@@ -479,6 +484,10 @@ func (w *Watcher) pollLiveness(ctx context.Context) error {
 		if hold > 0 && t.LastProgressAt != nil && now.Sub(*t.LastProgressAt) < hold {
 			continue
 		}
+		obs := w.capture(t.Window)
+		if err := w.trackStall(ctx, now, t, obs); err != nil {
+			return err
+		}
 		// Already-surfaced gate: a task already in needs_input/blocked is out of scope
 		// (not 'active'); one carrying an unresolved actionable event (a prior
 		// window_gone/idle_unreported, or a pending pr_merged) must not be re-flagged.
@@ -490,7 +499,6 @@ func (w *Watcher) pollLiveness(ctx context.Context) error {
 			continue
 		}
 
-		obs := w.capture(t.Window)
 		if !obs.present {
 			if _, err := w.Store.AppendEvent(ctx, db.Event{
 				EntityType: db.EntityTypeTask, EntityID: t.ID, Type: db.EventWindowGone,
@@ -639,6 +647,8 @@ func formatEventLine(e db.Event) string {
 		return fmt.Sprintf("window-gone           task=%-18s window=%s%s", e.EntityID, e.Payload, id)
 	case db.EventIdleUnreported:
 		return fmt.Sprintf("idle-unreported       task=%-18s window=%s%s", e.EntityID, e.Payload, id)
+	case db.EventStalled:
+		return formatStallLine(e, id)
 	case db.EventManagerStalled:
 		return fmt.Sprintf("manager-stalled       re-derive the board and advance outstanding work%s", id)
 	default:
