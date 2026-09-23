@@ -296,6 +296,9 @@ fallback) opens a separate window per worker. Toggle with `TTORCH_WORKER_TABS` a
 | `TTORCH_MODEL` | claude's default | worker + `ttorch cc` model — an alias (`haiku`/`sonnet`/`opus`/`fable`/`opusplan`) or a full model id; unset ⇒ no `--model`. Orthogonal to effort; the classifier auto-tiers a task's model+effort (autonomous dispatch and manual `ttorch spawn`) when both are unset |
 | `TTORCH_MANAGER_MODEL` | `opus` | manager model (planning; separate from the worker default; `default`/`off` for claude's own) |
 | `TTORCH_VALIDATE_TIMEOUT` | `10m` | per-check timeout for `ttorch validate` |
+| `TTORCH_STALL_AFTER` | `10m` | how long an active worker may sit at an unchanging idle prompt before `ttorch watch` raises a `stalled` update; `0`/`off` disables the stall ladder |
+| `TTORCH_STALL_REPEAT` | `15m` | how often `ttorch watch` re-raises a worker that stays stalled |
+| `TTORCH_STALL_RERAISES` | `3` | re-raises before further `stalled` updates carry the `needs-inspection` level |
 | `TTORCH_NO_AUTOINIT` | unset | set to any value to disable zero-config auto-init on first use (§7) |
 | `TTORCH_WORKER_TABS` | enabled | macOS-only: native-terminal worker views + the manager-in-iTerm2 launch; set `0`/`off`/`false`/`no` to disable (workers still run as tmux windows) |
 | `TTORCH_TERMINAL` | `auto` | which terminal to use for worker views: `auto` (iTerm then Terminal.app), `iterm`, or `terminal` |
