@@ -110,7 +110,7 @@ func TestGateGuard_UnicodeFoldCollisionAttack(t *testing.T) {
 	if approval.Valid(m.P.ApprovalFile("u1")) {
 		t.Fatal("a colliding-path diff must not auto-approve in trusted mode")
 	}
-	if err := m.Approve("u1", time.Minute, false); err != nil {
+	if _, err := m.Approve("u1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 	defHead := gitIn(t, repo, "rev-parse", "HEAD")
@@ -327,7 +327,17 @@ func TestGateGuard_FullFoldMakefileSubstitution(t *testing.T) {
 	// against diffTouchesGateConfig directly, which is platform-independent.
 	sawGuard := false
 	for _, scoped := range []bool{false, true} {
-		if err := m.Approve("fb1", time.Minute, scoped); err != nil {
+		if scoped {
+			// Approve refuses to record a gate-change grant for a blocking diff, so the
+			// scoped token is written directly. The merge must refuse it anyway: that is the
+			// token a process writing the file itself would hold.
+			if _, err := m.Approve("fb1", time.Minute, true); err == nil || !strings.Contains(err.Error(), "No approval clears that") {
+				t.Fatalf("--allow-gate-change must be refused at approve time for a blocking diff, got: %v", err)
+			}
+			if err := approval.Grant(m.P.ApprovalFile("fb1"), time.Minute, approvalPayload("human", head, []string{"Makefile", "Makeﬁle"})); err != nil {
+				t.Fatal(err)
+			}
+		} else if _, err := m.Approve("fb1", time.Minute, false); err != nil {
 			t.Fatal(err)
 		}
 		_, err := m.MergeLocal("fb1", false)
@@ -550,7 +560,7 @@ func TestGateGuard_ToolchainRedirectNeedsAllowGateChange(t *testing.T) {
 			if approval.Valid(m.P.ApprovalFile("tc1")) {
 				t.Fatalf("%s redirects what `go test` compiles; it must not auto-approve", path)
 			}
-			if err := m.Approve("tc1", time.Minute, false); err != nil {
+			if _, err := m.Approve("tc1", time.Minute, false); err != nil {
 				t.Fatal(err)
 			}
 			defHead := gitIn(t, repo, "rev-parse", "HEAD")
@@ -565,7 +575,7 @@ func TestGateGuard_ToolchainRedirectNeedsAllowGateChange(t *testing.T) {
 				t.Fatalf("%s must not have merged", path)
 			}
 			// Unlike a collision, this IS something a lead can legitimately authorize.
-			if err := m.Approve("tc1", time.Minute, true); err != nil {
+			if _, err := m.Approve("tc1", time.Minute, true); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := m.MergeLocal("tc1", false); err != nil {
@@ -678,7 +688,7 @@ func TestGateGuard_SymlinkSwapNeedsAllowGateChange(t *testing.T) {
 	if approval.Valid(m.P.ApprovalFile("ss1")) {
 		t.Fatal("swapping the instruction file every session loads must not auto-approve")
 	}
-	if err := m.Approve("ss1", time.Minute, false); err != nil {
+	if _, err := m.Approve("ss1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 	defHead := gitIn(t, repo, "rev-parse", "HEAD")
@@ -690,7 +700,7 @@ func TestGateGuard_SymlinkSwapNeedsAllowGateChange(t *testing.T) {
 	if gitIn(t, repo, "rev-parse", "HEAD") != defHead {
 		t.Fatal("the swap must not have merged")
 	}
-	if err := m.Approve("ss1", time.Minute, true); err != nil {
+	if _, err := m.Approve("ss1", time.Minute, true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.MergeLocal("ss1", false); err != nil {
@@ -822,7 +832,7 @@ func TestGateGuard_ProjectConfigAndNestedInstructions(t *testing.T) {
 			if approval.Valid(m.P.ApprovalFile("r61")) {
 				t.Fatalf("%s: %s — it must not auto-approve", tc.path, tc.why)
 			}
-			if err := m.Approve("r61", time.Minute, false); err != nil {
+			if _, err := m.Approve("r61", time.Minute, false); err != nil {
 				t.Fatal(err)
 			}
 			defHead := gitIn(t, repo, "rev-parse", "HEAD")
@@ -836,7 +846,7 @@ func TestGateGuard_ProjectConfigAndNestedInstructions(t *testing.T) {
 			if gitIn(t, repo, "rev-parse", "HEAD") != defHead {
 				t.Fatalf("%s must not have merged", tc.path)
 			}
-			if err := m.Approve("r61", time.Minute, true); err != nil {
+			if _, err := m.Approve("r61", time.Minute, true); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := m.MergeLocal("r61", false); err != nil {
@@ -990,7 +1000,7 @@ func TestGateGuard_LearningsLedgerIsAWriteChannelIntoAGENTS(t *testing.T) {
 			if approval.Valid(m.P.ApprovalFile("ld1")) {
 				t.Fatalf("%s writes into AGENTS.md on the next `ttorch learn`; it must not auto-approve", path)
 			}
-			if err := m.Approve("ld1", time.Minute, false); err != nil {
+			if _, err := m.Approve("ld1", time.Minute, false); err != nil {
 				t.Fatal(err)
 			}
 			defHead := gitIn(t, repo, "rev-parse", "HEAD")
@@ -1004,7 +1014,7 @@ func TestGateGuard_LearningsLedgerIsAWriteChannelIntoAGENTS(t *testing.T) {
 			if gitIn(t, repo, "rev-parse", "HEAD") != defHead {
 				t.Fatalf("%s must not have merged", path)
 			}
-			if err := m.Approve("ld1", time.Minute, true); err != nil {
+			if _, err := m.Approve("ld1", time.Minute, true); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := m.MergeLocal("ld1", false); err != nil {
@@ -1053,7 +1063,7 @@ func TestGateGuard_PublishedInstallersNeedAllowGateChange(t *testing.T) {
 			if approval.Valid(m.P.ApprovalFile("in1")) {
 				t.Fatalf("README publishes %s by raw URL for piping into a shell; it must not auto-approve", path)
 			}
-			if err := m.Approve("in1", time.Minute, false); err != nil {
+			if _, err := m.Approve("in1", time.Minute, false); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := m.MergeLocal("in1", false); err == nil {
@@ -1061,7 +1071,7 @@ func TestGateGuard_PublishedInstallersNeedAllowGateChange(t *testing.T) {
 			} else if !strings.Contains(err.Error(), path) {
 				t.Fatalf("the refusal must name %s, got: %v", path, err)
 			}
-			if err := m.Approve("in1", time.Minute, true); err != nil {
+			if _, err := m.Approve("in1", time.Minute, true); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := m.MergeLocal("in1", false); err != nil {
@@ -1197,7 +1207,7 @@ func TestGateGuard_RenameReportsBothSides(t *testing.T) {
 			if approval.Valid(m.P.ApprovalFile("rn1")) {
 				t.Fatalf("%s: the rename must not auto-approve", tc.why)
 			}
-			if err := m.Approve("rn1", time.Minute, false); err != nil {
+			if _, err := m.Approve("rn1", time.Minute, false); err != nil {
 				t.Fatal(err)
 			}
 			defHead := gitIn(t, repo, "rev-parse", "HEAD")
@@ -1207,7 +1217,7 @@ func TestGateGuard_RenameReportsBothSides(t *testing.T) {
 			if gitIn(t, repo, "rev-parse", "HEAD") != defHead {
 				t.Fatal("the rename must not have merged")
 			}
-			if err := m.Approve("rn1", time.Minute, true); err != nil {
+			if _, err := m.Approve("rn1", time.Minute, true); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := m.MergeLocal("rn1", false); err != nil {
@@ -1364,7 +1374,7 @@ func TestGateGuard_EmbeddedContentInstallChannels(t *testing.T) {
 			if approval.Valid(m.P.ApprovalFile("r8b")) {
 				t.Fatalf("%s: %s — it must not auto-approve", tc.path, tc.why)
 			}
-			if err := m.Approve("r8b", time.Minute, false); err != nil {
+			if _, err := m.Approve("r8b", time.Minute, false); err != nil {
 				t.Fatal(err)
 			}
 			defHead := gitIn(t, repo, "rev-parse", "HEAD")
@@ -1376,7 +1386,7 @@ func TestGateGuard_EmbeddedContentInstallChannels(t *testing.T) {
 			if gitIn(t, repo, "rev-parse", "HEAD") != defHead {
 				t.Fatalf("%s must not have merged", tc.path)
 			}
-			if err := m.Approve("r8b", time.Minute, true); err != nil {
+			if _, err := m.Approve("r8b", time.Minute, true); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := m.MergeLocal("r8b", false); err != nil {
@@ -1476,7 +1486,13 @@ func TestGateGuard_SymlinkAtCoveredDirectory(t *testing.T) {
 	if approval.Valid(m.P.ApprovalFile("sd1")) {
 		t.Fatal("the symlink swap must not auto-approve in trusted mode")
 	}
-	if err := m.Approve("sd1", time.Minute, true); err != nil {
+	// Approve refuses to record a gate-change grant for a blocking diff, so the scoped token
+	// is written directly. The merge must refuse it anyway: that is the token a process
+	// writing the file itself would hold.
+	if _, err := m.Approve("sd1", time.Minute, true); err == nil || !strings.Contains(err.Error(), "No approval clears that") {
+		t.Fatalf("--allow-gate-change must be refused at approve time for a symlink at covered ground, got: %v", err)
+	}
+	if err := approval.Grant(m.P.ApprovalFile("sd1"), time.Minute, approvalPayload("human", head, []string{".claude"})); err != nil {
 		t.Fatal(err)
 	}
 	defHead := gitIn(t, repo, "rev-parse", "HEAD")

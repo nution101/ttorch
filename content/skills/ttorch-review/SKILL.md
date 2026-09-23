@@ -183,8 +183,18 @@ invalidates the verdict — re-prep, re-review, re-record.
 
   If a worker's diff touches any of these, an auto-merge is refused outright, and a plain
   `ttorch approve` is refused too — the lead must run
-  `ttorch approve <id> --allow-gate-change`, and the merge's audit line then names the file
-  that changed.
+  `ttorch approve <id> --allow-gate-change`, and the merge's audit line then names every
+  file that changed. **The grant is bound to those files.** Approving records every
+  gate-definition path in that diff on the token and prints them, and a merge is refused if
+  the diff touches a gate-definition path the grant does not name, so approving because a
+  diff touches `AGENTS.md` cannot also authorize a `.ttorch/validate.sh` change riding in the
+  same commit. The covered set is evaluated again at merge time, so a path that became
+  covered after the approval (a newer binary, or a default branch that now reads as ttorch's
+  own source) is refused the same way. A diff carrying one of the blocking refusals below is
+  refused at approve time when the flag is given, since no approval clears it at the merge.
+  The lead still types a bare flag and does not name the paths, so a lead who passes it
+  without reading grants the same set as one who read. What the binding adds is that the set
+  is printed and fixed when the approval is given.
 
   **Matching on the name alone is not enough, so the guard does not rely on it.** Paths are
   compared under `fsIdentityKey` — NFD, Unicode FULL case folding, then SimpleFold
@@ -351,11 +361,6 @@ invalidates the verdict — re-prep, re-review, re-record.
   - The covered set answers TWO questions, not one: what decides how a change is reviewed or
     validated, and what a merge publishes directly to users (the two installers, and only
     those). Anything outside both is not covered however alarming it looks.
-  - The flag is a boolean, so the cheapest way to defeat the guard is habit. A lead who
-    passes the flag without reading has given exactly the same authorization as one who
-    read. What survives that is the audit line, which names the file either way. Making the
-    flag take the expected paths, so a bare `--allow-gate-change` stops working, is the
-    obvious next step and is not done here.
   - **The input set is the part that keeps being wrong.** Five separate bypasses here were
     defects in the list of paths handed to the matcher, not in the matcher: no case folding,
     then lowercasing instead of folding, then single-rune instead of full folding, then blobs

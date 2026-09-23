@@ -887,8 +887,36 @@ type gateConfigHit struct {
 
 // diffTouchesGateConfig reports whether the COMMITTED diff base..rev changes the gate's own
 // definition, so a merge of such a change can be refused in favour of an explicit human
-// approval. It reads committed objects, not the working tree, so the check cannot be evaded
-// by reverting the bytes in the worktree. A nil hit means the diff is clean.
+// approval. A nil hit means the diff is clean. It is diffGateConfigHits reduced to one hit:
+// the blocking hit when there is one, otherwise the first matched path in git's order. The
+// auto-mint in TrustRecord only needs to know whether the diff is clean, so it reads this.
+func diffTouchesGateConfig(repo, base, rev string) (*gateConfigHit, error) {
+	blocking, matched, err := diffGateConfigHits(repo, base, rev)
+	if err != nil || blocking != nil {
+		return blocking, err
+	}
+	if len(matched) == 0 {
+		return nil, nil
+	}
+	return &gateConfigHit{Path: matched[0], Reason: gateChangeReason(matched[:1])}, nil
+}
+
+// gateChangeReason is the refusal sentence for a diff that changes the gate-definition paths
+// named, which it lists in full.
+func gateChangeReason(paths []string) string {
+	return fmt.Sprintf("changes a gate-definition file (%s)", strings.Join(paths, ", "))
+}
+
+// diffGateConfigHits reports what the COMMITTED diff base..rev does to the gate's own
+// definition: a BLOCKING hit when there is one, and otherwise every changed path the gate set
+// matches, in git's order. matched is nil when blocking is set, because a blocking diff
+// has nothing an approval could be an approval of. It reads committed objects, not the
+// working tree, so the check cannot be evaded by reverting the bytes in the worktree.
+//
+// It returns every matched path, not the first, because an --allow-gate-change grant is bound
+// to the paths it was issued for: Approve records this list on the token, and MergeLocal
+// refuses any path in it the token does not name. Both read it from here, so the grant and
+// the check it is compared against come from one enumeration.
 //
 // Three refusals, in increasing order of how little they trust the path's spelling:
 //
@@ -924,10 +952,10 @@ type gateConfigHit struct {
 //
 // A collision or a hostile path is reported with the changed path as Path, so the refusal and
 // the audit both name the entry the worker actually added.
-func diffTouchesGateConfig(repo, base, rev string) (*gateConfigHit, error) {
+func diffGateConfigHits(repo, base, rev string) (blocking *gateConfigHit, matched []string, err error) {
 	changed, err := worktree.ChangedFiles(repo, base, rev)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	for _, n := range changed {
 		if hostilePath(n) {
@@ -935,22 +963,22 @@ func diffTouchesGateConfig(repo, base, rev string) (*gateConfigHit, error) {
 				Path:     sanitizePathForMessage(n),
 				Reason:   fmt.Sprintf("adds a path containing a control character (%s); such a path cannot be recorded in the audit log unambiguously", sanitizePathForMessage(n)),
 				Blocking: true,
-			}, nil
+			}, nil, nil
 		}
 	}
 	sc := resolveGateScope(repo, base)
 	if hit, err := linksOverGateConfig(repo, base, rev, sc); err != nil || hit != nil {
-		return hit, err
+		return hit, nil, err
 	}
 	if hit, err := collidesInTree(repo, base, rev); err != nil || hit != nil {
-		return hit, err
+		return hit, nil, err
 	}
 	for _, n := range changed {
 		if matchesGateConfig(n, sc) {
-			return &gateConfigHit{Path: n, Reason: fmt.Sprintf("changes a gate-definition file (%s)", n)}, nil
+			matched = append(matched, n)
 		}
 	}
-	return nil, nil
+	return nil, matched, nil
 }
 
 // linksOverGateConfig refuses a diff that introduces a symlink or gitlink standing at, or

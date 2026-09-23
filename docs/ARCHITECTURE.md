@@ -261,7 +261,11 @@ passing commit-pinned verdict plus a fresh green validate auto-mints the approva
   README tells users to pipe into a shell). On
   a **gated** merge (trusted mode, or any mode with `--require-verdict`) a human approval does
   not wave it through either: it needs `ttorch approve <id> --allow-gate-change`, and the
-  merge audit line names the file.
+  merge audit line names every file. The grant is **bound to the gate-definition paths that
+  diff touches**, recorded on the token and printed at approve time, and the merge refuses
+  any gate-definition path the grant does not name, including one that became covered after
+  the approval. Approving for one file does not silently authorize another in the same
+  commit. `--allow-gate-change` is refused at approve time for a diff with a blocking hit.
 - An ungated `local`/`validated` merge **does not run the check at all**. That path lands an
   `AGENTS.md` change on a plain human approval with no gate-config check and no audit line
   naming it, and `AGENTS.md` is what `projectinit.ReadMode` reads to decide trusted mode — so
@@ -866,11 +870,11 @@ and `make test-fast`, and the `make test-gate` step takes effect on the first me
 `ci.yml` weakens every later change's validation through the same delayed diff channel that
 put the skills on the list.
 
-What the numbers do not fix: the flag is a boolean. A lead who passes it by reflex authorizes
-exactly as much as one who read the diff. The audit line naming the file survives either way,
-which is the guard's durable half. Making the flag take the expected paths — so a bare
-`--allow-gate-change` stops working and the approval names what it covers — is the obvious
-next step and is not done here.
+What the numbers do not fix: the flag takes no paths. A lead who passes it by reflex grants
+every gate-definition path in the diff, the same set as one who read it. What the binding adds
+is that approve prints that set and records it on the token, and the merge refuses any path
+outside it. The audit line naming the files survives either way, which is the guard's durable
+half.
 
 
 The **approval token** (in `internal/approval`) and the **review verdict** (in the DB) are

@@ -1883,7 +1883,7 @@ func cmdApprove(args []string) error {
 	id := args[0]
 	fs := flag.NewFlagSet("approve", flag.ContinueOnError)
 	ttl := fs.Duration("ttl", 10*time.Minute, "how long the approval stays valid")
-	allowGateChange := fs.Bool("allow-gate-change", false, "also authorize a diff that modifies the gate's own definition (the validate script, AGENTS.md, the embedded reviewer/manager instructions, the CI workflows, and the Go code that decides a merge)")
+	allowGateChange := fs.Bool("allow-gate-change", false, "also authorize a diff that modifies the gate's own definition (the validate script, AGENTS.md, the embedded reviewer/manager instructions, the CI workflows, and the Go code that decides a merge); the grant is bound to the files this diff actually touches, which are printed")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -1897,12 +1897,16 @@ func cmdApprove(args []string) error {
 		return err
 	}
 	defer m.Close()
-	if err := m.Approve(id, *ttl, *allowGateChange); err != nil {
+	granted, err := m.Approve(id, *ttl, *allowGateChange)
+	if err != nil {
 		return err
 	}
 	scope := ""
-	if *allowGateChange {
-		scope = " (gate-definition changes authorized)"
+	if len(granted) > 0 {
+		// Name every gate-definition file the grant covers. The lead must see all of them,
+		// not just that "a gate change" was authorized: the whole point of binding the grant
+		// is that approving one file does not silently authorize another in the same commit.
+		scope = " (gate-definition changes authorized: " + strings.Join(granted, ", ") + ")"
 	}
 	fmt.Printf("approved %s for %s%s — now run: ttorch merge-local %s\n", id, *ttl, scope, id)
 	return nil

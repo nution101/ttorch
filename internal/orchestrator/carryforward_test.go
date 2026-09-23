@@ -48,7 +48,7 @@ func TestLand_FastLandCarriesHumanApprovalOnCleanRebase(t *testing.T) {
 	if v, ok := m.TrustShow("fh1"); !ok || v.ReviewedSHA != feat || v.DiffID == "" {
 		t.Fatalf("recorded verdict should pin the reviewed sha and a diff identity: %+v ok=%v", v, ok)
 	}
-	if err := m.Approve("fh1", time.Minute, false); err != nil { // human token, pinned to feat
+	if _, err := m.Approve("fh1", time.Minute, false); err != nil { // human token, pinned to feat
 		t.Fatal(err)
 	}
 
@@ -131,7 +131,7 @@ func TestCarryVerdictForward_CarriesHumanApprovalAndVerdict(t *testing.T) {
 	if _, err := m.TrustRecord("cu1", "", time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Approve("cu1", time.Minute, false); err != nil { // human token pinned to feat
+	if _, err := m.Approve("cu1", time.Minute, false); err != nil { // human token pinned to feat
 		t.Fatal(err)
 	}
 
@@ -216,7 +216,7 @@ func TestLand_FastLandRefusesChangedContentHumanApproval(t *testing.T) {
 	if _, err := m.TrustRecord("cc1", "", time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Approve("cc1", time.Minute, false); err != nil { // human token pinned to feat
+	if _, err := m.Approve("cc1", time.Minute, false); err != nil { // human token pinned to feat
 		t.Fatal(err)
 	}
 

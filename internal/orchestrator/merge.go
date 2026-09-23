@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -56,25 +57,56 @@ var ErrLandRebaseConflict = errors.New("land rebase hit conflicts with the curre
 // This is intended for the lead to run, not the manager.
 //
 // allowGateChange widens the grant to cover a diff that modifies the gate's own definition
-// (gateConfigFiles). It is off by default: a gated merge of such a diff is refused unless the
-// lead asked for it by name, and the audit line for that merge records the file. The scope
-// lives on the token, not on the durable verdict row, so an expired token re-minted from the
-// verdict comes back WITHOUT it and the merge refuses again until the lead re-approves — fail
-// closed, deliberately.
-func (m *Manager) Approve(taskID string, ttl time.Duration, allowGateChange bool) error {
+// (diffGateConfigHits). It is off by default: a gated merge of such a diff is refused unless
+// the lead asked for it, and the audit line for that merge records the files.
+//
+// The grant is BOUND to the gate-definition paths this diff actually touches, and those paths
+// are returned so the caller can show the lead exactly what was authorized. A single boolean
+// would mean a lead who typed the flag because the diff touches AGENTS.md had, in the same
+// breath, authorized a `.ttorch/validate.sh` change riding in the same commit: they approved
+// one thing and granted two. MergeLocal refuses any gate-definition path the token does not
+// name, so a grant can never cover more than it was issued for. The list comes from the same
+// diffGateConfigHits call MergeLocal makes, so the grant and the check use one enumeration.
+//
+// A diff with a BLOCKING hit (a control character in a path, a link over covered ground, two
+// entries resolving to one file) is refused here when the flag is given: no approval clears
+// it at the merge, so recording a grant for it would only tell the lead something false.
+//
+// The scope lives on the token, not on the durable verdict row, so an expired token re-minted
+// from the verdict comes back WITHOUT it and the merge refuses again until the lead
+// re-approves — fail closed, deliberately.
+func (m *Manager) Approve(taskID string, ttl time.Duration, allowGateChange bool) (granted []string, err error) {
 	t, ok, err := m.Store.GetTask(context.Background(), taskID)
 	if err != nil || !ok {
-		return fmt.Errorf("unknown task %q", taskID)
+		return nil, fmt.Errorf("unknown task %q", taskID)
 	}
 	if ttl <= 0 {
-		return fmt.Errorf("--ttl must be positive (got %s)", ttl)
+		return nil, fmt.Errorf("--ttl must be positive (got %s)", ttl)
 	}
 	head, err := worktree.Head(t.Worktree)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if err := approval.Grant(m.P.ApprovalFile(taskID), ttl, approvalPayload("human", head, allowGateChange)); err != nil {
-		return err
+	if allowGateChange {
+		blocking, matched, err := diffGateConfigHits(t.Project, worktree.DefaultBranch(t.Project), head)
+		if err != nil {
+			return nil, fmt.Errorf("could not determine which gate-definition files %q changes: %w", taskID, err)
+		}
+		if blocking != nil {
+			return nil, fmt.Errorf("refusing --allow-gate-change for %q: it %s. No approval clears that, so there is nothing to grant", taskID, blocking.Reason)
+		}
+		granted = matched
+		if len(granted) == 0 {
+			return nil, fmt.Errorf("--allow-gate-change was given for %q but its diff changes no gate-definition file; drop the flag", taskID)
+		}
+		for _, p := range granted {
+			if !grantablePath(p) {
+				return nil, fmt.Errorf("refusing to record a gate-change grant for %q: the path contains a comma or whitespace and would not round-trip through the approval token", p)
+			}
+		}
+	}
+	if err := approval.Grant(m.P.ApprovalFile(taskID), ttl, approvalPayload("human", head, granted)); err != nil {
+		return nil, err
 	}
 	// When a durable verdict exists (a gated repo where `trust record` ran), stamp the human
 	// approval onto its row too, so the verdict's approval provenance never drifts from the
@@ -95,14 +127,14 @@ func (m *Manager) Approve(taskID string, ttl time.Duration, allowGateChange bool
 		GatePassed: t.GatePassed, ApprovedBy: "human", ReviewedSHA: t.ReviewedSHA,
 		EventType: db.EventApproved, Actor: db.ActorLead, Verdict: dv,
 	}); err != nil {
-		return err
+		return nil, err
 	}
 	line := fmt.Sprintf("approve task=%s commit=%s ttl=%s", taskID, short(head), ttl)
-	if allowGateChange {
-		line += " scope=" + approvalScopeGateChange
+	if len(granted) > 0 {
+		line += " scope=" + approvalScopeGateChange + "=" + strings.Join(granted, ",")
 	}
 	m.audit(line)
-	return nil
+	return granted, nil
 }
 
 // recordDelivered marks a task delivered and appends a typed, manager-authored,
@@ -163,7 +195,7 @@ func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error)
 	// Read the approval token's provenance (human|auto) from the token itself, not from
 	// mutable task state, so a crash between minting and saving can never relabel a merge.
 	tokData, _ := approval.Data(m.P.ApprovalFile(taskID))
-	tokBy, _, tokAllowsGateChange := splitApprovalPayload(tokData)
+	tokBy, _, tokGrantedGateFiles := splitApprovalPayload(tokData)
 	// Fail closed: an AUTO-minted approval is only valid through the active gate. If the
 	// gate is not active here (the repo no longer reads as trusted — e.g. a degraded
 	// AGENTS.md silently dropped the mode — and no --require-verdict), an auto token must
@@ -172,9 +204,10 @@ func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error)
 		return "", fmt.Errorf("%q carries an auto-approval that is only valid through the trust gate, but the gate is not active (repo not in trusted mode and no --require-verdict); refusing to merge ungated", taskID)
 	}
 	def := worktree.DefaultBranch(repo)
-	// The gate-definition file this merge changes, when it changes one and the approval
-	// explicitly authorized that. Empty otherwise. It is recorded in the audit line so a
-	// merge that altered the gate is never reconstructable only by re-reading the diff.
+	// The gate-definition files this merge changes, comma-separated, when it changes any and
+	// the approval explicitly authorized every one of them. Empty otherwise. It is recorded in
+	// the audit line so a merge that altered the gate is never reconstructable only by
+	// re-reading the diff.
 	gateChange := ""
 	if gated {
 		// Defense in depth: the worktree must be clean (a clean signal that no worker is
@@ -225,21 +258,41 @@ func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error)
 		// so validating first would run the suite against the wrong bytes and, worse, cache
 		// that result green under the real tree's hash. Refuse the diff before anything reads
 		// it.
-		if hit, terr := diffTouchesGateConfig(repo, def, workerHead); terr != nil {
+		blocking, touchedGateFiles, terr := diffGateConfigHits(repo, def, workerHead)
+		if terr != nil {
 			return "", terr
-		} else if hit != nil {
-			// A BLOCKING hit is not a gate change anyone can authorize: the diff has no single
-			// well-defined checkout, so there is nothing for an approval to be an approval OF.
-			if hit.Blocking {
-				return "", fmt.Errorf("trust gate: %q %s; this is refused outright and --allow-gate-change does not clear it — the diff must not contain it at all", taskID, hit.Reason)
-			}
+		}
+		// A BLOCKING hit is not a gate change anyone can authorize: the diff has no single
+		// well-defined checkout, so there is nothing for an approval to be an approval OF.
+		if blocking != nil {
+			return "", fmt.Errorf("trust gate: %q %s; this is refused outright and --allow-gate-change does not clear it — the diff must not contain it at all", taskID, blocking.Reason)
+		}
+		if len(touchedGateFiles) > 0 {
+			reason := gateChangeReason(touchedGateFiles)
 			if tokBy == "auto" {
-				return "", fmt.Errorf("trust gate: %q %s; a trusted auto-merge cannot alter its own gate — the lead must approve it explicitly with 'ttorch approve %s --allow-gate-change'", taskID, hit.Reason, taskID)
+				return "", fmt.Errorf("trust gate: %q %s; a trusted auto-merge cannot alter its own gate — the lead must approve it explicitly with 'ttorch approve %s --allow-gate-change'", taskID, reason, taskID)
 			}
-			if !tokAllowsGateChange {
-				return "", fmt.Errorf("trust gate: %q %s, but its approval does not authorize a gate change; re-approve with 'ttorch approve %s --allow-gate-change'", taskID, hit.Reason, taskID)
+			if len(tokGrantedGateFiles) == 0 {
+				return "", fmt.Errorf("trust gate: %q %s, but its approval does not authorize a gate change; re-approve with 'ttorch approve %s --allow-gate-change'", taskID, reason, taskID)
 			}
-			gateChange = hit.Path
+			// The grant is bound to the files it was issued for. Every gate-definition path
+			// in the diff must be one the token names, so an approval given because the diff
+			// touches AGENTS.md cannot carry a .ttorch/validate.sh change in the same commit:
+			// the lead approved one thing and would otherwise have granted two. The same holds
+			// for a path that became covered after the approval (a newer binary, or a default
+			// branch that now reads as ttorch's own source), since the covered set is evaluated
+			// here at merge time and not taken from the token.
+			var ungranted []string
+			for _, f := range touchedGateFiles {
+				if !slices.Contains(tokGrantedGateFiles, f) {
+					ungranted = append(ungranted, f)
+				}
+			}
+			if len(ungranted) > 0 {
+				return "", fmt.Errorf("trust gate: %q changes gate-definition files its approval does not cover (%s); the grant authorizes only %s. Re-approve with 'ttorch approve %s --allow-gate-change' to authorize the full set",
+					taskID, strings.Join(ungranted, ", "), strings.Join(tokGrantedGateFiles, ", "), taskID)
+			}
+			gateChange = strings.Join(touchedGateFiles, ",")
 		}
 		// Validate the COMMITTED sha (an immutable detached checkout), using the gate
 		// definition from the DEFAULT BRANCH. No checks detected is a hard BLOCK. When trust
@@ -456,7 +509,7 @@ func (m *Manager) remintFromVerdict(t db.Task, targetSHA string) (bool, error) {
 			return false, nil
 		}
 	}
-	if err := approval.Grant(m.P.ApprovalFile(t.ID), remintTTL, approvalPayload(by, targetSHA, false)); err != nil {
+	if err := approval.Grant(m.P.ApprovalFile(t.ID), remintTTL, approvalPayload(by, targetSHA, nil)); err != nil {
 		return false, fmt.Errorf("trust gate: could not re-mint the approval for %q from its durable verdict: %w", t.ID, err)
 	}
 	m.audit(fmt.Sprintf("remint-approval task=%s commit=%s approver=%s (from durable verdict)", t.ID, short(targetSHA), by))
@@ -494,32 +547,48 @@ const approvalScopeGateChange = "allow-gate-change"
 // granted scopes into the approval token's opaque data, so a merge attributes the audit — and
 // decides what the approval authorizes — from the token it actually consumes rather than from
 // mutable task state (which a crash could desync).
-func approvalPayload(by, sha string, allowGateChange bool) string {
+func approvalPayload(by, sha string, gateChangeFiles []string) string {
 	data := by + " " + sha
-	if allowGateChange {
-		data += " " + approvalScopeGateChange
+	if len(gateChangeFiles) > 0 {
+		data += " " + approvalScopeGateChange + "=" + strings.Join(gateChangeFiles, ",")
 	}
 	return data
+}
+
+// grantablePath reports whether a path can be recorded in a token scope without ambiguity.
+// The payload is one space-separated line and the scope is a comma-separated list, so a path
+// containing either would not round-trip. Git permits both in a path, so the grant is refused
+// rather than silently mangled — fail closed.
+func grantablePath(p string) bool {
+	return p != "" && !strings.ContainsAny(p, ", \t\n")
 }
 
 // splitApprovalPayload unpacks approvalPayload. A token with no provenance prefix
 // (legacy/plain sha) yields by=="" so the gated path can fail closed on it. Unrecognized
 // trailing fields are ignored, so a token minted by a newer ttorch never parses as a wider
 // grant than the fields this build understands.
-func splitApprovalPayload(data string) (by, sha string, allowGateChange bool) {
+func splitApprovalPayload(data string) (by, sha string, gateChangeFiles []string) {
 	f := strings.Fields(data)
 	switch len(f) {
 	case 0:
-		return "", "", false
+		return "", "", nil
 	case 1:
-		return "", f[0], false
+		return "", f[0], nil
 	}
 	for _, scope := range f[2:] {
-		if scope == approvalScopeGateChange {
-			allowGateChange = true
+		// A bare marker with no "=<paths>" authorizes NOTHING. Builds before the binding
+		// wrote exactly that marker and meant "any gate change", which is the unbound grant
+		// this replaced, so such a token fails closed and the lead re-approves. A token lives
+		// only for its TTL, so that affects an approval in flight across the upgrade, no more.
+		if rest, ok := strings.CutPrefix(scope, approvalScopeGateChange+"="); ok {
+			for _, p := range strings.Split(rest, ",") {
+				if p != "" {
+					gateChangeFiles = append(gateChangeFiles, p)
+				}
+			}
 		}
 	}
-	return f[0], f[1], allowGateChange
+	return f[0], f[1], gateChangeFiles
 }
 
 // landIntegrate performs the mode-appropriate integration step of Land and returns the
