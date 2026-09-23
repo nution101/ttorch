@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/nution101/ttorch/internal/approval"
 	"github.com/nution101/ttorch/internal/db"
@@ -556,11 +557,15 @@ func approvalPayload(by, sha string, gateChangeFiles []string) string {
 }
 
 // grantablePath reports whether a path can be recorded in a token scope without ambiguity.
-// The payload is one space-separated line and the scope is a comma-separated list, so a path
-// containing either would not round-trip. Git permits both in a path, so the grant is refused
-// rather than silently mangled — fail closed.
+// splitApprovalPayload reads the payload back with strings.Fields, which splits on every rune
+// unicode.IsSpace reports: U+00A0, U+2003, U+3000 and the rest, not only ASCII space, tab and
+// newline. It then splits the scope on commas. This refuses a comma and every rune
+// unicode.IsSpace reports, the same predicate strings.Fields uses, so a path it accepts is one
+// field and one list item and comes back unchanged. Checking only the ASCII spaces let a path
+// that prints as one grant parse back as two. Git permits all of these in a path, so the grant
+// is refused rather than mangled, and the lead sees the path quoted in the refusal.
 func grantablePath(p string) bool {
-	return p != "" && !strings.ContainsAny(p, ", \t\n")
+	return p != "" && !strings.ContainsRune(p, ',') && strings.IndexFunc(p, unicode.IsSpace) < 0
 }
 
 // splitApprovalPayload unpacks approvalPayload. A token with no provenance prefix
