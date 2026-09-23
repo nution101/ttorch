@@ -299,6 +299,46 @@ func PinnedReportDimensions(inputsDir, sha string) []string {
 	return out
 }
 
+// BlockingReportsPinnedTo returns every dimension whose report in inputsDir is pinned to sha
+// and carries a blocking finding (Report.Blocks), read without the freshness check. These are
+// the reports a prep of sha must carry forward rather than supersede, so a re-prep can make
+// the verdict stricter and never looser.
+//
+// A report that will not parse cannot be shown to be pinned to sha and is left to be
+// superseded as before. Failing to list the directory or read a report is returned: without
+// the listing prep cannot tell whether it is about to discard a blocking finding, so the
+// caller must refuse rather than guess. A missing directory means there are no reports.
+func BlockingReportsPinnedTo(inputsDir, sha string) ([]string, error) {
+	entries, err := os.ReadDir(ReportsDir(inputsDir))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("could not list the review reports in %s: %w", inputsDir, err)
+	}
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ReportSuffix) {
+			continue
+		}
+		dim := strings.TrimSuffix(e.Name(), ReportSuffix)
+		if !ValidDimensionName(dim) {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(ReportsDir(inputsDir), e.Name()))
+		if err != nil {
+			return nil, fmt.Errorf("could not read the %s review report in %s: %w", dim, inputsDir, err)
+		}
+		var r Report
+		if json.Unmarshal(b, &r) != nil || r.ReviewedSHA != sha || !r.Blocks() {
+			continue
+		}
+		out = append(out, dim)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
 // prepState is the episode the reports in an inputs dir are folded against: the marker's
 // content, the moment it was written (its mtime), whether it could be read at all, and the
 // staged validate the reviewers themselves read, which the marker is cross-checked against.

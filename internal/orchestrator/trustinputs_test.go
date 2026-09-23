@@ -1166,6 +1166,84 @@ func gateBlockedEventMentions(t *testing.T, m *Manager, taskID, want string) boo
 	return false
 }
 
+// TestTrustPrep_ARePrepCanOnlyMakeTheVerdictStricter pins what a re-prep of an unchanged head
+// keeps. A report pinned to the head being prepped that carries a blocking finding (high,
+// critical, or a severity the aggregator does not recognise) stays in reports/ and stays
+// current past the new stamp. Everything else is superseded exactly as before: a clean or
+// low/medium report pinned to the head, because stale clean reviews must never form a pass,
+// and any report pinned to a different commit, because a stale finding must not block a new
+// one.
+func TestTrustPrep_ARePrepCanOnlyMakeTheVerdictStricter(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		pinOld   bool
+		findings []review.Finding
+		carried  bool
+	}{
+		{"critical pinned to head", false, []review.Finding{{Severity: review.SeverityCritical, Summary: "x"}}, true},
+		{"unknown severity pinned to head", false, []review.Finding{{Severity: "urgent", Summary: "x"}}, true},
+		{"clean pinned to head", false, nil, false},
+		{"medium pinned to head", false, []review.Finding{{Severity: review.SeverityMedium, Summary: "x"}}, false},
+		{"critical pinned to an older commit", true, []review.Finding{{Severity: review.SeverityCritical, Summary: "x"}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := "carry-" + strings.ReplaceAll(tc.name, " ", "-")
+			m, _, wt := trustHarness(t, id, "trusted", "exit 0")
+			head := commitCodeFiles(t, wt)
+			dir, err := m.TrustPrep(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pin := head
+			if tc.pinOld {
+				pin = gitIn(t, wt, "rev-parse", "HEAD~1")
+			}
+			for i := range tc.findings {
+				tc.findings[i].Dimension = review.DimensionSecurity
+			}
+			writeFindingReport(t, dir, review.DimensionSecurity, pin, tc.findings)
+			backdateFile(t, mustReportPath(t, dir, review.DimensionSecurity), time.Minute)
+
+			if _, err := m.TrustPrep(id); err != nil {
+				t.Fatal(err)
+			}
+			_, statErr := os.Stat(mustReportPath(t, dir, review.DimensionSecurity))
+			inPlace := statErr == nil
+			current := review.ReportCurrent(dir, review.DimensionSecurity, head)
+			archived, _ := filepath.Glob(filepath.Join(dir, supersededDirName, "*", review.ReportsDirName, review.DimensionSecurity+".json"))
+			if tc.carried {
+				if !inPlace || !current {
+					t.Fatalf("a blocking report pinned to the prepped head was not carried: in place=%v current=%v", inPlace, current)
+				}
+				return
+			}
+			if inPlace || len(archived) == 0 {
+				t.Fatalf("the report must be superseded into superseded/: in place=%v archived=%v", inPlace, archived)
+			}
+		})
+	}
+}
+
+// TestTrustPrep_RefusesToRePrepOverReportsItCannotList: prep decides which reports to carry by
+// listing them, so a listing it cannot read would leave it unable to tell whether it is about
+// to discard a blocking finding. It refuses rather than guess.
+func TestTrustPrep_RefusesToRePrepOverReportsItCannotList(t *testing.T) {
+	m, _, wt := trustHarness(t, "carry-unlisted", "trusted", "exit 0")
+	commitCodeFiles(t, wt)
+	dir, err := m.TrustPrep("carry-unlisted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reports := review.ReportsDir(dir)
+	if err := os.Chmod(reports, 0o300); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(reports, 0o755) })
+	if _, err := m.TrustPrep("carry-unlisted"); err == nil {
+		t.Fatal("prep re-prepped over a reports directory it could not list")
+	}
+}
+
 // TestGateOnce_AWedgedTmuxStillEscalates closes the gap between the two bounds. An episode
 // that makes no progress at all must end, and before this it could run forever.
 //
@@ -1227,26 +1305,29 @@ func TestGateOnce_AWedgedTmuxStillEscalates(t *testing.T) {
 }
 
 // TestGateOnce_ALostProgressRecordFailsClosed: losing the episode record must not lose a
-// finding. The record used to be the only memory that a security reviewer had been dispatched
-// over a docs-only diff, so deleting it dropped that reviewer's pinned critical report out of
-// the fold, the verdict passed, and trusted mode minted an approval over it.
+// finding that is already on disk. Deleting the row makes the gate treat the head as a new
+// episode and re-prep it, and prep used to archive every report, the head-pinned critical
+// included. The re-derived set for this docs-only diff is {correctness, scope}, so both came
+// back clean, a pass was recorded and trusted mode minted an approval. Security reproduced
+// that with `DELETE FROM gate_episodes WHERE task_id=?`, which the "deleted" case runs
+// verbatim.
 //
-// The fold now reads the reports rather than the record (foldDimensions), so a deleted row
-// costs the episode its scheduling state and nothing else. A row the gate cannot parse may
-// surface as an error instead, because refusing to tick is fail-closed.
+// What stops it now is that a re-prep carries forward a blocking report pinned to the head it
+// is prepping, so the critical is still current when the next record folds it. That keeps
+// ttorch from discarding the evidence. It does not stop a process running as the lead from
+// deleting or overwriting the report file itself. A row the gate cannot parse may surface as
+// an error instead, because refusing to tick is fail-closed.
 //
-// These probes used to delete and truncate gate-progress.json, a file nothing had read since
-// the record moved into the store, so they passed without touching the code. They act on the
-// store row now.
+// The report is seeded BEFORE the record is lost. An earlier version wrote it after the
+// re-prep tick, so it never covered a finding that was already on disk.
 func TestGateOnce_ALostProgressRecordFailsClosed(t *testing.T) {
+	const critical = "unauthenticated path traversal in the new handler"
 	for _, tc := range []struct {
 		name string
 		lose func(t *testing.T, m *Manager, id string)
 	}{
 		{"deleted", func(t *testing.T, m *Manager, id string) {
-			if err := m.Store.DeleteGateEpisode(context.Background(), id); err != nil {
-				t.Fatal(err)
-			}
+			execStateDB(t, m, `DELETE FROM gate_episodes WHERE task_id = ?`, id)
 		}},
 		{"corrupted", func(t *testing.T, m *Manager, id string) {
 			row, _, err := m.Store.GetGateEpisode(context.Background(), id)
@@ -1265,39 +1346,41 @@ func TestGateOnce_ALostProgressRecordFailsClosed(t *testing.T) {
 			t.Cleanup(func() { _, _ = m.Teardown(id, true) })
 			recordingReviewer(t, false)
 
-			// Lose the record, then let the gate tick. Losing it makes the episode look
-			// unopened, so this tick re-preps and re-stamps, which is already the damage:
-			// the episode that dispatched a security reviewer has been forgotten.
+			// The security reviewer of the episode in flight has already reported a
+			// critical over this head. The diff is docs-only, so security is an extra the
+			// re-derived set does not require.
+			writeFindingReport(t, dir, review.DimensionSecurity, head, []review.Finding{{
+				Dimension: review.DimensionSecurity, Severity: review.SeverityCritical,
+				Reviewer: "ttorch-reviewer-security", Summary: critical,
+			}})
+
+			// Lose the record, then let the gate tick. With no episode on record it re-preps
+			// the head and dispatches the re-derived set.
 			tc.lose(t, m, id)
-			// A record the gate cannot parse at all is allowed to surface as an error
-			// instead: refusing to tick is fail-closed, and no verdict can follow.
 			if _, err := m.gateOnceAt(id, time.Minute, 2, time.Hour, time.Now()); err != nil {
 				t.Logf("the gate refused to tick over the lost record: %v", err)
 				return
 			}
 
-			// The reviewers of the forgotten episode report into the new one. The diff is
-			// docs-only, so the derived set is {correctness, scope} and security is an extra
-			// that only the lost record knew had been dispatched.
+			// The re-derived reviewers come back clean.
 			writeCleanReport(t, dir, review.DimensionCorrectness, head)
 			writeCleanReport(t, dir, review.DimensionScope, head)
-			writeFindingReport(t, dir, review.DimensionSecurity, head, []review.Finding{{
-				Dimension: review.DimensionSecurity, Severity: review.SeverityCritical,
-				Reviewer: "ttorch-reviewer-security", Summary: "unauthenticated path traversal in the new handler",
-			}})
 
 			out, err := m.gateOnceAt(id, time.Minute, 2, time.Hour, time.Now())
 			if err != nil {
 				t.Fatalf("gateOnceAt: %v", err)
 			}
 			if out == GateRecorded {
-				t.Fatal("a verdict was recorded after the episode's dispatch record was lost")
+				t.Fatal("a verdict was recorded after the episode's record was lost")
 			}
 			if v, ok, _ := m.Store.GetVerdict(context.Background(), id); ok && v.Overall == review.Pass {
 				t.Fatalf("a PASS was recorded over a pinned critical report: %+v", v)
 			}
 			if _, err := os.Stat(m.P.ApprovalFile(id)); err == nil {
 				t.Fatal("an approval was minted over a pinned critical report")
+			}
+			if out != GateBlocked || !gateBlockedEventMentions(t, m, id, critical) {
+				t.Fatalf("outcome = %q; the gate must block and name the critical it kept", out)
 			}
 		})
 	}

@@ -285,10 +285,19 @@ func dispatchedDimensions(prog gateProgress) []string {
 // Reading the reports does not authenticate them. Any process running as the lead can write a
 // report pinned to head, and a forged report for a REQUIRED dimension still satisfies it; that
 // is the open report-authentication problem ReviewersFor describes, and nothing here changes
-// it. What reading them does buy is narrower and it holds: an extra can only add findings to
-// Aggregate, never satisfy or remove a requirement, so a report that is on disk is folded
-// whoever wrote it and whatever the record says. No edit to the record can take a finding
-// that is already on disk back out of the verdict.
+// it. What reading them does buy is narrower: an extra can only add findings to Aggregate,
+// never satisfy or remove a requirement, so a report that is on disk and current is folded
+// whoever wrote it and whatever the record says. A missing record no longer costs a finding
+// through prep either. The re-prep a deleted row triggers carries a blocking report pinned to
+// head into the new episode instead of archiving it (see TrustPrep).
+//
+// That keeps ttorch from discarding the evidence. It does not keep the evidence on disk. A
+// process running as the lead can delete, rename, overwrite or backdate a report file, and a
+// backdated one reads as superseded. For a REQUIRED dimension that reads as unreviewed and
+// blocks. For an extra it drops the finding: emptying the record stops the gate
+// re-dispatching that dimension, and deleting, renaming or staling its report then takes the
+// finding out of the verdict. That is limited to dimensions the committed diff does not
+// require, and it is the process channel, which design step 3 leaves to the sandbox.
 //
 // What the record is still trusted for: attempt counts, the dispatch timestamp, the last
 // dispatch error, which reviewer windows to tear down, and which dispatched dimensions the
@@ -536,7 +545,24 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 	// written for superseded inputs is simply not there to be folded. Best-effort: the
 	// episode stamp written below rejects a surviving report anyway, so failing to archive
 	// one degrades to a re-review, never to counting it.
-	m.archivePriorReports(taskID, dir)
+	//
+	// Except the reports that would make the verdict stricter. A re-prep can make the verdict
+	// stricter, never looser, which is the same floor rule the required dimensions follow. A
+	// report pinned to the head being prepped that carries a blocking finding is evidence
+	// about this exact commit, and archiving it let a lost episode row re-prep a head, drop
+	// its pinned critical, and record a pass over clean reports from the re-derived set. So
+	// those are carried: left in place here, and made current past the new stamp below. Clean
+	// reports are still superseded, because stale clean reviews must never form a pass (a task
+	// that sat idle keeps its head, so its old reviews still pin to it).
+	//
+	// This keeps ttorch from discarding the evidence. A process running as the lead can still
+	// delete or overwrite the report file itself; that is the process channel, left to the
+	// sandbox (design step 3).
+	carried, err := review.BlockingReportsPinnedTo(dir, head)
+	if err != nil {
+		return "", fmt.Errorf("trust prep %q: %w; refusing to re-prep over reports it cannot read", taskID, err)
+	}
+	m.archivePriorReports(taskID, dir, carried)
 	// The reviewers' diff is the COMMITTED three-dot diff `git diff <base>...<head>` (the
 	// merge-base diff against the branch's true base), so it contains ONLY the branch's own
 	// changes — never any lead the default gained since the branch was cut. The stale-base
@@ -599,6 +625,13 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if err := carryReportsPastStamp(dir, carried); err != nil {
+		// A carried report left older than the stamp would read as superseded, which drops
+		// the finding it was carried for. Withdraw the stamp instead, so no episode covers
+		// the head and every report fails closed until prep succeeds.
+		_ = os.Remove(filepath.Join(dir, review.PrepStampFile))
+		return "", fmt.Errorf("trust prep %q: could not carry a blocking report into the new episode: %w", taskID, err)
+	}
 	m.audit(fmt.Sprintf("trust-prep task=%s commit=%s size=%s reviewers=%s validate=%s",
 		taskID, short(head), size, strings.Join(dims, "+"), stamp.Label()))
 	return dir, nil
@@ -620,7 +653,14 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 // dimension DROPPED from the prepared set, or a missing/malformed record, is still covered.
 // Names from that record are validated before they are used as paths, since the file they
 // come from is worker-reachable (see review.ValidDimensionName).
-func (m *Manager) archivePriorReports(taskID, dir string) {
+//
+// carried names the dimensions whose reports stay in place: blocking reports pinned to the
+// head being prepped, which TrustPrep carries into the new episode rather than supersede.
+func (m *Manager) archivePriorReports(taskID, dir string, carried []string) {
+	keep := make(map[string]bool, len(carried))
+	for _, d := range carried {
+		keep[d] = true
+	}
 	var dims []string
 	seen := map[string]bool{}
 	for _, d := range append(append(m.ReviewersFor(taskID), requiredReviewers...), review.DimensionQA) {
@@ -654,6 +694,9 @@ func (m *Manager) archivePriorReports(taskID, dir string) {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ttorch: ignoring %v in %s\n", err, dir)
 			continue
+		}
+		if keep[dim] {
+			continue // a blocking report pinned to the head being prepped; see TrustPrep
 		}
 		if _, err := os.Stat(report); err != nil {
 			continue
@@ -735,6 +778,31 @@ func (m *Manager) archiveLegacyFlatReports(dir string, ensureArchive func() bool
 func legacySweepError(name, dir string, err error) {
 	fmt.Fprintf(os.Stderr, "ttorch: could not archive the legacy review report %s in %s: %s\n",
 		review.SafeQuote(name), dir, review.SafeLine(err.Error()))
+}
+
+// carryReportsPastStamp makes each carried report current for the episode just stamped in
+// dir, by giving it the stamp's own mtime. The fold treats a report older than the stamp as
+// superseded (review.ReportCurrent), and prep writes the stamp last, so a report left in place
+// would otherwise drop out of the very episode it was kept for. Taking the stamp's mtime
+// rather than the wall clock puts both sides of that comparison on one filesystem clock.
+func carryReportsPastStamp(dir string, carried []string) error {
+	if len(carried) == 0 {
+		return nil
+	}
+	st, err := os.Stat(filepath.Join(dir, review.PrepStampFile))
+	if err != nil {
+		return err
+	}
+	for _, dim := range carried {
+		path, err := review.InputPath(dir, dim, review.ReportSuffix)
+		if err != nil {
+			return err
+		}
+		if err := os.Chtimes(path, st.ModTime(), st.ModTime()); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // TrustRecord aggregates the reviewers' per-dimension reports for taskID into a

@@ -79,6 +79,17 @@ func (s Severity) blocking() bool {
 	}
 }
 
+// Blocks reports whether any finding in r would block a verdict, by the same severity rule
+// Aggregate applies: high, critical, or a severity it does not recognise.
+func (r Report) Blocks() bool {
+	for _, f := range r.Findings {
+		if f.Severity.blocking() {
+			return true
+		}
+	}
+	return false
+}
+
 // Finding is one issue a reviewer raised about the diff.
 type Finding struct {
 	Dimension string   `json:"dimension"` // correctness | scope | security
