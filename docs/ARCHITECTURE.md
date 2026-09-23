@@ -256,7 +256,8 @@ passing commit-pinned verdict plus a fresh green validate auto-mints the approva
   `Makefile`, `go.work`, `go.work.sum` and `vendor/**` (which
   between them decide what `make lint` and `make test-fast` actually compile and run), and
   `.github/workflows/**` (the full suite, which `.ttorch/validate.sh` defers to by name
-  because it runs only the fast lane), and `docs/install.sh` and `docs/install.ps1` (which
+  because it runs lint, the fast lane and the gate's own proofs rather than the whole
+  suite), and `docs/install.sh` and `docs/install.ps1` (which
   README tells users to pipe into a shell). On
   a **gated** merge (trusted mode, or any mode with `--require-verdict`) a human approval does
   not wave it through either: it needs `ttorch approve <id> --allow-gate-change`, and the
@@ -465,6 +466,12 @@ The same reasoning put `skipIfShort` in `gateconfig_test.go`. `TestFSIdentityKey
 `TestGateCostFiguresMatchTheDoc` call it, and while it lived in `orchestrator_test.go`, which
 the gate does not cover, a one-line edit there skipped both in every lane and merged unflagged.
 
+Two other parts of `orchestrator_test.go` sit in front of the gate's proofs and are still
+uncovered. `TestMain` is one: a version that skips `m.Run` runs no test in the package and
+still exits 0, which would make the package's `make test-gate` line vacuous. `deliveryHarness`
+is the other, and every end-to-end attack test goes through it. Covering them would put e2e
+setup behind `--allow-gate-change`; that was left as a decision, not an oversight.
+
 **`internal/skills/` installs third-party code into `~/.claude/skills`.** `Recommended()`
 returns refs, `InstallCmd` turns each into `npx skills add <ref>`, and `EnsureInstalled` runs
 before every team launch and every worker spawn. One line there fetches and installs arbitrary
@@ -610,10 +617,10 @@ shipped first, and each was exploitable:
 | NFD + fold + NFD | the 172 Cherokee runes | `cases.Fold` is an **involution** there — `fold(U+13A0)=U+AB70` and `fold(U+AB70)=U+13A0` — so the two spellings swap and never meet |
 
 The second is worse than the first. `Makefile` is in the covered set *because* the validate
-script does nothing but run `make lint` and `make test-fast`, so an attacker who substitutes
-it substitutes what the gate runs, and the gate approves the substitution. U+FB06 `ﬆ` → `st`
-reaches `internal/inﬆaller/` and `internal/orcheﬆrator/gate.go` the same way, and U+00DF `ß`
-→ `ss` reaches any covered path with a double s.
+script does nothing but run `make lint`, `make test-fast` and `make test-gate`, so an attacker
+who substitutes it substitutes what the gate runs, and the gate approves the substitution.
+U+FB06 `ﬆ` → `st` reaches `internal/inﬆaller/` and `internal/orcheﬆrator/gate.go` the same way,
+and U+00DF `ß` → `ss` reaches any covered path with a double s.
 
 Folding correctly fixes those spellings. It does not fix the class, because the attacker picks
 the spelling and the guard would otherwise have to anticipate every collapse rule of every
@@ -744,13 +751,13 @@ the filesystem-measured test above.
 
 `Makefile`, `go.work`, `go.work.sum`, `vendor/**`, `content.go` and
 `internal/orchestrator/audit.go` each decide the gate; the generated table has what each costs.
-`.ttorch/validate.sh` is covered but does nothing except run `make lint` and `make test-fast`,
-so redefining those targets redefines green without touching a covered script. `content.go` is
-the `//go:embed` that maps a repo file onto an installed reviewer definition, and
-`internal/installer/**` is the mapping itself: covering the content while leaving the mapping
-open would let a file from an uncovered subtree be installed as a reviewer instead. `audit.go`
-holds the only `writeAudit`, and `MergeLocal` refuses to merge when it fails, so one line there
-strips the record from every trusted merge.
+`.ttorch/validate.sh` is covered but does nothing except run `make lint`, `make test-fast` and
+`make test-gate`, so redefining those targets redefines green without touching a covered script.
+`content.go` is the `//go:embed` that maps a repo file onto an installed reviewer definition,
+and `internal/installer/**` is the mapping itself: covering the content while leaving the
+mapping open would let a file from an uncovered subtree be installed as a reviewer instead.
+`audit.go` holds the only `writeAudit`, and `MergeLocal` refuses to merge when it fails, so one
+line there strips the record from every trusted merge.
 
 `.ttorch/**` is a **prefix**, not the single `.ttorch/validate.sh` it started as, and the
 inversion closes a class rather than a file. What forced it: `.ttorch/learnings.jsonl` is the
@@ -851,9 +858,12 @@ uncovered file; that is closed by `installer.ApplyEmbedded` instead. See "The in
 parameter" below.
 
 `.github/workflows/**` is in for a different reason. The trusted gate never consults CI, which
-is the argument against it — but this repo's `.ttorch/validate.sh` runs only `make test-fast`
-and says in its own header that the full suite, including the orchestrator e2e tests, runs in
-CI as the required check. CI is therefore half of what "validated" means here, and weakening
+is the argument against it — but this repo's `.ttorch/validate.sh` runs `make lint`,
+`make test-fast` and `make test-gate`, not the full suite, and says in its own header that the
+full suite, including the orchestrator e2e tests, runs in CI. The gate runs the default
+branch's copy of that script, never the branch under review's, so a worker cannot weaken its
+own gate. The consequence is that until this branch lands, the gate still runs only `make lint`
+and `make test-fast`, and the `make test-gate` step takes effect on the first merge after it. CI is therefore half of what "validated" means here, and weakening
 `ci.yml` weakens every later change's validation through the same delayed diff channel that
 put the skills on the list.
 

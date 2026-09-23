@@ -166,8 +166,8 @@ invalidates the verdict — re-prep, re-review, re-record.
   | `internal/projectinit/**` | parses `AGENTS.md` into the delivery mode and the auto-mint staleness bound |
   | `internal/orchestrator/{gate,merge,validate,validatecache}.go` | the Go code that resolves, enforces and caches the decision |
   | *(measured cost of each entry)* | see the generated table in `docs/ARCHITECTURE.md` (gate-cost block); this file does not restate it, because a second copy here is what let the figures diverge |
-  | `.github/workflows/**` | the full suite: `.ttorch/validate.sh` runs only the fast lane and defers to CI by name |
-  | `Makefile` | `.ttorch/validate.sh` does nothing but run `make lint` and `make test-fast` |
+  | `.github/workflows/**` | the full suite: `.ttorch/validate.sh` runs lint, the fast lane and the gate's proofs (`make test-gate`), and defers the rest to CI by name. The gate runs the default branch's copy of that script, never the branch under review's, so a change to it takes effect only after it lands |
+  | `Makefile` | `.ttorch/validate.sh` does nothing but run `make lint`, `make test-fast` and `make test-gate` |
   | `go.work`, `go.work.sum` | auto-discovered via `GOWORK`; `replace` directives there override `go.mod`, so a committed one redirects what `go test` compiles |
   | `vendor/**` | a consistent `vendor/` makes the toolchain build from it instead of the module cache |
   | `content.go`, `internal/installer/**` | decide which embedded file becomes which installed file. `content.go` is a separate exact entry — the `content/` prefix does **not** match it, since the two share no prefix relationship |
