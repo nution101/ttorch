@@ -29,6 +29,7 @@ import (
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/livestate"
 	"github.com/nution101/ttorch/internal/paths"
+	"github.com/nution101/ttorch/internal/proc"
 )
 
 // managerWindow is the tmux window the manager session runs in. The watcher self-
@@ -93,6 +94,10 @@ type Watcher struct {
 	briefGrace     time.Duration      // override for briefAcquireGrace (0 ⇒ default)
 	resetGrace     time.Duration      // override for resetAcquireGrace (0 ⇒ default)
 
+	// agent reports whether a task's recorded agent is still the process in its window
+	// (a proc fingerprint check); a seam like those above.
+	agent func(t db.Task) (proc.AgentState, string)
+
 	lastPRCheck time.Time // PR-poll rate-limit clock
 
 	stall stallTracker // the stall ladder's policy + commit-time seam (stall.go)
@@ -150,6 +155,11 @@ func New(store *db.Store, p paths.Paths, be backend.Backend, session string) *Wa
 			return paneObservation{present: true}
 		}
 		return paneObservation{present: true, captured: true, pane: out}
+	}
+	w.agent = func(t db.Task) (proc.AgentState, string) {
+		return proc.StoredAgentState(w.P.AgentFingerprintPath(t.ID), func() (int, error) {
+			return w.Backend.PanePIDErr(w.Session, t.Window)
+		})
 	}
 	w.nudge = func(window string) error {
 		// A plain "continue" turn: after an API stall the worker sits at an empty
@@ -508,6 +518,23 @@ func (w *Watcher) pollLiveness(ctx context.Context) error {
 			}
 			continue
 		}
+		// A present window can still have lost its agent: it died and left the pane's shell,
+		// or the pid now belongs to another process. That is as definitive as a gone window
+		// when the fingerprint says so; a check that could not complete is skipped like an
+		// unreadable pane, never read as alive or as exited. A task with no fingerprint
+		// (spawned before fingerprints, or resumed) keeps the window-presence behaviour.
+		switch state, reason := w.agent(t); state {
+		case proc.AgentExited:
+			if _, err := w.Store.AppendEvent(ctx, db.Event{
+				EntityType: db.EntityTypeTask, EntityID: t.ID, Type: db.EventAgentExited,
+				Actor: db.ActorSystem, Actionable: true, Payload: t.Window + " (" + reason + ")",
+			}); err != nil {
+				return err
+			}
+			continue
+		case proc.AgentUnknown:
+			continue
+		}
 		if !obs.captured {
 			continue // present but unreadable this sweep — leave the count untouched
 		}
@@ -647,6 +674,8 @@ func formatEventLine(e db.Event) string {
 		return fmt.Sprintf("window-gone           task=%-18s window=%s%s", e.EntityID, e.Payload, id)
 	case db.EventIdleUnreported:
 		return fmt.Sprintf("idle-unreported       task=%-18s window=%s%s", e.EntityID, e.Payload, id)
+	case db.EventAgentExited:
+		return fmt.Sprintf("agent-exited          task=%-18s window=%s; peek it, then respawn or tear down%s", e.EntityID, e.Payload, id)
 	case db.EventStalled:
 		return formatStallLine(e, id)
 	case db.EventManagerStalled:

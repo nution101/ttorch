@@ -43,6 +43,7 @@ const (
 	EventPRMerged         = "pr_merged"
 	EventWindowGone       = "window_gone"
 	EventIdleUnreported   = "idle_unreported"
+	EventAgentExited      = "agent_exited"     // watcher found the process in a live window is no longer the agent spawned there (proc fingerprint); actor=system, actionable; payload=window and reason
 	EventAutoResumed      = "auto_resumed"     // watcher nudged an API-stalled worker to continue (§4.4); non-actionable
 	EventIdleNudged       = "idle_nudged"      // scheduler nudged an alive-but-idle worker to continue (§roadmap H2); actor=system, non-actionable; payload=pane hash
 	EventManagerStalled   = "manager_stalled"  // external watchdog re-poke of a stalled manager (§4.7); actionable, entity_type=manager
