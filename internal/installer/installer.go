@@ -33,12 +33,12 @@ type Result struct {
 // ApplyEmbedded installs (or updates) the managed content from ttorch's own embedded
 // payload. It is the only way to reach the installer from outside this package.
 //
-// The FS is chosen HERE, in a package the trust gate covers, rather than by the caller.
-// It used to be a parameter on an exported Apply, and internal/cli picked the tree —
-// deliberately uncovered on cost grounds. That made the gate guard's "the installer
-// has no file outside content/ to reach" conditional on an uncovered file, and the bypass
-// needed no covered path at all: a payload/content/ tree, a payload/embed.go carrying its
-// own `//go:embed all:content`, and one line in internal/cli handing that FS to Apply
+// The FS is chosen HERE, in a package the trust gate covers, rather than by the caller. It used
+// to be a parameter on an exported Apply, and internal/cli picked the tree — deliberately
+// uncovered (see the gate-cost block in docs/ARCHITECTURE.md). That made the gate guard's "the
+// installer has no file outside content/ to reach" conditional on an uncovered file, and the
+// bypass needed no covered path at all: a payload/content/ tree, a payload/embed.go carrying
+// its own `//go:embed all:content`, and one line in internal/cli handing that FS to Apply
 // installs a replacement security reviewer. embedRoot is the constant "content", so any FS
 // with a top-level content directory installs.
 //

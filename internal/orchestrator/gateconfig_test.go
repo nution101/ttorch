@@ -98,15 +98,14 @@ var nonDecidingFiles = map[string]string{
 //
 // gateConfigPrefixes can name whole directories because content/, internal/review/,
 // internal/approval/ and internal/validate/ are each small and single-purpose. This package
-// is not, so covering "internal/orchestrator/" wholesale would put most of the repo's
-// commits behind --allow-gate-change and turn the flag into a formality. gateConfigFiles
-// therefore names five files instead.
+// is not, and covering "internal/orchestrator/" wholesale is declined on cost; the last row of
+// the generated table in docs/ARCHITECTURE.md (gate-cost block) is what that rests on.
+// gateConfigFiles therefore names five files instead.
 //
-// The figures are in docs/ARCHITECTURE.md and only there. This comment used to restate them
-// and drifted twice; the second time it understated the cost, in the direction that made the
-// boundary look better than it is.
-// TestGateCostFiguresMatchTheDoc measures the doc, so a figure that lives only there cannot
-// go stale unnoticed, and one restated here can.
+// This comment used to restate the figures and drifted twice. They are generated into that
+// block now. TestGateCostFiguresMatchTheDoc proves the block matches the matcher. It does not
+// prove this comment is free of figures, only that none is written here on one line in a
+// shape costFigureFor knows.
 //
 // A file list over a package that gets refactored decays silently — this package has already
 // been re-split once (140d2b91, "split god-file into focused single-responsibility files"),
@@ -116,7 +115,7 @@ var nonDecidingFiles = map[string]string{
 // quietly stopped guarding.
 //
 // Fixing a failure means either moving the function back, or adding its new file to
-// gateConfigFiles and re-measuring the blast radius — not deleting the entry.
+// gateConfigFiles and regenerating the gate-cost block, not deleting the entry.
 //
 // WHAT THIS TEST DOES NOT DO: it asks one direction only. Each listed function must live in a
 // covered file. It cannot notice a NEW deciding function, and inside a file already classified
@@ -206,14 +205,14 @@ func TestGateConfigCoversTheDecidingCode(t *testing.T) {
 //
 // Scoped to the guard, not to all of validate.go. That file also holds the gate RUNNER
 // (runGate, stagedGreen, validateCommitted), and pulling its tests in would mark
-// orchestrator_test.go a proof file at the highest cost on the table, the boundary this branch has
-// repeatedly refused to cross.
+// orchestrator_test.go a proof file and bring it into the covered set, which this branch has
+// repeatedly declined.
 //
 // Limit worth stating: matching is by identifier NAME, not by resolved symbol, so a local
 // that shadows a guard name marks its file a proof. One did, a `gateScope` local in a
 // splitApprovalPayload test, and it was renamed rather than special-cased. A false positive
-// is expensive rather than safe here, since it pulls a costly file into the covered set, so
-// TestGateCostFiguresMatchTheDoc is what surfaces one.
+// is not safe here: TestOrchestratorFilesAreClassified then demands that the file be covered,
+// which is a change to the covered set and to the generated cost block, not a free fix.
 func guardSymbols(t *testing.T) map[string]bool {
 	t.Helper()
 	return guardClosure(t).symbols
@@ -578,10 +577,9 @@ func TestMergeLocal_DecidingCodeChangeNeedsAllowGateChange(t *testing.T) {
 		// ~/.claude/skills via `npx skills add`, before every team launch and every worker
 		// spawn. No ttorch build and no ttorch install in between.
 		{"the recommended external skills", "internal/skills/skills.go", true},
-		// Still the control, and now deliberately so: covering internal/cli/ would take the
-		// covered set past the more-than-half line
-		// that is the stated reason internal/orchestrator/ is not covered wholesale. The
-		// bypass that ran through it is closed by installer.ApplyEmbedded instead.
+		// Still the control, and now deliberately so: internal/cli/ is left uncovered (see
+		// the gate-cost block in docs/ARCHITECTURE.md), and the bypass that ran through it
+		// is closed by installer.ApplyEmbedded instead.
 		{"CONTROL: ordinary source", "internal/cli/cli.go", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -692,7 +690,7 @@ func TestOrchestratorFilesAreClassified(t *testing.T) {
 		if strings.HasSuffix(n, "_test.go") {
 			// Parsed, not grepped. A substring scan counts a guard name MENTIONED in a
 			// comment, which would have marked orchestrator_test.go a proof file for two
-			// passing references in prose and pulled in the most expensive file on the table.
+			// passing references in prose, and so demanded that it be covered.
 			isProof := proofs[n]
 			if isProof && !covered[rel] {
 				t.Errorf("%s references the guard but is not covered. A diff can then "+
@@ -1243,11 +1241,9 @@ func TestEmbeddedPayloadIsNotAssignable(t *testing.T) {
 // outside its own package choose the tree it installs.
 //
 // installer.Apply used to take an fs.FS and internal/cli picked it, which made the guard's
-// superset argument conditional on a file the gate deliberately does not cover. Covering
-// internal/cli/ instead would have taken the set past
-// the more-than-half line that is the stated reason internal/orchestrator/ is not covered
-// wholesale — so the fix was to unexport apply and add ApplyEmbedded, which picks
-// ttorch.Content inside the covered package, which was already covered and so costs nothing.
+// superset argument conditional on a file the gate deliberately does not cover. Rather than
+// cover internal/cli/, the fix was to unexport apply and add ApplyEmbedded, which picks
+// ttorch.Content inside internal/installer, a package that was already covered.
 //
 // If an exported function in internal/installer takes an fs.FS again, the parameter is back
 // and so is the bypass, so this fails.
@@ -1292,27 +1288,26 @@ func TestInstallerExposesNoFSChoice(t *testing.T) {
 	}
 }
 
-// gateCostBase is the corpus every cost figure in docs/ARCHITECTURE.md is measured over:
+// gateCostBase is the corpus the generated cost block in docs/ARCHITECTURE.md is measured over:
 // the non-merge commits reachable from this sha. Pinned so the figures are reproducible as
 // history grows.
 const gateCostBase = "b642ba6"
 
-// TestGateCostFiguresMatchTheDoc re-measures the cost figures and fails if docs/ARCHITECTURE.md
-// disagrees.
+// TestGateCostFiguresMatchTheDoc generates the cost table and fails if the gate-cost block in
+// docs/ARCHITECTURE.md differs from it, then looks for hand-written figures elsewhere.
 //
-// The figures are the whole justification for where the covered set stops, and for three
-// rounds running a commit updated the main table and left one stale elsewhere — the Rejected
-// table, the prose under it, and a "roughly double" claim in the skill that was the only
-// stated cost reason for leaving internal/cli/ uncovered, which is where a real bypass sat.
-// Transcription is the failure mode, so this measures instead of trusting.
+// The figures are the justification for where the covered set stops, and for three rounds
+// running a commit updated the main table and left one stale elsewhere: the Rejected table,
+// the prose under it, and a "roughly double" claim in the skill that was the only stated
+// cost reason for leaving internal/cli/ uncovered, which is where a real bypass sat.
+// Transcription was the failure mode, so the table is generated instead of maintained.
 //
-// It derives the covered set from the live gateConfigFiles/gateConfigPrefixes/
-// gateConfigBasenames rather than restating them, so the table cannot drift from the guard
-// either.
+// It reads the covered set from the live lists rather than restating them, so the table
+// cannot drift from the guard either.
 //
-// Limit worth knowing: it needs the corpus. CI checks out shallow (actions/checkout defaults
-// to depth 1), so gateCostBase is unreachable there and this skips; only a full clone
-// exercises it. Raising fetch-depth would fix that but changes a covered file.
+// Limit worth knowing: it needs the corpus. It skips when gateCostBase is unreachable, which
+// includes CI's depth-1 checkout and any copy of the tree without its git history. Raising
+// fetch-depth would fix CI but changes a covered file.
 func TestGateCostFiguresMatchTheDoc(t *testing.T) {
 	skipIfShort(t)
 	root := repoRootForGateConfig(t)
@@ -1459,23 +1454,24 @@ func TestGateCostFiguresMatchTheDoc(t *testing.T) {
 		t.Logf("the corpus is now %d commits; every figure above is measured from it, so nothing needs editing", n)
 	}
 
-	// The anti-transcription rule, and the reason this test no longer sweeps for "figures
-	// that match a measured value". That sweep was widened twice and was behind a format
-	// both times: it matched N/196 and N%, so every bare commit count went unchecked, and
-	// five marginals in this very table were wrong while it passed. A sweep that lists the
-	// shapes it knows will always be one shape short.
+	// The previous version swept for figures that matched a measured value. It knew two
+	// shapes, N/196 and N%, so bare commit counts went unchecked and five marginals in this
+	// table were wrong while it passed.
 	//
-	// So the rule is inverted. There is exactly ONE place a cost figure may appear, the
-	// generated block above, and anywhere else a cost-figure shape is a failure regardless
-	// of whether the number happens to be right. Being right is not the property that was
-	// missing; being generated is.
+	// This one inverts the question: outside the block, a figure in one of the shapes
+	// costFigureFor knows is a failure whether or not the number is right. It still knows
+	// only those shapes, on one line, in the files assertNoHandWrittenFigures reads. A figure
+	// split across lines, separated from its noun by other words, spelled out, or replaced
+	// by a comparison gets past it. The rule is wider than the check, and review holds the
+	// rest.
+	//
 	// Strips the block that is IN the file, not the one just generated. When the two
 	// differ the block is already reported as out of date, and stripping the expected text
 	// would leave the actual rows in place to be re-reported one per figure.
 	assertNoHandWrittenFigures(t, root, got, len(shas))
 }
 
-// costBlockOpen and costBlockClose delimit the one place a cost figure may live.
+// costBlockOpen and costBlockClose delimit the generated cost block.
 const (
 	costBlockOpen  = "<!-- gate-cost: generated by TestGateCostFiguresMatchTheDoc. Do not edit by hand. -->"
 	costBlockClose = "<!-- /gate-cost -->"
@@ -1510,30 +1506,32 @@ func own(p string, touched [][]string) int {
 	return n
 }
 
-// costFigureFor matches the SHAPE of a cost figure, not a known value.
+// costFigureFor matches five shapes of a cost figure, not a known value: a number over the
+// corpus size, a number "of" the corpus size (optionally "of the"), a percentage, a number
+// followed by a single space and "commit", "commits" or "marginal", and a parenthesised
+// commit count. Everything has to sit on one line.
 //
-// Deliberately loose. A hand-written figure can be a fraction, a percentage or a bare count
-// of commits, and the check this replaces knew only about the first two, which is why every
-// bare count went unswept and five marginals in the table were wrong while it passed.
-// Matching the shape catches a new one on arrival in a format nobody anticipated, and the
-// fix for a false positive is to phrase the sentence without a number, which is the outcome
-// being pushed for anyway.
+// That is what it catches, and it is less than the rule it serves. It misses a figure split
+// across a line break ("cost 0" then "commits" on the next line), a number with other words
+// between it and its noun ("0 additional commits"), a number written as a word, a fraction
+// over any denominator other than the corpus size, and a cost stated as a comparison with
+// no number at all ("the cheaper of the two"). All but the other-denominator case have
+// occurred in this repo and got past it. A green run means none of the five shapes is present, not that no figure is.
 //
-// The one part that is not pure shape is the denominator: "x/y" is only read as a figure
-// when y is the corpus size, because "(1/2/101/...)" in a comment about ssh exit codes is
-// not a cost figure and rewording that sentence would make it worse. The corpus is commits
-// reachable from a fixed base, so that size does not drift. Percentages and counts stay
-// shape-only, and between them they cover the forms that have actually gone stale here.
+// The denominator is bound to the corpus size because "(1/2/101/...)" in a comment about ssh
+// exit codes is not a cost figure and rewording that sentence would make it worse. The
+// corpus is commits reachable from a fixed base, so that size does not drift.
 func costFigureFor(corpus int) *regexp.Regexp {
 	n := fmt.Sprint(corpus)
 	return regexp.MustCompile(`\d+\s*/\s*` + n + `|\d+ of (the )?` + n + `|[+-]?\d+(\.\d+)?%|[+-]?\d+ (commits?|marginal)|\(\d+ commits?\)`)
 }
 
-// assertNoHandWrittenFigures fails on a cost figure written anywhere but the generated block.
+// assertNoHandWrittenFigures fails on text matching costFigureFor outside the generated block.
 //
-// The files it reads are DERIVED: the two published documents, plus every Go file in the
-// covered set. Go files are read as comments only, through the parser, so a format verb or
-// a real numeric constant is not mistaken for prose.
+// It reads docs/ARCHITECTURE.md, the reviewer skill, and the comments of the .go files in the
+// covered set, derived from the covered set itself. Go files are read as comments only,
+// through the parser, so a format verb or a real numeric constant is not mistaken for prose.
+// Anything else in the repository is not read. See costFigureFor for the shapes it misses.
 func assertNoHandWrittenFigures(t *testing.T, root, block string, corpus int) {
 	t.Helper()
 	costFigure := costFigureFor(corpus)
@@ -1831,9 +1829,9 @@ func TestGateTestsSelectorCoversTheProofs(t *testing.T) {
 // with --allow-gate-change touches no guard symbol and reads as ordinary. One such test was
 // written, in orchestrator_test.go, and nothing swept it.
 //
-// Covering orchestrator_test.go wholesale is the most expensive option on the table, so the fix is not to
-// widen the covered set. It is to refuse to let an on-topic test live somewhere no sweep
-// reaches, and say where it should go instead.
+// orchestrator_test.go stays uncovered, so the fix is not to widen the covered set. It is to
+// refuse to let an on-topic test live somewhere no sweep reaches, and say where it should go
+// instead.
 var onTopicTestName = regexp.MustCompile(`GateConfig|GateGuard|GateScope|GateCost|GateTests|AllowGateChange|GateInstruction|MatchesGateConfig`)
 
 // TestOnTopicTestsLiveInAProofFile fails when a test named for the gate sits in a file the
@@ -1943,10 +1941,8 @@ func TestGateLaneRunsTheEvidencePackages(t *testing.T) {
 
 // Moved here from orchestrator_test.go. These are the gate's own proofs, and a proof
 // that is not covered can be deleted in the same unflagged merge as the attack it
-// catches. Covering orchestrator_test.go where they used to live would have cost 43 of
-// taken the covered set past the more-than-half line
-// that is the stated reason internal/orchestrator/ is not covered wholesale. Moving them
-// into a file that is already covered costs 0.
+// catches. Rather than cover orchestrator_test.go where they used to live, they moved into
+// a file that was already covered.
 
 // The case-fold cases used to pin a KNOWN LIMIT here (the match was byte-exact, so a
 // differently-cased path naming a covered file slipped through). They now pin the behaviour:

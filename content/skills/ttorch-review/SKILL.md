@@ -165,7 +165,7 @@ invalidates the verdict — re-prep, re-review, re-record.
   | `internal/validate/**` | what counts as a passing check |
   | `internal/projectinit/**` | parses `AGENTS.md` into the delivery mode and the auto-mint staleness bound |
   | `internal/orchestrator/{gate,merge,validate,validatecache}.go` | the Go code that resolves, enforces and caches the decision |
-  | *(measured cost of every entry)* | see the table in `docs/ARCHITECTURE.md` — the numbers live there only, because keeping a second copy here is what let them diverge |
+  | *(measured cost of each entry)* | see the generated table in `docs/ARCHITECTURE.md` (gate-cost block); this file does not restate it, because a second copy here is what let the figures diverge |
   | `.github/workflows/**` | the full suite: `.ttorch/validate.sh` runs only the fast lane and defers to CI by name |
   | `Makefile` | `.ttorch/validate.sh` does nothing but run `make lint` and `make test-fast` |
   | `go.work`, `go.work.sum` | auto-discovered via `GOWORK`; `replace` directives there override `go.mod`, so a committed one redirects what `go test` compiles |
@@ -275,13 +275,16 @@ invalidates the verdict — re-prep, re-review, re-record.
   internal/orchestrator/orchestrator.go
   ```
 
-  The two that cost the most to leave out, with the measured reason:
-  covering `internal/cli/` would take the set past the more-than-half line that is the stated
-  reason `internal/orchestrator/` is not covered wholesale, and `internal/db/` is the cheaper
-  of the two but still lands past half. The measured figures are generated into
-  `docs/ARCHITECTURE.md`; nothing restates them, here or anywhere else. `internal/worktree/` used to be here and is now COVERED: it holds `ChangedFiles`, the only
-  input to the guard, plus the raw blob read the scope resolves from, so an incomplete list
-  or a desynced read there makes the guard match nothing at all.
+  `internal/cli/` and `internal/db/` are left out on cost. What covering any entry above
+  would cost is in the generated table in `docs/ARCHITECTURE.md` (gate-cost block), and this
+  file does not restate or rank it. `TestGateCostFiguresMatchTheDoc` checks that the block
+  matches the matcher. Its check for hand-written figures elsewhere is partial: it catches a
+  number written on one line as a fraction of the corpus, a percentage, or "N commits", and
+  misses a figure split across lines, one with words between the number and its noun, one
+  spelled out, and a comparison with no number. Treat a cost claim you find anywhere else as
+  unverified. `internal/worktree/` used to be in this list and is now COVERED: it holds
+  `ChangedFiles`, the only input to the guard, plus the raw blob read the scope resolves
+  from, so an incomplete list or a desynced read there makes the guard match nothing at all.
 
 - **What that claim does NOT cover**, stated so nobody reads it as wider than it is:
   - Gated means trusted mode or `--require-verdict`. A `local`/`validated` merge without
@@ -296,18 +299,16 @@ invalidates the verdict — re-prep, re-review, re-record.
     whole story for `~/.claude/skills/`, which was an understatement: `internal/skills/` is a
     diff-channel route into that directory and is now covered.
   - **The rest of `internal/orchestrator/`** — `spawn.go`, `landqueue.go`, `autostart.go`,
-    `overlap.go` and the others. A deliberate, measured exclusion: covering the whole package
-    would put most of this repo's commits behind `--allow-gate-change` and the flag would stop
-    being a signal, while the five named files cost a fraction of that.
+    `overlap.go` and the others. A deliberate, measured exclusion; the last row of the
+    generated table in `docs/ARCHITECTURE.md` is what it rests on. A flag that fires on most
+    commits stops being a signal.
     `TestGateConfigCoversTheDecidingCode` fails if a deciding function moves out of those
     five, so the narrower list cannot decay into false coverage unnoticed.
   - `internal/cli/` wires the `--allow-gate-change` flag but is not covered, and
     `internal/db/` holds the verdict row the merge trusts for `Overall == pass`. Both are cost
-    judgements rather than oversights, and both land the set past half. `internal/cli/` is the
-    one that matters, because it also used to choose the tree the installer walked — see the
-    generated cost block in `docs/ARCHITECTURE.md`, which is where the figures live. An
-    earlier version of this line said both "would roughly double the flag's frequency", which
-    overstated the cost of the one package a real bypass ran through.
+    judgements rather than oversights; the figures are in the generated table in
+    `docs/ARCHITECTURE.md`. `internal/cli/` is the one that matters, because it also used to
+    choose the tree the installer walked.
   - Filesystems whose folding rules differ from Unicode's. `fsIdentityKey` is measured
     against **APFS only**, by `TestFSIdentityKeySweep` creating both files and reading one
     back, which beats reading the Unicode tables but says nothing about any other
@@ -349,12 +350,11 @@ invalidates the verdict — re-prep, re-review, re-record.
   - The covered set answers TWO questions, not one: what decides how a change is reviewed or
     validated, and what a merge publishes directly to users (the two installers, and only
     those). Anything outside both is not covered however alarming it looks.
-  - The flag is a boolean, so the cheapest way to defeat the guard is habit. It fires on
-    roughly two of every five commits in this repo, and a lead who passes the flag without
-    reading has given exactly the same authorization as one who read. What survives that is
-    the audit line, which names the file either way. Making the flag take the expected paths,
-    so a bare `--allow-gate-change` stops working, is the obvious next step and is not done
-    here.
+  - The flag is a boolean, so the cheapest way to defeat the guard is habit. A lead who
+    passes the flag without reading has given exactly the same authorization as one who
+    read. What survives that is the audit line, which names the file either way. Making the
+    flag take the expected paths, so a bare `--allow-gate-change` stops working, is the
+    obvious next step and is not done here.
   - **The input set is the part that keeps being wrong.** Five separate bypasses here were
     defects in the list of paths handed to the matcher, not in the matcher: no case folding,
     then lowercasing instead of folding, then single-rune instead of full folding, then blobs

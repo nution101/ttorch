@@ -341,24 +341,24 @@ Rejected, measured against that same set:
 
 Two columns because one number cannot carry it. "Commits touching it" is that entry in
 isolation; "marginal" is what it adds *given everything else already covered*, which is the
-figure that matters when deciding whether to include something. They differ a lot: an entry
-whose every commit also touched something else already covered adds nothing at the margin,
+figure that matters when deciding whether to include something. They can differ widely: an
+entry whose every commit also touched something else already covered adds nothing at the margin,
 and a marginal SHRINKS as the rest of the set grows. An earlier version of this table mixed
 two baselines row by row and was not coherent; these are all one definition.
 
-Every figure above is generated. Nothing in this document, in the reviewer skill, or in a Go
-comment may restate one, and `TestGateCostFiguresMatchTheDoc` fails on a cost-figure shape
-found anywhere else. That rule exists because the hand-written copies were wrong every single
-time they were checked — first the percentages, then a marginal added to a base it was not
-measured against, then five marginals in this table at once. Keep the argument, let the block
-carry the number.
+The figures above are generated. The rule is that no other text states or ranks a coverage
+cost; it points here instead. The hand-written copies this replaced were found wrong three
+rounds running: first the percentages, then a marginal added to a base it was not measured
+against, then five marginals in this table at once. `TestGateCostFiguresMatchTheDoc` enforces
+less of that rule than the rule asks for, and "Keeping the figures honest" below says exactly
+how much.
 
-The second rejected row is the answer to "why not just cover the packages".
+The last row of the rejected table is the answer to "why not just cover the packages".
 `internal/orchestrator/` holds spawn, the land queue, the scheduler wiring and the overlap
-planner, and covering it wholesale puts most of this repository's changes behind the flag. A
-flag that fires on most commits is not a signal; it is a formality, and it launders a real
-gate change through a habit. The five files that actually resolve, enforce, cache and record
-the decision cost a small fraction of that at the margin.
+planner alongside the five files that resolve, enforce, cache and record the decision. That
+row is what covering all of it would do; the rows for the five files above are what they add
+instead. The principle for reading it: a flag that fires on most commits is not a signal, it
+is a formality, and it launders a real gate change through a habit.
 
 A file list over a package is brittle in a way a directory prefix is not: this package has
 already been re-split once (`140d2b91`), and a later split that moved `MergeLocal` into a new
@@ -432,18 +432,16 @@ needed no covered path at all:
 |---|---|
 | `payload/content/agents/ttorch-reviewer-security.md` | no — the prefix is `content/`, not `*/content/` |
 | `payload/embed.go` with `//go:embed all:content` | no |
-| one line in `internal/cli` handing that FS to `Apply` | no — deliberately uncovered, on cost |
+| one line in `internal/cli` handing that FS to `Apply` | no — deliberately uncovered; see the generated table |
 
 That installs a replacement security reviewer, and `collidesInTree` sees nothing because there
 is no colliding pair. So the claim "the installer has no file outside `content/` to reach" was
 conditional on a file the gate does not cover.
 
-Covering `internal/cli/` would close it, but takes the covered set past the more-than-half
-line that is the stated reason `internal/orchestrator/` is not covered wholesale. Rather than apply that rule to one package and break it for another, the fix is to
-remove the choice: `Apply` is now unexported `apply`, and `ApplyEmbedded` picks
-`ttorch.Content` inside `internal/installer/`, which the gate covers. `internal/cli` no longer
-imports the payload at all, and `internal/installer/**` was already covered, so the fix costs
-nothing at the margin.
+Covering `internal/cli/` would close it; the generated table shows what that would cost. The
+fix taken instead removes the choice: `Apply` is now unexported `apply`, and `ApplyEmbedded`
+picks `ttorch.Content` inside `internal/installer/`, which the gate already covers.
+`internal/cli` no longer imports the payload at all.
 
 Two tests hold the two halves, and they are separate on purpose, because the payload tree and
 its delivery are separate legs:
@@ -470,20 +468,36 @@ the gate does not cover, a one-line edit there skipped both in every lane and me
 **`internal/skills/` installs third-party code into `~/.claude/skills`.** `Recommended()`
 returns refs, `InstallCmd` turns each into `npx skills add <ref>`, and `EnsureInstalled` runs
 before every team launch and every worker spawn. One line there fetches and installs arbitrary
-third-party skills into the same directory `content/skills/` is covered to protect, by a
-shorter route — npx fetches at spawn time, with no ttorch build or install in between. It
-costs nothing at the margin. The limits list used to name `~/.claude/skills` only as an
-out-of-repo exposure no diff-channel guard could see, which stopped being true once this route
-existed.
+third-party skills into the same directory `content/skills/` is covered to protect, by a shorter
+route — npx fetches at spawn time, with no ttorch build or install in between. The limits list
+used to name `~/.claude/skills` only as an out-of-repo exposure no diff-channel guard could see,
+which stopped being true once this route existed.
 
 ### Keeping the figures honest
 
-Three rounds running, a commit updated the main cost table and left a figure stale somewhere
-else — the *Rejected* table, the prose beneath it, and a "roughly double" claim in the skill
-that was the only stated cost reason for leaving `internal/cli/` uncovered. Transcription is
-the failure mode, so `TestGateCostFiguresMatchTheDoc` re-measures the whole-set total and both
-rejected rows from the live `gateConfigFiles`/`gateConfigPrefixes`/`gateConfigBasenames` and
-compares them to the numbers parsed out of this file.
+The cost table used to be maintained by hand, and three rounds running a commit updated it and
+left a figure stale somewhere else: the *Rejected* table, the prose beneath it, and a "roughly
+double" claim in the skill that was the only stated cost reason for leaving `internal/cli/`
+uncovered. Transcription was the failure mode each time.
+
+`TestGateCostFiguresMatchTheDoc` now generates the gate-cost block from the live covered-set
+lists and the real matcher, and fails if the block in this file differs from what it
+generates. That part is complete: the block cannot drift from the guard.
+
+It also looks for hand-written figures, and that part checks much less than the rule above asks
+for. Outside the block, in this file, in `content/skills/ttorch-review/SKILL.md` and in the
+comments of the covered `.go` files, it fails on text shaped like `<n>/<corpus size>`, `<n> of
+<corpus size>`, `<n>%`, `<n> commits` or `<n> marginal` with a single space, or `(<n> commits)`,
+all on one line. It does not catch a figure split across a line break, a number with other words
+between it and its noun ("costs 0 additional commits"), a number written as a word, a cost
+stated as a comparison with no number ("the cheaper of the two"), a fraction over any other
+denominator, or anything in a file outside that list. All of those except the other-denominator
+case have occurred here and passed the check. They are held by the rule and by review. A green
+run means none of the checked shapes is present, not that no figure is.
+
+The whole test skips, rather than fails, when `gateCostBase` is unreachable. That includes CI's
+depth-1 clone and any copy of the tree without its git history, so it only proves anything
+where the full history is present.
 
 It derives the covered set from the code rather than restating it, so the table cannot drift
 from the guard. Its limit is the corpus: it needs the 196 non-merge commits reachable from
@@ -581,8 +595,7 @@ reviewer entirely.
 
 Widening the set could have made every ordinary file move a flagged change, so
 `TestGateGuard_OrdinaryRenameStillMerges` pins that a rename whose source and destination are
-both uncovered still auto-approves and merges clean. The historical cost figures are unaffected
-— re-measuring the whole corpus with `--no-renames` moves no commit in it.
+both uncovered still auto-approves and merges clean.
 
 ### Why name-matching is not the load-bearing control
 
@@ -730,15 +743,14 @@ path has no non-ASCII spelling of its own, but it is *reachable by* one, which i
 the filesystem-measured test above.
 
 `Makefile`, `go.work`, `go.work.sum`, `vendor/**`, `content.go` and
-`internal/orchestrator/audit.go` each cost **nothing** at the margin — no commit in the corpus
-has touched one without touching something already covered — and each decides the gate. `.ttorch/validate.sh` is covered but does nothing
-except run `make lint` and `make test-fast`, so redefining those targets redefines green
-without touching a covered script. `content.go` is the `//go:embed` that maps a repo file onto
-an installed reviewer definition, and `internal/installer/**` is the mapping
-itself: covering the content while leaving the mapping open would let a file from an
-uncovered subtree be installed as a reviewer
-instead. `audit.go` holds the only `writeAudit`, and `MergeLocal` refuses to merge when it
-fails, so one line there strips the record from every trusted merge.
+`internal/orchestrator/audit.go` each decide the gate; the generated table has what each costs.
+`.ttorch/validate.sh` is covered but does nothing except run `make lint` and `make test-fast`,
+so redefining those targets redefines green without touching a covered script. `content.go` is
+the `//go:embed` that maps a repo file onto an installed reviewer definition, and
+`internal/installer/**` is the mapping itself: covering the content while leaving the mapping
+open would let a file from an uncovered subtree be installed as a reviewer instead. `audit.go`
+holds the only `writeAudit`, and `MergeLocal` refuses to merge when it fails, so one line there
+strips the record from every trusted merge.
 
 `.ttorch/**` is a **prefix**, not the single `.ttorch/validate.sh` it started as, and the
 inversion closes a class rather than a file. What forced it: `.ttorch/learnings.jsonl` is the
@@ -752,9 +764,8 @@ merge alone, with no build and no install, and the ledger is not gitignored.
 Adding `learnings.jsonl` as a second exact path would have left the *next* `.ttorch/` file in
 exactly the same position. This is the third time an enumerated subset has been the bug:
 `content/` missed installed files twice, then `.ttorch/` missed the ledger. Covering the tree
-covers what is not there yet. Across the corpus the only `.ttorch/` path ever committed is
-`validate.sh`, so the prefix costs nothing at the margin. `.ttorch/task` — the only other file that
-appears locally — is gitignored so it cannot reach a diff, and that had to be *fixed* here:
+covers what is not there yet. `.ttorch/task`, the one file besides `validate.sh` that
+appears locally, is gitignored so it cannot reach a diff, and that had to be *fixed* here:
 it was excluded only through `.git/info/exclude`, which is local to a clone and does not
 travel. The manager writes that file into every worker worktree, so in a fresh clone a
 worker's `git add -A` would have staged it and this prefix would have refused the merge on
@@ -780,16 +791,15 @@ takes documented precedence over `~/.claude/agents/` on a name collision, so a l
 `.claude/agents/ttorch-reviewer-security.md` replaces the security reviewer for every later
 gate run in that repo. `content/agents/ttorch-reviewer-*.md` is already covered for the same
 effect, but that route needs a build and an install first; this one takes effect on the merge.
-`.mcp.json` adds tools to those same sessions. Neither exists in this repo, so both cost 0
-commits — and worth recording, `.claude/` is not in `.gitignore` here, so nothing but this
-guard stands between a committed reviewer override and a merge.
+`.mcp.json` adds tools to those same sessions. Neither exists in this repo. `.claude/` is not
+in `.gitignore` here either, so nothing but this guard stands between a committed reviewer
+override and a merge.
 
-`go.mod` and `go.sum` are covered on the argument already carrying `go.work` and `vendor/`,
-and this branch sharpened it against itself: `fsIdentityKey` now depends on
-`golang.org/x/text`, so a `replace` on `x/text` redirects the guard's **own** Unicode folding.
-Unlike `go.work` these actually exist and are authoritative, and both are cheap at the
-margin. Step 6's not-covered list still names them; that line goes when the two land
-together.
+`go.mod` and `go.sum` are covered on the argument already carrying `go.work` and `vendor/`, and
+this branch sharpened it against itself: `fsIdentityKey` now depends on `golang.org/x/text`, so
+a `replace` on `x/text` redirects the guard's **own** Unicode folding. Unlike `go.work` these
+actually exist and are authoritative. Step 6's not-covered list still names them; that line goes
+when the two land together.
 
 `AGENTS.md` and `CLAUDE.md` are matched by FILENAME at any depth, not only at the root. A
 nested one loads on demand when a session reads files in its directory, which is the root
@@ -798,7 +808,7 @@ could exist today is deliberate: the set of directories is open and a list would
 first time someone adds a package. One consequence, recorded because it reverses an earlier
 call: `docs/AGENTS.md` was pinned in the match table as a near-miss that must stay OUT, and is
 now correctly IN — a session reading files under `docs/` loads it, so it is an instruction file
-like any other. No nested one has ever been committed, so this costs 0.
+like any other.
 
 `CLAUDE.md` is covered at the root for a second, separate reason: the guard matches a symlink
 by its OWN path, never by what it
@@ -829,33 +839,25 @@ Since none of them exists here, their appearance in a diff is exactly the event 
 and `absentByDesign` in the test file records that so the dead-coverage check does not demand
 they exist.
 
-Two genuine cost judgements are left out, and both are recorded here and in the skill so they
-read as decisions rather than omissions.
+Two packages that touch the decision are left out on cost, and both are recorded here and in
+the skill so they read as decisions rather than omissions. What covering each would cost is
+in the rejected table; this section does not restate or rank it.
 
-`internal/db/` holds `Store.GetVerdict`, the row the merge trusts for `Overall == pass`;
-covering it is the cheaper of the two, and still leaves the set past half.
+`internal/db/` holds `Store.GetVerdict`, the row the merge trusts for `Overall == pass`.
 
-`internal/cli/` wires the `--allow-gate-change` flag and is the larger of the two, and
-covering it would take the set well past the more-than-half line that is the stated reason `internal/orchestrator/` is not covered
-wholesale, so covering it would mean applying the rule to one package and breaking it for
-another. It was also the caller that chose the tree `installer.Apply` walked, which made the
-`content/` superset argument conditional on an uncovered file; that is closed by
-`installer.ApplyEmbedded` instead, at no marginal cost. See "The installer's FS parameter" below.
-
-An earlier version of this section said covering either "would roughly double the flag's
-frequency". The measured marginals are nowhere near that, so the claim was overstated — and it
-was the only stated cost reason for leaving `internal/cli/` uncovered, which is where a real
-bypass sat.
+`internal/cli/` wires the `--allow-gate-change` flag. It was also the caller that chose the
+tree `installer.Apply` walked, which made the `content/` superset argument conditional on an
+uncovered file; that is closed by `installer.ApplyEmbedded` instead. See "The installer's FS
+parameter" below.
 
 `.github/workflows/**` is in for a different reason. The trusted gate never consults CI, which
 is the argument against it — but this repo's `.ttorch/validate.sh` runs only `make test-fast`
 and says in its own header that the full suite, including the orchestrator e2e tests, runs in
 CI as the required check. CI is therefore half of what "validated" means here, and weakening
 `ci.yml` weakens every later change's validation through the same delayed diff channel that
-put the skills on the list, and it is cheap at the margin.
+put the skills on the list.
 
-What the numbers do not fix: a large minority of merges in this repo need
-`--allow-gate-change`, and the flag is a boolean. A lead who passes it by reflex authorizes
+What the numbers do not fix: the flag is a boolean. A lead who passes it by reflex authorizes
 exactly as much as one who read the diff. The audit line naming the file survives either way,
 which is the guard's durable half. Making the flag take the expected paths — so a bare
 `--allow-gate-change` stops working and the approval names what it covers — is the obvious

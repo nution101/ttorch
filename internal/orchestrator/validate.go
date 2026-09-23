@@ -87,12 +87,11 @@ func (m *Manager) Validate(taskID string) ([]validate.Result, error) {
 // one, because the maintainer self-updates routinely; a landed weakening of gate.go reaches
 // every repo on the machine the first time they do.
 //
-// The orchestrator entries are listed by exact FILE and not as "internal/orchestrator/",
-// because covering all of it would put more than half of every change behind
-// --allow-gate-change (measured: see docs/ARCHITECTURE.md, which holds every figure).
+// The orchestrator entries are listed by exact FILE and not as "internal/orchestrator/".
+// Covering the whole package is what the last row of the generated table in
+// docs/ARCHITECTURE.md (gate-cost block) measures, and it is declined on that basis.
 // audit.go is here because MergeLocal refuses to merge when writeAudit fails, so a one-line
-// change there strips the record from every trusted merge; it costs 0 additional commits,
-// since nothing has ever touched it alone.
+// change there strips the record from every trusted merge.
 //
 // A file-granular list over a package that gets refactored decays silently, so two tests hold
 // it: TestGateConfigCoversTheDecidingCode catches a MOVE of a listed deciding function into an
@@ -116,13 +115,12 @@ func (m *Manager) Validate(taskID string) ([]validate.Result, error) {
 //	              dependency, and a `toolchain` directive changes the compiler. Unlike
 //	              go.work it actually exists here — and since fsIdentityKey now depends on
 //	              golang.org/x/text, a replace on x/text redirects the guard's OWN Unicode
-//	              folding. Cheap at the margin.
+//	              folding.
 //	go.sum        the hashes that make go.mod's choices verifiable
 //
 // content.go is the //go:embed that decides which repo file becomes which installed reviewer
-// definition. All of these cost nothing at the margin: no commit in the corpus has been
-// touched without something already covered being touched too, and go.work and vendor/ have
-// never been touched at all.
+// definition. For what each entry here costs, see the generated table in
+// docs/ARCHITECTURE.md (gate-cost block).
 var gateConfigFiles = []string{
 	".ttorch/validate.sh",
 	"AGENTS.md",
@@ -187,15 +185,11 @@ var ttorchSourceFiles = []string{
 	// What none of them catch, stated rather than left implied: a test that is about the
 	// gate, uses none of its identifiers, AND is named for none of it. Once the symbol
 	// signal is gone the name is the only handle left, and nothing mechanical sees past
-	// it. The place such a test would most likely be written is orchestrator_test.go, and
-	// covering that file wholesale is the most expensive option on the table, and that is the trade being made
-	// here rather than an oversight.
+	// it. The place such a test would most likely be written is orchestrator_test.go,
+	// which is deliberately left uncovered. That gap is accepted, not overlooked.
 	//
-	// The gate-config tests used to live in orchestrator_test.go too. Covering that file
-	// have taken the set past the more-than-half
-	// line that is the stated reason internal/orchestrator/ is not covered wholesale, so
-	// the tests moved into a file that was already covered instead. Both files here cost 0
-	// commits: they exist only to hold these proofs.
+	// The gate-config tests used to live in orchestrator_test.go too. Rather than cover
+	// that file, they moved into these two, which exist only to hold the gate's proofs.
 	"internal/orchestrator/gateattacks_test.go",
 	"internal/orchestrator/gateconfig_test.go",
 }
@@ -237,8 +231,7 @@ var ttorchSourceFiles = []string{
 // TestEveryInstalledContentFileIsCovered walks the real embedded tree and asserts every file
 // under content/ matches, which gives derivation's safety property without the coupling.
 //
-// Cost: see docs/ARCHITECTURE.md. Widening from the two narrow prefixes to content/ added
-// Cheap at the margin.
+// Cost: see the generated table in docs/ARCHITECTURE.md (gate-cost block).
 //
 // internal/review/ is the verdict itself: the findings contract, the severity-to-block rule,
 // and the diff-size classifier that decides WHICH reviewers run at all. internal/approval/ is
@@ -265,8 +258,7 @@ var ttorchSourceFiles = []string{
 // into ~/.claude/skills — the same directory content/skills/ is covered to protect, reached
 // by a shorter route, since npx fetches at spawn time with no ttorch build or install in
 // between. The limits list used to name ~/.claude/skills only as an out-of-repo exposure no
-// diff-channel guard could see; that was an understatement once this route existed. It costs
-// Nothing at the margin.
+// diff-channel guard could see; that was an understatement once this route existed.
 //
 // .ttorch/ is a PREFIX rather than the single ".ttorch/validate.sh" it used to be, and this
 // inversion closes a class rather than a file. The channel that forced it:
@@ -281,13 +273,12 @@ var ttorchSourceFiles = []string{
 // Adding "learnings.jsonl" as a second exact path would have left the NEXT .ttorch/ file in
 // exactly the same position. An enumerated subset of content/ had already missed installed
 // files twice, and an enumerated subset of .ttorch/ then missed the ledger; covering the tree
-// covers everything under it, including files that do not exist yet. Across the corpus the
-// only .ttorch/ path ever committed is validate.sh, so the prefix costs nothing. .ttorch/task —
-// the only other file that shows up locally — is gitignored so it cannot appear in a diff, and
+// covers everything under it, including files that do not exist yet. .ttorch/task, the one file
+// besides validate.sh that shows up locally, is gitignored so it cannot appear in a diff, and
 // that needed FIXING as part of this change: it was excluded only through .git/info/exclude,
-// which is local to a clone and does not travel. The manager writes that file into every
-// worker worktree, so in a fresh clone a worker's `git add -A` would have staged it and this
-// prefix would have refused the merge on every task. TestTtorchRuntimeFileIsIgnored holds the
+// which is local to a clone and does not travel. The manager writes that file into every worker
+// worktree, so in a fresh clone a worker's `git add -A` would have staged it and this prefix
+// would have refused the merge on every task. TestTtorchRuntimeFileIsIgnored holds the
 // .gitignore line so that false positive cannot come back quietly.
 //
 // .claude/ and .mcp.json are PROJECT-level agent configuration, and this is the strongest
@@ -297,7 +288,7 @@ var ttorchSourceFiles = []string{
 // takes precedence over ~/.claude/agents/ on a name collision. content/agents/ttorch-reviewer-*
 // is already covered for the same effect, but that route needs a build and an install first;
 // this one takes effect on the merge. .mcp.json adds tools to those same sessions. Neither
-// exists in this repo, so both cost nothing and their appearance in a diff is the event.
+// exists in this repo, so their appearance in a diff is itself the event.
 //
 // vendor/ is the third way to change what `go test` compiles without touching a covered
 // script: with a consistent vendor/modules.txt the toolchain builds from vendor/ rather than
@@ -312,7 +303,7 @@ var ttorchSourceFiles = []string{
 // into a shell, with no build, no install and no release step in between. That is the same
 // delayed out-of-band effect that justifies the rest of the set, with the most severe
 // consequence of any file in the repo, and covering one platform's installer but not the
-// other would be an obvious gap, and together they are cheap.
+// other would be an obvious gap.
 //
 // So the covered set answers two questions, not one: what decides how a change is REVIEWED or
 // VALIDATED, and what a merge PUBLISHES DIRECTLY to users. Anything outside both is not
@@ -324,8 +315,8 @@ var ttorchSourceFiles = []string{
 // a landed weakening of ci.yml weakens every later change's validation through exactly the
 // delayed diff channel that put the skills on this list. The trusted gate does not itself
 // consult CI, which is the argument against including it; it loses to the fact that the gate
-// script defers to CI by name. It is cheap at the margin, so the blast-radius argument that
-// keeps internal/orchestrator/ off the list does not apply.
+// script defers to CI by name. Its cost is in the generated table in docs/ARCHITECTURE.md
+// (gate-cost block).
 var gateConfigPrefixes = []string{
 	"vendor/",
 	".claude/",
@@ -354,8 +345,8 @@ var ttorchSourcePrefixes = []string{
 	// read the scope resolves from. A one-line change to CatBlobs's record framing
 	// reproduces the .gitattributes critical, and it sat outside the covered set while
 	// internal/review/ and internal/validate/ were inside it on a thinner dependency.
-	// Whole package rather than the one file: all 18 of its commits touch worktree.go, so
-	// file-granularity buys nothing and decays. It keeps the set under the more-than-half line.
+	// Whole package rather than the one file, because a file list over a package decays
+	// silently when the package is re-split, and a prefix does not.
 	"internal/worktree/",
 }
 
@@ -447,8 +438,6 @@ func orbitMin(s string) string {
 // someone adds a package. It is why docs/AGENTS.md, which an earlier version of
 // TestMatchesGateConfig pinned as a near-miss that must stay OUT, is now correctly IN: a
 // session reading files under docs/ loads it, so it is an instruction file like any other.
-//
-// Never committed at a nested path anywhere in the corpus, so this costs nothing.
 //
 // This OVERLAPS gateConfigFiles, which also names AGENTS.md and CLAUDE.md, and the redundancy
 // is deliberate. The root AGENTS.md is the delivery-mode config — the single most important
@@ -639,10 +628,9 @@ func matchesGateConfig(name string, sc gateScope) bool {
 		// the prefix: trimming would turn "content/" into the prefix "content" and pull in
 		// "contentious/", which TestMatchesGateConfig pins as a near-miss.
 		//
-		// Costs nothing, and not by luck. git names a directory in a diff only when that
-		// path IS an entry, which for a directory means a symlink or a gitlink; ordinary
-		// commits report the files inside it. Measured over the 196-commit corpus: 0
-		// commits newly flagged, the covered set unchanged.
+		// It does not flag ordinary commits, and not by luck: git names a directory in a
+		// diff only when that path IS an entry, which for a directory means a symlink or a
+		// gitlink, and ordinary commits report the files inside it.
 		if dir, ok := strings.CutSuffix(fp, "/"); ok && folded == dir {
 			return true
 		}
