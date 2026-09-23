@@ -404,6 +404,10 @@ func shq(s string) string {
 // work). The Stop hook fires when the worker goes idle and blocks the stop until it reports a
 // terminal/blocking status. It is scoped to the worktree-local settings — never global — so it
 // governs workers only, never the manager, `ttorch cc`, or the user's own sessions.
+//
+// Beside it go the harness's lifecycle hooks (HooksFor), which record each turn's start and
+// end for the hook liveness signal. They sit in their own hook groups, so the Stop hook's
+// entry is the same as before they existed.
 func WriteWorkerSettings(kind, worktree string) error {
 	if kind != "claude" {
 		return nil
@@ -415,27 +419,34 @@ func WriteWorkerSettings(kind, worktree string) error {
 	type hookGroup struct {
 		Hooks []hookCommand `json:"hooks"`
 	}
-	type hooksBlock struct {
-		Stop []hookGroup `json:"Stop"`
-	}
 	type settings struct {
 		// IncludeCoAuthoredBy=false stops the agent from adding an AI co-author
 		// trailer to commits — work is authored as the repo's git user, not the agent.
 		IncludeCoAuthoredBy bool `json:"includeCoAuthoredBy"`
-		// Hooks installs the worker Stop hook that enforces `ttorch report` (see above).
-		Hooks hooksBlock `json:"hooks"`
+		// Hooks, keyed by Claude Code hook event: the worker Stop hook that enforces
+		// `ttorch report` (see above) and the lifecycle hooks.
+		Hooks map[string][]hookGroup `json:"hooks"`
 	}
 	// The absolute ttorch binary so the hook resolves regardless of the hook process's PATH.
 	stopHookCmd := shq(paths.Default().Binary()) + " stop-hook"
+	hooks := map[string][]hookGroup{
+		"Stop": {{Hooks: []hookCommand{{Type: "command", Command: stopHookCmd}}}},
+	}
+	lifecycle := HooksFor(kind)
+	for _, ev := range lifecycle.Events() {
+		for _, native := range lifecycle.NativeEvents(ev) {
+			hooks[native] = append(hooks[native], hookGroup{
+				Hooks: []hookCommand{{Type: "command", Command: LifecycleHookCommand(ev)}},
+			})
+		}
+	}
 	dir := filepath.Join(worktree, ".claude")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	b, err := json.MarshalIndent(settings{
 		IncludeCoAuthoredBy: false,
-		Hooks: hooksBlock{Stop: []hookGroup{{
-			Hooks: []hookCommand{{Type: "command", Command: stopHookCmd}},
-		}}},
+		Hooks:               hooks,
 	}, "", "  ")
 	if err != nil {
 		return err
