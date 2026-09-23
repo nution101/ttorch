@@ -331,3 +331,13 @@ func TestToResults(t *testing.T) {
 		t.Fatalf("a clean verdict should render one passing result, got %+v", clean)
 	}
 }
+
+// TestPinnedReportDimensions_AMissingDirectoryIsNoExtras is the must-not-trip half of failing
+// closed on a listing error: before any reviewer has reported there is no reports directory,
+// and that means no extras, not an error.
+func TestPinnedReportDimensions_AMissingDirectoryIsNoExtras(t *testing.T) {
+	got, err := PinnedReportDimensions(t.TempDir(), "0123456789abcdef")
+	if err != nil || got != nil {
+		t.Fatalf("PinnedReportDimensions over a missing reports dir = (%v, %v), want (nil, nil)", got, err)
+	}
+}

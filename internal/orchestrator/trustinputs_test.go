@@ -608,8 +608,8 @@ func TestFoldDimensions_ReadsTheReportsNotTheRecord(t *testing.T) {
 	stageGreenPrep(t, dir, head)
 
 	required := []string{review.DimensionCorrectness, review.DimensionScope, review.DimensionSecurity}
-	if got := m.foldDimensions(dir, head, required); strings.Join(got, " ") != strings.Join(required, " ") {
-		t.Fatalf("with no extra report present the fold is just the required set, got %v", got)
+	if got, err := m.foldDimensions(dir, head, required); err != nil || strings.Join(got, " ") != strings.Join(required, " ") {
+		t.Fatalf("with no extra report present the fold is just the required set, got %v (err %v)", got, err)
 	}
 
 	// A report in the gate's own reports dir, pinned to head, is folded — with nothing in the
@@ -617,8 +617,8 @@ func TestFoldDimensions_ReadsTheReportsNotTheRecord(t *testing.T) {
 	writeFindingReport(t, dir, review.DimensionQA, head, []review.Finding{{
 		Dimension: review.DimensionQA, Severity: review.SeverityCritical, Summary: "no tests",
 	}})
-	got := m.foldDimensions(dir, head, required)
-	if len(got) != len(required)+1 {
+	got, err := m.foldDimensions(dir, head, required)
+	if err != nil || len(got) != len(required)+1 {
 		t.Fatalf("a report pinned to head must be folded whatever the record says, got %v", got)
 	}
 
@@ -634,8 +634,8 @@ func TestFoldDimensions_ReadsTheReportsNotTheRecord(t *testing.T) {
 	if err := os.Remove(mustReportPath(t, dir, review.DimensionQA)); err != nil {
 		t.Fatal(err)
 	}
-	if got := m.foldDimensions(dir, head, required); strings.Join(got, " ") != strings.Join(required, " ") {
-		t.Fatalf("an advisory report must not enter the trust fold, got %v", got)
+	if got, err := m.foldDimensions(dir, head, required); err != nil || strings.Join(got, " ") != strings.Join(required, " ") {
+		t.Fatalf("an advisory report must not enter the trust fold, got %v (err %v)", got, err)
 	}
 }
 
@@ -1241,6 +1241,56 @@ func TestTrustPrep_RefusesToRePrepOverReportsItCannotList(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(reports, 0o755) })
 	if _, err := m.TrustPrep("carry-unlisted"); err == nil {
 		t.Fatal("prep re-prepped over a reports directory it could not list")
+	}
+}
+
+// TestTrustRecord_AnUnlistableReportsDirBlocks: the extras the fold adds come from listing the
+// reports directory, and the listing used to fold every error to "no extras". With the
+// directory at 0300 the required reports still open by name, so the verdict passed while a
+// pinned critical in an extra dimension sat unread. A missing directory may still mean no
+// extras; any other listing error must block and say why. The daemon case also empties the
+// episode record, so the extra can only reach the fold through the listing.
+func TestTrustRecord_AnUnlistableReportsDirBlocks(t *testing.T) {
+	for _, path := range []string{"manual", "daemon"} {
+		t.Run(path, func(t *testing.T) {
+			id := "unlisted-" + path
+			m, dir, head := shrunkSetHarness(t, id)
+			t.Cleanup(func() { _, _ = m.Teardown(id, true) })
+			recordingReviewer(t, false)
+			writeCleanReport(t, dir, review.DimensionCorrectness, head)
+			writeCleanReport(t, dir, review.DimensionScope, head)
+			writeFindingReport(t, dir, review.DimensionSecurity, head, []review.Finding{{
+				Dimension: review.DimensionSecurity, Severity: review.SeverityCritical,
+				Reviewer: "ttorch-reviewer-security", Summary: "unauthenticated path traversal in the new handler",
+			}})
+			reports := review.ReportsDir(dir)
+			if err := os.Chmod(reports, 0o300); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(reports, 0o755) })
+
+			if path == "manual" {
+				v, err := m.TrustRecord(id, head, time.Minute)
+				if err == nil && v.Overall == review.Pass {
+					t.Fatal("a pass was recorded while the reports directory could not be listed")
+				}
+				if err == nil && !verdictMentions(v, "could not be listed") {
+					t.Errorf("the block must say the reports could not be listed; findings = %+v", v.Findings)
+				}
+			} else {
+				execStateDB(t, m, `UPDATE gate_episodes SET dims='[]', attempts='{}' WHERE task_id = ?`, id)
+				out, err := m.gateOnceAt(id, time.Minute, 2, time.Hour, time.Now())
+				if out == GateRecorded {
+					t.Fatalf("the gate recorded a verdict while the reports directory could not be listed (err %v)", err)
+				}
+				if out != GateBlocked || !gateBlockedEventMentions(t, m, id, "could not be listed") {
+					t.Errorf("outcome = %q; the gate must block and say the reports could not be listed", out)
+				}
+			}
+			if _, err := os.Stat(m.P.ApprovalFile(id)); err == nil {
+				t.Fatal("an approval was minted while the reports directory could not be listed")
+			}
+		})
 	}
 }
 

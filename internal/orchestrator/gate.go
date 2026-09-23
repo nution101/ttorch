@@ -310,20 +310,37 @@ func dispatchedDimensions(prog gateProgress) []string {
 // Advisory reports are kept out by living in a different directory (AdvisoryInputsDir): the
 // gate scans the inputs dir's reports and the audits scan the subdirectory's, so neither
 // reads the other's artifact.
-func (m *Manager) foldDimensions(dir, head string, required []string) []string {
+//
+// A listing error is returned with the required set alone. The caller must block on it: the
+// extras are exactly what the listing is for, so without it a pinned report outside the
+// required set cannot be ruled out.
+func (m *Manager) foldDimensions(dir, head string, required []string) ([]string, error) {
 	out := append([]string(nil), required...)
+	pinned, err := review.PinnedReportDimensions(dir, head)
+	if err != nil {
+		return out, err
+	}
 	have := make(map[string]bool, len(required))
 	for _, d := range required {
 		have[d] = true
 	}
-	for _, d := range review.PinnedReportDimensions(dir, head) {
+	for _, d := range pinned {
 		if have[d] {
 			continue
 		}
 		have[d] = true
 		out = append(out, d)
 	}
-	return out
+	return out, nil
+}
+
+// unlistedReportsFinding is the blocking finding a verdict carries when the reports directory
+// could not be listed, so the extras foldDimensions adds could not be established.
+func unlistedReportsFinding(err error) review.Finding {
+	return review.Finding{
+		Dimension: "review", Severity: review.SeverityHigh, Reviewer: "ttorch",
+		Summary: fmt.Sprintf("the review reports could not be listed (%v), so a pinned report outside the required set cannot be ruled out; the verdict blocks until the directory can be read", err),
+	}
 }
 
 // ReviewDiff returns a worker's changes against the repo's default branch.
@@ -848,7 +865,7 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 	// reports. The manual path used to take its extras from the episode record, so the one
 	// rewrite that fooled the daemon fooled `ttorch trust record` too.
 	inputs := m.P.ReviewInputsDir(taskID)
-	dims := m.foldDimensions(inputs, sha, required)
+	dims, lerr := m.foldDimensions(inputs, sha, required)
 	verdict, err := review.Aggregate(inputs, sha, dims)
 	if err != nil {
 		return zero, err
@@ -856,6 +873,10 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 	if len(dropped) > 0 {
 		verdict.Overall = review.Block
 		verdict.Findings = append(verdict.Findings, droppedDimensionFinding(dropped))
+	}
+	if lerr != nil {
+		verdict.Overall = review.Block
+		verdict.Findings = append(verdict.Findings, unlistedReportsFinding(lerr))
 	}
 	// Pin the reviewed diff's content identity onto the verdict (the committed three-dot diff
 	// the reviewers read) so a later clean rebase onto an advanced default can carry the
@@ -1738,7 +1759,11 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 	// set shrank under it or because the episode record forgot it. review.Aggregate is the
 	// SAME deterministic fold the manager's `trust record` uses, and TrustRecord derives the
 	// same extras the same way, so the daemon does not fork the decision.
-	fold := m.foldDimensions(dir, head, dims)
+	fold, lerr := m.foldDimensions(dir, head, dims)
+	if lerr != nil {
+		m.surfaceGateBlocked(taskID, head, unlistedReportsFinding(lerr).Summary)
+		return GateBlocked, m.endEpisode(taskID, prog, gateOutcomeBlocked, unionDimensions(fold, dispatchedDimensions(prog)))
+	}
 	v, err := review.Aggregate(dir, head, fold)
 	if err != nil {
 		// Only a stale-sha mismatch makes Aggregate error, which reviewReportPinned already

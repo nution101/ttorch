@@ -279,10 +279,16 @@ func ReportsDir(inputsDir string) string {
 // Only plain "<dimension>.json" children count, and only ones ValidDimensionName accepts, so
 // a file dropped into the directory under any other name is ignored rather than turned into
 // a dimension. A missing directory is not an error: it means no reviewer has reported yet.
-func PinnedReportDimensions(inputsDir, sha string) []string {
+// Any other listing error is returned. Folding it to "no extras" hid a pinned extra behind a
+// directory mode that still let the required reports open by name (0300), so a caller must
+// block on it rather than read it as an empty set.
+func PinnedReportDimensions(inputsDir, sha string) ([]string, error) {
 	entries, err := os.ReadDir(ReportsDir(inputsDir))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	var out []string
 	for _, e := range entries {
@@ -296,7 +302,7 @@ func PinnedReportDimensions(inputsDir, sha string) []string {
 		out = append(out, dim)
 	}
 	sort.Strings(out)
-	return out
+	return out, nil
 }
 
 // BlockingReportsPinnedTo returns every dimension whose report in inputsDir is pinned to sha
