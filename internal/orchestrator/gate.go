@@ -2169,10 +2169,10 @@ func writeReviewerPrompt(cwd, brief string) (string, error) {
 // verdict aggregation, so a missing or malformed report fails the gate closed regardless of
 // what the session does.
 //
-// bare is the review workspace's bare mirror for an isolated dimension, or "" when the session
-// runs in the worker's worktree. When it is set the brief MUST teach the git read path, because
-// the session has no working tree to search and a reviewer that silently gives up on reading
-// callers writes a worse report rather than an honest "I could not check this".
+// bare is the review workspace's bare mirror. Every dispatched reviewer has one, and the brief
+// MUST teach the git read path, because the session has no working tree to search and a
+// reviewer that silently gives up on reading callers writes a worse report rather than an
+// honest "I could not check this".
 func reviewerBrief(taskID, dim, inputsDir, head, reportPath, bare string) string {
 	return fmt.Sprintf(`# Adversarial trust-gate review — %s dimension (task %s)
 
@@ -2213,10 +2213,10 @@ written, you are done — do not modify the repository.
 // which is why the cost of moving the session out of the tree is a worse review experience
 // rather than a blind one.
 //
-// Every dispatched dimension now has a mirror, so the empty-bare branch is unreachable from
-// the gate. It is kept because the function is also called when composing a brief for
-// inspection, where there may be no workspace, and returning a section that points at nothing
-// would be worse than returning none.
+// No caller passes an empty bare. reviewerBrief is called only by spawnReviewer, after
+// reviewerCwd has built the workspace, and reviewerCwd fails the dispatch rather than return
+// without a mirror. The empty-bare branch is a guard for a future caller, so a brief composed
+// without a workspace gets no section rather than one pointing at an empty path.
 func bareSourceSection(bare, head string) string {
 	if bare == "" {
 		return ""
