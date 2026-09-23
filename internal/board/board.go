@@ -12,6 +12,10 @@
 // the URL for the page, and as a header or form field on each action. Requests whose Host
 // is not exactly 127.0.0.1:<port> are refused, which defeats DNS rebinding, and actions
 // must come from the page's own origin. No CORS headers are ever set.
+//
+// Because the page's token is in its URL, it stays in the browser's history and in the
+// terminal scrollback where `ttorch board` printed it; it is good only until that board
+// process exits, since each start generates a new one.
 package board
 
 import (
