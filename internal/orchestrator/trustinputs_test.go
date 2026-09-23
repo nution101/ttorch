@@ -1671,55 +1671,100 @@ func execStateDB(t *testing.T, m *Manager, stmt string, args ...any) {
 }
 
 // TestAdvisoryPrep_GuardDoesNotRestOnAWorkerWritableFile: the guard that stops an advisory
-// prep resetting a live gate episode keyed on review.ValidateState, which reads prep.json
-// from the review-inputs dir. One `rm` turned the guard off, so TrustPrep ran and opened a new
-// episode over a live one. It now consults the store episode first, which the worker cannot
-// write, and falls back to the stamp only for the manual flow, which has no episode.
+// prep resetting a live gate episode keyed on review.ValidateState, which reads prep.json from
+// the review-inputs dir, so one `rm` turned it off. It then consulted the store row as well,
+// but the row is writable by the same uid, and `DELETE FROM gate_episodes` plus the `rm`
+// turned it off again. It now also consults the gate_episode_opened marker the gate appends
+// when it opens an episode, so each case removes a different subset and the prep must not run.
 //
-// This asserts what the GUARD decides: no re-prep, and the episode survives. It deliberately
-// does not assert the reports stay current, because they do not, and not because of the
-// guard. review.ReportCurrent folds a report against the prep stamp, so removing prep.json
-// makes every report read as not-current on its own, with no advisory prep involved at all
-// (measured directly). That is a property of the landed freshness design rather than anything
-// here, and its direction is safe: reports read as absent, so the gate re-reviews rather than
-// passing. It is reported rather than fixed here.
+// This asserts what the GUARD decides: no re-prep, and where the row survives, the episode and
+// its clock are untouched. It deliberately does not assert the reports stay current, because
+// they do not, and not because of the guard. review.ReportCurrent folds a report against the
+// prep stamp, so removing prep.json makes every report read as not-current on its own, with no
+// advisory prep involved at all (measured directly). That is a property of the landed
+// freshness design rather than anything here, and its direction is safe: reports read as
+// absent, so the gate re-reviews rather than passing. It is reported rather than fixed here.
 func TestAdvisoryPrep_GuardDoesNotRestOnAWorkerWritableFile(t *testing.T) {
-	m, _ := trustedTaskWithSubstantialDiff(t, "advisory-guard", "ag1")
-	t.Cleanup(func() { _, _ = m.Teardown("ag1", true) })
-	recordingReviewer(t, false)
+	for _, tc := range []struct {
+		name      string
+		deleteRow bool
+	}{
+		{"stamp removed", false},
+		{"stamp removed and row deleted", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := "ag-" + strings.ReplaceAll(tc.name, " ", "-")
+			m, _ := trustedTaskWithSubstantialDiff(t, "advisory-guard", id)
+			t.Cleanup(func() { _, _ = m.Teardown(id, true) })
+			recordingReviewer(t, false)
 
-	if out, err := m.GateOnce("ag1"); err != nil || out != GateDispatched {
+			if out, err := m.GateOnce(id); err != nil || out != GateDispatched {
+				t.Fatalf("tick1 = (%q, %v), want dispatched", out, err)
+			}
+			dir := m.P.ReviewInputsDir(id)
+			head := gitIn(t, mustTask(t, m, id).Worktree, "rev-parse", "HEAD")
+			before, _, err := m.readGateProgress(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if err := os.Remove(filepath.Join(dir, review.PrepStampFile)); err != nil {
+				t.Fatal(err)
+			}
+			if tc.deleteRow {
+				execStateDB(t, m, `DELETE FROM gate_episodes WHERE task_id = ?`, id)
+			}
+			if _, _, err := m.AdvisoryPrep(id, []string{review.DimensionSecurity}); err != nil {
+				t.Fatalf("AdvisoryPrep: %v", err)
+			}
+
+			// A re-prep would have written a fresh stamp for the gate's own inputs dir. The
+			// advisory episode gets its own stamp under advisory/, which is a different
+			// directory.
+			if review.ValidateState(dir, head) != "unprepped" {
+				t.Fatal("the advisory prep re-stamped the gate's episode instead of leaving it alone")
+			}
+			if tc.deleteRow {
+				return
+			}
+			after, ok, err := m.readGateProgress(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok || after.Head != head {
+				t.Fatalf("the advisory prep lost the gate's episode: ok=%v head=%q", ok, after.Head)
+			}
+			if after.StartedAt != before.StartedAt {
+				t.Error("the advisory prep restarted the gate's episode clock, which is the bound it must not touch")
+			}
+		})
+	}
+}
+
+// TestAdvisoryPrep_AMarkerForAnEarlierHeadDoesNotCount is the must-not-trip half of the
+// guard. The marker the guard consults is scoped to the head under review, so once the worker
+// commits past a gated head, an advisory prep for the new head must prep as it would for any
+// commit the gate has not opened an episode for.
+func TestAdvisoryPrep_AMarkerForAnEarlierHeadDoesNotCount(t *testing.T) {
+	m, _ := trustedTaskWithSubstantialDiff(t, "advisory-moved", "am1")
+	t.Cleanup(func() { _, _ = m.Teardown("am1", true) })
+	recordingReviewer(t, false)
+	if out, err := m.GateOnce("am1"); err != nil || out != GateDispatched {
 		t.Fatalf("tick1 = (%q, %v), want dispatched", out, err)
 	}
-	dir := m.P.ReviewInputsDir("ag1")
-	head := gitIn(t, mustTask(t, m, "ag1").Worktree, "rev-parse", "HEAD")
-	before, _, err := m.readGateProgress("ag1")
-	if err != nil {
+	wt := mustTask(t, m, "am1").Worktree
+	if err := os.WriteFile(filepath.Join(wt, "c.go"), []byte("package c\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	gitIn(t, wt, "add", "-A")
+	gitIn(t, wt, "commit", "-q", "-m", "more work")
+	next := gitIn(t, wt, "rev-parse", "HEAD")
 
-	// The one write that used to turn the guard off.
-	if err := os.Remove(filepath.Join(dir, review.PrepStampFile)); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := m.AdvisoryPrep("ag1", []string{review.DimensionSecurity}); err != nil {
+	if _, _, err := m.AdvisoryPrep("am1", []string{review.DimensionSecurity}); err != nil {
 		t.Fatalf("AdvisoryPrep: %v", err)
 	}
-
-	after, ok, err := m.readGateProgress("ag1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok || after.Head != head {
-		t.Fatalf("the advisory prep lost the gate's episode: ok=%v head=%q", ok, after.Head)
-	}
-	if after.StartedAt != before.StartedAt {
-		t.Error("the advisory prep restarted the gate's episode clock, which is the bound it must not touch")
-	}
-	// A re-prep would have written a fresh stamp for the gate's own inputs dir. The advisory
-	// episode gets its own stamp under advisory/, which is a different directory.
-	if review.ValidateState(dir, head) != "unprepped" {
-		t.Error("the advisory prep re-stamped the gate's episode instead of leaving it alone")
+	if review.ValidateState(m.P.ReviewInputsDir("am1"), next) == "unprepped" {
+		t.Fatal("the advisory prep skipped prepping a head the gate never opened an episode for")
 	}
 }
 

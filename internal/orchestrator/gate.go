@@ -1002,14 +1002,27 @@ func (m *Manager) AdvisoryPrep(taskID string, dims []string) (inputsDir, advisor
 	// Keying that on review.ValidateState alone was the same root as the episode record: the
 	// stamp it reads is prep.json, in the review-inputs dir, so removing one file turned the
 	// guard off and an advisory prep archived a healthy gate's reports and drove it to
-	// gate_blocked. The store episode is checked first because the worker cannot write it; the
-	// stamp is still consulted for the manual flow, which has no gate episode but can equally
-	// have a review in progress.
+	// gate_blocked. Adding the store row did not settle it, because the row is writable by the
+	// same uid: deleting it and prep.json turned the guard off again. So three independent
+	// records are consulted and any one of them keeps the prep from running: the row, the
+	// gate_episode_opened marker the gate appends when it opens an episode for this head, and
+	// the stamp, which is also what covers the manual flow, where there is no gate episode but
+	// a review can equally be in progress.
+	//
+	// A same-uid process can still remove all three. What that buys it is a re-prep that
+	// archives the gate's reports, which denies the gate a verdict; it cannot produce one.
 	prog, found, perr := m.readGateProgress(taskID)
 	if perr != nil {
 		return "", "", fmt.Errorf("advisory prep for %q: could not read the gate episode: %w", taskID, perr)
 	}
 	gated := found && prog.Head == head
+	if !gated {
+		_, opened, oerr := m.Store.GateEpisodeOpenedAt(context.Background(), taskID, head)
+		if oerr != nil {
+			return "", "", fmt.Errorf("advisory prep for %q: could not read the gate's episode marker: %w", taskID, oerr)
+		}
+		gated = opened
+	}
 	if !gated && review.ValidateState(inputsDir, head) == "unprepped" {
 		if inputsDir, err = m.TrustPrep(taskID); err != nil {
 			return "", "", err
