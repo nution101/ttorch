@@ -1,0 +1,297 @@
+{{define "page" -}}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>ttorch board</title>
+<style nonce="{{.Nonce}}">
+:root {
+  --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66; --line: #e2e2dc;
+  --accent: #2f5fb3; --warn: #a15c00; --bad: #b3261e; --good: #1e7a3c; --code: #f0f0ec;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161615; --panel: #1f1f1d; --text: #e8e8e3; --muted: #9a9a93; --line: #33332f;
+    --accent: #8fb0ee; --warn: #e0a24a; --bad: #f08a80; --good: #7cc795; --code: #2a2a27;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline;
+  padding: 14px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+header h1 { font-size: 17px; margin: 0; }
+header .meta { color: var(--muted); font-size: 12px; }
+#status { margin-left: auto; font-size: 12px; color: var(--muted); }
+#status.bad { color: var(--bad); }
+#flash { display: none; margin: 12px 16px 0; padding: 10px 12px; border-radius: 6px;
+  border: 1px solid var(--line); background: var(--panel); white-space: pre-wrap; word-break: break-word; }
+#flash.show { display: block; }
+#flash.ok { border-color: var(--good); }
+#flash.noop { border-color: var(--warn); }
+#flash.err { border-color: var(--bad); }
+main { padding: 4px 16px 32px; max-width: 1200px; }
+section { margin-top: 18px; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted);
+  margin: 0 0 8px; display: flex; gap: 8px; align-items: baseline; }
+h2 .count { background: var(--code); color: var(--text); border-radius: 10px; padding: 0 7px;
+  font-size: 12px; letter-spacing: 0; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px 12px; margin-bottom: 8px; }
+.card.decision { border-left: 3px solid var(--warn); }
+.row { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; }
+.id { font-weight: 600; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.tag { font-size: 12px; color: var(--muted); }
+.state-working { color: var(--good); }
+.state-idle { color: var(--warn); }
+.state-gone { color: var(--bad); }
+.text { white-space: pre-wrap; word-break: break-word; margin: 6px 0 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
+  background: var(--code); padding: 8px; border-radius: 6px; max-height: 18em; overflow: auto; }
+ul.findings { margin: 6px 0 0; padding-left: 18px; }
+ul.findings li { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
+  word-break: break-word; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--code);
+  padding: 1px 5px; border-radius: 4px; word-break: break-all; }
+.empty { color: var(--muted); font-style: italic; margin: 0 0 8px; }
+.note { color: var(--muted); font-size: 12px; margin-top: 6px; }
+form { margin-top: 8px; }
+textarea { width: 100%; min-height: 4.5em; font: inherit; color: var(--text);
+  background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+button { font: inherit; color: #fff; background: var(--accent); border: 0; border-radius: 6px;
+  padding: 5px 12px; margin-top: 6px; cursor: pointer; }
+button:disabled { opacity: .5; cursor: default; }
+table { width: 100%; border-collapse: collapse; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 12px; color: var(--muted); font-weight: 600; }
+tr:last-child td { border-bottom: 0; }
+td .fp { color: var(--muted); font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  word-break: break-all; }
+.scroll { overflow-x: auto; }
+</style>
+</head>
+<body data-token="{{.Token}}" data-poll="{{.Poll}}">
+<header>
+  <h1>ttorch board</h1>
+  <span class="meta">127.0.0.1 only · refreshes every few seconds</span>
+  <span id="status">live</span>
+</header>
+<div id="flash" role="status" aria-live="polite"></div>
+<main id="board">{{template "sections" .}}</main>
+<script nonce="{{.Nonce}}">
+(function () {
+  "use strict";
+  var token = document.body.dataset.token;
+  var poll = parseInt(document.body.dataset.poll, 10) || 3000;
+  var board = document.getElementById("board");
+  var status = document.getElementById("status");
+  var flash = document.getElementById("flash");
+  var busy = 0;
+
+  function show(kind, text) {
+    flash.className = "show " + kind;
+    flash.textContent = text; // never innerHTML: messages carry task ids and worker text
+  }
+
+  // A refresh replaces the sections wholesale, so skip it while the lead is typing an answer
+  // or an action is in flight; the next tick picks it up.
+  function editing() {
+    if (busy > 0) return true;
+    var fields = board.querySelectorAll("textarea");
+    for (var i = 0; i < fields.length; i++) {
+      if (fields[i].value !== "" || fields[i] === document.activeElement) return true;
+    }
+    return false;
+  }
+
+  function refresh(force) {
+    // Each refresh probes tmux for every worker, so a tab nobody is looking at stays quiet.
+    if (!force && document.hidden) return;
+    if (!force && editing()) { status.textContent = "paused while you type"; return; }
+    fetch("/api/board", { headers: { "X-Ttorch-Token": token }, cache: "no-store", credentials: "omit" })
+      .then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.text();
+      })
+      .then(function (html) {
+        if (!force && editing()) return;
+        board.innerHTML = html; // server-rendered by html/template, every value escaped
+        status.className = "";
+        status.textContent = "updated " + new Date().toLocaleTimeString();
+      })
+      .catch(function (e) {
+        status.className = "bad";
+        status.textContent = "not updating (" + e.message + "); is ttorch board still running?";
+      });
+  }
+
+  board.addEventListener("submit", function (ev) {
+    var form = ev.target;
+    if (!form.dataset.action) return;
+    ev.preventDefault();
+    var button = form.querySelector("button");
+    if (button) button.disabled = true;
+    busy++;
+    show("noop", "working…");
+    fetch(form.dataset.action, {
+      method: "POST",
+      headers: { "X-Ttorch-Token": token },
+      body: new URLSearchParams(new FormData(form)),
+      cache: "no-store",
+      credentials: "omit"
+    })
+      .then(function (r) { return r.json().catch(function () { return { ok: false, message: "HTTP " + r.status }; }); })
+      .then(function (res) {
+        show(!res.ok ? "err" : (res.done ? "ok" : "noop"), res.message || "");
+        if (res.ok) {
+          var ta = form.querySelector("textarea");
+          if (ta) ta.value = "";
+        }
+      })
+      .catch(function (e) { show("err", "request failed: " + e.message); })
+      .then(function () {
+        busy--;
+        if (button) button.disabled = false;
+        refresh(true);
+      });
+  });
+
+  setInterval(function () { refresh(false); }, poll);
+  document.addEventListener("visibilitychange", function () { if (!document.hidden) refresh(false); });
+})();
+</script>
+</body>
+</html>
+{{- end}}
+
+{{define "sections" -}}
+{{with .Snap}}
+<section id="decisions">
+  <h2>Pending decisions <span class="count">{{.Pending}}</span></h2>
+  {{if eq .Pending 0}}<p class="empty">Nothing is waiting on you.</p>{{end}}
+
+  {{range .Gates}}
+  <div class="card decision">
+    <div class="row">
+      <span class="id">{{.TaskID}}</span>
+      <span class="tag">gate escalated</span>
+      {{if .Head}}<span class="tag">at {{.Head}}</span>{{end}}
+      <span class="tag">{{.Project}}</span>
+      <span class="tag">{{ago .At}}</span>
+    </div>
+    <div class="text">{{.Reason}}</div>
+    {{if .Findings}}<ul class="findings">{{range .Findings}}<li>{{.}}</li>{{end}}</ul>{{end}}
+    {{if .Reprep}}
+    <p class="note">Gate prep re-run from the board {{ago .Reprep}}. Next: run the reviewers, then <code>ttorch trust record {{.TaskID}}</code>.</p>
+    {{else}}
+    <form data-action="/api/gate-prep">
+      <input type="hidden" name="task" value="{{.TaskID}}">
+      <input type="hidden" name="event" value="{{.EventID}}">
+      <button type="submit">Re-run gate prep</button>
+    </form>
+    {{end}}
+  </div>
+  {{end}}
+
+  {{range .Questions}}
+  <div class="card decision">
+    <div class="row">
+      <span class="id">{{.TaskID}}</span>
+      <span class="tag">{{.Status}}</span>
+      {{if .Actor}}<span class="tag">from {{.Actor}}</span>{{end}}
+      <span class="tag">{{.Project}}</span>
+      {{if not .At.IsZero}}<span class="tag">{{ago .At}}</span>{{end}}
+    </div>
+    {{if .Text}}<div class="text">{{.Text}}</div>{{else}}<p class="note">No message came with this status.</p>{{end}}
+    {{if .AnsweredAt}}
+    <p class="note">Answered from the board {{ago .AnsweredAt}}. Waiting for the worker to pick it up.</p>
+    {{else if not .EventID}}
+    <p class="note">No recorded question to answer; use <code>ttorch send {{.TaskID}} …</code>.</p>
+    {{else if not .HasWindow}}
+    <p class="note">This task has no worker window to receive an answer.</p>
+    {{else}}
+    <form data-action="/api/answer">
+      <input type="hidden" name="task" value="{{.TaskID}}">
+      <input type="hidden" name="question" value="{{.EventID}}">
+      <textarea name="answer" placeholder="Your answer, sent to the worker as ttorch send would" aria-label="Answer for {{.TaskID}}"></textarea>
+      <button type="submit">Send answer</button>
+    </form>
+    {{end}}
+  </div>
+  {{end}}
+
+  {{range .Approvals}}
+  <div class="card decision">
+    <div class="row">
+      <span class="id">{{.TaskID}}</span>
+      <span class="tag">awaiting your approval</span>
+      <span class="tag">{{.Mode}} mode</span>
+      <span class="tag">{{.Project}}</span>
+    </div>
+    <p class="note">{{.Reason}}</p>
+    <p>Approve it yourself at a terminal: <code>{{.Command}}</code></p>
+  </div>
+  {{end}}
+</section>
+
+<section id="workers">
+  <h2>Live workers <span class="count">{{len .Workers}}</span></h2>
+  {{if .Workers}}
+  <div class="scroll"><table>
+    <tr><th>Task</th><th>State</th><th>Status</th><th>Stage</th><th>Project</th><th>Model</th><th>Last progress</th></tr>
+    {{range .Workers}}
+    <tr>
+      <td><span class="id">{{.TaskID}}</span> <span class="tag">{{.Kind}}</span>
+        {{if .Footprint}}<div class="fp">{{join .Footprint}}</div>{{end}}</td>
+      <td class="state-{{.State}}">{{.State}}</td>
+      <td>{{.Status}}</td>
+      <td>{{.Stage}}</td>
+      <td>{{.Project}}</td>
+      <td>{{.Model}}{{if .Effort}} · {{.Effort}}{{end}}</td>
+      <td>{{if .LastProgress}}{{ago .LastProgress}}{{end}}</td>
+    </tr>
+    {{end}}
+  </table></div>
+  {{else}}<p class="empty">No live workers.</p>{{end}}
+</section>
+
+<section id="completions">
+  <h2>Recent completions <span class="count">{{len .Completions}}</span></h2>
+  {{if .Completions}}
+  <div class="scroll"><table>
+    <tr><th>Task</th><th>Event</th><th>When</th><th>Detail</th></tr>
+    {{range .Completions}}
+    <tr><td><span class="id">{{.TaskID}}</span></td><td>{{.Type}}</td><td>{{ago .At}}</td><td>{{.Detail}}</td></tr>
+    {{end}}
+  </table></div>
+  {{else}}<p class="empty">Nothing delivered yet.</p>{{end}}
+</section>
+
+<section id="backlog">
+  <h2>Queued backlog <span class="count">{{len .Backlog}}</span></h2>
+  {{if .Backlog}}
+  <div class="scroll"><table>
+    <tr><th>Task</th><th>Title</th><th>Project</th><th>Footprint</th><th></th></tr>
+    {{range .Backlog}}
+    <tr>
+      <td><span class="id">{{.TaskID}}</span> <span class="tag">{{.Kind}}</span></td>
+      <td>{{.Title}}</td>
+      <td>{{.Project}}</td>
+      <td>{{if .Footprint}}<span class="fp">{{join .Footprint}}</span>{{else}}<span class="tag">none declared</span>{{end}}</td>
+      <td>{{if .HasBrief}}
+        <form data-action="/api/dispatch">
+          <input type="hidden" name="task" value="{{.TaskID}}">
+          <button type="submit">Dispatch</button>
+        </form>
+        {{else}}<span class="tag">no stored brief</span>{{end}}</td>
+    </tr>
+    {{end}}
+  </table></div>
+  {{else}}<p class="empty">The backlog is empty.</p>{{end}}
+</section>
+<p class="note">Read {{.Generated.Format "15:04:05"}}. The board never approves or merges; approvals are run by you at a terminal.</p>
+{{end}}
+{{- end}}
