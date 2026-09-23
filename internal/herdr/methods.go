@@ -3,7 +3,9 @@ package herdr
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
+	"unicode/utf8"
 )
 
 // AgentStatus is Herdr's semantic agent state. Done means idle and not yet
@@ -160,8 +162,13 @@ func (c *Client) SplitPane(ctx context.Context, p PaneSplit) (PaneInfo, error) {
 	return out.Pane, err
 }
 
-// SendText writes literal text to a pane without pressing any key
+// SendText writes text to a pane as-is, without pressing any key
 // (pane.send_text).
+//
+// The text reaches the pane's terminal unfiltered: a CR or LF in it submits
+// whatever precedes it, and ESC or other control characters act as terminal
+// control. Never pass text that came from a task, a brief or another agent
+// here; use SendLiteral, which refuses control characters.
 func (c *Client) SendText(ctx context.Context, paneID, text string) error {
 	p := struct {
 		PaneID string `json:"pane_id"`
@@ -182,6 +189,10 @@ func (c *Client) SendKeys(ctx context.Context, paneID string, keys ...string) er
 
 // SendInput writes text and then the keys in one request (pane.send_input),
 // so a prompt and its submitting "enter" cannot be split by another writer.
+//
+// As with SendText, the text is unfiltered: CR or LF submits and ESC acts as
+// terminal control. For text that did not come from ttorch itself, use
+// SendLiteral.
 func (c *Client) SendInput(ctx context.Context, paneID, text string, keys ...string) error {
 	p := struct {
 		PaneID string   `json:"pane_id"`
@@ -189,6 +200,36 @@ func (c *Client) SendInput(ctx context.Context, paneID, text string, keys ...str
 		Keys   []string `json:"keys,omitempty"`
 	}{paneID, text, keys}
 	return c.call(ctx, c.timeout(), "pane.send_input", p, "ok", nil)
+}
+
+// ErrControlCharacter means SendLiteral was given text containing a
+// character the terminal would act on rather than display.
+var ErrControlCharacter = errors.New("herdr: text contains a control character")
+
+// SendLiteral is SendInput for text that must arrive as plain characters.
+// It refuses, without sending anything, text that is not valid UTF-8 or
+// contains a C0 control character (including tab, CR and LF), DEL, or a C1
+// control character, so the text can neither submit itself early nor emit a
+// control sequence. The keys, such as a final "enter", are sent after the
+// text in the same request; they are the caller's explicit intent and are
+// not filtered.
+func (c *Client) SendLiteral(ctx context.Context, paneID, text string, keys ...string) error {
+	if err := literalText(text); err != nil {
+		return err
+	}
+	return c.SendInput(ctx, paneID, text, keys...)
+}
+
+func literalText(text string) error {
+	if !utf8.ValidString(text) {
+		return fmt.Errorf("%w: invalid UTF-8", ErrControlCharacter)
+	}
+	for i, r := range text {
+		if r < 0x20 || r >= 0x7f && r <= 0x9f {
+			return fmt.Errorf("%w: %U at byte %d", ErrControlCharacter, r, i)
+		}
+	}
+	return nil
 }
 
 // ReadPane returns a pane's screen or scrollback text (pane.read).

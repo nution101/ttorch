@@ -275,3 +275,40 @@ func TestWaitAgent_RequiresPositiveTimeout(t *testing.T) {
 		t.Fatalf("server got %d requests, want none", n)
 	}
 }
+
+// SendLiteral refuses, without sending anything, text a terminal would act
+// on: CR or LF would submit it, ESC and C1 bytes start control sequences,
+// and invalid UTF-8 can decode as C1 in some terminals.
+func TestSendLiteral_RefusesControlCharacters(t *testing.T) {
+	for name, text := range map[string]string{
+		"newline":      "fix the bug\nrm -rf ~",
+		"carriage ret": "done\r",
+		"escape":       "hi\x1b[2J",
+		"tab":          "a\tb",
+		"nul":          "a\x00b",
+		"delete":       "a\x7fb",
+		"c1 csi":       "a\u009b2J",
+		"bad utf-8":    "a\x9bb",
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newFakeServer(t)
+			s.handle("pane.send_input", replyOK)
+			err := s.client().SendLiteral(context.Background(), "w1:p1", text, "enter")
+			if !errors.Is(err, ErrControlCharacter) {
+				t.Fatalf("err = %v, want ErrControlCharacter", err)
+			}
+			if n := len(s.received()); n != 0 {
+				t.Fatalf("server received %d requests, want none", n)
+			}
+		})
+	}
+}
+
+func TestSendLiteral_SendsPlainTextAndKeysTogether(t *testing.T) {
+	s := newFakeServer(t)
+	s.handle("pane.send_input", replyOK)
+	if err := s.client().SendLiteral(context.Background(), "w1:p1", "continue with the plan, café ✓", "enter"); err != nil {
+		t.Fatal(err)
+	}
+	wantParams(t, s, "pane.send_input", `{"pane_id":"w1:p1","text":"continue with the plan, café ✓","keys":["enter"]}`)
+}
