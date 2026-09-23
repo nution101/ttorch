@@ -44,10 +44,15 @@
 //     pushed stream instead of polling.
 //   - Teardown. ClosePane ends the worker's pane and its process.
 //
-// Before dialling, every call checks that the socket is a real socket owned
-// by the current user in a directory that user owns and no one else can
-// write, and refuses it with an *UnsafeSocketError otherwise, so a socket
-// another local user planted never receives a request.
+// Every call checks the socket twice and refuses it with an
+// *UnsafeSocketError on either failure. Before dialling, the path must be a
+// socket (not a symlink) owned by the current user, in a directory (not a
+// symlink) that user owns with no group or other write bit; these path
+// checks narrow, but cannot close, the window for another user to swap the
+// path. After connecting and before writing anything, the client reads the
+// listening process's uid from the kernel and refuses any server not run by
+// the current user, which does close it, whatever the path. On an OS where
+// that uid cannot be read, every connection is refused.
 //
 // Every request/response call is bounded by the earlier of the context's
 // deadline and Client.Timeout; WaitAgent is bounded by its own timeout plus

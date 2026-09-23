@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -102,13 +103,21 @@ func configDir() (string, error) {
 	return "", ErrNoConfigDir
 }
 
-// checkSocket refuses a socket path another local user could have planted,
-// before anything is dialled. The socket must be a real socket (not a
-// symlink) owned by this process's uid, and its directory must be owned by
-// this uid and not group- or world-writable, so no other user can have put
-// the socket there or can swap it for their own afterwards. A missing socket
-// is ErrNoSocket, as before. The check runs on every path, whether it came
-// from HERDR_SOCKET_PATH, XDG_CONFIG_HOME, HOME or the caller.
+// checkSocket is the pre-dial half of the socket check. It runs on every
+// path, whether it came from HERDR_SOCKET_PATH, XDG_CONFIG_HOME, HOME or the
+// caller, and refuses unless:
+//
+//   - the path itself (Lstat) is a socket, not a symlink or other file, and
+//     is owned by this process's uid;
+//   - its parent directory (Lstat) is a directory, not a symlink, owned by
+//     this uid, with neither the group nor the other write bit set.
+//
+// A missing socket is ErrNoSocket. Only the mode bits are read: an ACL that
+// grants another user write access to the directory is not detected. Nothing
+// above the parent directory is checked either, so a user who can write to
+// a directory higher up could still swap the path between this check and
+// the dial. These checks only narrow that window; checkPeer, run on the
+// connected socket, is what closes it.
 func (c *Client) checkSocket() error {
 	path := c.socketPath
 	owner := c.owner
@@ -137,9 +146,12 @@ func (c *Client) checkSocket() error {
 	}
 
 	dir := filepath.Dir(path)
-	di, err := os.Stat(dir)
+	di, err := os.Lstat(dir)
 	if err != nil {
 		return fmt.Errorf("herdr: stat socket directory %s: %w", dir, err)
+	}
+	if !di.IsDir() {
+		return refuse("directory %s is a symlink or not a directory (mode %s)", dir, di.Mode())
 	}
 	if got, ok := owner(di); !ok {
 		return refuse("cannot read the owner of directory %s", dir)
@@ -150,6 +162,48 @@ func (c *Client) checkSocket() error {
 		return refuse("directory %s is group- or world-writable (mode %04o)", dir, perm)
 	}
 	return nil
+}
+
+// checkPeer is the post-connect half of the socket check, and the one that
+// does not depend on the path: it asks the kernel for the uid of the process
+// listening on the connected socket (LOCAL_PEERCRED on macOS, SO_PEERCRED on
+// Linux) and refuses unless it is this process's uid. A socket swapped in by
+// another user, by any route, is served by that user's process and fails
+// here, before the client writes a byte. A peer whose uid cannot be read is
+// refused too, including on any OS without an implementation. A server run
+// by this same uid is trusted; that is the same boundary as the user's own
+// files.
+func (c *Client) checkPeer(conn net.Conn) error {
+	lookup := c.peer
+	if lookup == nil {
+		lookup = peerUID
+	}
+	uid := uint32(os.Getuid())
+	got, err := lookup(conn)
+	if err != nil {
+		return &UnsafeSocketError{Path: c.socketPath, Reason: fmt.Sprintf("cannot read the server's uid: %v", err)}
+	}
+	if got != uid {
+		return &UnsafeSocketError{Path: c.socketPath, Reason: fmt.Sprintf("server is running as uid %d, not %d", got, uid)}
+	}
+	return nil
+}
+
+// controlUnix runs fn on the file descriptor of a Unix socket connection.
+func controlUnix(conn net.Conn, fn func(fd int) error) error {
+	uc, ok := conn.(*net.UnixConn)
+	if !ok {
+		return fmt.Errorf("not a Unix socket connection: %T", conn)
+	}
+	raw, err := uc.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var fnErr error
+	if err := raw.Control(func(fd uintptr) { fnErr = fn(int(fd)) }); err != nil {
+		return err
+	}
+	return fnErr
 }
 
 // statOwner reads the owning uid from a Unix stat result.

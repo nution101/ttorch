@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -265,5 +266,73 @@ func TestDefaultSocketPath_RejectsUnsafeSessionEnv(t *testing.T) {
 	t.Setenv("HERDR_SESSION", "../../tmp/evil")
 	if p, err := DefaultSocketPath(); !errors.Is(err, ErrInvalidSessionName) {
 		t.Fatalf("DefaultSocketPath = %q, %v; want ErrInvalidSessionName", p, err)
+	}
+}
+
+// The path checks can race with a swap higher up the tree, so the client
+// also asks the kernel who is listening and refuses a server run by another
+// uid before writing a byte.
+func TestDial_RefusesServerRunByAnotherUser(t *testing.T) {
+	s := newFakeServer(t)
+	pingServer(s)
+	c := s.client()
+	c.peer = func(net.Conn) (uint32, error) { return uint32(os.Getuid()) + 1, nil }
+	_, err := c.Ping(context.Background())
+	wantRefused(t, s, err, "server is running as uid")
+}
+
+func TestDial_RefusesPeerThatCannotBeRead(t *testing.T) {
+	s := newFakeServer(t)
+	pingServer(s)
+	c := s.client()
+	c.peer = func(net.Conn) (uint32, error) { return 0, errors.New("getsockopt: not supported") }
+	_, err := c.Ping(context.Background())
+	wantRefused(t, s, err, "cannot read the server's uid", "not supported")
+}
+
+func TestSubscribe_RefusesServerRunByAnotherUser(t *testing.T) {
+	s := newFakeServer(t)
+	s.handle("events.subscribe", streamHandler(true))
+	c := s.client()
+	c.peer = func(net.Conn) (uint32, error) { return uint32(os.Getuid()) + 1, nil }
+	_, err := c.Subscribe(context.Background(), AgentStatusChanges("w1:p1", ""))
+	wantRefused(t, s, err, "server is running as uid")
+}
+
+// The real lookup, not the seam: on a socket this process is listening on,
+// the kernel reports this process's own uid.
+func TestPeerUID_RealSocketReportsOwnUID(t *testing.T) {
+	s := newFakeServer(t)
+	conn, err := net.Dial("unix", s.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	uid, err := peerUID(conn)
+	if err != nil {
+		t.Fatalf("peerUID: %v", err)
+	}
+	if uid != uint32(os.Getuid()) {
+		t.Fatalf("peerUID = %d, want %d", uid, os.Getuid())
+	}
+}
+
+// A symlinked socket directory is refused: the link could be repointed at a
+// directory another user controls between the check and the dial.
+func TestDial_RefusesSymlinkedDirectory(t *testing.T) {
+	s := newFakeServer(t)
+	pingServer(s)
+	link := filepath.Join(shortSocketDir(t), "d")
+	if err := os.Symlink(filepath.Dir(s.path), link); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(link, filepath.Base(s.path))
+	_, err := New(path).Ping(context.Background())
+	var unsafe *UnsafeSocketError
+	if !errors.As(err, &unsafe) || !strings.Contains(unsafe.Reason, "symlink") {
+		t.Fatalf("err = %v, want refusal naming the symlinked directory", err)
+	}
+	if n := len(s.received()); n != 0 {
+		t.Fatalf("server received %d requests through the symlinked directory", n)
 	}
 }

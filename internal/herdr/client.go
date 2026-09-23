@@ -102,6 +102,10 @@ type Client struct {
 	// owner reports the uid that owns a file. Tests replace it to simulate a
 	// socket or directory belonging to another user; nil means statOwner.
 	owner func(fs.FileInfo) (uid uint32, ok bool)
+	// peer reports the uid of the process on the other end of a connection.
+	// Tests replace it to simulate a server run by another user; nil means
+	// peerUID.
+	peer func(net.Conn) (uint32, error)
 }
 
 // New returns a client for the server listening at socketPath. It does not
@@ -168,6 +172,10 @@ func (c *Client) dial(ctx context.Context) (net.Conn, error) {
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "unix", c.socketPath)
 	if err == nil {
+		if err := c.checkPeer(conn); err != nil {
+			conn.Close()
+			return nil, err
+		}
 		return conn, nil
 	}
 	if errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ECONNREFUSED) {
