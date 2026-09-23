@@ -27,6 +27,25 @@ import (
 	"github.com/nution101/ttorch/internal/projectinit"
 )
 
+// skipIfShort skips a slow test under `go test -short`, the fast local lane (`make
+// test-fast`, run by .ttorch/validate.sh). The orchestrator e2e tests drive real tmux
+// windows, git worktrees, rebases and validate runs and dominate the package's wall-clock.
+// Skipping them locally is a speed optimization, not a weaker gate: `make test-gate` runs
+// the gate's proofs without -short, and the full suite runs in CI. Any new test that
+// performs a real Spawn must call this.
+//
+// It lives here, in a covered file, because two of the gate's own proofs call it:
+// TestFSIdentityKeySweep and TestGateCostFiguresMatchTheDoc. It used to live in
+// orchestrator_test.go, which the gate does not cover, so a one-line edit there made both
+// proofs skip in every lane while the diff auto-merged unflagged. The e2e tests in
+// orchestrator_test.go still call it; same package.
+func skipIfShort(t *testing.T) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("slow integration (e2e) test: skipped in the fast local lane (go test -short); the full suite runs in CI")
+	}
+}
+
 // ttorchScope is the scope for ttorch's own source repository, where content/ is the
 // embedded payload and internal/ holds the code that decides a merge. Tests that assert
 // against this repo's paths pass it explicitly, so the dependency on the repo's identity is

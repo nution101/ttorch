@@ -987,20 +987,6 @@ func TestMergeLocal_ApprovalBinding(t *testing.T) {
 	_, _ = m.Teardown("b1", true)
 }
 
-// skipIfShort skips a slow orchestrator integration ("e2e") test under `go test -short`
-// — the fast local gate lane (`make test-fast`, run by .ttorch/validate.sh). These tests
-// drive real tmux windows, git worktrees, rebases and validate runs and dominate the
-// package's wall-clock (~100s). Skipping them locally is a speed optimization, NOT a
-// weaker gate: the FULL suite — including every one of these — still runs in CI
-// (.github/workflows/ci.yml) on every push/PR, so nothing lands without the e2e having
-// passed there. Any new test that performs a real Spawn must call this.
-func skipIfShort(t *testing.T) {
-	t.Helper()
-	if testing.Short() {
-		t.Skip("slow integration (e2e) test: skipped in the fast local lane (go test -short); the full suite runs in CI")
-	}
-}
-
 // deliveryHarness spins up a Manager against a fresh main-branch repo and a unique
 // tmux session, registering teardown. It mirrors the inline setup the other
 // delivery tests use.

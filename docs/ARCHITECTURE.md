@@ -463,6 +463,10 @@ takes its `t.Skipf` escape there, so it does not run in the lane the gate actual
 still runs in CI, which is the required check. A guard test that skips where the gate runs is
 not a guard.
 
+The same reasoning put `skipIfShort` in `gateconfig_test.go`. `TestFSIdentityKeySweep` and
+`TestGateCostFiguresMatchTheDoc` call it, and while it lived in `orchestrator_test.go`, which
+the gate does not cover, a one-line edit there skipped both in every lane and merged unflagged.
+
 **`internal/skills/` installs third-party code into `~/.claude/skills`.** `Recommended()`
 returns refs, `InstallCmd` turns each into `npx skills add <ref>`, and `EnsureInstalled` runs
 before every team launch and every worker spawn. One line there fetches and installs arbitrary
