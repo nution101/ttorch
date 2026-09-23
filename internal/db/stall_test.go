@@ -51,7 +51,7 @@ func TestStallInfo_RaisesCountFromLatestClock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !st.HasClock || st.ClockPane != "aaaa" {
+	if !st.HasClock || st.ClockPayload != "aaaa" {
 		t.Fatalf("clock = %+v, want pane aaaa", st)
 	}
 	want0 := time.Date(2026, 1, 1, 0, 10, 0, 0, time.UTC)
@@ -65,7 +65,7 @@ func TestStallInfo_RaisesCountFromLatestClock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.ClockID != clockID || st.ClockPane != "" || len(st.Raises) != 0 {
+	if st.ClockID != clockID || st.ClockPayload != "" || len(st.Raises) != 0 {
 		t.Fatalf("after a restart want the new clock and no raises, got %+v", st)
 	}
 }

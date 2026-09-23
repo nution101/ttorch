@@ -12,9 +12,9 @@ import (
 // which it does every time it surfaces a batch.
 const (
 	// EventStallClock restarts a task's stall clock: the watcher observed progress (the
-	// pane changed, the worker reported, a commit landed) at ts. payload is the hash of
-	// the idle pane the clock now runs on, or "" while the pane is busy (the clock is
-	// stopped). actor=system, non-actionable.
+	// pane changed, the worker reported, HEAD moved) at ts. payload is the watcher's
+	// JSON record of what it observed then (the idle pane's hash, "" while busy, and the
+	// worktree's HEAD id). actor=system, non-actionable.
 	EventStallClock = "stall_clock"
 	// EventStalled is one step of the stall ladder: the task has shown no progress since
 	// its latest stall_clock. payload is JSON (level, raise, idle, window). actor=system,
@@ -26,11 +26,11 @@ const (
 type StallState struct {
 	// HasClock is false when the watcher has never recorded a stall_clock for the task.
 	HasClock bool
-	// ClockID, ClockAt and ClockPane describe the latest stall_clock: its events.id, its
-	// timestamp (when progress was last observed) and its payload.
-	ClockID   int64
-	ClockAt   time.Time
-	ClockPane string
+	// ClockID, ClockAt and ClockPayload describe the latest stall_clock: its events.id,
+	// its timestamp (when progress was last observed) and its payload, verbatim.
+	ClockID      int64
+	ClockAt      time.Time
+	ClockPayload string
 	// SignOfLifeID is the id of the task's latest spawned, status_changed or
 	// worker-authored event (0 when none). One newer than ClockID is progress the clock
 	// has not yet absorbed. Ids, not timestamps, order it against the clock, so a
@@ -49,7 +49,7 @@ func (s *Store) StallInfo(ctx context.Context, taskID string) (StallState, error
 		SELECT id, ts, payload FROM events
 		 WHERE entity_type = 'task' AND entity_id = ? AND type = ?
 		 ORDER BY id DESC LIMIT 1`,
-		taskID, EventStallClock).Scan(&st.ClockID, &ts, &st.ClockPane)
+		taskID, EventStallClock).Scan(&st.ClockID, &ts, &st.ClockPayload)
 	switch err {
 	case nil:
 		st.HasClock = true

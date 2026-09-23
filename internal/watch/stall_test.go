@@ -4,9 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -256,7 +254,7 @@ func TestStall_BusyThenIdleStartsClockAtIdle(t *testing.T) {
 
 // TestStall_CommitCountsAsProgress: a new commit in the worktree restarts the clock even
 // though the pane never changed. It runs against a real git repository through the
-// production commit-time reader.
+// production HEAD reader.
 func TestStall_CommitCountsAsProgress(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
@@ -419,71 +417,6 @@ func TestStallPolicyFromEnv(t *testing.T) {
 	}
 }
 
-// TestGitHeadCommitTime_RunsNoConfiguredProgram: the worktree belongs to the worker, so
-// its git config is worker-controlled. With log.showSignature on and gpg.program pointed
-// at a script, a signed HEAD commit must not make the commit-time read run that script,
-// and the time must still come back.
-func TestGitHeadCommitTime_RunsNoConfiguredProgram(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git not installed")
-	}
-	repo := t.TempDir()
-	marker := filepath.Join(t.TempDir(), "ran")
-	script := filepath.Join(t.TempDir(), "fake-gpg")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\ntouch '"+marker+"'\nexit 1\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	run := func(stdin string, args ...string) string {
-		t.Helper()
-		cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
-		cmd.Stdin = strings.NewReader(stdin)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %v: %v\n%s", args, err, out)
-		}
-		return strings.TrimSpace(string(out))
-	}
-	run("", "init", "-q")
-	run("", "config", "log.showSignature", "true")
-	run("", "config", "gpg.program", script)
-	tree := run("", "hash-object", "-t", "tree", "-w", "--stdin")
-	const when = 1767225600 // 2026-01-01T00:00:00Z
-	commit := fmt.Sprintf("tree %s\nauthor A U Thor <a@example.invalid> %d +0000\n"+
-		"committer C O Mitter <c@example.invalid> %d +0000\n"+
-		"gpgsig -----BEGIN PGP SIGNATURE-----\n \n AAAA\n -----END PGP SIGNATURE-----\n\nsigned\n",
-		tree, when, when)
-	sha := run(commit, "hash-object", "-t", "commit", "-w", "--stdin")
-	run("", "update-ref", "HEAD", sha)
-
-	got, ok := gitHeadCommitTime(repo)
-	if _, err := os.Stat(marker); err == nil {
-		t.Fatal("reading the commit time ran the repository's configured gpg.program")
-	}
-	if !ok || got.Unix() != when {
-		t.Fatalf("gitHeadCommitTime = %v, %v; want %d, true", got, ok, when)
-	}
-}
-
-func TestCommitterTime(t *testing.T) {
-	cases := []struct {
-		name string
-		obj  string
-		want int64
-		ok   bool
-	}{
-		{"plain", "tree abc\nauthor A <a@x> 100 +0000\ncommitter C D <c@x> 200 -0700\n\nmsg\n", 200, true},
-		{"committer line in the message is ignored", "tree abc\n\ncommitter X <x@x> 300 +0000\n", 0, false},
-		{"malformed timestamp", "tree abc\ncommitter C <c@x> soon +0000\n\nmsg\n", 0, false},
-		{"no committer", "tree abc\nauthor A <a@x> 100 +0000\n\nmsg\n", 0, false},
-	}
-	for _, c := range cases {
-		got, ok := committerTime(c.obj)
-		if ok != c.ok || (ok && got.Unix() != c.want) {
-			t.Errorf("%s: committerTime = %v, %v; want %d, %v", c.name, got.Unix(), ok, c.want, c.ok)
-		}
-	}
-}
-
 // TestStall_TinyEnvIntervalsCannotWakeEveryPoll: TTORCH_STALL_REPEAT=1ns must not turn
 // every one-second poll into a stalled row and a manager wake.
 func TestStall_TinyEnvIntervalsCannotWakeEveryPoll(t *testing.T) {
@@ -495,4 +428,67 @@ func TestStall_TinyEnvIntervalsCannotWakeEveryPoll(t *testing.T) {
 	if n := len(stallRaises(t, s, "tiny")); n != 5 {
 		t.Fatalf("5 minutes idle at the one-minute floor should give 5 updates, got %d", n)
 	}
+}
+
+// TestStall_BackdatedCommitStillCountsAsProgress: the ladder compares HEAD's identity, not
+// its date, so a commit whose dates are an hour before the clock started still counts.
+func TestStall_BackdatedCommitStillCountsAsProgress(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	w, s, clk, start := stallFixture(t, "backdated")
+	repo := t.TempDir()
+	gitIn(t, repo, "init", "-q")
+	gitIn(t, repo, "commit", "-q", "--allow-empty", "-m", "base")
+	if err := s.SetTaskFields(context.Background(), "backdated", db.TaskFields{Worktree: &repo}); err != nil {
+		t.Fatalf("SetTaskFields: %v", err)
+	}
+	sweepUntil(t, w, clk, start.Add(9*time.Minute), 30*time.Second)
+	stamp := fmt.Sprintf("@%d +0000", start.Add(-time.Hour).Unix())
+	cmd := exec.Command("git", "-C", repo, "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "old dates")
+	cmd.Env = append(cmd.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.invalid", "GIT_AUTHOR_DATE="+stamp,
+		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.invalid", "GIT_COMMITTER_DATE="+stamp)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v\n%s", err, out)
+	}
+	sweepUntil(t, w, clk, start.Add(15*time.Minute), 30*time.Second)
+	if got := stallRaises(t, s, "backdated"); len(got) != 0 {
+		t.Fatalf("a backdated commit at +9m must still hold off the +10m update, got %+v", got)
+	}
+}
+
+// TestStall_UnknownHeadNeitherResetsNorRaises: a HEAD that cannot be read is not progress,
+// and a HEAD that becomes readable after the clock recorded none is not progress either.
+func TestStall_UnknownHeadNeitherResetsNorRaises(t *testing.T) {
+	t.Run("unreadable at the due time", func(t *testing.T) {
+		w, s, clk, start := stallFixture(t, "unk")
+		readable := true
+		w.stall.headIdentity = func(string) (string, bool) {
+			if !readable {
+				return "", false
+			}
+			return idA, true
+		}
+		sweepUntil(t, w, clk, start.Add(5*time.Minute), 30*time.Second)
+		readable = false
+		sweepUntil(t, w, clk, start.Add(11*time.Minute), 30*time.Second)
+		got := stallRaises(t, s, "unk")
+		if len(got) != 1 || !got[0].at.Equal(start.Add(10*time.Minute)) {
+			t.Fatalf("want the normal +10m update, got %+v", got)
+		}
+	})
+	t.Run("readable only after the clock started", func(t *testing.T) {
+		w, s, clk, start := stallFixture(t, "late")
+		w.stall.headIdentity = func(string) (string, bool) {
+			if clk.t.Before(start.Add(5 * time.Minute)) {
+				return "", false
+			}
+			return idB, true
+		}
+		sweepUntil(t, w, clk, start.Add(11*time.Minute), 30*time.Second)
+		got := stallRaises(t, s, "late")
+		if len(got) != 1 || !got[0].at.Equal(start.Add(10*time.Minute)) {
+			t.Fatalf("want the normal +10m update, got %+v", got)
+		}
+	})
 }

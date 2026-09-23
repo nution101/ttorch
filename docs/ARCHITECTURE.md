@@ -974,9 +974,11 @@ manager.)
   `stalled` update after `TTORCH_STALL_AFTER` (default 10m), repeats it every
   `TTORCH_STALL_REPEAT` (default 15m), and after `TTORCH_STALL_RERAISES` re-raises (default
   3) marks each further update `needs-inspection`. A pane change, a report or stage, a status
-  change or re-dispatch, or a new commit in the worktree restarts the clock. The clock and
-  the ladder are events in the store, so they carry across watcher re-arms. The ladder only
-  reports: lease expiry and recovery are unchanged. `TTORCH_STALL_AFTER=0` turns it off.
+  change or re-dispatch, or HEAD moving in the worktree restarts the clock. HEAD is read
+  from the worktree's files, never by running git there, because the worker controls that
+  repository's config. The clock and the ladder are events in the store, so they carry
+  across watcher re-arms. The ladder only reports: lease expiry and recovery are unchanged.
+  `TTORCH_STALL_AFTER=0` turns it off.
 
 ## 7. Worktrees, footprints, and isolation
 

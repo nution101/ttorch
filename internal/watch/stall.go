@@ -11,7 +11,7 @@ package watch
 //
 // Progress is any of: the pane changed (a busy pane is always changing), the worker
 // reported or staged (which extends its lease), its status changed or it was
-// re-dispatched, or a new commit appeared in its worktree. Any of them restarts the clock
+// re-dispatched, or HEAD moved in its worktree. Any of them restarts the clock
 // and puts the worker back at the bottom of the ladder. What the ladder flags is a worker
 // sitting at an idle, unchanging prompt while its task is still active.
 //
@@ -24,7 +24,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -67,13 +66,13 @@ type stallPolicy struct {
 // stallTracker holds the ladder's policy and its one external seam.
 type stallTracker struct {
 	policy stallPolicy
-	// headCommitTime reports the committer time of HEAD in a worktree (ok=false when it
-	// cannot be read). Tests swap it out.
-	headCommitTime func(dir string) (time.Time, bool)
+	// headIdentity reports the commit id HEAD resolves to in a worktree (ok=false when
+	// it cannot be read). It reads files only; see headref.go. Tests swap it out.
+	headIdentity func(dir string) (string, bool)
 }
 
 func newStallTracker() stallTracker {
-	return stallTracker{policy: stallPolicyFromEnv(), headCommitTime: gitHeadCommitTime}
+	return stallTracker{policy: stallPolicyFromEnv(), headIdentity: headIdentity}
 }
 
 // stallPolicyFromEnv reads the ladder thresholds. A missing or invalid value falls back
@@ -104,44 +103,12 @@ func stallPolicyFromEnv() stallPolicy {
 	return p
 }
 
-// gitHeadCommitTime is the production headCommitTime. The worktree belongs to the worker,
-// so its git config is worker-controlled, and a porcelain read such as `git log` honours
-// settings that run programs (log.showSignature hands a signed commit to gpg.program). So
-// it reads the raw commit object with `cat-file`, which formats nothing and verifies
-// nothing, and parses the committer line itself. core.fsmonitor is forced off as well, so
-// no index refresh can launch a monitor hook.
-func gitHeadCommitTime(dir string) (time.Time, bool) {
-	if dir == "" {
-		return time.Time{}, false
-	}
-	out, err := exec.Command("git", "-C", dir, "-c", "core.fsmonitor=false", "cat-file", "commit", "HEAD").Output()
-	if err != nil {
-		return time.Time{}, false
-	}
-	return committerTime(string(out))
-}
-
-// committerTime parses the committer timestamp from a raw commit object: the header line
-// "committer <name> <email> <unix-seconds> <tz>", before the first blank line.
-func committerTime(obj string) (time.Time, bool) {
-	for _, line := range strings.Split(obj, "\n") {
-		if line == "" {
-			break // end of the header; the message follows
-		}
-		if !strings.HasPrefix(line, "committer ") {
-			continue
-		}
-		f := strings.Fields(line)
-		if len(f) < 3 {
-			return time.Time{}, false
-		}
-		sec, err := strconv.ParseInt(f[len(f)-2], 10, 64)
-		if err != nil {
-			return time.Time{}, false
-		}
-		return time.Unix(sec, 0), true
-	}
-	return time.Time{}, false
+// stallClock is the JSON payload of a stall_clock event: what the watcher saw when it
+// last observed progress. Pane is the idle pane's hash ("" while busy); Head is the
+// worktree's HEAD id ("" if it has never been readable).
+type stallClock struct {
+	Pane string `json:"pane"`
+	Head string `json:"head,omitempty"`
 }
 
 // stallPayload is the JSON payload of a stalled event. Raise counts from 1 within one
@@ -172,8 +139,10 @@ func (w *Watcher) trackStall(ctx context.Context, now time.Time, t db.Task, obs 
 	if !busy {
 		pane = hashPane(obs.pane)
 	}
-	if !st.HasClock || st.ClockPane != pane || progressSinceClock(t, st) {
-		return w.restartStallClock(ctx, now, t.ID, st, pane)
+	var clock stallClock
+	decoded := json.Unmarshal([]byte(st.ClockPayload), &clock) == nil
+	if !st.HasClock || !decoded || clock.Pane != pane || progressSinceClock(t, st) {
+		return w.restartStallClock(ctx, now, t, st, clock, pane)
 	}
 	if busy {
 		return nil // mid-turn: the clock stays stopped
@@ -187,9 +156,10 @@ func (w *Watcher) trackStall(ctx context.Context, now time.Time, t db.Task, obs 
 	if now.Before(due) {
 		return nil
 	}
-	// A commit is only checked once an update is due, so the git call runs rarely.
-	if at, ok := w.stall.headCommitTime(t.Worktree); ok && at.After(st.ClockAt) {
-		return w.restartStallClock(ctx, now, t.ID, st, pane)
+	// HEAD is only read once an update is due. A HEAD that cannot be read now, or was
+	// never recorded, is not progress: unknown neither restarts the clock nor raises.
+	if head, ok := w.stall.headIdentity(t.Worktree); ok && clock.Head != "" && head != clock.Head {
+		return w.restartStallClock(ctx, now, t, st, clock, pane)
 	}
 
 	level := stallLevelStalled
@@ -229,17 +199,27 @@ func progressSinceClock(t db.Task, st db.StallState) bool {
 }
 
 // restartStallClock records progress: a stall_clock at now carrying pane (the idle pane's
-// hash, or "" while busy). Within stallClockGap of the previous clock the write is
+// hash, or "" while busy) and the worktree's current HEAD id. When HEAD cannot be read the
+// previous clock's HEAD is carried forward, so a later readable HEAD is still compared
+// against the last one seen. Within stallClockGap of the previous clock the write is
 // deferred to a later sweep.
-func (w *Watcher) restartStallClock(ctx context.Context, now time.Time, taskID string, st db.StallState, pane string) error {
+func (w *Watcher) restartStallClock(ctx context.Context, now time.Time, t db.Task, st db.StallState, prev stallClock, pane string) error {
 	if st.HasClock {
 		if d := now.Sub(st.ClockAt); d >= 0 && d < stallClockGap {
 			return nil
 		}
 	}
-	_, err := w.Store.AppendEvent(ctx, db.Event{
-		TS: now, EntityType: db.EntityTypeTask, EntityID: taskID, Type: db.EventStallClock,
-		Actor: db.ActorSystem, Payload: pane,
+	next := stallClock{Pane: pane, Head: prev.Head}
+	if head, ok := w.stall.headIdentity(t.Worktree); ok {
+		next.Head = head
+	}
+	payload, err := json.Marshal(next)
+	if err != nil {
+		return err
+	}
+	_, err = w.Store.AppendEvent(ctx, db.Event{
+		TS: now, EntityType: db.EntityTypeTask, EntityID: t.ID, Type: db.EventStallClock,
+		Actor: db.ActorSystem, Payload: string(payload),
 	})
 	return err
 }
