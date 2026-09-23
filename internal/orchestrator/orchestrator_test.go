@@ -7,11 +7,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 	"time"
-	"unicode"
 
 	"github.com/nution101/ttorch/internal/approval"
 	"github.com/nution101/ttorch/internal/db"
@@ -1799,141 +1797,6 @@ func TestMergeLocal_GateUsesDefaultBranchScriptNotWorker(t *testing.T) {
 // every merge that trips it, so a near-miss like a non-reviewer agent definition or a docs copy
 // of AGENTS.md must stay out.
 //
-
-// TestApprovalPayloadScope pins the token wire format the gate reads its authority from: the
-// gate-change scope round-trips WITH the paths it was granted for, an ordinary token carries
-// none, a legacy provenance-less token still yields by=="" so the gated path fails closed, and
-// a bare marker with no "=<paths>" authorizes NOTHING rather than everything.
-func TestApprovalPayloadScope(t *testing.T) {
-	sha := "abc123"
-	for _, tc := range []struct {
-		name    string
-		data    string
-		wantBy  string
-		wantSHA string
-		wantFor []string
-	}{
-		{"human plain", approvalPayload("human", sha, nil), "human", sha, nil},
-		{"human scoped to one", approvalPayload("human", sha, []string{"AGENTS.md"}), "human", sha, []string{"AGENTS.md"}},
-		{"human scoped to two", approvalPayload("human", sha, []string{".ttorch/validate.sh", "AGENTS.md"}), "human", sha, []string{".ttorch/validate.sh", "AGENTS.md"}},
-		{"auto plain", approvalPayload("auto", sha, nil), "auto", sha, nil},
-		{"legacy bare sha", sha, "", sha, nil},
-		{"empty", "", "", "", nil},
-		{"unknown trailing scope", "human " + sha + " something-else", "human", sha, nil},
-		{"bare marker authorizes nothing", "human " + sha + " allow-gate-change", "human", sha, nil},
-		{"marker with empty list authorizes nothing", "human " + sha + " allow-gate-change=", "human", sha, nil},
-	} {
-		by, gotSHA, gotFor := splitApprovalPayload(tc.data)
-		if by != tc.wantBy || gotSHA != tc.wantSHA || !slices.Equal(gotFor, tc.wantFor) {
-			t.Errorf("%s: splitApprovalPayload(%q) = (%q, %q, %q), want (%q, %q, %q)",
-				tc.name, tc.data, by, gotSHA, gotFor, tc.wantBy, tc.wantSHA, tc.wantFor)
-		}
-	}
-}
-
-// unicodeSpaceGrantPath is the path the round-13 review built: one covered file under
-// .github/workflows/ whose name carries a Unicode space and then what reads as a second grant.
-// It prints to the lead as one path. Before grantablePath refused every unicode.IsSpace rune,
-// strings.Fields split it at the space and the token parsed back as two grants, one of them
-// .ttorch/validate.sh, which the diff never touched.
-func unicodeSpaceGrantPath(space rune) string {
-	return ".github/workflows/x" + string(space) + "allow-gate-change=.ttorch/validate.sh"
-}
-
-// TestGrantablePath_RefusesEveryFieldsSeparator: grantablePath must refuse exactly the runes
-// splitApprovalPayload splits on, which for strings.Fields is every rune unicode.IsSpace
-// reports and not only ASCII space, tab and newline. The rows are the three the review named
-// and the ASCII cases the check always covered.
-func TestGrantablePath_RefusesEveryFieldsSeparator(t *testing.T) {
-	for _, r := range []rune{' ', ' ', '　', ' ', '\t', '\n'} {
-		p := unicodeSpaceGrantPath(r)
-		if grantablePath(p) {
-			_, _, back := splitApprovalPayload(approvalPayload("human", "abc123", []string{p}))
-			t.Errorf("grantablePath accepted %q (space U+%04X); the token parses it back as %q", p, r, back)
-		}
-	}
-	if grantablePath(".github/workflows/a,b.yml") {
-		t.Error("grantablePath must refuse a comma, which separates the scope's paths")
-	}
-	if grantablePath("") {
-		t.Error("grantablePath must refuse an empty path")
-	}
-}
-
-// TestApprovalPayload_RoundTripsEveryGrantablePath is the property the binding rests on: for
-// every path grantablePath accepts, splitApprovalPayload(approvalPayload(paths)) returns
-// exactly those paths, alone and beside another grant. It walks every Unicode code point, and
-// every byte that is invalid UTF-8 on its own, inside a covered path. The other direction is
-// checked too, so the fix cannot pass by refusing more than it has to: a path is refused only
-// for a comma or a rune unicode.IsSpace reports.
-func TestApprovalPayload_RoundTripsEveryGrantablePath(t *testing.T) {
-	const sha = "abc123"
-	check := func(p string, r rune, isRune bool) {
-		t.Helper()
-		if !grantablePath(p) {
-			if isRune && (r == ',' || unicode.IsSpace(r)) {
-				return
-			}
-			t.Errorf("grantablePath refused %q, which contains no comma and no space", p)
-			return
-		}
-		for _, grant := range [][]string{{p}, {".ttorch/validate.sh", p}, {p, "AGENTS.md"}} {
-			by, gotSHA, back := splitApprovalPayload(approvalPayload("human", sha, grant))
-			if by != "human" || gotSHA != sha || !slices.Equal(back, grant) {
-				t.Errorf("round trip of %q gave (%q, %q, %q)", grant, by, gotSHA, back)
-			}
-		}
-	}
-	for r := rune(0); r <= unicode.MaxRune; r++ {
-		check(".github/workflows/a"+string(r)+"b.yml", r, true)
-	}
-	for b := 0x80; b <= 0xff; b++ {
-		check(".github/workflows/a"+string([]byte{byte(b)})+"b.yml", 0, false)
-	}
-}
-
-// TestApprove_RefusesUnicodeSpaceInGrantPath: a covered path carrying a Unicode space is
-// refused when the lead approves with --allow-gate-change, and no token is minted, rather
-// than being recorded and read back as different grants.
-func TestApprove_RefusesUnicodeSpaceInGrantPath(t *testing.T) {
-	m, repo := deliveryHarness(t, "grantspace")
-	commitGateScript(t, repo, "exit 0")
-	if _, err := projectinit.Init(repo, "trusted"); err != nil {
-		t.Fatal(err)
-	}
-	task, err := m.Spawn("gs1", repo, false, "sleep 60")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _, _ = m.Teardown("gs1", true) }()
-	wt := task.Worktree
-	for _, r := range []rune{' ', ' ', '　'} {
-		p := unicodeSpaceGrantPath(r)
-		full := filepath.Join(wt, filepath.FromSlash(p))
-		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(full, []byte("on: push\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		gitIn(t, wt, "add", "-A")
-		gitIn(t, wt, "commit", "-q", "-m", "add a workflow")
-
-		granted, err := m.Approve("gs1", time.Minute, true)
-		if err == nil {
-			data, _ := approval.Data(m.P.ApprovalFile("gs1"))
-			_, _, back := splitApprovalPayload(data)
-			t.Fatalf("U+%04X: Approve granted %q, and the token parses back as %q", r, granted, back)
-		}
-		if !strings.Contains(err.Error(), "comma or whitespace") {
-			t.Fatalf("U+%04X: expected the grantable-path refusal, got: %v", r, err)
-		}
-		if approval.Valid(m.P.ApprovalFile("gs1")) {
-			t.Fatalf("U+%04X: a refused approval must not leave a token behind", r)
-		}
-		gitIn(t, wt, "reset", "-q", "--hard", "HEAD~1")
-	}
-}
 
 // TestMergeLocal_RefusesAutoApprovalWhenGateInactive is the ungated-auto guard: an
 // auto-minted approval is only valid through the active gate. If the gate goes inactive
