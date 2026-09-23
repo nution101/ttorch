@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -409,6 +411,71 @@ func TestStallPolicyFromEnv(t *testing.T) {
 		t.Setenv("TTORCH_STALL_RERAISES", c.reraises)
 		if got := stallPolicyFromEnv(); got != c.want {
 			t.Errorf("env (%q,%q,%q) = %+v, want %+v", c.after, c.repeat, c.reraises, got, c.want)
+		}
+	}
+}
+
+// TestGitHeadCommitTime_RunsNoConfiguredProgram: the worktree belongs to the worker, so
+// its git config is worker-controlled. With log.showSignature on and gpg.program pointed
+// at a script, a signed HEAD commit must not make the commit-time read run that script,
+// and the time must still come back.
+func TestGitHeadCommitTime_RunsNoConfiguredProgram(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	repo := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "ran")
+	script := filepath.Join(t.TempDir(), "fake-gpg")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\ntouch '"+marker+"'\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run := func(stdin string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+		cmd.Stdin = strings.NewReader(stdin)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	run("", "init", "-q")
+	run("", "config", "log.showSignature", "true")
+	run("", "config", "gpg.program", script)
+	tree := run("", "hash-object", "-t", "tree", "-w", "--stdin")
+	const when = 1767225600 // 2026-01-01T00:00:00Z
+	commit := fmt.Sprintf("tree %s\nauthor A U Thor <a@example.invalid> %d +0000\n"+
+		"committer C O Mitter <c@example.invalid> %d +0000\n"+
+		"gpgsig -----BEGIN PGP SIGNATURE-----\n \n AAAA\n -----END PGP SIGNATURE-----\n\nsigned\n",
+		tree, when, when)
+	sha := run(commit, "hash-object", "-t", "commit", "-w", "--stdin")
+	run("", "update-ref", "HEAD", sha)
+
+	got, ok := gitHeadCommitTime(repo)
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("reading the commit time ran the repository's configured gpg.program")
+	}
+	if !ok || got.Unix() != when {
+		t.Fatalf("gitHeadCommitTime = %v, %v; want %d, true", got, ok, when)
+	}
+}
+
+func TestCommitterTime(t *testing.T) {
+	cases := []struct {
+		name string
+		obj  string
+		want int64
+		ok   bool
+	}{
+		{"plain", "tree abc\nauthor A <a@x> 100 +0000\ncommitter C D <c@x> 200 -0700\n\nmsg\n", 200, true},
+		{"committer line in the message is ignored", "tree abc\n\ncommitter X <x@x> 300 +0000\n", 0, false},
+		{"malformed timestamp", "tree abc\ncommitter C <c@x> soon +0000\n\nmsg\n", 0, false},
+		{"no committer", "tree abc\nauthor A <a@x> 100 +0000\n\nmsg\n", 0, false},
+	}
+	for _, c := range cases {
+		got, ok := committerTime(c.obj)
+		if ok != c.ok || (ok && got.Unix() != c.want) {
+			t.Errorf("%s: committerTime = %v, %v; want %d, %v", c.name, got.Unix(), ok, c.want, c.ok)
 		}
 	}
 }

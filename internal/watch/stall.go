@@ -98,20 +98,44 @@ func stallPolicyFromEnv() stallPolicy {
 	return p
 }
 
-// gitHeadCommitTime is the production headCommitTime: `git log -1 --format=%ct` in dir.
+// gitHeadCommitTime is the production headCommitTime. The worktree belongs to the worker,
+// so its git config is worker-controlled, and a porcelain read such as `git log` honours
+// settings that run programs (log.showSignature hands a signed commit to gpg.program). So
+// it reads the raw commit object with `cat-file`, which formats nothing and verifies
+// nothing, and parses the committer line itself. core.fsmonitor is forced off as well, so
+// no index refresh can launch a monitor hook.
 func gitHeadCommitTime(dir string) (time.Time, bool) {
 	if dir == "" {
 		return time.Time{}, false
 	}
-	out, err := exec.Command("git", "-C", dir, "log", "-1", "--format=%ct").Output()
+	out, err := exec.Command("git", "-C", dir, "-c", "core.fsmonitor=false", "cat-file", "commit", "HEAD").Output()
 	if err != nil {
 		return time.Time{}, false
 	}
-	sec, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
-	if err != nil {
-		return time.Time{}, false
+	return committerTime(string(out))
+}
+
+// committerTime parses the committer timestamp from a raw commit object: the header line
+// "committer <name> <email> <unix-seconds> <tz>", before the first blank line.
+func committerTime(obj string) (time.Time, bool) {
+	for _, line := range strings.Split(obj, "\n") {
+		if line == "" {
+			break // end of the header; the message follows
+		}
+		if !strings.HasPrefix(line, "committer ") {
+			continue
+		}
+		f := strings.Fields(line)
+		if len(f) < 3 {
+			return time.Time{}, false
+		}
+		sec, err := strconv.ParseInt(f[len(f)-2], 10, 64)
+		if err != nil {
+			return time.Time{}, false
+		}
+		return time.Unix(sec, 0), true
 	}
-	return time.Unix(sec, 0), true
+	return time.Time{}, false
 }
 
 // stallPayload is the JSON payload of a stalled event. Raise counts from 1 within one
