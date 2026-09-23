@@ -17,9 +17,11 @@ import (
 // non-actionable, so they never wake the watcher; they exist so a second click on a decision
 // the board already acted on finds the first one and does nothing, even across a restart.
 const (
-	// eventBoardAnswer records that the lead answered one worker question from the board;
-	// payload "question=<event id>".
+	// eventBoardAnswer is the claim a board takes on one worker question before sending the
+	// lead's answer (Store.ClaimMarker); payload "question=<event id>".
 	eventBoardAnswer = "board_answer"
+	// eventBoardAnswerFailed gives a claimed question back after the send failed; same payload.
+	eventBoardAnswerFailed = "board_answer_failed"
 	// eventBoardGatePrep records that the lead re-ran gate prep for one gate_blocked event;
 	// payload "event=<event id>".
 	eventBoardGatePrep = "board_gate_prep"
@@ -208,14 +210,24 @@ func latestQuestion(t db.Task, evs []db.Event) (db.Event, bool) {
 	return db.Event{}, false
 }
 
-// markerAt returns when the board recorded a marker of type typ for key, if it did.
-func markerAt(evs []db.Event, typ, key string) (time.Time, bool) {
+// claimHeld reports whether the newest claimType or releaseType event for key is a claim, and
+// when that claim was taken. It reads the same rule Store.ClaimMarker enforces; releaseType ""
+// means the marker is never released.
+func claimHeld(evs []db.Event, claimType, releaseType, key string) (time.Time, bool) {
+	var at time.Time
+	held := false
 	for _, e := range evs {
-		if e.Type == typ && e.Payload == key {
-			return e.TS, true
+		if e.Payload != key {
+			continue
+		}
+		switch {
+		case e.Type == claimType:
+			at, held = e.TS, true
+		case releaseType != "" && e.Type == releaseType:
+			held = false
 		}
 	}
-	return time.Time{}, false
+	return at, held
 }
 
 func questionKey(id int64) string { return "question=" + strconv.FormatInt(id, 10) }
@@ -228,7 +240,7 @@ func questionFor(t db.Task, evs []db.Event) Question {
 		return q
 	}
 	q.EventID, q.At, q.Text, q.Actor = e.ID, e.TS, e.Payload, e.Actor
-	if at, ok := markerAt(evs, eventBoardAnswer, questionKey(e.ID)); ok {
+	if at, ok := claimHeld(evs, eventBoardAnswer, eventBoardAnswerFailed, questionKey(e.ID)); ok {
 		q.AnsweredAt = &at
 	}
 	return q
@@ -266,7 +278,7 @@ func gateFor(t db.Task, evs []db.Event) (GateDecision, bool) {
 		g.Findings = splitFindings(list)
 		g.Reason = strings.TrimSuffix(reviewBlockedPrefix, ": ")
 	}
-	if at, ok := markerAt(evs, eventBoardGatePrep, gateKey(e.ID)); ok {
+	if at, ok := claimHeld(evs, eventBoardGatePrep, "", gateKey(e.ID)); ok {
 		g.Reprep = &at
 	}
 	return g, true

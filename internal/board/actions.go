@@ -47,7 +47,8 @@ func (s *Server) lockTask(id string) func() {
 	return mu.Unlock
 }
 
-// actedOn reports whether this process already acted on the decision a marker names.
+// actedOn reports whether this process already acted on the decision a marker names. Gate
+// prep uses it; an answer's once-only guarantee is its DB claim.
 func (s *Server) actedOn(typ, key string) bool {
 	s.actedMu.Lock()
 	defer s.actedMu.Unlock()
@@ -93,8 +94,14 @@ func normalizeAnswer(s string) string {
 
 // Answer sends the lead's answer to a worker waiting on input. questionID names the
 // status_changed event the page showed; if the task has since moved on (it is no longer
-// waiting, or it asked something newer), nothing is sent. Each question is answered at most
-// once: the send is recorded as a board_answer marker, and a second submit finds it.
+// waiting, or it asked something newer), nothing is sent.
+//
+// Each question is answered at most once, by any number of boards on one DB. Before sending,
+// Answer takes an atomic claim on the question in the DB (Store.ClaimMarker writes the
+// board_answer event under the write lock), so of two boards or two clicks exactly one sends.
+// If the send fails, a board_answer_failed event gives the question back for a retry. If the
+// board dies between the claim and the send, the question stays claimed and shows as answered
+// though nothing reached the worker; `ttorch send` still reaches it.
 //
 // The message goes through Fleet.Send, which is exactly what `ttorch send` calls.
 func (s *Server) Answer(ctx context.Context, taskID string, questionID int64, text string) (Result, error) {
@@ -128,18 +135,27 @@ func (s *Server) Answer(ctx context.Context, taskID string, questionID int64, te
 	if !ok || q.ID != questionID {
 		return Result{Message: fmt.Sprintf("%s has moved on from the question you answered; nothing sent. Reload to see what it is asking now", t.ID)}, nil
 	}
-	if at, ok := markerAt(evs, eventBoardAnswer, questionKey(q.ID)); ok {
+	key := questionKey(q.ID)
+	if at, ok := claimHeld(evs, eventBoardAnswer, eventBoardAnswerFailed, key); ok {
 		return Result{Message: fmt.Sprintf("that question was already answered at %s; nothing sent", at.Local().Format("15:04:05"))}, nil
 	}
-	if s.actedOn(eventBoardAnswer, questionKey(q.ID)) {
-		return Result{Message: "that question was already answered from this board; nothing sent"}, nil
+	won, err := s.cfg.Store.ClaimMarker(ctx, t.ID, eventBoardAnswer, eventBoardAnswerFailed, key, db.ActorLead)
+	if err != nil {
+		return Result{}, fmt.Errorf("could not claim the question on %s, so nothing was sent: %w", t.ID, err)
+	}
+	if !won {
+		return Result{Message: "that question was just answered from another board; nothing sent"}, nil
 	}
 
 	if err := s.cfg.Fleet.Send(t.ID, msg); err != nil {
+		// Give the question back. The write ignores the request's context: the claim must not
+		// stay held because the browser tab closed.
+		if _, rerr := s.cfg.Store.AppendEvent(context.Background(), db.Event{
+			EntityType: db.EntityTypeTask, EntityID: t.ID, Type: eventBoardAnswerFailed, Actor: db.ActorLead, Payload: key,
+		}); rerr != nil {
+			return Result{}, fmt.Errorf("send to %s failed (%v), and releasing the question failed too (%v); answer it with ttorch send", t.ID, err, rerr)
+		}
 		return Result{}, fmt.Errorf("send to %s failed: %w", t.ID, err)
-	}
-	if err := s.recordActed(t.ID, eventBoardAnswer, questionKey(q.ID)); err != nil {
-		return Result{Done: true, Message: fmt.Sprintf("sent to %s, but recording the answer failed (%v); do not send it again", t.ID, err)}, nil
 	}
 	return Result{Done: true, Message: fmt.Sprintf("sent to %s", t.ID)}, nil
 }
@@ -222,33 +238,19 @@ func (s *Server) Dispatch(ctx context.Context, taskID string) (Result, error) {
 // recorded as a board_gate_prep marker.
 //
 // It holds the gate claim the daemon's gate pass takes (ClaimForLand as "gater:<id>") while
-// the prep runs, so it never stages review inputs over a daemon gate tick on the same task.
-// It records no verdict: the reviewers still run and `ttorch trust record` still decides.
+// the prep runs, so it never stages review inputs over a daemon gate tick on the same task,
+// or over another board's prep. The checks are repeated once the claim is held, because the
+// holder it waited on may have written the marker just before releasing. It records no
+// verdict: the reviewers still run and `ttorch trust record` still decides.
 func (s *Server) GatePrep(ctx context.Context, taskID string, eventID int64) (Result, error) {
 	if taskID == "" {
 		return Result{}, inputError{"missing task id"}
 	}
 	defer s.lockTask(taskID)()
 
-	t, evs, ok, err := s.timeline(ctx, taskID)
-	if err != nil {
-		return Result{}, err
-	}
-	if !ok {
-		return Result{}, inputError{fmt.Sprintf("unknown task %q", taskID)}
-	}
-	if t.Status != db.StatusDone {
-		return Result{Message: fmt.Sprintf("%s is %s now, not done; nothing to prep", t.ID, t.Status)}, nil
-	}
-	g, ok := latestGateBlocked(evs)
-	if !ok || g.ID != eventID {
-		return Result{Message: fmt.Sprintf("that escalation on %s has been superseded; nothing run. Reload to see its current state", t.ID)}, nil
-	}
-	if at, ok := markerAt(evs, eventBoardGatePrep, gateKey(g.ID)); ok {
-		return Result{Message: fmt.Sprintf("gate prep for that escalation already ran at %s; nothing run", at.Local().Format("15:04:05"))}, nil
-	}
-	if s.actedOn(eventBoardGatePrep, gateKey(g.ID)) {
-		return Result{Message: "gate prep for that escalation already ran from this board; nothing run"}, nil
+	t, g, stop, err := s.gatePrepCheck(ctx, taskID, eventID)
+	if err != nil || stop != nil {
+		return derefResult(stop), err
 	}
 
 	owner := "gater:" + t.ID
@@ -260,6 +262,9 @@ func (s *Server) GatePrep(ctx context.Context, taskID string, eventID int64) (Re
 		return Result{Message: fmt.Sprintf("the gate is working on %s right now; nothing run. Try again shortly", t.ID)}, nil
 	}
 	defer func() { _, _ = s.cfg.Store.ReleaseLandClaim(context.Background(), t.ID, owner) }()
+	if t, g, stop, err = s.gatePrepCheck(ctx, taskID, eventID); err != nil || stop != nil {
+		return derefResult(stop), err
+	}
 
 	dir, err := s.cfg.Fleet.TrustPrep(t.ID)
 	if err != nil {
@@ -277,4 +282,37 @@ func (s *Server) GatePrep(ctx context.Context, taskID string, eventID int64) (Re
 		return Result{Done: true, Message: msg + fmt.Sprintf(" (recording this failed: %v)", err)}, nil
 	}
 	return Result{Done: true, Message: msg}, nil
+}
+
+// gatePrepCheck re-reads a task and decides whether the escalation eventID still wants a
+// gate prep. A non-nil Result says why nothing should run.
+func (s *Server) gatePrepCheck(ctx context.Context, taskID string, eventID int64) (db.Task, db.Event, *Result, error) {
+	t, evs, ok, err := s.timeline(ctx, taskID)
+	if err != nil {
+		return t, db.Event{}, nil, err
+	}
+	if !ok {
+		return t, db.Event{}, nil, inputError{fmt.Sprintf("unknown task %q", taskID)}
+	}
+	if t.Status != db.StatusDone {
+		return t, db.Event{}, &Result{Message: fmt.Sprintf("%s is %s now, not done; nothing to prep", t.ID, t.Status)}, nil
+	}
+	g, ok := latestGateBlocked(evs)
+	if !ok || g.ID != eventID {
+		return t, g, &Result{Message: fmt.Sprintf("that escalation on %s has been superseded; nothing run. Reload to see its current state", t.ID)}, nil
+	}
+	if at, ok := claimHeld(evs, eventBoardGatePrep, "", gateKey(g.ID)); ok {
+		return t, g, &Result{Message: fmt.Sprintf("gate prep for that escalation already ran at %s; nothing run", at.Local().Format("15:04:05"))}, nil
+	}
+	if s.actedOn(eventBoardGatePrep, gateKey(g.ID)) {
+		return t, g, &Result{Message: "gate prep for that escalation already ran from this board; nothing run"}, nil
+	}
+	return t, g, nil, nil
+}
+
+func derefResult(r *Result) Result {
+	if r == nil {
+		return Result{}
+	}
+	return *r
 }
