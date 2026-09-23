@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nution101/ttorch/internal/backend"
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/paths"
 )
@@ -67,7 +68,7 @@ func newWatcher(t *testing.T) (*Watcher, *db.Store, *bytes.Buffer, *fakeClock) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	w := New(s, paths.Default(), "test-session")
+	w := New(s, paths.Default(), backend.Tmux{}, "test-session")
 	buf := &bytes.Buffer{}
 	w.Out = buf
 	clk := &fakeClock{t: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}

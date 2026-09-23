@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/nution101/ttorch/internal/backend"
 	"github.com/nution101/ttorch/internal/buildinfo"
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/doctor"
@@ -38,7 +39,6 @@ import (
 	"github.com/nution101/ttorch/internal/selfupdate"
 	"github.com/nution101/ttorch/internal/singleton"
 	"github.com/nution101/ttorch/internal/skills"
-	"github.com/nution101/ttorch/internal/tmux"
 	"github.com/nution101/ttorch/internal/validate"
 	"github.com/nution101/ttorch/internal/watch"
 	"github.com/nution101/ttorch/internal/worktree"
@@ -1421,6 +1421,10 @@ func cmdWatch(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	be, err := backend.FromEnv()
+	if err != nil {
+		return err
+	}
 	p := paths.Default()
 	store, err := db.Open(p.StateDB())
 	if err != nil {
@@ -1433,7 +1437,7 @@ func cmdWatch(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	w := watch.New(store, p, tmux.SessionName())
+	w := watch.New(store, p, be, be.SessionName())
 	if *reset {
 		return w.Reset(ctx)
 	}

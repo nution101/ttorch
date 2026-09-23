@@ -25,10 +25,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nution101/ttorch/internal/backend"
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/livestate"
 	"github.com/nution101/ttorch/internal/paths"
-	"github.com/nution101/ttorch/internal/tmux"
 )
 
 // managerWindow is the tmux window the manager session runs in. The watcher self-
@@ -58,13 +58,14 @@ type paneObservation struct {
 	pane     string
 }
 
-// Watcher runs the blocking watch loop over a Store. The seam fields reach real
-// tmux / gh in production and are swapped out in tests; New wires the production
-// defaults.
+// Watcher runs the blocking watch loop over a Store. The seam fields reach the real
+// session backend / gh in production and are swapped out in tests; New wires the
+// production defaults.
 type Watcher struct {
 	Store   *db.Store
 	P       paths.Paths
 	Session string
+	Backend backend.Backend // hosts Session; the production seams read and steer windows through it
 	Out     io.Writer
 
 	// Tunables (zero ⇒ the default above).
@@ -108,13 +109,14 @@ type Result struct {
 	Batch     []db.Event // the coalesced, entity-deduped batch (valid when Fired)
 }
 
-// New builds a Watcher with production seams. store and p are required; session is
-// the tmux session the manager runs in.
-func New(store *db.Store, p paths.Paths, session string) *Watcher {
+// New builds a Watcher with production seams. store, p and be are required; be is the
+// session backend and session the session in it that the manager runs in.
+func New(store *db.Store, p paths.Paths, be backend.Backend, session string) *Watcher {
 	w := &Watcher{
 		Store:    store,
 		P:        p,
 		Session:  session,
+		Backend:  be,
 		Out:      os.Stdout,
 		Since:    -1,
 		Coalesce: defaultCoalesce,
@@ -130,17 +132,17 @@ func New(store *db.Store, p paths.Paths, session string) *Watcher {
 		// Only a genuinely-absent window (exists==false, no read error) is gone.
 		// tmux being unavailable or a list-windows hiccup is "can't observe" — skip,
 		// never flag gone (§4.4 must not re-flag a worker on a transient failure).
-		if !tmux.Available() {
+		if !w.Backend.Available() {
 			return paneObservation{present: true}
 		}
-		exists, err := tmux.WindowExistsErr(w.Session, window)
+		exists, err := w.Backend.WindowExistsErr(w.Session, window)
 		if err != nil {
 			return paneObservation{present: true}
 		}
 		if !exists {
 			return paneObservation{}
 		}
-		out, err := tmux.CapturePane(w.Session, window, captureLines)
+		out, err := w.Backend.CapturePane(w.Session, window, captureLines)
 		if err != nil {
 			return paneObservation{present: true}
 		}
@@ -150,10 +152,10 @@ func New(store *db.Store, p paths.Paths, session string) *Watcher {
 		// A plain "continue" turn: after an API stall the worker sits at an empty
 		// prompt, and submitting that resumes it. SendLine types + Enters with a settle
 		// delay; it is not a slash-command, so the short delay applies.
-		return tmux.SendLine(w.Session, window, "continue")
+		return w.Backend.SendLine(w.Session, window, "continue")
 	}
 	w.managerPresent = func() bool {
-		return tmux.Available() && tmux.WindowExists(w.Session, managerWindow)
+		return w.Backend.Available() && w.Backend.WindowExists(w.Session, managerWindow)
 	}
 	w.ghAvailable = func() bool { _, err := exec.LookPath("gh"); return err == nil }
 	w.prState = func(prURL string) (string, error) {
@@ -182,10 +184,10 @@ func New(store *db.Store, p paths.Paths, session string) *Watcher {
 		// and the holder gets the benefit of the doubt (never reaped on session grounds);
 		// failing closed here is deliberate, so a transient ps glitch can never make a LIVE
 		// watcher's token look stale and get it reaped (double-arm).
-		if !tmux.Available() {
+		if !w.Backend.Available() {
 			return ""
 		}
-		pid := tmux.PanePID(w.Session, managerWindow)
+		pid := w.Backend.PanePID(w.Session, managerWindow)
 		if pid <= 0 {
 			return ""
 		}
