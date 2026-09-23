@@ -196,7 +196,8 @@ func isSanctionedStallNudge(f *ast.File, filename string, call *ast.CallExpr) bo
 }
 
 // detectManagerInjection parses Go source and returns the 1-based line numbers of every
-// forbidden send into the manager session: a tmux.SendLine/SendKey whose window argument
+// forbidden send into the manager session: a SendLine/SendKey call on any receiver (package
+// tmux, or a session backend.Backend however it is reached) whose window argument
 // resolves to the manager window — directly OR through a local variable — carrying anything
 // other than (a) a harness.Manager… launch command or (b) the single allow-listed API-stall
 // recovery nudge (a SendLine of the fixed "continue" literal from the sanctioned file+function;
@@ -211,12 +212,12 @@ func detectManagerInjection(fset *token.FileSet, f *ast.File) []int {
 		if !ok {
 			return true
 		}
+		// The receiver is deliberately not checked. Sends used to be tmux.SendLine only; the
+		// orchestrator now makes them as Backend method calls (m.backend().SendLine,
+		// w.Backend.SendLine), and a check pinned to the package name would pass a poke
+		// spelled either way.
 		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok {
-			return true
-		}
-		pkg, ok := sel.X.(*ast.Ident)
-		if !ok || pkg.Name != "tmux" || (sel.Sel.Name != "SendLine" && sel.Sel.Name != "SendKey") {
+		if !ok || (sel.Sel.Name != "SendLine" && sel.Sel.Name != "SendKey") {
 			return true
 		}
 		if len(call.Args) < 2 {
@@ -273,7 +274,7 @@ func TestNoInjectionIntoManagerSession(t *testing.T) {
 		}
 	}
 	if len(offenders) > 0 {
-		t.Fatalf("forbidden injection into the manager session — tmux.SendLine/SendKey to the manager "+
+		t.Fatalf("forbidden injection into the manager session — SendLine/SendKey to the manager "+
 			"window carrying something other than a harness.Manager… launch command:\n%s", strings.Join(offenders, "\n"))
 	}
 }
@@ -328,6 +329,15 @@ func TestManagerInjectionDetector(t *testing.T) {
 		{name: "wrong literal in sanctioned site", file: sanctionedStallNudgeFile, fn: sanctionedStallNudgeFunc, body: `return tmux.SendLine(session, managerWindow, "rm -rf /")`, injection: true},
 		// TIGHT: a SendKey is never the sanctioned nudge, even of the literal in the sanctioned site.
 		{name: "sendkey in sanctioned site is not exempt", file: sanctionedStallNudgeFile, fn: sanctionedStallNudgeFunc, body: `tmux.SendKey(session, managerWindow, "continue")`, injection: true},
+		// The orchestrator reaches tmux through a session Backend, so a send is a method call on
+		// whatever holds the backend, not on package tmux. Every spelling of the receiver counts.
+		{name: "backend accessor poke", body: `_ = m.backend().SendLine(m.Session, "manager", "ttorch wake: drain and advance")`, injection: true},
+		{name: "backend field poke", body: `m.Backend.SendLine(m.Session, managerWindow, pokeDirective)`, injection: true},
+		{name: "backend local var poke", body: "b := m.Backend\nw := \"manager\"\n_ = b.SendLine(m.Session, w, directive)", injection: true},
+		{name: "backend sendkey poke", body: `b.SendKey(s, "manager", "Enter")`, injection: true},
+		{name: "backend manager launch", body: `_ = m.backend().SendLine(m.Session, "manager", harness.ManagerCommand(h, sid, m.charterFile()))`, injection: false},
+		{name: "backend worker send", body: `return m.backend().SendLine(m.Session, t.Window, text)`, injection: false},
+		{name: "backend sanctioned nudge", file: sanctionedStallNudgeFile, fn: sanctionedStallNudgeFunc, body: `return be.SendLine(session, managerWindow, "continue")`, injection: false},
 	}
 	for _, c := range cases {
 		fn := c.fn
