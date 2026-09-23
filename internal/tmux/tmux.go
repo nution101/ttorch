@@ -536,16 +536,24 @@ func PaneCurrentCommand(session, window string) string {
 
 // PanePID returns the PID of the process running in a window's pane, or 0.
 func PanePID(session, window string) int {
+	pid, _ := PanePIDErr(session, window)
+	return pid
+}
+
+// PanePIDErr returns the PID of the process running in a window's pane (the shell tmux
+// started there), with the reason when it cannot be read. A fingerprint check needs the
+// distinction PanePID drops: a failed read is "cannot tell", not "no process".
+func PanePIDErr(session, window string) (int, error) {
 	out, err := run("list-panes", "-t", target(session, window), "-F", "#{pane_pid}")
 	if err != nil {
-		return 0
+		return 0, err
 	}
 	line := strings.TrimSpace(strings.SplitN(out, "\n", 2)[0])
 	pid, err := strconv.Atoi(line)
-	if err != nil {
-		return 0
+	if err != nil || pid <= 0 {
+		return 0, fmt.Errorf("tmux list-panes %s: unexpected pane pid %q", target(session, window), line)
 	}
-	return pid
+	return pid, nil
 }
 
 // KillWindow removes a window (best effort).
