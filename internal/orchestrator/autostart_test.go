@@ -78,12 +78,13 @@ func TestAutoStartScheduler(t *testing.T) {
 
 // TestSchedulerDaemonArgsEnableGate pins the auto-started daemon's argument list: it must run the
 // full mechanical loop — dispatch, GATE, land, supervise — under the singleton lock, so trusted
-// done-work is gated hands-off and never waits for a manager turn. --gate is the load-bearing
-// assertion (its omission is what left gating manager-paced); the exact list also guards against a
-// pass silently dropping out of auto-start. It reads the package var directly, so it needs no
-// forked process.
+// done-work is gated hands-off and never waits for a manager turn, plus the WATCH loop, so the
+// manager is woken for updates without re-arming `ttorch watch`. --gate and --watch are the
+// load-bearing assertions (omitting either leaves that work manager-paced); the exact list also
+// guards against a pass silently dropping out of auto-start. It reads the package var directly,
+// so it needs no forked process.
 func TestSchedulerDaemonArgsEnableGate(t *testing.T) {
-	want := []string{"scheduler", "--singleton", "--dispatch", "--gate", "--land", "--supervise"}
+	want := []string{"scheduler", "--singleton", "--dispatch", "--gate", "--land", "--supervise", "--watch"}
 	if len(schedulerDaemonArgs) != len(want) {
 		t.Fatalf("schedulerDaemonArgs = %v, want %v", schedulerDaemonArgs, want)
 	}

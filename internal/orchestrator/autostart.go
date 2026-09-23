@@ -21,10 +21,12 @@ var schedulerDaemonLauncher = launchSchedulerDaemon
 // mechanical loop under the singleton lock — dispatch, GATE (trusted done-work), land, and
 // supervise — so a normal `ttorch` session drives the board with no manager turn, INCLUDING
 // gating trusted work hands-off (the mechanical prep→dispatch→aggregate→record choreography the
-// LLM manager used to run each turn). It is a package var so a test can assert the daemon
-// launches with gating enabled without forking a real process. --gate sits between --dispatch
-// and --land to mirror the loop's dispatch→gate→land sequence; flag order is otherwise immaterial.
-var schedulerDaemonArgs = []string{"scheduler", "--singleton", "--dispatch", "--gate", "--land", "--supervise"}
+// LLM manager used to run each turn). --watch adds the always-on watch loop, so the manager is
+// woken for updates whether or not it re-armed `ttorch watch`. It is a package var so a test can
+// assert the daemon launches with gating and watching enabled without forking a real process.
+// --gate sits between --dispatch and --land to mirror the loop's dispatch→gate→land sequence;
+// flag order is otherwise immaterial.
+var schedulerDaemonArgs = []string{"scheduler", "--singleton", "--dispatch", "--gate", "--land", "--supervise", "--watch"}
 
 // autoStartScheduler starts the deterministic scheduler daemon in the background so a normal
 // `ttorch` session drives the board autonomously — dispatching ready backlog, gating done-work
@@ -69,7 +71,7 @@ func schedulerAutoStartEnabled() bool {
 }
 
 // launchSchedulerDaemon forks `ttorch scheduler` with schedulerDaemonArgs
-// (`--singleton --dispatch --gate --land --supervise`) as a
+// (`--singleton --dispatch --gate --land --supervise --watch`) as a
 // detached background process (its own session via Setsid, so it outlives the launching `ttorch`,
 // which exits as soon as the lead's terminal attaches), with stdout/stderr redirected to the
 // scheduler log. It launches the INSTALLED, user-owned binary (paths.Binary), not the running

@@ -53,3 +53,35 @@ func TestCmdInbox_PrintsUnreadAndClearsAwaitingLead(t *testing.T) {
 		t.Fatal("ttorch inbox must clear awaiting-lead, as arming ttorch watch does")
 	}
 }
+
+// TestCmdSchedulerOnceWatch: `ttorch scheduler --once --watch` runs one watch-loop sweep. With
+// an unread update and no manager window it records only and reports that no wake was typed.
+// The tmux session is pinned to a name that cannot exist, so the sweep can never reach a real
+// manager window on the machine running the tests, and the daemon's skill install is skipped so
+// the test never runs npx.
+func TestCmdSchedulerOnceWatch(t *testing.T) {
+	t.Setenv("TTORCH_TMUX_SESSION", "ttorch-test-no-such-session-watch")
+	t.Setenv("TTORCH_SKIP_SKILL_INSTALL", "1")
+	withSeedDB(t, func(ctx context.Context, s *db.Store) {
+		proj, err := s.UpsertProject(ctx, "/repo/watch", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.CreateTask(ctx, db.Task{ID: "watch-t1", ProjectID: proj.ID, Status: db.StatusActive, Kind: db.KindShip}, db.ActorManager); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.ReportStatus(ctx, "watch-t1", db.StatusBlocked, "worker:watch-t1", "need a decision"); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	out, err := captureStdout(t, func() error {
+		return cmdScheduler([]string{"--once", "--dispatch=false", "--watch"})
+	})
+	if err != nil {
+		t.Fatalf("scheduler --once --watch: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "scheduler: watch: 1 unread update(s), woke manager: false") {
+		t.Fatalf("expected one sweep reporting the unread update and no wake, got:\n%s", out)
+	}
+}

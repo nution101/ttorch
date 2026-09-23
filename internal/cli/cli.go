@@ -1623,6 +1623,9 @@ func cmdWatchdog(args []string) error {
 //     carry verdict+approval, per-repo fast-forward, teardown) — so green, gated work merges
 //     without the manager doing it by hand. It NEVER lands ungated work: a passing verdict is
 //     required to attempt a task and the land path's own commit-pinned gate is the authority.
+//   - WATCH (opt-in via --watch): not a tick pass. The watch loop (watch.Daemon) runs beside the
+//     ticks on its own short cadence, records worker liveness and PR merges into the manager's
+//     inbox, and wakes an idle manager with one fixed line telling it to run `ttorch inbox`.
 //
 // The four passes are independent (--dispatch defaults on; --gate, --land, and --supervise
 // opt-in), so it can run as a dispatch-only daemon, a land-only daemon, a supervisor, or any
@@ -1647,6 +1650,7 @@ func cmdScheduler(args []string) error {
 	land := fs.Bool("land", false, "also LAND done tasks that already carry a passing verdict, via the same pipeline as 'ttorch land' (off by default)")
 	supervise := fs.Bool("supervise", false, "also SUPERVISE the fleet: reclaim workers that verifiably died (window gone / lease expired) and re-dispatch within a bounded retry ceiling, poison-pilling the rest (off by default)")
 	gate := fs.Bool("gate", false, "also GATE done tasks in a trusted repo with no passing verdict: run the trust prep, dispatch the adversarial reviewers, and on an all-pass record the verdict via the unchanged trust-record path — fails closed (a blocking finding/prep refusal/stalled reviewer is surfaced for the manager, never recorded) (off by default)")
+	watchLoop := fs.Bool("watch", false, "also run the always-on watch loop beside the ticks: record worker liveness and PR merges into the manager's inbox, and type one short wake line into an idle manager window when unread updates wait (never into a busy pane; stands down while a 'ttorch watch' is armed) (off by default)")
 	single := fs.Bool("singleton", false, "hold a per-~/.ttorch singleton lock and exit quietly if another scheduler daemon already holds it (used by the manager's auto-start; a plain 'ttorch scheduler' stays safe to run as multiple instances)")
 	// Backpressure governor (H4): machine-load throttle on TOP of the worktree-pool cap. Each
 	// defaults to -1 (sentinel for "not set on the command line"); when set it OVERRIDES the
@@ -1658,8 +1662,8 @@ func cmdScheduler(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if !*dispatch && !*land && !*supervise && !*gate {
-		return errors.New("scheduler: nothing to do — enable at least one of --dispatch (default), --land, --gate, or --supervise")
+	if !*dispatch && !*land && !*supervise && !*gate && !*watchLoop {
+		return errors.New("scheduler: nothing to do — enable at least one of --dispatch (default), --land, --gate, --supervise, or --watch")
 	}
 	m, err := mgr()
 	if err != nil {
@@ -1692,6 +1696,11 @@ func cmdScheduler(args []string) error {
 	sch.Land = *land
 	sch.Supervise = *supervise
 	sch.Gate = *gate
+	var watchDaemon *watch.Daemon
+	if *watchLoop {
+		watchDaemon = watch.NewDaemon(m.Store, m.P, m.Backend, m.Session, os.Stdout)
+		sch.Watch = watchDaemon
+	}
 	// Override the governor's env-or-default knobs only when the flag was EXPLICITLY passed, so a
 	// flag beats the env, the env beats the built-in default, and an unset flag leaves New()'s
 	// resolution intact (fs.Visit only visits flags that were set). The auto-start daemon passes
@@ -1753,9 +1762,16 @@ func cmdScheduler(args []string) error {
 			}
 			fmt.Printf("scheduler: landed %d task(s)\n", n)
 		}
+		if *watchLoop && ctx.Err() == nil {
+			res, err := watchDaemon.Tick(ctx)
+			if err != nil && ctx.Err() == nil {
+				return err
+			}
+			fmt.Printf("scheduler: watch: %d unread update(s), woke manager: %t\n", res.Unread, res.Woke)
+		}
 		return nil
 	}
-	fmt.Fprintf(os.Stdout, "scheduler: %s every %s (Ctrl-C to stop)\n", schedulerModes(*dispatch, *land, *supervise, *gate), *interval)
+	fmt.Fprintf(os.Stdout, "scheduler: %s every %s (Ctrl-C to stop)\n", schedulerModes(*dispatch, *land, *supervise, *gate, *watchLoop), *interval)
 	if err := sch.Run(ctx); err != nil {
 		// A clean cancel/SIGTERM is a normal exit, not an error.
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -1818,7 +1834,7 @@ func cmdSchedulerStatus(args []string) error {
 // schedulerModes describes the enabled passes for the daemon's startup banner, in tick order
 // (supervise → dispatch → gate → land). The caller has already refused an all-off config, so
 // the result is never empty.
-func schedulerModes(dispatch, land, supervise, gate bool) string {
+func schedulerModes(dispatch, land, supervise, gate, watching bool) string {
 	var parts []string
 	if supervise {
 		parts = append(parts, "recovering dead workers")
@@ -1831,6 +1847,9 @@ func schedulerModes(dispatch, land, supervise, gate bool) string {
 	}
 	if land {
 		parts = append(parts, "landing gated work")
+	}
+	if watching {
+		parts = append(parts, "watching for the manager")
 	}
 	return strings.Join(parts, ", ")
 }
@@ -2458,6 +2477,13 @@ Supervision:
     [--land]                just-claimed worker, within free worktree capacity — via the
     [--gate]                manager's own spawn path. Skips (never fails) overlapping or
     [--supervise]           capacity-blocked and footprint-less tasks (left for the manager).
+    [--watch]               WATCH (--watch, off): run the always-on watch loop beside the
+                            ticks. It records worker liveness and PR merges into the manager's
+                            inbox and types one fixed wake line into the manager window when
+                            unread updates wait and the pane is idle at an empty prompt; never
+                            into a busy pane, never while awaiting the lead, at most one wake
+                            outstanding (re-woken every few minutes if unanswered). Stands
+                            down while a 'ttorch watch' is armed.
                             GATE (--gate, off): also gate done tasks in a TRUSTED repo with no
                             passing verdict — run the trust prep, dispatch the adversarial
                             reviewers, and on an all-pass record the verdict via the unchanged

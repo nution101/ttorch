@@ -260,6 +260,13 @@ type Scheduler struct {
 	// --gate; RunGateOnce is an unconditional primitive that this toggle only gates the loop on.
 	Gate bool
 
+	// Watch is the always-on watch loop (watch.Daemon): it records worker liveness and PR merges
+	// into the manager's inbox and wakes an idle manager when unread updates wait. Run starts it
+	// beside the tick loop, so a long gate or land pass never delays a wake, and waits for it to
+	// stop on cancellation. nil (a bare struct, and New()) leaves it off; `scheduler --watch`
+	// sets it.
+	Watch interface{ Run(context.Context) error }
+
 	// IdleNudgeGrace and MaxIdleNudges configure the alive-but-idle recovery pass that runs
 	// inside Supervise (§roadmap H2). An alive worker (live window, valid lease, status
 	// 'active') whose pane has sat idle at the prompt longer than IdleNudgeGrace is nudged
@@ -587,6 +594,14 @@ func (sc *Scheduler) Run(ctx context.Context) error {
 	interval := sc.Interval
 	if interval <= 0 {
 		interval = DefaultInterval
+	}
+	if sc.Watch != nil {
+		stopped := make(chan struct{})
+		go func() {
+			defer close(stopped)
+			_ = sc.Watch.Run(ctx) // returns only on cancellation; sweep errors are logged inside
+		}()
+		defer func() { <-stopped }()
 	}
 	sc.runTick(ctx) // immediate first tick
 	t := time.NewTicker(interval)
