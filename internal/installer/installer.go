@@ -59,7 +59,7 @@ func apply(content fs.FS, p paths.Paths, version string) (*Result, error) {
 	}
 
 	prev := manifest.Load(p.ManifestFile())
-	next, rep, err := manifest.Reconcile(desired, prev, version)
+	next, rep, err := manifest.ReconcileSettings(desired, prev, version, agentSettings{dir: p.ClaudeAgents()})
 	if err != nil {
 		return nil, err
 	}
