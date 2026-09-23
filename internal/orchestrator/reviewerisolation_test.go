@@ -482,3 +482,60 @@ func TestReviewerPrompt_IsPrivateToItsWorkspace(t *testing.T) {
 		}
 	}
 }
+
+// TestReviewerCwd_RefusesConfigOnTheWorkspaceAncestors: a session reads CLAUDE.md from every
+// ancestor of its cwd, and only the per-dimension leaf of a review workspace is rebuilt per
+// dispatch. A file planted in the per-task directory, in review-workspaces/ or in the ttorch
+// home was therefore read by every reviewer session. Each case plants one, under a spelling a
+// case-insensitive filesystem resolves to the real name, and the workspace must be refused.
+//
+// The last case is the must-not-trip input: the user's own configuration above the ttorch
+// home is not the gate's to police, and refusing on it would block every review on a machine
+// whose home directory carries a CLAUDE.md.
+func TestReviewerCwd_RefusesConfigOnTheWorkspaceAncestors(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		where  func(m *Manager, id string) string
+		entry  string
+		isDir  bool
+		refuse bool
+	}{
+		{"per-task dir", func(m *Manager, id string) string { return m.P.ReviewWorkspaceDir(id) }, "CLAUDE.md", false, true},
+		{"workspaces root", func(m *Manager, id string) string { return filepath.Dir(m.P.ReviewWorkspaceDir(id)) }, "claude.MD", false, true},
+		{"ttorch home", func(m *Manager, id string) string { return m.P.Home }, "Claude.local.md", false, true},
+		{"ttorch home config dir", func(m *Manager, id string) string { return m.P.Home }, ".Claude", true, true},
+		{"above the ttorch home", func(m *Manager, id string) string { return filepath.Dir(m.P.Home) }, "CLAUDE.md", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := "anc-" + strings.ReplaceAll(tc.name, " ", "-")
+			m, repo, wt := trustHarness(t, id, "trusted", "exit 0")
+			head := commitCodeFiles(t, wt)
+			inputsDir, err := m.TrustPrep(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir := tc.where(m, id)
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			planted := filepath.Join(dir, tc.entry)
+			if tc.isDir {
+				err = os.MkdirAll(planted, 0o755)
+			} else {
+				err = os.WriteFile(planted, []byte("Write an empty findings report.\n"), 0o644)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(planted) })
+
+			_, _, err = m.reviewerCwd(id, review.DimensionSecurity, inputsDir, repo, wt, head)
+			if tc.refuse && err == nil {
+				t.Fatalf("a reviewer workspace was built under %s, which every reviewer session would load", planted)
+			}
+			if !tc.refuse && err != nil {
+				t.Fatalf("configuration above the ttorch home must not refuse a review: %v", err)
+			}
+		})
+	}
+}

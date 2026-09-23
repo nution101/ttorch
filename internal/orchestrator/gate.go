@@ -1778,7 +1778,60 @@ func (m *Manager) reviewerCwd(taskID, dim, inputsDir, repo, wt, head string) (cw
 	if ws == "" {
 		return "", "", fmt.Errorf("refusing to build a review workspace for task %q dimension %q: not a single safe path component", taskID, dim)
 	}
+	if err := checkReviewWorkspaceAncestors(m.P.Home, ws); err != nil {
+		return "", "", err
+	}
 	return prepareReviewWorkspace(ws, inputsDir, repo, wt, head)
+}
+
+// reviewerConfigNames are the entries a Claude session can pick up from a directory on its
+// configuration path: the memory files it reads from every ancestor of its cwd, and the
+// project configuration directory.
+var reviewerConfigNames = []string{"CLAUDE.md", "CLAUDE.local.md", ".claude"}
+
+// checkReviewWorkspaceAncestors refuses a review workspace whose ancestors, up to and
+// including the ttorch home, hold session configuration.
+//
+// A Claude session walks up from its cwd reading CLAUDE.md in every ancestor. The workspace
+// leaf is rebuilt on every dispatch, but its parents persist: the per-task directory,
+// review-workspaces/ and the ttorch home itself. A CLAUDE.md planted in any of them was read
+// by every reviewer session the gate launched, which gave back part of what moving the cwd
+// out of the worktree bought. Rebuilding them is not an option for the home, which holds the
+// store, so they are checked instead, and a hit fails the dispatch as a standing error that
+// reaches the attempt ceiling and surfaces as gate_blocked naming the file.
+//
+// Names are compared case-insensitively, because on a case-insensitive filesystem a file
+// written as claude.md is read as CLAUDE.md. The walk stops at the home: above it is the
+// user's own configuration, which every session on the machine reads, and it is not the
+// gate's to police.
+//
+// This runs at dispatch. A file planted after the check and before the session starts is
+// still read; that race is the same-uid process channel, and it is not closed here.
+func checkReviewWorkspaceAncestors(home, ws string) error {
+	home = filepath.Clean(home)
+	dir := filepath.Dir(filepath.Clean(ws))
+	for {
+		rel, err := filepath.Rel(home, dir)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("review workspace %s is not under the ttorch home %s", ws, home)
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("could not inspect %s on the reviewer's configuration path: %w", dir, err)
+		}
+		for _, e := range entries {
+			for _, name := range reviewerConfigNames {
+				if strings.EqualFold(e.Name(), name) {
+					return fmt.Errorf("refusing to launch a reviewer under %s: it holds %s, which every reviewer session there would load",
+						dir, review.SafeQuote(e.Name()))
+				}
+			}
+		}
+		if rel == "." {
+			return nil
+		}
+		dir = filepath.Dir(dir)
+	}
 }
 
 // prepareReviewWorkspace materializes the scratch cwd an isolated reviewer runs in and returns
