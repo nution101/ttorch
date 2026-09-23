@@ -15,11 +15,11 @@ import (
 	"time"
 
 	"github.com/nution101/ttorch/internal/approval"
+	"github.com/nution101/ttorch/internal/backend"
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/harness"
 	"github.com/nution101/ttorch/internal/projectinit"
 	"github.com/nution101/ttorch/internal/review"
-	"github.com/nution101/ttorch/internal/tmux"
 	"github.com/nution101/ttorch/internal/validate"
 	"github.com/nution101/ttorch/internal/worktree"
 )
@@ -1713,7 +1713,7 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 	// DispatchedAt tied both of the gate's bounds to the same fact: the attempt ceiling counts
 	// launches, so an episode that never launches anything was invisible to both and ran
 	// forever. That is reachable with no attacker. reviewerWindowAlive uses the bool
-	// tmux.WindowExists, which folds a timed-out probe to "present" so a wedged server cannot
+	// Backend.WindowExists, which folds a timed-out probe to "present" so a wedged server cannot
 	// make the gate double-launch into an occupied worktree, so a server wedged from the
 	// episode's first tick makes every dimension read as already-running.
 	//
@@ -2071,7 +2071,7 @@ func reviewerWindow(taskID, dim string) string {
 // dimension with no usable window name has no window.
 func (m *Manager) reviewerWindowAlive(taskID, dim string) bool {
 	window := reviewerWindow(taskID, dim)
-	return window != "" && tmux.WindowExists(m.Session, window)
+	return window != "" && m.backend().WindowExists(m.Session, window)
 }
 
 // reviewReportPinned reports whether dimension dim's report in dir is the report the verdict
@@ -2097,11 +2097,11 @@ func (m *Manager) teardownReviewers(taskID string, dims []string) {
 			_ = os.RemoveAll(ws)
 		}
 		window := reviewerWindow(taskID, dim)
-		if window == "" || !tmux.WindowExists(m.Session, window) {
+		if window == "" || !m.backend().WindowExists(m.Session, window) {
 			continue
 		}
 		m.killPaneProcesses(window)
-		_ = tmux.KillWindow(m.Session, window)
+		_ = m.backend().KillWindow(m.Session, window)
 	}
 }
 
@@ -2230,8 +2230,8 @@ func (m *Manager) spawnReviewer(taskID, dim, inputsDir, head, repo, wt string) e
 		return err
 	}
 	window := reviewerWindow(taskID, dim)
-	exists, err := tmux.WindowExistsErr(m.Session, window)
-	if errors.Is(err, tmux.ErrTimeout) {
+	exists, err := m.backend().WindowExistsErr(m.Session, window)
+	if errors.Is(err, backend.ErrTimeout) {
 		// A wedged tmux server: the window could not be inspected, so nothing was launched and
 		// nothing can be concluded about whether a launch would have worked. Marked unstarted
 		// so the retry budget survives the hang (see errReviewerNotStarted).
@@ -2240,7 +2240,7 @@ func (m *Manager) spawnReviewer(taskID, dim, inputsDir, head, repo, wt string) e
 	if exists {
 		return nil // already running — idempotent
 	}
-	if err := tmux.EnsureSession(m.Session); err != nil {
+	if err := m.backend().EnsureSession(m.Session); err != nil {
 		return err
 	}
 	cwd, bare, err := m.reviewerCwd(taskID, dim, inputsDir, repo, wt, head)
@@ -2270,9 +2270,9 @@ func (m *Manager) spawnReviewer(taskID, dim, inputsDir, head, repo, wt string) e
 		return err
 	}
 	cmd := harness.BriefCommand(h, briefPath, sid, reviewerEffort, reviewerModel)
-	if err := tmux.SendLine(m.Session, window, cmd); err != nil {
+	if err := m.backend().SendLine(m.Session, window, cmd); err != nil {
 		m.killPaneProcesses(window)
-		_ = tmux.KillWindow(m.Session, window)
+		_ = m.backend().KillWindow(m.Session, window)
 		return err
 	}
 	m.audit(fmt.Sprintf("gate-dispatch-reviewer task=%s dim=%s commit=%s actor=daemon", taskID, dim, short(head)))

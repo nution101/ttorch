@@ -7,7 +7,6 @@ import (
 
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/state"
-	"github.com/nution101/ttorch/internal/tmux"
 )
 
 // Conflict reports that a proposed footprint overlaps a live worker's footprint.
@@ -104,7 +103,7 @@ type LiveSnapshot struct {
 	// the candidate set for liveness.
 	Tasks []db.Task
 	// liveWins is the set of window names present in tmux at snapshot time. Membership is the
-	// in-memory equivalent of Manager.Live(t) / tmux.WindowExists, with no per-call subprocess.
+	// in-memory equivalent of Manager.Live(t) / Backend.WindowExists, with no per-call subprocess.
 	liveWins map[string]struct{}
 }
 
@@ -153,7 +152,7 @@ func (m *Manager) Snapshot() (*LiveSnapshot, error) {
 	if len(tasks) == 0 {
 		return &LiveSnapshot{liveWins: map[string]struct{}{}}, nil
 	}
-	wins, err := tmux.ListWindows(m.Session)
+	wins, err := m.backend().ListWindows(m.Session)
 	if err != nil {
 		return nil, err
 	}

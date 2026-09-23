@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/nution101/ttorch/internal/backend"
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/harness"
 	"github.com/nution101/ttorch/internal/livestate"
@@ -22,18 +23,29 @@ import (
 	"github.com/nution101/ttorch/internal/profile"
 	"github.com/nution101/ttorch/internal/projectinit"
 	"github.com/nution101/ttorch/internal/termtab"
-	"github.com/nution101/ttorch/internal/tmux"
 	"github.com/nution101/ttorch/internal/worktree"
 )
 
-// Manager performs runtime operations against a tmux session and the state store.
+// Manager performs runtime operations against a session and the state store.
 type Manager struct {
 	P       paths.Paths
 	Session string
 	Store   *db.Store
 	Pool    worktree.Pool
+	// Backend hosts the session every window lives in. New selects it from
+	// TTORCH_BACKEND; a Manager built without New leaves it nil, which means tmux.
+	Backend backend.Backend
 
 	clocks episodeClocks // the gate's own sightings of each episode; see episodeStart
+}
+
+// backend returns the session host. A nil Backend is tmux, the default, so a Manager
+// built as a struct literal behaves as it did before the backend existed.
+func (m *Manager) backend() backend.Backend {
+	if m.Backend == nil {
+		return backend.Tmux{}
+	}
+	return m.Backend
 }
 
 // New builds a Manager from the standard paths. It opens the SQLite state store
@@ -41,23 +53,31 @@ type Manager struct {
 // it now returns an error. A short-lived CLI command opens one Manager and closes it
 // (Close) at the end of the process; the long-blocking watcher holds its store for
 // its lifetime.
+//
+// The session backend is chosen here, from TTORCH_BACKEND, before the store is opened,
+// so an unknown value is refused without touching any state.
 func New(p paths.Paths) (*Manager, error) {
+	be, err := backend.FromEnv()
+	if err != nil {
+		return nil, err
+	}
 	store, err := db.Open(p.StateDB())
 	if err != nil {
 		return nil, err
 	}
 	m := &Manager{
 		P:       p,
-		Session: tmux.SessionName(),
+		Session: be.SessionName(),
 		Store:   store,
 		Pool:    worktree.Pool{Root: p.Worktrees(), Max: worktree.MaxFromEnv()},
+		Backend: be,
 	}
 	// Migrate any pre-SQLite JSON state into the DB (one-shot, idempotent — §2.5).
 	// A task's tmux window decides its imported status (active vs torn_down). This is
 	// best-effort: the legacy source is preserved either way (state.migrated/), so a
 	// transient import hiccup must not brick startup.
 	if _, err := db.ImportLegacy(context.Background(), store, p.StateDir(), func(window string) bool {
-		return tmux.WindowExists(m.Session, window)
+		return m.backend().WindowExists(m.Session, window)
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "ttorch: legacy state import skipped: %v\n", err)
 	}
@@ -122,7 +142,7 @@ func (m *Manager) inUseWorktrees(repo string) ([]string, error) {
 // killPaneProcesses reaps a window's pane process group so a returned worktree is
 // not held by lingering children.
 func (m *Manager) killPaneProcesses(window string) {
-	pid := tmux.PanePID(m.Session, window)
+	pid := m.backend().PanePID(m.Session, window)
 	if pid <= 0 {
 		return
 	}
@@ -132,7 +152,7 @@ func (m *Manager) killPaneProcesses(window string) {
 }
 
 func (m *Manager) requireTmux() error {
-	if !tmux.Available() {
+	if !m.backend().Available() {
 		return errors.New("tmux is required (run 'ttorch doctor' to install it)")
 	}
 	return nil
@@ -149,19 +169,15 @@ func windowLabel(kind, id string) string {
 }
 
 // newWindow creates a ttorch window and gives it a friendly display title (the
-// terminal tab name) while keeping its tmux name as the stable target. Labeling is
+// terminal tab name) while keeping its window name as the stable target. Labeling is
 // best-effort, so only the window creation can fail the caller.
 func (m *Manager) newWindow(window, cwd, label string) error {
-	if err := tmux.NewWindow(m.Session, window, cwd); err != nil {
-		return err
-	}
-	_ = tmux.LabelWindow(m.Session, window, label)
-	return nil
+	return m.backend().NewWindow(m.Session, window, cwd, label)
 }
 
 // Live reports whether a task's tmux window is still present.
 func (m *Manager) Live(t db.Task) bool {
-	return tmux.WindowExists(m.Session, t.Window)
+	return m.backend().WindowExists(m.Session, t.Window)
 }
 
 // Status returns the live (non-terminal) tracked tasks. It propagates the board-read
@@ -193,10 +209,10 @@ func DeriveState(live bool, pane string) string {
 // TaskState reports a worker's live state for `ttorch status` (see DeriveState).
 // A live pane that can't be captured falls back to "idle".
 func (m *Manager) TaskState(t db.Task) string {
-	if !tmux.WindowExists(m.Session, t.Window) {
+	if !m.backend().WindowExists(m.Session, t.Window) {
 		return DeriveState(false, "")
 	}
-	out, _ := tmux.CapturePane(m.Session, t.Window, 6)
+	out, _ := m.backend().CapturePane(m.Session, t.Window, 6)
 	return DeriveState(true, out)
 }
 
@@ -206,7 +222,7 @@ func (m *Manager) Peek(taskID string, lines int) (string, error) {
 	if err != nil || !ok {
 		return "", fmt.Errorf("unknown task %q", taskID)
 	}
-	return tmux.CapturePane(m.Session, t.Window, lines)
+	return m.backend().CapturePane(m.Session, t.Window, lines)
 }
 
 // Send types a line into a worker's pane. It refuses loudly when the worker has no
@@ -217,10 +233,10 @@ func (m *Manager) Send(taskID, text string) error {
 	if err != nil || !ok {
 		return fmt.Errorf("unknown task %q", taskID)
 	}
-	if !tmux.WindowExists(m.Session, t.Window) {
+	if !m.backend().WindowExists(m.Session, t.Window) {
 		return fmt.Errorf("task %q has no live window to receive %q; it was torn down or never started", taskID, text)
 	}
-	return tmux.SendLine(m.Session, t.Window, text)
+	return m.backend().SendLine(m.Session, t.Window, text)
 }
 
 // closeTermTab closes a worker's native terminal view tab on teardown. It is a
@@ -281,7 +297,7 @@ func (m *Manager) Teardown(taskID string, force bool) ([]string, error) {
 	// the view's exec'd tmux (see termtab.viewCommand) then exits and the terminal
 	// closes the now-empty tab.
 	m.killPaneProcesses(t.Window)
-	_ = tmux.KillWindow(m.Session, t.Window)
+	_ = m.backend().KillWindow(m.Session, t.Window)
 	closeTermTab(t.Window)
 	if t.Project != "" && t.Worktree != "" {
 		if err := m.Pool.Release(t.Project, t.Worktree); err != nil {
@@ -465,7 +481,7 @@ func (m *Manager) StartManager() error {
 	if err := m.requireTmux(); err != nil {
 		return err
 	}
-	if err := tmux.EnsureSession(m.Session); err != nil {
+	if err := m.backend().EnsureSession(m.Session); err != nil {
 		return err
 	}
 	// Auto-start the deterministic scheduler daemon (config-gated, default-on, singleton) so a
@@ -475,7 +491,7 @@ func (m *Manager) StartManager() error {
 	// restore, fresh) so a missing daemon is (re)started; the singleton makes a redundant launch a
 	// no-op. Best-effort and non-blocking: it never fails or delays the attach below.
 	m.autoStartScheduler()
-	if tmux.WindowExists(m.Session, "manager") {
+	if m.backend().WindowExists(m.Session, "manager") {
 		fmt.Fprintln(os.Stderr, "ttorch: attaching to your running manager — 'ttorch stop' to end it (then 'ttorch' in another folder to restart there).")
 		return m.attachManager()
 	}
@@ -506,7 +522,7 @@ func (m *Manager) StartManager() error {
 	if err := m.newWindow("manager", dir, "manager"); err != nil {
 		return err
 	}
-	_ = tmux.SendLine(m.Session, "manager", harness.ManagerCommand(harness.Resolve(), sid, m.charterFile()))
+	_ = m.backend().SendLine(m.Session, "manager", harness.ManagerCommand(harness.Resolve(), sid, m.charterFile()))
 	fmt.Fprintf(os.Stderr, "ttorch: manager started in %s — tell it the repo to work on; 'ttorch stop' to end.\n", dir)
 	return m.attachManager()
 }
@@ -528,7 +544,7 @@ func (m *Manager) attachManager() error {
 		fmt.Fprintln(os.Stderr, "ttorch: opened the manager in a new iTerm2 window (now in front) — workers open as tabs there; this terminal is free.")
 		return nil
 	}
-	return tmux.Attach(m.Session, "manager")
+	return m.backend().Attach(m.Session, "manager")
 }
 
 // restore rebuilds any missing windows from saved state, resuming each session to
@@ -536,19 +552,19 @@ func (m *Manager) attachManager() error {
 // is noted but never aborts the rest. It returns human-readable notes.
 func (m *Manager) restore() []string {
 	var notes []string
-	if err := tmux.EnsureSession(m.Session); err != nil {
+	if err := m.backend().EnsureSession(m.Session); err != nil {
 		return []string{"could not ensure tmux session: " + err.Error()}
 	}
 	h := harness.Resolve()
 
 	// Manager window first, so there is always a manager to talk to.
-	if !tmux.WindowExists(m.Session, "manager") {
+	if !m.backend().WindowExists(m.Session, "manager") {
 		mgr, ok, _ := m.Store.GetManager(context.Background())
 		if ok {
 			if err := m.newWindow("manager", mgr.Dir, "manager"); err != nil {
 				notes = append(notes, "skipped manager ("+err.Error()+")")
 			} else {
-				_ = tmux.SendLine(m.Session, "manager", harness.ManagerResumeOrFresh(h, mgr.SessionID, m.charterFile()))
+				_ = m.backend().SendLine(m.Session, "manager", harness.ManagerResumeOrFresh(h, mgr.SessionID, m.charterFile()))
 				notes = append(notes, "restored manager")
 			}
 		} else {
@@ -562,7 +578,7 @@ func (m *Manager) restore() []string {
 			if err := m.newWindow("manager", dir, "manager"); err != nil {
 				notes = append(notes, "skipped manager ("+err.Error()+")")
 			} else {
-				_ = tmux.SendLine(m.Session, "manager", harness.ManagerCommand(h, sid, m.charterFile()))
+				_ = m.backend().SendLine(m.Session, "manager", harness.ManagerCommand(h, sid, m.charterFile()))
 				notes = append(notes, "started a fresh manager (no saved manager record)")
 			}
 		}
@@ -581,7 +597,7 @@ func (m *Manager) restore() []string {
 		if t.Kind == "cc" {
 			continue // ad-hoc, lead-driven sessions are not auto-restored
 		}
-		if tmux.WindowExists(m.Session, t.Window) {
+		if m.backend().WindowExists(m.Session, t.Window) {
 			continue
 		}
 		if _, err := os.Stat(t.Worktree); err != nil {
@@ -592,7 +608,7 @@ func (m *Manager) restore() []string {
 			notes = append(notes, fmt.Sprintf("skipped %s (%s)", t.ID, err.Error()))
 			continue
 		}
-		_ = tmux.SendLine(m.Session, t.Window, harness.WorkerResumeOrFresh(h, t.SessionID, m.P.BriefPath(t.ID), t.Effort, t.Model))
+		_ = m.backend().SendLine(m.Session, t.Window, harness.WorkerResumeOrFresh(h, t.SessionID, m.P.BriefPath(t.ID), t.Effort, t.Model))
 		_ = termtab.Open(m.Session, t.Window)
 		// Refresh the supervisor's sign-of-life anchor for the worker just rebuilt in place. A
 		// resume re-drives the window but, on its own, appends no event — so a window_gone
@@ -635,7 +651,7 @@ func (m *Manager) Resume() ([]string, error) {
 	if err := m.requireTmux(); err != nil {
 		return nil, err
 	}
-	if err := tmux.EnsureSession(m.Session); err != nil {
+	if err := m.backend().EnsureSession(m.Session); err != nil {
 		return nil, err
 	}
 	return m.restore(), nil
@@ -646,8 +662,8 @@ func (m *Manager) Resume() ([]string, error) {
 // deletes worktrees or branches.
 func (m *Manager) Reset() ([]string, error) {
 	var notes []string
-	if tmux.Available() && tmux.HasSession(m.Session) {
-		if err := tmux.KillSession(m.Session); err != nil {
+	if m.backend().Available() && m.backend().HasSession(m.Session) {
+		if err := m.backend().KillSession(m.Session); err != nil {
 			notes = append(notes, "tmux: "+err.Error())
 		} else {
 			notes = append(notes, "killed the ttorch tmux session")
@@ -676,17 +692,17 @@ func (m *Manager) Reset() ([]string, error) {
 // NOT clear state, so the session can be resumed later with `ttorch` or
 // `ttorch resume`.
 func (m *Manager) StopSession() ([]string, error) {
-	if !tmux.Available() || !tmux.HasSession(m.Session) {
+	if !m.backend().Available() || !m.backend().HasSession(m.Session) {
 		return []string{"no ttorch session was running"}, nil
 	}
-	windows, _ := tmux.ListWindows(m.Session)
+	windows, _ := m.backend().ListWindows(m.Session)
 	workers := 0
 	for _, w := range windows {
 		if strings.HasPrefix(w, "wk-") {
 			workers++
 		}
 	}
-	if err := tmux.KillSession(m.Session); err != nil {
+	if err := m.backend().KillSession(m.Session); err != nil {
 		return nil, err
 	}
 	notes := []string{fmt.Sprintf("stopped the ttorch session %q (%d window(s))", m.Session, len(windows))}
@@ -735,7 +751,7 @@ func (m *Manager) OpenCC(isolated bool) error {
 			}
 		}
 	}
-	if err := tmux.EnsureSession(m.Session); err != nil {
+	if err := m.backend().EnsureSession(m.Session); err != nil {
 		return err
 	}
 	if err := m.newWindow(window, dir, windowLabel("cc", id)); err != nil {
@@ -747,7 +763,7 @@ func (m *Manager) OpenCC(isolated bool) error {
 	} else {
 		harness.TrustWorktree(h, dir)
 	}
-	_ = tmux.SendLine(m.Session, window, harness.InteractiveCommand(h))
+	_ = m.backend().SendLine(m.Session, window, harness.InteractiveCommand(h))
 	// Track the cc session (best-effort, as before). Every task needs a project (FK),
 	// so the session's directory is upserted as the project — a cc session may not be
 	// in a git repo, and repo_path is only a grouping/display key here.
@@ -758,7 +774,7 @@ func (m *Manager) OpenCC(isolated bool) error {
 			Kind: db.KindCC, Created: time.Now(), Status: db.StatusActive,
 		}, db.ActorManager)
 	}
-	return tmux.Attach(m.Session, window)
+	return m.backend().Attach(m.Session, window)
 }
 
 // Promote turns a scout task into a ship task (restoring teardown protection).
@@ -827,7 +843,7 @@ func (m *Manager) FleetSync(repoPath string) ([]string, error) {
 // Recovery reconciles tracked tasks against live tmux windows and reports drift.
 func (m *Manager) Recovery() ([]string, error) {
 	var notes []string
-	windows, _ := tmux.ListWindows(m.Session)
+	windows, _ := m.backend().ListWindows(m.Session)
 	winSet := map[string]bool{}
 	for _, w := range windows {
 		winSet[w] = true

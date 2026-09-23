@@ -12,7 +12,6 @@ import (
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/harness"
 	"github.com/nution101/ttorch/internal/termtab"
-	"github.com/nution101/ttorch/internal/tmux"
 	"github.com/nution101/ttorch/internal/worktree"
 )
 
@@ -95,7 +94,7 @@ func (m *Manager) spawnWorker(taskID, projectPath string, scout bool, rawCmd str
 	}
 
 	window := "wk-" + taskID
-	if tmux.WindowExists(m.Session, window) {
+	if m.backend().WindowExists(m.Session, window) {
 		return zero, fmt.Errorf("task %q already has a window; tear it down first", taskID)
 	}
 	kind := "ship"
@@ -154,7 +153,7 @@ func (m *Manager) spawnWorker(taskID, projectPath string, scout bool, rawCmd str
 		_ = m.Pool.Release(repo, wt)
 		return zero, fmt.Errorf("spawn %q: preparing a fresh task branch: %w", taskID, err)
 	}
-	if err := tmux.EnsureSession(m.Session); err != nil {
+	if err := m.backend().EnsureSession(m.Session); err != nil {
 		_ = m.Pool.Release(repo, wt)
 		return zero, err
 	}
@@ -192,7 +191,7 @@ func (m *Manager) spawnWorker(taskID, projectPath string, scout bool, rawCmd str
 		// fallback that also survives a resume). §3.1.
 		cmd = harness.WorkerLaunchPrefix(taskID, dbPath) + harness.BriefCommand(h, brief, sid, resolvedEffort, resolvedModel)
 	}
-	if err := tmux.SendLine(m.Session, window, cmd); err != nil {
+	if err := m.backend().SendLine(m.Session, window, cmd); err != nil {
 		m.abortSpawn(window, repo, wt)
 		return zero, err
 	}
@@ -322,12 +321,12 @@ func (m *Manager) waitForLaunch(window string) error {
 		// Only a window CONFIRMED absent (read succeeded, window not listed) means the
 		// launch died; a transient tmux read failure is retried until the deadline so a
 		// momentary hiccup never tears down a healthy, just-launched worker.
-		exists, err := tmux.WindowExistsErr(m.Session, window)
+		exists, err := m.backend().WindowExistsErr(m.Session, window)
 		if err == nil {
 			if !exists {
 				return errors.New("the worker's window exited before its command started")
 			}
-			if cur := tmux.PaneCurrentCommand(m.Session, window); cur != "" && !isShellCommand(cur) {
+			if cur := m.backend().PaneCurrentCommand(m.Session, window); cur != "" && !isShellCommand(cur) {
 				return nil
 			}
 		}
@@ -359,7 +358,7 @@ func isShellCommand(cmd string) bool {
 // behind no phantom worker window or leaked pool slot.
 func (m *Manager) abortSpawn(window, repo, wt string) {
 	m.killPaneProcesses(window)
-	_ = tmux.KillWindow(m.Session, window)
+	_ = m.backend().KillWindow(m.Session, window)
 	if repo != "" && wt != "" {
 		_ = m.Pool.Release(repo, wt)
 	}
