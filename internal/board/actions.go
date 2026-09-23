@@ -178,6 +178,21 @@ func (s *Server) Dispatch(ctx context.Context, taskID string) (Result, error) {
 		return Result{}, inputError{fmt.Sprintf("%s has no stored brief; store one with 'ttorch task add %s --brief-file <path>' or dispatch it with 'ttorch spawn'", t.ID, t.ID)}
 	}
 
+	// Overlap follows the dispatch pass exactly. It reads the live fleet once, before claiming,
+	// so this task's own footprint is not counted against it, and refuses when the fleet cannot
+	// be read rather than treating it as empty. An overlapping footprint runs in parallel (each
+	// worker has its own worktree and the land pass rebases the second one), unless
+	// TTORCH_SERIALIZE_OVERLAP asked for the old refusal. forceOverlap goes to the spawn only
+	// for a real overlap, so a disjoint dispatch keeps the spawn's own fail-closed check.
+	snap, err := s.cfg.Fleet.Snapshot()
+	if err != nil {
+		return Result{}, fmt.Errorf("cannot read the live fleet to check %s's footprint, so nothing was dispatched: %w", t.ID, err)
+	}
+	overlaps := scheduler.DispatchOverlaps(snap, t)
+	if overlaps && s.cfg.SerializeOverlap {
+		return Result{}, fmt.Errorf("%s overlaps a live worker's footprint and TTORCH_SERIALIZE_OVERLAP is set, so it stays in the backlog", t.ID)
+	}
+
 	owner := "worker:" + t.ID
 	claimed, won, err := s.cfg.Store.ClaimTask(ctx, t.ID, owner)
 	if err != nil {
@@ -187,11 +202,8 @@ func (s *Server) Dispatch(ctx context.Context, taskID string) (Result, error) {
 		return Result{Message: fmt.Sprintf("%s was dispatched by something else first; nothing dispatched", t.ID)}, nil
 	}
 	model, effort, autoTiered := scheduler.ResolveDispatchTier(claimed)
-	// Overlap follows the daemon's policy: a worker has its own worktree, so an overlapping
-	// footprint runs in parallel and the land pass rebases the second one, unless
-	// TTORCH_SERIALIZE_OVERLAP asked for the old refusal.
 	worker, err := s.cfg.Fleet.SpawnAutonomous(claimed.ID, claimed.Project, claimed.Kind == db.KindScout, "",
-		claimed.Footprint, !s.cfg.SerializeOverlap, effort, model)
+		claimed.Footprint, overlaps, effort, model)
 	if err != nil {
 		// Put it back so it can be dispatched again. The claim's lease is the backstop if
 		// this release fails.

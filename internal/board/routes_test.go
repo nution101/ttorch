@@ -68,7 +68,7 @@ func TestFleetCannotApproveOrMerge(t *testing.T) {
 		}
 	}
 	sort.Strings(names)
-	want := "ReviewersFor Send SpawnAutonomous TaskState TrustPrep"
+	want := "ReviewersFor Send Snapshot SpawnAutonomous TaskState TrustPrep"
 	if got := strings.Join(names, " "); got != want {
 		t.Fatalf("Fleet methods = %s, want exactly %s", got, want)
 	}

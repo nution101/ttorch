@@ -3,6 +3,7 @@ package board
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -10,21 +11,32 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/nution101/ttorch/internal/db"
+	"github.com/nution101/ttorch/internal/orchestrator"
+	"github.com/nution101/ttorch/internal/state"
 )
 
 // fakeFleet records every call the board makes through the Fleet interface, so a test can
 // count sends, spawns and preps without tmux or a worktree pool.
 type fakeFleet struct {
-	mu       sync.Mutex
-	sends    []sentMsg
-	sendErr  error
-	spawns   []string
-	spawnErr error
-	preps    []string
-	prepErr  error
-	state    string
+	mu        sync.Mutex
+	sends     []sentMsg
+	sendErr   error
+	sendDelay time.Duration // a real tmux send takes ~300ms; races need the window
+	spawns    []string
+	forced    []bool // forceOverlap per spawn
+	spawnErr  error
+	preps     []string
+	prepErr   error
+	state     string
+
+	// The live fleet Snapshot returns. readErr fails every read of it: Snapshot, and the
+	// overlap check SpawnAutonomous runs when forceOverlap is false, as the real spawn does.
+	live        []db.Task
+	liveWindows []string
+	readErr     error
 }
 
 type sentMsg struct{ task, text string }
@@ -38,15 +50,32 @@ func (f *fakeFleet) TaskState(db.Task) string {
 
 func (f *fakeFleet) Send(taskID, text string) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.sendErr != nil {
-		return f.sendErr
+	err, delay := f.sendErr, f.sendDelay
+	f.mu.Unlock()
+	time.Sleep(delay)
+	if err != nil {
+		return err
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.sends = append(f.sends, sentMsg{taskID, text})
 	return nil
 }
 
+func (f *fakeFleet) Snapshot() (*orchestrator.LiveSnapshot, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.readErr != nil {
+		return nil, f.readErr
+	}
+	return orchestrator.NewLiveSnapshot(f.live, f.liveWindows), nil
+}
+
 func (f *fakeFleet) TrustPrep(taskID string) (string, error) {
+	f.mu.Lock()
+	delay := f.sendDelay
+	f.mu.Unlock()
+	time.Sleep(delay)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.prepErr != nil {
@@ -58,14 +87,34 @@ func (f *fakeFleet) TrustPrep(taskID string) (string, error) {
 
 func (f *fakeFleet) ReviewersFor(string) []string { return []string{"correctness", "scope"} }
 
-func (f *fakeFleet) SpawnAutonomous(taskID, _ string, _ bool, _ string, _ []string, _ bool, _, _ string) (db.Task, error) {
+func (f *fakeFleet) SpawnAutonomous(taskID, _ string, _ bool, _ string, footprint []string, forceOverlap bool, _, _ string) (db.Task, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.spawnErr != nil {
 		return db.Task{}, f.spawnErr
 	}
+	// The real spawn's overlap gate (spawnWorker's CheckOverlap) reads the live fleet unless
+	// forceOverlap is set, and refuses when it cannot.
+	if len(footprint) > 0 && !forceOverlap {
+		if f.readErr != nil {
+			return db.Task{}, fmt.Errorf("spawn %q: cannot verify footprint is disjoint from live workers: %w", taskID, f.readErr)
+		}
+		snap := orchestrator.NewLiveSnapshot(f.live, f.liveWindows)
+		for _, t := range f.live {
+			if snap.Live(t) && len(state.FootprintOverlap(footprint, t.Footprint)) > 0 {
+				return db.Task{}, fmt.Errorf("spawn %q: footprint overlaps live worker %s", taskID, t.ID)
+			}
+		}
+	}
 	f.spawns = append(f.spawns, taskID)
+	f.forced = append(f.forced, forceOverlap)
 	return db.Task{ID: taskID, Window: "wk-" + taskID}, nil
+}
+
+func (f *fakeFleet) prepCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.preps)
 }
 
 func (f *fakeFleet) sendCount() int {

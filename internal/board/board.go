@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"github.com/nution101/ttorch/internal/db"
+	"github.com/nution101/ttorch/internal/orchestrator"
 	"github.com/nution101/ttorch/internal/review"
 )
 
@@ -68,6 +69,9 @@ type Fleet interface {
 	TrustPrep(taskID string) (string, error)
 	// ReviewersFor names the reviewers the prepared inputs call for.
 	ReviewersFor(taskID string) []string
+	// Snapshot reads the live fleet once: the scheduler's dispatch pass reads it the same way
+	// to decide whether a footprint overlaps.
+	Snapshot() (*orchestrator.LiveSnapshot, error)
 	// SpawnAutonomous dispatches an already-claimed task: the scheduler's dispatch call.
 	SpawnAutonomous(taskID, projectPath string, scout bool, rawCmd string, footprint []string, forceOverlap bool, effort, model string) (db.Task, error)
 }
