@@ -57,6 +57,12 @@
 // the current user, which does close it, whatever the path. On an OS where
 // that uid cannot be read, every connection is refused.
 //
+// Strings the server returns (pane text, labels, agent names, cwd, titles)
+// are passed through as received and may contain control characters or
+// escape sequences. Herdr strips ANSI from pane.read by default, but the
+// client does not check or rely on that. Callers must strip or escape
+// control characters before printing any of them to a terminal or log.
+//
 // Every request/response call is bounded by the earlier of the context's
 // deadline and Client.Timeout; WaitAgent is bounded by its own timeout plus
 // WaitGrace. Failures are typed: ErrNoSocket, ErrUnsafeSocket,

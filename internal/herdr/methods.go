@@ -79,7 +79,9 @@ type AgentInfo struct {
 	Revision    uint64      `json:"revision"`
 }
 
-// PaneRead is the text pane.read returned.
+// PaneRead is the text pane.read returned. Text is passed through as
+// received and may contain control characters; strip them before printing
+// it.
 type PaneRead struct {
 	PaneID    string     `json:"pane_id"`
 	Source    ReadSource `json:"source"`
