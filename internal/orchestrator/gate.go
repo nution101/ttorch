@@ -1801,7 +1801,9 @@ func prepareReviewWorkspace(dir, inputsDir, repo, wt, head string) (cwd, bare st
 	if err := os.RemoveAll(cwd); err != nil {
 		return "", "", err
 	}
-	if err := os.MkdirAll(cwd, 0o755); err != nil {
+	// 0700: the workspace holds the reviewer's prompt, and no other user has a reason to
+	// read or write anything in it (see writeReviewerPrompt for what that does not cover).
+	if err := os.MkdirAll(cwd, 0o700); err != nil {
 		return "", "", err
 	}
 	// Best-effort: prep always stages diff.patch before a reviewer is dispatched, and the brief
@@ -2030,21 +2032,14 @@ func (m *Manager) spawnReviewer(taskID, dim, inputsDir, head, repo, wt string) e
 	// on it.
 	_ = harness.WriteWorkerSettings(h, cwd)
 	harness.TrustWorktree(h, repo, cwd)
-	// The prompt is written into the reviewer's OWN workspace, not the review-inputs dir.
-	//
-	// BriefCommand launches the session with "$(cat <briefPath>)", so the file is read by the
-	// pane at launch rather than by this process at write time. While it lived in the inputs
-	// dir, a write landing between the WriteFile here and the cat there replaced the
-	// reviewer's entire instructions, and the inputs dir is the directory the gate does not
-	// vouch for. Handing an isolated reviewer a worker-writable prompt gives back most of what
-	// moving its cwd took away.
-	//
-	// The workspace is under paths.ReviewWorkspaceDir, is rebuilt per dispatch, and its
-	// per-dimension name is already validated by reviewWorkspaceDir, so the join needs no
-	// second check.
-	briefPath := reviewerPromptPath(cwd)
-	brief := reviewerBrief(taskID, dim, inputsDir, head, reportPath, bare)
-	if err := os.WriteFile(briefPath, []byte(brief), 0o644); err != nil {
+	// The prompt is written into the reviewer's own workspace, never the review-inputs dir,
+	// and privately (see writeReviewerPrompt). BriefCommand launches the session with
+	// "$(cat <briefPath>)", so the pane reads the file at launch rather than this process at
+	// write time; while it lived in the inputs dir, anything that could write there could
+	// replace the reviewer's instructions in that window. Moving and tightening the file
+	// shrinks that to the same uid. It does not close it for the same uid.
+	briefPath, err := writeReviewerPrompt(cwd, reviewerBrief(taskID, dim, inputsDir, head, reportPath, bare))
+	if err != nil {
 		return err
 	}
 	if err := m.newWindow(window, cwd, "review · "+dim+" · "+taskID); err != nil {
@@ -2060,19 +2055,35 @@ func (m *Manager) spawnReviewer(taskID, dim, inputsDir, head, repo, wt string) e
 	return nil
 }
 
-// reviewerPromptPath is where a dispatched reviewer's prompt is written: inside the
-// reviewer's OWN workspace, never the review-inputs dir.
+// writeReviewerPrompt writes a dispatched reviewer's prompt into its own workspace and returns
+// the path BriefCommand hands the pane. The file is created by os.CreateTemp, so it is 0600,
+// opened O_EXCL under a name nobody chose in advance, inside the per-dimension workspace
+// prepareReviewWorkspace has just recreated 0700.
 //
-// BriefCommand launches the session with "$(cat <path>)", so the file is read by the pane at
-// launch rather than by this process at write time. While the prompt lived in the inputs dir,
-// a write landing between the WriteFile and the cat replaced the reviewer's entire
-// instructions, and that directory is the one the gate does not vouch for. Handing an isolated
-// reviewer a worker-writable prompt gives back most of what moving its cwd took away.
+// What that closes, stated narrowly: no other user can read or replace the prompt, a file or
+// symlink planted at the path cannot redirect the write because the create fails instead of
+// following it, and the path cannot be computed before the write happens.
 //
-// cwd is the per-dimension workspace under paths.ReviewWorkspaceDir, whose name reviewWorkspaceDir
-// has already validated, so the join needs no second check.
-func reviewerPromptPath(cwd string) string {
-	return filepath.Join(cwd, "reviewer-brief.md")
+// What it does not close is anything running as the lead's own uid, which includes the
+// worker. That process can still list the workspace, find the file, and rewrite it in the
+// window between this write and the pane's `cat`. It can also type into the reviewer's tmux
+// pane or write the report directly. No path or mode stops a process with the same uid; that
+// is the process channel, and closing it is the sandbox (design step 3), not this.
+func writeReviewerPrompt(cwd, brief string) (string, error) {
+	f, err := os.CreateTemp(cwd, "reviewer-brief-*.md")
+	if err != nil {
+		return "", err
+	}
+	if _, err := f.WriteString(brief); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
 }
 
 // reviewerBrief is the initial prompt for a daemon-dispatched reviewer. It dispatches the real

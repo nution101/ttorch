@@ -424,12 +424,20 @@ func TestReviewWorkspaceDir_RefusesATraversingTaskID(t *testing.T) {
 	}
 }
 
-// TestSpawnReviewer_ThePromptIsNotWorkerWritable: BriefCommand launches the session with
-// "$(cat <briefPath>)", so the prompt is read by the pane at launch, not by this process at
-// write time. While it sat in the review-inputs dir, a write landing in that window replaced
-// the reviewer's entire instructions — and that directory is the one the gate says it cannot
-// vouch for. Isolation that hands the reviewer a worker-writable prompt is not isolation.
-func TestSpawnReviewer_ThePromptIsNotWorkerWritable(t *testing.T) {
+// TestReviewerPrompt_IsPrivateToItsWorkspace: BriefCommand launches the session with
+// "$(cat <path>)", so the prompt is read by the pane at launch, not by this process at write
+// time. It used to be written 0644 at a fixed name in a 0755 workspace, so any user could read
+// it and its path was known before it existed.
+//
+// This checks what writeReviewerPrompt can promise: the prompt is inside the reviewer's own
+// workspace and never the review-inputs dir, the workspace is 0700, the file is 0600, and its
+// name is not reused between writes. It does not check that the worker cannot rewrite the
+// prompt, because it can: the worker runs as the same uid. That is the process channel, and
+// no mode or path closes it.
+//
+// This test used to be called TestSpawnReviewer_ThePromptIsNotWorkerWritable while checking
+// only the path.
+func TestReviewerPrompt_IsPrivateToItsWorkspace(t *testing.T) {
 	m, repo, wt := trustHarness(t, "prompt1", "trusted", "exit 0")
 	inputsDir := m.P.ReviewInputsDir("prompt1")
 	head := plantHostileHarnessConfig(t, wt, inputsDir)
@@ -441,14 +449,36 @@ func TestSpawnReviewer_ThePromptIsNotWorkerWritable(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		// The prompt must land inside the reviewer's own workspace, which the worker cannot
-		// write, and nowhere under the review-inputs dir, which it can.
-		got := reviewerPromptPath(cwd)
+		brief := "review the " + dim + " dimension"
+		got, err := writeReviewerPrompt(cwd, brief)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if rel, err := filepath.Rel(cwd, got); err != nil || strings.HasPrefix(rel, "..") {
 			t.Fatalf("%s: prompt at %q is not under the reviewer's workspace %q", dim, got, cwd)
 		}
 		if rel, err := filepath.Rel(inputsDir, got); err == nil && !strings.HasPrefix(rel, "..") {
-			t.Fatalf("%s: prompt at %q is inside the worker-writable inputs dir", dim, got)
+			t.Fatalf("%s: prompt at %q is inside the review-inputs dir", dim, got)
+		}
+		if st, err := os.Stat(cwd); err != nil || st.Mode().Perm() != 0o700 {
+			t.Errorf("%s: workspace mode = %v (err %v), want 0700", dim, st.Mode().Perm(), err)
+		}
+		st, err := os.Stat(got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.Mode().Perm() != 0o600 {
+			t.Errorf("%s: prompt mode = %v, want 0600", dim, st.Mode().Perm())
+		}
+		if b, err := os.ReadFile(got); err != nil || string(b) != brief {
+			t.Errorf("%s: prompt content = %q (err %v), want %q", dim, b, err, brief)
+		}
+		again, err := writeReviewerPrompt(cwd, brief)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if again == got {
+			t.Errorf("%s: two writes used the same prompt path %q, so it can be known in advance", dim, got)
 		}
 	}
 }
