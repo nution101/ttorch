@@ -458,7 +458,7 @@ func (w *Watcher) pollArmedPRs(ctx context.Context) error {
 // background shell (e.g. `make test`) from being mistaken for a stall, since the sweep
 // count alone is poll-cadence-sensitive and trips in seconds. The per-task sweep count
 // is persisted (SetLiveness) so it survives across short-lived watch invocations; a pane
-// change resets it. A busy pane (livestate.Busy) is always treated as live and resets
+// change resets it. A busy worker (w.busy) is always treated as live and resets
 // the count, so a worker mid-turn is never flagged regardless of the dwell. As a fast
 // path, an idle pane carrying one of the harness's recoverable API-stall errors
 // (livestate.Stalled) is auto-resumed with a "continue" nudge once stable, instead of
@@ -511,7 +511,7 @@ func (w *Watcher) pollLiveness(ctx context.Context) error {
 		if !obs.captured {
 			continue // present but unreadable this sweep — leave the count untouched
 		}
-		if livestate.Busy(obs.pane) {
+		if w.busy(t, obs.pane) {
 			// Mid-turn: reset the idle bookkeeping so a busy worker never goes stale.
 			if err := w.setLiveness(ctx, t, hashPane(obs.pane), 0); err != nil {
 				return err
