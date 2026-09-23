@@ -209,12 +209,15 @@ func DeriveState(live bool, pane string) string {
 // TaskState reports a worker's live state for `ttorch status` (see DeriveState). A live
 // worker is read from its hook record and its pane together (liveState). A live pane that
 // can't be captured falls back to "idle" unless the hook record says a turn is running.
+// A present window whose recorded agent has exited reads "agent-exited", and one whose
+// agent could not be checked reads "unknown" (see deriveLiveState).
 func (m *Manager) TaskState(t db.Task) string {
 	if !m.backend().WindowExists(m.Session, t.Window) {
 		return DeriveState(false, "")
 	}
+	agent, _ := m.agentState(t)
 	out, _ := m.backend().CapturePane(m.Session, t.Window, 6)
-	return liveState(m.P, t, out, time.Now())
+	return deriveLiveState(agent, liveState(m.P, t, out, time.Now()))
 }
 
 // Peek returns the last n lines of a worker's pane.
@@ -609,6 +612,9 @@ func (m *Manager) restore() []string {
 			notes = append(notes, fmt.Sprintf("skipped %s (%s)", t.ID, err.Error()))
 			continue
 		}
+		// A resume does not wait for its agent to come up, so it records no fingerprint; clear
+		// the old incarnation's so the rebuilt window is judged by presence, not by a dead pid.
+		m.clearAgentFingerprint(t.ID)
 		_ = m.backend().SendLine(m.Session, t.Window, harness.WorkerResumeOrFresh(h, t.SessionID, m.P.BriefPath(t.ID), t.Effort, t.Model))
 		_ = termtab.Open(m.Session, t.Window)
 		// Refresh the supervisor's sign-of-life anchor for the worker just rebuilt in place. A

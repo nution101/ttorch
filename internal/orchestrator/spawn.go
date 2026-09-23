@@ -191,6 +191,7 @@ func (m *Manager) spawnWorker(taskID, projectPath string, scout bool, rawCmd str
 		// fallback that also survives a resume). §3.1.
 		cmd = harness.WorkerLaunchPrefix(taskID, dbPath) + harness.BriefCommand(h, brief, sid, resolvedEffort, resolvedModel)
 	}
+	m.clearAgentFingerprint(taskID)
 	if err := m.backend().SendLine(m.Session, window, cmd); err != nil {
 		m.abortSpawn(window, repo, wt)
 		return zero, err
@@ -209,6 +210,9 @@ func (m *Manager) spawnWorker(taskID, projectPath string, scout bool, rawCmd str
 	if harnessLaunch && h == "claude" {
 		time.Sleep(spawnSettle)
 	}
+	// Pin the identity of the process that took over the pane, so a later liveness read can
+	// tell this agent from the shell it leaves behind when it exits.
+	m.recordAgentFingerprint(taskID, window)
 	// Best-effort: open a native terminal tab/window that attaches a view onto
 	// this worker's tmux window so the lead can watch it. The worker stays in
 	// tmux regardless; never fail the spawn on this.

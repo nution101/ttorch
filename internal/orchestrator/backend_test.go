@@ -77,6 +77,9 @@ func TestWorkerLifecycle_GoesThroughBackend(t *testing.T) {
 		"SendLine(fake-sess, wk-f1, sleep 30)",
 		"WindowExistsErr(fake-sess, wk-f1)",
 		"PaneCurrentCommand(fake-sess, wk-f1)",
+		// The agent fingerprint reads the pane pid. The fake has none set, so the read
+		// fails, nothing is recorded, and the task keeps window-presence liveness below.
+		"PanePIDErr(fake-sess, wk-f1)",
 	)
 
 	if err := m.Send("f1", "hello"); err != nil {

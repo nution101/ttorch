@@ -103,6 +103,12 @@ func (p Paths) Worktrees() string { return filepath.Join(p.Home, "worktrees") }
 // BriefPath is where a task's brief lives.
 func (p Paths) BriefPath(id string) string { return filepath.Join(p.DataDir(), id, "brief.md") }
 
+// AgentFingerprintPath is where the identity of a task's launched agent process is recorded
+// (see proc.Fingerprint), beside its brief.
+func (p Paths) AgentFingerprintPath(id string) string {
+	return filepath.Join(p.DataDir(), id, "agent.fingerprint")
+}
+
 // WatchPIDFile holds the running `ttorch watch` singleton's PID. The watcher takes
 // an exclusive flock on it (flock-as-truth) so at most one watcher blocks at a time;
 // the recorded pid is for `ttorch watch --reset`'s observability and pid-reuse-guarded

@@ -94,6 +94,7 @@ var decidingFunctions = []string{
 // file forces one explicit decision instead of defaulting to uncovered.
 var nonDecidingFiles = map[string]string{
 	"internal/orchestrator/autostart.go":    "starts the scheduler daemon; every gate check still runs inside MergeLocal",
+	"internal/orchestrator/fingerprint.go":  "records and checks a worker's agent process for status liveness",
 	"internal/orchestrator/landqueue.go":    "serializes WHEN tasks land, not WHETHER; each land re-enters MergeLocal",
 	"internal/orchestrator/livesignal.go":   "reads a worker's hook record for `ttorch status`; only TaskState calls it",
 	"internal/orchestrator/orchestrator.go": "Manager construction, task CRUD and status",
