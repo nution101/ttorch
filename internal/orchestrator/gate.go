@@ -294,10 +294,12 @@ func dispatchedDimensions(prog gateProgress) []string {
 // That keeps ttorch from discarding the evidence. It does not keep the evidence on disk. A
 // process running as the lead can delete, rename, overwrite or backdate a report file, and a
 // backdated one reads as superseded. For a REQUIRED dimension that reads as unreviewed and
-// blocks. For an extra it drops the finding: emptying the record stops the gate
-// re-dispatching that dimension, and deleting, renaming or staling its report then takes the
-// finding out of the verdict. That is limited to dimensions the committed diff does not
-// require, and it is the process channel, which design step 3 leaves to the sandbox.
+// blocks. For an extra it drops the finding. The manual path (`ttorch trust record`) never
+// reads the record, so there deleting, renaming or staling the report is enough on its own.
+// The daemon keeps waiting on, and re-dispatching, a dimension the record says it dispatched,
+// so there the record has to be emptied as well. Either way it is limited to dimensions the
+// committed diff does not require, and it is the process channel, which design step 3 leaves
+// to the sandbox.
 //
 // What the record is still trusted for: attempt counts, the dispatch timestamp, the last
 // dispatch error, which reviewer windows to tear down, and which dispatched dimensions the
