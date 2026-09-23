@@ -52,7 +52,8 @@
 // Every request/response call is bounded by the earlier of the context's
 // deadline and Client.Timeout; WaitAgent is bounded by its own timeout plus
 // WaitGrace. Failures are typed: ErrNoSocket, ErrUnsafeSocket,
-// ErrNoConfigDir, ErrUnknownMethod, ErrMismatchedID, ErrMalformedResponse,
+// ErrNoConfigDir, ErrInvalidSessionName, ErrControlCharacter,
+// ErrUnknownMethod, ErrMismatchedID, ErrMalformedResponse,
 // ErrConnectionClosed, ErrWaitTimeout, and *APIError for any other error
 // Herdr returns.
 package herdr
