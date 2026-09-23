@@ -2,7 +2,6 @@ package herdr
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -122,9 +121,14 @@ type Pong struct {
 
 // Ping checks the server is reachable and reports its version and protocol.
 func (c *Client) Ping(ctx context.Context) (Pong, error) {
-	var p Pong
-	err := c.call(ctx, c.timeout(), "ping", nil, "pong", &p)
-	return p, err
+	var out struct {
+		resultHead
+		Pong
+	}
+	if err := c.call(ctx, c.timeout(), "ping", nil, "pong", &out); err != nil {
+		return Pong{}, err
+	}
+	return out.Pong, nil
 }
 
 func (c *Client) timeout() time.Duration {
@@ -144,7 +148,7 @@ func (c *Client) maxLine() int {
 // call runs one request/response exchange on a fresh connection, bounded by
 // the earlier of ctx's deadline and bound. want is the result's "type"
 // discriminator; out, when non-nil, receives the decoded result object.
-func (c *Client) call(ctx context.Context, bound time.Duration, method string, params any, want string, out any) error {
+func (c *Client) call(ctx context.Context, bound time.Duration, method string, params any, want string, out result) error {
 	ctx, cancel := context.WithTimeout(ctx, bound)
 	defer cancel()
 	conn, err := c.dial(ctx)
@@ -190,16 +194,30 @@ type request struct {
 	Params any    `json:"params"`
 }
 
+// resultHead is the "type" discriminator every result carries. Each
+// method's result struct embeds it, so the result's type and fields decode
+// together straight from the response line.
+type resultHead struct {
+	Type string `json:"type"`
+}
+
+func (h *resultHead) head() *resultHead { return h }
+
+// result is a pointer to a struct embedding resultHead.
+type result interface{ head() *resultHead }
+
 type envelope struct {
-	ID     *string         `json:"id"`
-	Result json.RawMessage `json:"result"`
+	ID *string `json:"id"`
+	// Result holds the caller's result pointer before decoding, so the
+	// line is decoded once, directly into it. JSON null sets it to nil.
+	Result any `json:"result"`
 	Error  *struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
 	} `json:"error"`
 }
 
-func (c *Client) exchange(ctx context.Context, conn net.Conn, r *bufio.Reader, method string, params any, want string, out any) error {
+func (c *Client) exchange(ctx context.Context, conn net.Conn, r *bufio.Reader, method string, params any, want string, out result) error {
 	if params == nil {
 		// Herdr's request enum is adjacently tagged, so params must be
 		// present even for methods that take none.
@@ -220,9 +238,14 @@ func (c *Client) exchange(ctx context.Context, conn net.Conn, r *bufio.Reader, m
 	return decodeResponse(resp, id, method, want, out)
 }
 
-// decodeResponse validates one response line against the request it answers.
-func decodeResponse(line []byte, id, method, want string, out any) error {
-	var env envelope
+// decodeResponse validates one response line against the request it
+// answers, decoding the line once. out may be filled even when an error is
+// returned; callers return their zero value on error.
+func decodeResponse(line []byte, id, method, want string, out result) error {
+	if out == nil {
+		out = &resultHead{}
+	}
+	env := envelope{Result: out}
 	if err := json.Unmarshal(line, &env); err != nil {
 		return fmt.Errorf("%w: %s: %v", ErrMalformedResponse, method, err)
 	}
@@ -242,22 +265,13 @@ func decodeResponse(line []byte, id, method, want string, out any) error {
 	if *env.ID != id {
 		return fmt.Errorf("%w: %s: sent %q, got %q", ErrMismatchedID, method, id, *env.ID)
 	}
-	if len(env.Result) == 0 || bytes.Equal(env.Result, []byte("null")) {
-		return fmt.Errorf("%w: %s: response has neither result nor error", ErrMalformedResponse, method)
+	// An absent result leaves the type empty, the same as a result with no
+	// type; neither is a response to this request.
+	if env.Result == nil || out.head().Type == "" {
+		return fmt.Errorf("%w: %s: response has no typed result and no error", ErrMalformedResponse, method)
 	}
-	var head struct {
-		Type string `json:"type"`
-	}
-	if err := json.Unmarshal(env.Result, &head); err != nil {
-		return fmt.Errorf("%w: %s: result: %v", ErrMalformedResponse, method, err)
-	}
-	if head.Type != want {
-		return fmt.Errorf("%w: %s: result type %q, want %q", ErrMalformedResponse, method, head.Type, want)
-	}
-	if out != nil {
-		if err := json.Unmarshal(env.Result, out); err != nil {
-			return fmt.Errorf("%w: %s: result: %v", ErrMalformedResponse, method, err)
-		}
+	if got := out.head().Type; got != want {
+		return fmt.Errorf("%w: %s: result type %q, want %q", ErrMalformedResponse, method, got, want)
 	}
 	return nil
 }

@@ -327,3 +327,45 @@ func TestErrWaitTimeout_OnlyForAgentWait(t *testing.T) {
 		t.Fatalf("pane.read's timeout matched ErrWaitTimeout: %v", err)
 	}
 }
+
+// A rejected response returns the zero value, never fields decoded from the
+// line that was rejected.
+func TestMethods_RejectedResponseReturnsZeroValue(t *testing.T) {
+	wrongID := func(result map[string]any) fakeHandler {
+		return func(c *fakeConn, req fakeRequest) { c.result(req.ID+"_other", result) }
+	}
+	s := newFakeServer(t)
+	s.handle("ping", reply(map[string]any{"type": "not_pong", "version": "0.9.1", "protocol": 22}))
+	s.handle("workspace.create", wrongID(map[string]any{"type": "workspace_created", "workspace": fakeWorkspace, "tab": fakeTab, "root_pane": fakePane}))
+	s.handle("tab.create", wrongID(map[string]any{"type": "tab_created", "tab": fakeTab, "root_pane": fakePane}))
+	s.handle("pane.split", wrongID(map[string]any{"type": "pane_info", "pane": fakePane}))
+	s.handle("pane.read", reply(map[string]any{"type": "pane_info", "read": map[string]any{"pane_id": "w1:p1", "text": "leaked"}}))
+	s.handle("agent.get", wrongID(map[string]any{"type": "agent_info", "agent": fakeAgent}))
+	s.handle("agent.wait", reply(map[string]any{"type": "agent_prompted", "agent": fakeAgent}))
+	c := s.client()
+	ctx := context.Background()
+
+	check := func(method string, got, zero any, err error) {
+		t.Helper()
+		if err == nil {
+			t.Errorf("%s: want an error", method)
+		}
+		if !reflect.DeepEqual(got, zero) {
+			t.Errorf("%s returned %+v alongside its error, want the zero value", method, got)
+		}
+	}
+	p, err := c.Ping(ctx)
+	check("ping", p, Pong{}, err)
+	w, err := c.CreateWorkspace(ctx, WorkspaceCreate{})
+	check("workspace.create", w, WorkspaceCreated{}, err)
+	tc, err := c.CreateTab(ctx, TabCreate{})
+	check("tab.create", tc, TabCreated{}, err)
+	pi, err := c.SplitPane(ctx, PaneSplit{Direction: SplitDown})
+	check("pane.split", pi, PaneInfo{}, err)
+	r, err := c.ReadPane(ctx, PaneReadRequest{PaneID: "w1:p1", Source: ReadRecent})
+	check("pane.read", r, PaneRead{}, err)
+	a, err := c.Agent(ctx, "w1:p1")
+	check("agent.get", a, AgentInfo{}, err)
+	a, err = c.WaitAgent(ctx, "w1:p1", time.Second)
+	check("agent.wait", a, AgentInfo{}, err)
+}

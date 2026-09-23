@@ -141,25 +141,38 @@ type PaneReadRequest struct {
 
 // CreateWorkspace opens a workspace (workspace.create).
 func (c *Client) CreateWorkspace(ctx context.Context, p WorkspaceCreate) (WorkspaceCreated, error) {
-	var out WorkspaceCreated
-	err := c.call(ctx, c.timeout(), "workspace.create", p, "workspace_created", &out)
-	return out, err
+	var out struct {
+		resultHead
+		WorkspaceCreated
+	}
+	if err := c.call(ctx, c.timeout(), "workspace.create", p, "workspace_created", &out); err != nil {
+		return WorkspaceCreated{}, err
+	}
+	return out.WorkspaceCreated, nil
 }
 
 // CreateTab opens a tab (tab.create).
 func (c *Client) CreateTab(ctx context.Context, p TabCreate) (TabCreated, error) {
-	var out TabCreated
-	err := c.call(ctx, c.timeout(), "tab.create", p, "tab_created", &out)
-	return out, err
+	var out struct {
+		resultHead
+		TabCreated
+	}
+	if err := c.call(ctx, c.timeout(), "tab.create", p, "tab_created", &out); err != nil {
+		return TabCreated{}, err
+	}
+	return out.TabCreated, nil
 }
 
 // SplitPane opens a pane beside an existing one (pane.split).
 func (c *Client) SplitPane(ctx context.Context, p PaneSplit) (PaneInfo, error) {
 	var out struct {
+		resultHead
 		Pane PaneInfo `json:"pane"`
 	}
-	err := c.call(ctx, c.timeout(), "pane.split", p, "pane_info", &out)
-	return out.Pane, err
+	if err := c.call(ctx, c.timeout(), "pane.split", p, "pane_info", &out); err != nil {
+		return PaneInfo{}, err
+	}
+	return out.Pane, nil
 }
 
 // SendText writes text to a pane as-is, without pressing any key
@@ -235,10 +248,13 @@ func literalText(text string) error {
 // ReadPane returns a pane's screen or scrollback text (pane.read).
 func (c *Client) ReadPane(ctx context.Context, p PaneReadRequest) (PaneRead, error) {
 	var out struct {
+		resultHead
 		Read PaneRead `json:"read"`
 	}
-	err := c.call(ctx, c.timeout(), "pane.read", p, "pane_read", &out)
-	return out.Read, err
+	if err := c.call(ctx, c.timeout(), "pane.read", p, "pane_read", &out); err != nil {
+		return PaneRead{}, err
+	}
+	return out.Read, nil
 }
 
 // ClosePane closes a pane and ends its process (pane.close).
@@ -253,13 +269,16 @@ func (c *Client) ClosePane(ctx context.Context, paneID string) error {
 // target is a pane id or an agent name.
 func (c *Client) Agent(ctx context.Context, target string) (AgentInfo, error) {
 	var out struct {
+		resultHead
 		Agent AgentInfo `json:"agent"`
 	}
 	p := struct {
 		Target string `json:"target"`
 	}{target}
-	err := c.call(ctx, c.timeout(), "agent.get", p, "agent_info", &out)
-	return out.Agent, err
+	if err := c.call(ctx, c.timeout(), "agent.get", p, "agent_info", &out); err != nil {
+		return AgentInfo{}, err
+	}
+	return out.Agent, nil
 }
 
 // WaitGrace is added to a wait's server-side timeout to form its local
@@ -290,10 +309,13 @@ func (c *Client) WaitAgent(ctx context.Context, target string, timeout time.Dura
 		TimeoutMS int64         `json:"timeout_ms"`
 	}{target, until, ms}
 	var out struct {
+		resultHead
 		Agent AgentInfo `json:"agent"`
 	}
-	err := c.call(ctx, timeout+WaitGrace, "agent.wait", p, "agent_info", &out)
-	return out.Agent, err
+	if err := c.call(ctx, timeout+WaitGrace, "agent.wait", p, "agent_info", &out); err != nil {
+		return AgentInfo{}, err
+	}
+	return out.Agent, nil
 }
 
 func nonNil(s []string) []string {
