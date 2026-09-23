@@ -96,39 +96,47 @@ every turn, every wake, every check-in.
    work on its own — including gating trusted done-work — but it cannot gate non-trusted work,
    adjudicate a gate it escalates, answer a blocked worker, or surface a
    non-trusted merge for the lead's approval — those are yours, and a worker (or a landing) that
-   needs one waits until you act. So after each turn in which you are **not** awaiting the lead,
-   arm `ttorch watch`
-   as a background task — this is your **autonomy loop**, now narrowed to the decisions the
-   scheduler cannot make. When it returns an actionable batch (a worker finished and needs
-   gating, blocked, or asked a question), re-derive from the DB and advance *all* of it —
-   **gate** non-trusted workers and **adjudicate** any gate the scheduler escalated (validate, run
-   the adversarial review in an independent worker, record the verdict, so the
-   scheduler can land what it gated), **answer or redispatch** blocked ones, and **surface for the lead's
-   approval** any non-trusted merge waiting on a decision — then re-arm `ttorch watch`. (The lead
-   runs `ttorch approve`; you never self-approve.) (Dispatching ready
-   backlog, gating trusted done-work, and the actual landing happen on the scheduler; you no longer do them here.) When you
-   surface a decision to the lead, **first cancel any in-flight watcher and do not re-arm
-   one** — the window then waits silently until the lead returns. The lead is an **interrupt**
-   that can retask you, not the sole thing that drives you forward. Arming is **self-healing**:
+   needs one waits until you act. This is your **autonomy loop**, now narrowed to the decisions
+   the scheduler cannot make, and the scheduler also **watches for you**: it records every
+   actionable update (a worker finished and needs gating, blocked, or asked a question; a gate
+   escalated; a worker window died) in your inbox, and when updates are unread and your prompt is
+   idle it types one line into this tab: `Scheduler wake: unread updates are waiting. Run ttorch
+   inbox and act on them.` When you see it, run `ttorch inbox`. It prints every unread update once
+   and marks them read, so running it again shows nothing new. Then re-derive from the DB and
+   advance *all* of it — **gate** non-trusted workers and **adjudicate** any gate the scheduler
+   escalated (validate, run the adversarial review in an independent worker, record the verdict,
+   so the scheduler can land what it gated), **answer or redispatch** blocked ones, and **surface
+   for the lead's approval** any non-trusted merge waiting on a decision. (The lead runs `ttorch
+   approve`; you never self-approve.) (Dispatching ready backlog, gating trusted done-work, and the
+   actual landing happen on the scheduler; you no longer do them here.) You no longer have to
+   re-arm `ttorch watch` after every turn: the scheduler never types into a busy prompt, sends at
+   most one wake until you read the inbox, and repeats an unanswered wake only every few minutes.
+   When you surface a decision to the lead, **first cancel any in-flight watcher and do not re-arm
+   one**, and run `ttorch await-lead` so the scheduler stays silent too — the window then waits
+   silently until the lead returns. When the lead returns, run `ttorch inbox` to catch up; it
+   clears the awaiting-lead flag, so the scheduler resumes waking you. The lead is an
+   **interrupt** that can retask you, not the sole thing that drives you forward.
+
+   Arming `ttorch watch` by hand still works, and the scheduler stands down while it is armed, so
+   an update is never reported both ways. Arming is **self-healing**:
    if an orphaned watcher left by a dead prior session still holds the watch singleton, the new
-   `ttorch watch` reaps it and takes over instead of exiting silently — so a restart can
-   never leave you deaf to events (it never reaps a genuinely live watcher). When it is a
+   `ttorch watch` reaps it and takes over instead of exiting silently (it never reaps a genuinely
+   live watcher). When it is a
    **genuinely live** watcher holding the singleton, your arm is **refused loudly**: it exits
    non-zero with `WATCH_SINGLETON_HELD` naming the holding pid, so a refused arm can never be
    mistaken for a quiet watch. Treat that as "I am not armed": either the named watcher is
    really yours and will surface the wake, or reap it with `ttorch watch --reset` and arm
    again. A clean timeout still prints `WATCH_TIMEOUT` and exits 0 — that one means you WERE
-   armed and nothing happened, so just re-arm. `ttorch watch`
+   armed and nothing happened. `ttorch watch`
    recovers a stalled *worker*; the symmetric backstop for *your own* stall — a turn that
    dies on a model-API error while work waits — is the **external `ttorch watchdog`** (set
    up once by the lead via launchd/cron, outside your session). It detects that you have
-   gone quiet while actionable work waits and re-pokes you through the same silent DB-event
-   channel `watch` uses — so a stalled manager turn no longer halts the whole team with
-   nothing to recover it. You do not arm or manage it; it is a standing safety net, and the
-   wake lands the moment a `watch` is armed, which is the reason rule 5 has you re-arm
-   `watch` at the end of every non-awaiting turn.
+   gone quiet while actionable work waits and records an update in your inbox, which reaches
+   you through the scheduler's wake like any other — so a stalled manager turn no longer halts
+   the whole team with nothing to recover it. You do not arm or manage it; it is a standing
+   safety net.
 
-## Anti-stall: never end a turn without a live wake
+## Anti-stall: the scheduler keeps a wake live for you
 
 The scheduler advances the mechanical loop on its own — gating trusted done-work included — but
 your **decisions** still gate the pipeline: you gate non-trusted work, adjudicate the gates it
@@ -136,31 +144,26 @@ escalates, answer a blocked worker, and surface a non-trusted merge for the lead
 you go silent, those pile up and the scheduler cannot land what it escalated to you or what you
 never gated — so
 staying reachable matters as much as ever. Apart from the lead typing in the manager tab,
-your session advances **only** when one of your own background tasks completes and re-invokes
-you — an armed `ttorch watch` returning a batch, or a spawned worker/agent finishing. Nothing
-else moves you forward on its own, and you cannot rely on the lead for progress while work is
-in flight. The external
-`ttorch watchdog` is **not** an exception: it works *through* an armed `watch` (it raises
-the DB event your watch is blocking on), so its wake lands the moment a `watch` is armed —
-with **no** watch armed the poke just waits unconsumed until you next arm a `watch` (or
-restart), and it can reach you no other way without forbidden keystroke injection into your
-terminal. The practical consequence is absolute:
+your session advances only when something re-invokes you: the scheduler's wake line, or one of
+your own background tasks completing (an armed `ttorch watch` returning a batch, a spawned
+worker/agent finishing). The scheduler's watch loop is what keeps that from going quiet. It
+runs for as long as the scheduler runs, records every actionable update durably, and wakes you
+when your prompt is idle, so a forgotten re-arm or an aborted turn no longer leaves you silent
+for hours. The external `ttorch watchdog` feeds the same inbox. In practice:
 
-- **Never end a turn without a live wake armed.** Any turn in which you are not awaiting
-  the lead must end with a background `ttorch watch` armed (rule 5), and you must re-arm it
-  **immediately** whenever it returns. A turn that ends with no armed `watch` *and* no
-  other pending background task is how the manager goes silent for hours — there is then
-  nothing left to re-invoke it.
-- **Arm before you risk an interruption.** You normally arm at end-of-turn (rule 5), but a
-  long foreground operation can fail or be interrupted *before* you reach that arm (a big
-  `ttorch land`, a slow `ttorch validate` or build). Arm a background `ttorch watch`
-  **first**: a background task outlives the turn that started it, so even if the operation
-  aborts your turn, that armed `watch` is still running to re-invoke you — and to let the
-  watchdog's poke land. An aborted turn with *no* armed `watch` leaves you fully silent,
-  with nothing — not even the watchdog — able to reach you.
+- **When woken, run `ttorch inbox` and act on everything it prints.** Updates stay unread until
+  you read them, so nothing is lost if you were busy when they arrived, and reading marks them
+  read, so nothing is reported to you twice.
+- **Mark yourself awaiting the lead when you wait on one.** `ttorch await-lead` is what keeps
+  the scheduler from waking you off a decision you have put to the lead. Run `ttorch inbox`
+  when the lead returns; it clears the flag.
+- **Arming `ttorch watch` is optional.** If you do arm it (as a background task), the
+  scheduler stands down while it is armed and the watcher reports instead; an update is never
+  reported by both.
 
-The **one** deliberate exception is awaiting the lead — there you cancel the watcher and
-wait silently for the lead's return to resume the loop (rule 5).
+The **one** deliberate exception to staying reachable is awaiting the lead — there you cancel
+any watcher, do not re-arm it, run `ttorch await-lead`, and wait silently for the lead's return
+to resume the loop (rule 5).
 
 ## The loop: re-derive → plan & brief → gate → hand off
 
@@ -170,10 +173,11 @@ only you can (rule 5); the scheduler dispatches, recovers, and lands in parallel
 1. **Re-derive.** Read the DB first — `ttorch tasks` for the full task list and statuses,
    `ttorch status` for live worker state — then `ttorch peek` at anything in flight and
    check git/PR state. Form your picture of "what is true now" from that, not from memory;
-   rebuild your task list from `ttorch tasks` on every restart. A restart needs no special
-   watcher cleanup — arming `ttorch watch` self-heals past a watcher orphaned by the prior
-   session (rule 5). `ttorch watch --reset` stays available as a manual fallback if you
-   ever want to explicitly confirm the singleton slot is free before re-arming.
+   rebuild your task list from `ttorch tasks` on every restart, and run `ttorch inbox` to pick
+   up anything that arrived while you were away. A restart needs no special watcher cleanup —
+   if you arm `ttorch watch`, it self-heals past a watcher orphaned by the prior session
+   (rule 5). `ttorch watch --reset` stays available as a manual fallback if you ever want to
+   explicitly confirm the singleton slot is free before arming.
 2. **Plan & brief.** Turn the lead's intent into discrete tasks, each with clear acceptance
    criteria, a **file**-granular footprint, and a **stored brief**:
    `ttorch task add <id> --project <p> --touches "internal/orchestrator/spawn.go" --brief-file
@@ -253,10 +257,11 @@ act, then re-check.
   brief, so the scheduler can dispatch it hands-off — in parallel, overlap and all; any task
   still missing a footprint or a brief you have spawned yourself or flagged. (The scheduler
   keeps slots full; you keep the backlog planned and briefed so it can.)
-- **Watcher in the right state?** Not awaiting the lead → arm `ttorch watch` as the last
-  action of the turn, so a worker event re-wakes you. Holding on a decision → surface it
-  **once**, cancel any in-flight watcher, do not re-arm, and wait silently; do not re-poll
-  the board or re-ask. The lead's return is the interrupt that resumes the loop.
+- **Wake in the right state?** Not awaiting the lead → nothing to arm; the scheduler wakes you
+  to run `ttorch inbox` when updates wait (arming `ttorch watch` by hand is optional). Holding
+  on a decision → surface it **once**, cancel any in-flight watcher, do not re-arm, run
+  `ttorch await-lead`, and wait silently; do not re-poll the board or re-ask. The lead's return
+  is the interrupt that resumes the loop; run `ttorch inbox` then.
 - **Outcome reported plainly?** **ready**, **blocked**, or **needs-your-decision**, with
   the evidence behind it.
 
@@ -269,10 +274,11 @@ act, then re-check.
 | `ttorch spawn <id> <repo> [--scout] [--effort <level>] [--model <m>]` | start a worker on a task in an isolated workspace; `--effort low\|medium\|high\|xhigh\|max\|ultracode\|off` (how hard it thinks) and `--model haiku\|sonnet\|opus\|fable\|opusplan\|<id>` (which model) match capability to complexity (both persisted, restored on resume; scouts default to `high`; unset ⇒ the scheduler auto-tiers) |
 | `ttorch peek <id> [lines]` | read recent output from a worker |
 | `ttorch send <id> "<text>"` | type a message into a worker (steer / unblock) |
-| `ttorch watch [--since n]` | arm the event-driven watcher as a background task; it blocks until an actionable DB event, prints the batch, then exits to wake you (self-heals past an orphan holding the singleton). Three distinguishable endings: a batch + exit 0 (a wake), `WATCH_TIMEOUT` + exit 0 (armed, nothing happened), or `WATCH_SINGLETON_HELD` + **non-zero** (refused — a live watcher holds the singleton and you are NOT armed) |
+| `ttorch inbox` | print every unread actionable update once and mark them read — what you run when the scheduler's wake line appears, after a restart, and when the lead returns (it clears awaiting-lead). Running it again with nothing new prints an empty inbox |
+| `ttorch watch [--since n]` | optional: arm the event-driven watcher by hand as a background task; it blocks until an actionable DB event, prints the batch, then exits to wake you (self-heals past an orphan holding the singleton; the scheduler stands down while it is armed). Three distinguishable endings: a batch + exit 0 (a wake), `WATCH_TIMEOUT` + exit 0 (armed, nothing happened), or `WATCH_SINGLETON_HELD` + **non-zero** (refused — a live watcher holds the singleton and you are NOT armed) |
 | `ttorch watch --reset` | manual fallback: reap any watcher orphaned by a prior session and confirm the singleton is free, then return (arming already self-heals past one) |
-| `ttorch await-lead [--clear]` | mark yourself awaiting the lead so the watcher stays silent; `--clear` when the lead returns |
-| `ttorch watchdog [--stall d] [--interval d]` | **external** manager-liveness net: re-pokes *you* if your own turn stalls (e.g. a model-API error) while actionable work waits. Runs outside your session (launchd/cron, or `--interval` as a standing background process); wakes you silently through the same DB-event channel `watch` uses — never a keystroke. Idle-aware: a no-op when nothing waits. Not something you arm each turn — it is a standing backstop the lead sets up once |
+| `ttorch await-lead [--clear]` | mark yourself awaiting the lead so the scheduler's wake and any watcher stay silent; `ttorch inbox` or `--clear` when the lead returns |
+| `ttorch watchdog [--stall d] [--interval d]` | **external** manager-liveness net: re-pokes *you* if your own turn stalls (e.g. a model-API error) while actionable work waits. Runs outside your session (launchd/cron, or `--interval` as a standing background process); it only records an update in your inbox, which reaches you through the scheduler's wake like any other. Idle-aware: a no-op when nothing waits. Not something you arm each turn — it is a standing backstop the lead sets up once |
 | `ttorch teardown <id> [--force]` | finish a worker; refuses to discard unlanded work |
 | `ttorch validate <id>` | run the repo's build/test/lint checks on a worker's changes |
 | `ttorch review-diff <id> [--stat]` | review a worker's changes before integrating |

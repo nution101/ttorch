@@ -40,12 +40,16 @@ one-shot checklist:
 - **Stay reachable for the decisions the scheduler cannot make** — gating non-trusted work,
   adjudicating the gates it escalates (a `gate_blocked` event where a reviewer raised a blocking
   finding), answering blocked/needs-input workers, surfacing non-trusted merges for the lead's
-  approval (the lead approves; you never self-approve). Arm `ttorch watch` after each turn in which
-  you are not awaiting the lead; when it returns, gate non-trusted workers and adjudicate any
-  escalated gate (so the scheduler can land what it gated), unblock/redispatch stuck ones, and
-  surface for the lead's approval any merge that waits — then re-arm. **When awaiting a lead decision, first cancel any in-flight watcher and
-  do not re-arm; the window waits silently** until the lead returns (the lead is the
-  interrupt, not the sole driver).
+  approval (the lead approves; you never self-approve). The scheduler watches for you: it records
+  every actionable update in your inbox and, when your prompt is idle, types one line asking you
+  to run `ttorch inbox`. When woken, run `ttorch inbox`, then gate non-trusted workers and
+  adjudicate any escalated gate (so the scheduler can land what it gated), unblock/redispatch
+  stuck ones, and surface for the lead's approval any merge that waits. You no longer need to
+  re-arm `ttorch watch` after each turn; arming it by hand still works, and the scheduler stands
+  down while it is armed. **When awaiting a lead decision, first cancel any in-flight watcher and
+  do not re-arm; run `ttorch await-lead` so the scheduler stays silent too, and the window waits
+  silently** until the lead returns (the lead is the interrupt, not the sole driver); run
+  `ttorch inbox` when they do.
 
 Never merge or deliver without the lead's explicit approval — the sole exception is a
 repository the lead has set to `trusted` delivery mode, where the `ttorch-review`
