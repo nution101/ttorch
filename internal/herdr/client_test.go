@@ -304,3 +304,48 @@ func within(t *testing.T, d time.Duration, fn func() error) error {
 		return nil
 	}
 }
+
+// Server-supplied text is quoted in error strings, so a hostile or broken
+// server cannot put raw newlines or escape sequences into a log line.
+func TestErrors_QuoteServerText(t *testing.T) {
+	const hostile = "line one\nFAKE LOG LINE \x1b[31mred\x1b[0m"
+	raw := func(t *testing.T, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("want an error")
+		}
+		if strings.ContainsAny(err.Error(), "\n\r\x1b\x7f\u009b") {
+			t.Fatalf("error string carries raw control characters: %q", err.Error())
+		}
+	}
+	t.Run("api error", func(t *testing.T) {
+		s := newFakeServer(t)
+		s.handle("ping", func(c *fakeConn, req fakeRequest) { c.fail(req.ID, "bad\ncode", hostile) })
+		_, err := s.client().Ping(context.Background())
+		raw(t, err)
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) || apiErr.Message != hostile {
+			t.Fatalf("APIError.Message must keep the server's text verbatim: %#v", err)
+		}
+	})
+	t.Run("mismatched id", func(t *testing.T) {
+		s := newFakeServer(t)
+		s.handle("ping", func(c *fakeConn, req fakeRequest) { c.result(hostile, map[string]any{"type": "pong"}) })
+		_, err := s.client().Ping(context.Background())
+		raw(t, err)
+	})
+	t.Run("result type", func(t *testing.T) {
+		s := newFakeServer(t)
+		s.handle("ping", reply(map[string]any{"type": hostile}))
+		_, err := s.client().Ping(context.Background())
+		raw(t, err)
+	})
+	t.Run("non-event line", func(t *testing.T) {
+		s := newFakeServer(t)
+		// JSON forbids raw C0 bytes in a line but allows raw DEL and C1.
+		s.handle("events.subscribe", streamHandler(true, "{\"note\":\"\u009b2J\x7f\"}"))
+		sub := subscribe(t, s, AgentStatusChanges("w1:p1", ""))
+		_, err := next(t, sub)
+		raw(t, err)
+	})
+}

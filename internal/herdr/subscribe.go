@@ -142,7 +142,10 @@ func decodeEvent(line []byte) (Event, error) {
 		return Event{}, &APIError{Method: "events.subscribe", Code: raw.Error.Code, Message: raw.Error.Message}
 	}
 	if raw.Kind == "" || len(raw.Data) == 0 {
-		return Event{}, fmt.Errorf("%w: events.subscribe: line is not an event: %.200s", ErrMalformedResponse, line)
+		if len(line) > 200 {
+			line = line[:200]
+		}
+		return Event{}, fmt.Errorf("%w: events.subscribe: line is not an event: %q", ErrMalformedResponse, line)
 	}
 	return raw.Event, nil
 }

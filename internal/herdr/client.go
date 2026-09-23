@@ -63,8 +63,11 @@ type APIError struct {
 	Message string
 }
 
+// Error quotes the server's code and message, so a server cannot put raw
+// newlines or escape sequences into a log line. The fields keep the text
+// verbatim.
 func (e *APIError) Error() string {
-	return fmt.Sprintf("herdr: %s: %s: %s", e.Method, e.Code, e.Message)
+	return fmt.Sprintf("herdr: %s: %q: %q", e.Method, e.Code, e.Message)
 }
 
 // Is maps server error codes onto the package's sentinels. An unknown method
