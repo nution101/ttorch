@@ -124,84 +124,108 @@ func mentionsManagerLaunch(n ast.Node) bool {
 	return found
 }
 
-// The ONE send into the manager window permitted outside the launch/resume bootstrap: the
-// scheduler's production wiring of the API-stall recovery seam (scheduler.New →
-// wireManagerStallNudgeSeams). The lead authorized resuming a genuinely-stalled manager — which
-// cannot nudge itself — and isSanctionedStallNudge pins the exemption to THREE independent facts so
-// it admits exactly that site and nothing else:
+// The sends into the manager window permitted outside the launch/resume bootstrap. Each is
+// pinned to THREE independent facts that must hold together, so the allow-list admits exactly
+// those sites and nothing else:
 //
-//   - sanctionedStallNudgeFile: the send must live in internal/scheduler/scheduler.go, so a
-//     same-named function added in ANY other file/package is not exempt;
-//   - sanctionedStallNudgeFunc, as a TOP-LEVEL (non-method) FuncDecl: a method of that name, or any
-//     other function, is not exempt; and
-//   - a fixed "continue" string LITERAL payload (isFixedContinueLiteral): NOT an identifier (which a
-//     local could shadow to launder arbitrary content past a value-blind name check), not a
-//     concatenation, not a call — so the manager can only ever receive the one literal resume word.
+//   - file: the send must live in that exact source file, so a same-named function added in ANY
+//     other file/package is not exempt;
+//   - fn, as a TOP-LEVEL (non-method) FuncDecl: a method of that name, or any other function, is
+//     not exempt; and
+//   - payload, as a fixed string LITERAL (isFixedLiteral): NOT an identifier (which a local could
+//     shadow to launder arbitrary content past a value-blind name check), not a concatenation, not
+//     a call — so the manager can only ever receive that one literal line.
 //
-// The RUNTIME guard that the nudge fires ONLY when livestate.APIStalled(pane) holds, bounded per
-// episode, lives in scheduler.recoverStall and is covered by the scheduler's stall-recovery tests (a
-// HEALTHY manager is never injected into); this source-scan invariant guards the complementary
-// property — that no OTHER write into the manager window can be introduced.
+// The entries are matched whole: the stall-nudge site sending the wake line, or the wake site
+// sending "continue", is still an injection.
+//
+// (1) The API-stall recovery nudge: the scheduler's production wiring (scheduler.New →
+// wireManagerStallNudgeSeams). The lead authorized resuming a genuinely-stalled manager, which
+// cannot nudge itself. The RUNTIME guard that it fires ONLY when livestate.APIStalled(pane) holds,
+// bounded per episode, lives in scheduler.recoverStall and is covered by the scheduler's
+// stall-recovery tests.
+//
+// (2) The scheduler watch loop's wake line (watch.NewDaemon → wireManagerWake): the always-on
+// watcher types one fixed line telling an idle manager to run `ttorch inbox`. The RUNTIME guards
+// (only with unread updates, never while awaiting the lead, never into a busy pane, a non-empty
+// prompt or a shell, at most one outstanding wake) live in watch.Daemon.Tick and are covered by
+// internal/watch/daemon_test.go.
+//
+// This source-scan invariant guards the complementary property: that no OTHER write into the
+// manager window can be introduced.
 const (
 	sanctionedStallNudgeFunc = "wireManagerStallNudgeSeams"
 	sanctionedStallNudgeFile = "internal/scheduler/scheduler.go"
 	sanctionedNudgePayload   = "continue"
+
+	sanctionedWakeFunc    = "wireManagerWake"
+	sanctionedWakeFile    = "internal/watch/daemon.go"
+	sanctionedWakePayload = "Scheduler wake: unread updates are waiting. Run ttorch inbox and act on them."
 )
 
-// inSanctionedNudgeFunc reports whether pos lies inside the body of the ONE sanctioned wiring
-// function: a TOP-LEVEL (non-method) FuncDecl named sanctionedStallNudgeFunc. A method of that name
-// (Recv != nil), or pos outside every such function, is rejected — so the name alone cannot launder
-// an injection (fail closed).
-func inSanctionedNudgeFunc(f *ast.File, pos token.Pos) bool {
+// sanctionedManagerSend is one allow-listed (file, top-level function, literal payload) triple.
+type sanctionedManagerSend struct{ file, fn, payload string }
+
+var sanctionedManagerSends = []sanctionedManagerSend{
+	{sanctionedStallNudgeFile, sanctionedStallNudgeFunc, sanctionedNudgePayload},
+	{sanctionedWakeFile, sanctionedWakeFunc, sanctionedWakePayload},
+}
+
+// inTopLevelFunc reports whether pos lies inside the body of a TOP-LEVEL (non-method) FuncDecl
+// named name. A method of that name (Recv != nil), or pos outside every such function, is
+// rejected — so the name alone cannot launder an injection (fail closed).
+func inTopLevelFunc(f *ast.File, name string, pos token.Pos) bool {
 	for _, decl := range f.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
 		if !ok || fn.Recv != nil { // a method named the same is NOT the sanctioned wiring function
 			continue
 		}
-		if fn.Name.Name == sanctionedStallNudgeFunc && fn.Pos() <= pos && pos <= fn.End() {
+		if fn.Name.Name == name && fn.Pos() <= pos && pos <= fn.End() {
 			return true
 		}
 	}
 	return false
 }
 
-// isFixedContinueLiteral reports whether expr is the exact "continue" STRING LITERAL — not an
-// identifier (an ident is value-blind: a local var of any name, even one matching a package const,
-// could carry interpolated/attacker-influenced content), not a concatenation, not a call. Requiring
-// a literal is what statically proves the manager pane can only ever receive the fixed resume word.
-func isFixedContinueLiteral(expr ast.Expr) bool {
+// isFixedLiteral reports whether expr is exactly the want STRING LITERAL — not an identifier (an
+// ident is value-blind: a local var of any name, even one matching a package const, could carry
+// interpolated/attacker-influenced content), not a concatenation, not a call. Requiring a literal
+// is what statically proves the manager pane can only ever receive the fixed line.
+func isFixedLiteral(expr ast.Expr, want string) bool {
 	lit, ok := expr.(*ast.BasicLit)
 	if !ok || lit.Kind != token.STRING {
 		return false
 	}
 	v, err := strconv.Unquote(lit.Value)
-	return err == nil && v == sanctionedNudgePayload
+	return err == nil && v == want
 }
 
-// isSanctionedStallNudge reports whether a manager-targeting tmux send is THE one allow-listed
-// API-stall recovery nudge: it is in the sanctioned file AND inside the sanctioned top-level wiring
-// function AND carries the fixed "continue" string literal. Any of those failing — a different file,
-// a different/method function, an ident or interpolated/arbitrary payload — leaves it flagged.
-func isSanctionedStallNudge(f *ast.File, filename string, call *ast.CallExpr) bool {
-	if !strings.HasSuffix(filepath.ToSlash(filename), sanctionedStallNudgeFile) {
-		return false
-	}
-	if !inSanctionedNudgeFunc(f, call.Pos()) {
-		return false
-	}
+// isSanctionedManagerSend reports whether a manager-targeting tmux send is one of the
+// allow-listed sends: for a single entry, it is in that file AND inside that top-level function
+// AND carries that fixed literal. Any of those failing — a different file, a different/method
+// function, an ident or interpolated/arbitrary payload, or another entry's payload — leaves it
+// flagged.
+func isSanctionedManagerSend(f *ast.File, filename string, call *ast.CallExpr) bool {
 	if len(call.Args) < 3 {
 		return false // SendLine(session, window, payload) — no payload to verify
 	}
-	return isFixedContinueLiteral(call.Args[2])
+	for _, s := range sanctionedManagerSends {
+		if strings.HasSuffix(filepath.ToSlash(filename), s.file) &&
+			inTopLevelFunc(f, s.fn, call.Pos()) &&
+			isFixedLiteral(call.Args[2], s.payload) {
+			return true
+		}
+	}
+	return false
 }
 
 // detectManagerInjection parses Go source and returns the 1-based line numbers of every
 // forbidden send into the manager session: a SendLine/SendKey call on any receiver (package
 // tmux, or a session backend.Backend however it is reached) whose window argument
 // resolves to the manager window — directly OR through a local variable — carrying anything
-// other than (a) a harness.Manager… launch command or (b) the single allow-listed API-stall
-// recovery nudge (a SendLine of the fixed "continue" literal from the sanctioned file+function;
-// see isSanctionedStallNudge). Operating on the AST (rather than one line at a time) is what lets
+// other than (a) a harness.Manager… launch command or (b) one of the allow-listed sends (a
+// SendLine of an entry's fixed literal from that entry's file+function; see
+// isSanctionedManagerSend). Operating on the AST (rather than one line at a time) is what lets
 // it catch the indirect, variable-laundered form, and locate each send's file + enclosing function
 // for the allow-list.
 func detectManagerInjection(fset *token.FileSet, f *ast.File) []int {
@@ -234,9 +258,9 @@ func detectManagerInjection(fset *token.FileSet, f *ast.File) []int {
 		if mentionsManagerLaunch(call) {
 			return true // the launch/resume bootstrap — exempt (it creates the session, never injects)
 		}
-		// The single allow-listed API-stall recovery nudge — restricted to SendLine (a SendKey to the
-		// manager is never sanctioned) in the pinned file+function carrying the fixed literal.
-		if sel.Sel.Name == "SendLine" && isSanctionedStallNudge(f, fset.Position(call.Pos()).Filename, call) {
+		// An allow-listed send — restricted to SendLine (a SendKey to the manager is never
+		// sanctioned) in a pinned file+function carrying that entry's fixed literal.
+		if sel.Sel.Name == "SendLine" && isSanctionedManagerSend(f, fset.Position(call.Pos()).Filename, call) {
 			return true
 		}
 		lines = append(lines, fset.Position(call.Pos()).Line)
@@ -246,16 +270,17 @@ func detectManagerInjection(fset *token.FileSet, f *ast.File) []int {
 }
 
 // TestNoInjectionIntoManagerSession is the increment-6 net invariant, evolved: NO code path may
-// type into the manager session EXCEPT two sanctioned ones. The supervisor's poke (tmux.SendLine
+// type into the manager session EXCEPT the sanctioned ones. The supervisor's poke (tmux.SendLine
 // into the "manager" window carrying a directive) was retired; the remaining permitted sends are
 // (1) the launch/resume bootstrap, which START the session rather than inject into a running one,
-// and (2) the single API-stall recovery nudge — the fixed "continue" resume the scheduler's
-// production wiring (sanctionedStallNudgeFunc) sends to a genuinely-stalled manager, lead-authorized
-// so the daemon can recover a manager that cannot recover itself. This parses all non-test Go source
-// and FAILS if any send to the manager window — including one laundered through a local variable —
-// carries anything other than a harness.Manager… launch command OR is anything but that one
-// allow-listed nudge: a manager send from any other function, or carrying interpolated/arbitrary
-// content even from the sanctioned function, still fails the build (see isSanctionedStallNudge).
+// (2) the API-stall recovery nudge — the fixed "continue" resume the scheduler's production wiring
+// (sanctionedStallNudgeFunc) sends to a genuinely-stalled manager — and (3) the scheduler watch
+// loop's fixed wake line (sanctionedWakeFunc), typed into an idle manager when unread updates wait.
+// This parses all non-test Go source and FAILS if any send to the manager window — including one
+// laundered through a local variable — carries anything other than a harness.Manager… launch
+// command OR is anything but an allow-listed send: a manager send from any other function, or
+// carrying interpolated/arbitrary content even from a sanctioned function, still fails the build
+// (see isSanctionedManagerSend).
 //
 // The manager→worker `ttorch send` path (SendLine into a WORKER window) is unaffected: its
 // window argument never resolves to the manager window, so it is never matched.
@@ -282,11 +307,12 @@ func TestNoInjectionIntoManagerSession(t *testing.T) {
 // TestManagerInjectionDetector pins the detector so the invariant test cannot pass vacuously: it
 // must FLAG a poke under every spelling — including the indirect form laundered through a local
 // variable — and PASS a manager launch/resume (even when laundered), a send to a worker window, and
-// the one allow-listed API-stall recovery nudge. It also pins the allow-list as TIGHT against the
-// exact bypasses an adversarial review surfaced: the sanctioned exemption requires ALL THREE of the
-// right file, the right top-level (non-method) function, and a fixed "continue" LITERAL — so the same
-// send from another file, a same-named function/method elsewhere, an identifier payload (launderable
-// via a local shadow), or any interpolated/arbitrary content STILL fails. file/fn/recv let a case
+// the allow-listed sends (the API-stall recovery nudge and the watch loop's wake line). It also pins
+// the allow-list as TIGHT against the exact bypasses an adversarial review surfaced: an exemption
+// requires ALL THREE of one entry's file, its top-level (non-method) function, and its fixed
+// LITERAL — so the same send from another file, a same-named function/method elsewhere, an
+// identifier payload (launderable via a local shadow), another entry's payload, or any
+// interpolated/arbitrary content STILL fails. file/fn/recv let a case
 // place its send in a chosen file, function, and (optionally) on a receiver; defaults put it in a
 // non-sanctioned file ("x.go") and a plain func "f".
 func TestManagerInjectionDetector(t *testing.T) {
@@ -338,6 +364,19 @@ func TestManagerInjectionDetector(t *testing.T) {
 		{name: "backend manager launch", body: `_ = m.backend().SendLine(m.Session, "manager", harness.ManagerCommand(h, sid, m.charterFile()))`, injection: false},
 		{name: "backend worker send", body: `return m.backend().SendLine(m.Session, t.Window, text)`, injection: false},
 		{name: "backend sanctioned nudge", file: sanctionedStallNudgeFile, fn: sanctionedStallNudgeFunc, body: `return be.SendLine(session, managerWindow, "continue")`, injection: false},
+		// The watch loop's wake line: exempt only as the fixed literal from wireManagerWake in
+		// internal/watch/daemon.go.
+		{name: "sanctioned wake (managerWindow ident)", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: "return tmux.SendLine(session, managerWindow, " + strconv.Quote(sanctionedWakePayload) + ")", injection: false},
+		{name: "sanctioned wake (literal window)", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: "return tmux.SendLine(session, \"manager\", " + strconv.Quote(sanctionedWakePayload) + ")", injection: false},
+		// TIGHT: entries are matched whole, never as a cross-product of file/func/payload.
+		{name: "wake line from the stall-nudge site", file: sanctionedStallNudgeFile, fn: sanctionedStallNudgeFunc, body: "return tmux.SendLine(session, managerWindow, " + strconv.Quote(sanctionedWakePayload) + ")", injection: true},
+		{name: "continue from the wake site", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: `return tmux.SendLine(session, managerWindow, "continue")`, injection: true},
+		{name: "wake func+literal but wrong file", file: "internal/watch/other.go", fn: sanctionedWakeFunc, body: "return tmux.SendLine(session, managerWindow, " + strconv.Quote(sanctionedWakePayload) + ")", injection: true},
+		{name: "wake file+literal but wrong function", file: sanctionedWakeFile, fn: "somethingElse", body: "return tmux.SendLine(session, managerWindow, " + strconv.Quote(sanctionedWakePayload) + ")", injection: true},
+		{name: "wake name as a method is not exempt", file: sanctionedWakeFile, fn: sanctionedWakeFunc, recv: "d *Daemon", body: "return tmux.SendLine(session, managerWindow, " + strconv.Quote(sanctionedWakePayload) + ")", injection: true},
+		{name: "ident payload in wake site is not exempt", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: `return tmux.SendLine(session, managerWindow, wakeLine)`, injection: true},
+		{name: "event payload in wake site is not exempt", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: `return tmux.SendLine(session, managerWindow, "Scheduler wake: "+e.Payload)`, injection: true},
+		{name: "sendkey in wake site is not exempt", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: `tmux.SendKey(session, managerWindow, "Enter")`, injection: true},
 	}
 	for _, c := range cases {
 		fn := c.fn
