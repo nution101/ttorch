@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -1374,38 +1376,69 @@ func TestTextRulesStopWhenTheBudgetIsSpent(t *testing.T) {
 // first version of it fed bans only, so it covered rule 4 alone: rule 3 acquired the same
 // quadratic in the commit after rule 4 lost it, and this test stayed green throughout.
 //
-// The assertion is complexity, not a wall-clock number. Each input is sized so that the
-// quadratic form cannot finish inside the budget while the linear form finishes in a
-// fraction of it, so a regression reports a spent budget where a healthy rule reports its
-// findings.
+// The assertion is on growth, not on a wall-clock number. An absolute budget cannot tell a
+// slow machine from a quadratic: it failed on a macOS CI runner with every rule linear, and
+// it would pass a quadratic on a machine fast enough. So each rule runs alone, at two sizes
+// a factor of 4 apart, and fails when its time grows by more than 8x. Linear growth over
+// that factor is about 4x and quadratic about 16x. Each size keeps the best of several
+// interleaved runs, because noise only ever adds time, and interleaving spreads a burst of
+// contention across both sizes instead of landing on one.
 func TestEveryTextRuleIsLinearInTheBrief(t *testing.T) {
 	repo, _ := fixture(t)
-	cases := map[string]struct {
-		rule   RuleID
-		body   string
-		budget time.Duration
-		was    string // measured at 0e5f11b, the sha that carried the defect
+	const (
+		factor    = 4   // the larger brief repeats its unit this many times more
+		maxGrowth = 8.0 // linear is about 4x over that factor, quadratic about 16x
+		runs      = 5
+	)
+	cases := []struct {
+		name string
+		rule RuleID
+		unit string
+		n    int    // repetitions of unit in the larger brief
+		was  string // measured at 0e5f11b, the sha that carried the defect
 	}{
-		"rule 4, bans": {
-			RuleProhibition, strings.Repeat("do not push ", 4000), 10 * time.Second,
-			"17s at 4000 before cf73928",
-		},
-		"rule 3, counts": {
-			RuleHardCounts, strings.Repeat("there are 21 occurrences. ", 16000), 5 * time.Second,
-			"8.5s at 16000 before this round",
-		},
-		"rule 2, citations": {
-			RuleFilePaths, strings.Repeat("see internal/pkg/file.go and internal/pkg/other.go ", 4000), 10 * time.Second,
-			"44s at 8000 tokens before this round",
-		},
+		{"rule 4, bans", RuleProhibition, "do not push ", 4000, "17s at 4000 before cf73928"},
+		{"rule 3, counts", RuleHardCounts, "there are 21 occurrences. ", 16000, "8.5s at 16000 before this round"},
+		{"rule 2, citations", RuleFilePaths, "see internal/pkg/file.go and internal/pkg/other.go ", 4000, "44s at 8000 tokens before this round"},
 	}
-	for name, tc := range cases {
-		brief := "Base is origin/main in this repository.\n\n" + tc.body + "\n"
-		r := Lint(brief, Options{Repo: repo, Budget: tc.budget})
-		for _, f := range r.Findings {
-			if f.Rule == tc.rule && strings.Contains(f.Detail, "the run budget expired") {
-				t.Errorf("%s: exhausted a %s budget, which is the quadratic returning (%s)", name, tc.budget, tc.was)
+	for _, tc := range cases {
+		// Only the rule under test runs, so its time is not diluted by the git work of the
+		// others, and no earlier rule spends a deadline this one then inherits.
+		opt := Options{Repo: repo, Budget: 2 * time.Minute, Config: Config{Disabled: map[RuleID]bool{}}}
+		for _, id := range Rules() {
+			opt.Config.Disabled[id] = id != tc.rule
+		}
+		// The budget is far above any healthy run, so it never ends a measurement early. A
+		// run it does end is not a timing at all, and the case reports that instead.
+		expired := false
+		timed := func(n int) time.Duration {
+			brief := "Base is origin/main in this repository.\n\n" + strings.Repeat(tc.unit, n) + "\n"
+			runtime.GC()
+			start := time.Now()
+			r := Lint(brief, opt)
+			elapsed := time.Since(start)
+			for _, f := range findingsFor(r, tc.rule) {
+				if strings.Contains(f.Detail, "the run budget expired") {
+					expired = true
+				}
 			}
+			return elapsed
+		}
+		timed(tc.n / factor) // warm-up, not measured
+		small, large := time.Duration(math.MaxInt64), time.Duration(math.MaxInt64)
+		for i := 0; i < runs && !expired; i++ {
+			small = min(small, timed(tc.n/factor))
+			large = min(large, timed(tc.n))
+		}
+		if expired {
+			t.Errorf("%s: a healthy run takes a small fraction of a %s budget, and this one spent all of it; the quadratic is back (%s)", tc.name, opt.Budget, tc.was)
+			continue
+		}
+		growth := float64(large) / float64(small)
+		t.Logf("%s: %d units %s, %d units %s, growth %.2fx", tc.name, tc.n/factor, small, tc.n, large, growth)
+		if growth > maxGrowth {
+			t.Errorf("%s: time grew %.1fx for a %dx larger brief (%s to %s), past the %.0fx limit; linear is about %dx, so the quadratic is back (%s)",
+				tc.name, growth, factor, small, large, maxGrowth, factor, tc.was)
 		}
 	}
 }
