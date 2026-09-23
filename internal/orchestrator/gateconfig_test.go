@@ -104,8 +104,8 @@ var nonDecidingFiles = map[string]string{
 //
 // This comment used to restate the figures and drifted twice. They are generated into that
 // block now. TestGateCostFiguresMatchTheDoc proves the block matches the matcher. It does not
-// prove this comment is free of figures, only that none is written here on one line in a
-// shape costFigureFor knows.
+// prove this comment is free of figures, only that none is written here in a shape
+// costFigureFor knows.
 //
 // A file list over a package that gets refactored decays silently — this package has already
 // been re-split once (140d2b91, "split god-file into focused single-responsibility files"),
@@ -1460,9 +1460,9 @@ func TestGateCostFiguresMatchTheDoc(t *testing.T) {
 	//
 	// This one inverts the question: outside the block, a figure in one of the shapes
 	// costFigureFor knows is a failure whether or not the number is right. It still knows
-	// only those shapes, on one line, in the files assertNoHandWrittenFigures reads. A figure
-	// split across lines, separated from its noun by other words, spelled out, or replaced
-	// by a comparison gets past it. The rule is wider than the check, and review holds the
+	// only those shapes, in the files assertNoHandWrittenFigures reads, and three of them
+	// only on one line. A count split from its noun across lines, separated from it by other
+	// words, spelled out, or replaced by a comparison gets past it. The rule is wider than the check, and review holds the
 	// rest.
 	//
 	// Strips the block that is IN the file, not the one just generated. When the two
@@ -1509,10 +1509,12 @@ func own(p string, touched [][]string) int {
 // costFigureFor matches five shapes of a cost figure, not a known value: a number over the
 // corpus size, a number "of" the corpus size (optionally "of the"), a percentage, a number
 // followed by a single space and "commit", "commits" or "marginal", and a parenthesised
-// commit count. Everything has to sit on one line.
+// commit count. The fraction is found across a line break on either side of the slash,
+// because \s* matches a newline, and a percentage split inside the number still trips on its
+// trailing digits. The other three shapes need the number and its word on one line.
 //
 // That is what it catches, and it is less than the rule it serves. It misses a figure split
-// across a line break ("cost 0" then "commits" on the next line), a number with other words
+// across a line break in those three shapes ("cost 0" then "commits"), a number with other words
 // between it and its noun ("0 additional commits"), a number written as a word, a fraction
 // over any denominator other than the corpus size, and a cost stated as a comparison with
 // no number at all ("the cheaper of the two"). All but the other-denominator case have
@@ -1677,8 +1679,9 @@ func TestTtorchSourceListIsHonest(t *testing.T) {
 // not claimed to be.
 func TestNotCoveredListIsHonest(t *testing.T) {
 	entries := readFence(t, notCoveredFence)
-	// Non-empty on purpose. internal/cli/ alone is a deliberate, measured exclusion at +32
-	// commits, so an empty list here would be false rather than an achievement.
+	// Non-empty on purpose. internal/cli/ and internal/db/ are deliberate, measured
+	// exclusions (see the gate-cost block in docs/ARCHITECTURE.md), so an empty list here
+	// would be false rather than an achievement.
 	if len(entries) == 0 {
 		t.Fatal("the not-covered list is empty. internal/cli/ and internal/db/ are deliberate " +
 			"exclusions, so an empty list is a false claim rather than a finished job.")

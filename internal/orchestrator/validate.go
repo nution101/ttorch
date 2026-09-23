@@ -101,9 +101,9 @@ func (m *Manager) Validate(taskID string) ([]validate.Result, error) {
 //
 // Makefile, go.work, go.work.sum and content.go sit outside both packages and are here on the
 // same delayed-diff argument. .ttorch/validate.sh — the gate's validation authority, already
-// covered — does nothing but run `make lint` and `make test-fast`, so anything that redefines
-// what those two commands compile or run redefines what green means without touching a
-// covered script:
+// covered — does nothing but run `make lint`, `make test-fast` and `make test-gate`, so
+// anything that redefines what those commands compile or run redefines what green means
+// without touching a covered script:
 //
 //	Makefile      redefines the targets themselves
 //	go.work       the toolchain AUTO-DISCOVERS it at the repo root via GOWORK, and its
@@ -293,8 +293,7 @@ var ttorchSourceFiles = []string{
 // vendor/ is the third way to change what `go test` compiles without touching a covered
 // script: with a consistent vendor/modules.txt the toolchain builds from vendor/ rather than
 // the module cache, so committed bytes there replace a dependency's implementation (verified
-// the same way as go.work). It is a whole directory, so a prefix is the honest unit. 0
-// commits in 196.
+// the same way as go.work). It is a whole directory, so a prefix is the honest unit.
 //
 // docs/install.sh and docs/install.ps1 are in on a DIFFERENT argument from everything above,
 // named as such so the flag keeps one meaning. They do not decide how a change is reviewed or

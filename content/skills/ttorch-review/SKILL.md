@@ -217,7 +217,7 @@ invalidates the verdict — re-prep, re-review, re-record.
   directory symlink can introduce files git never lists by path, and refusing all of them
   would fire on ordinary layout.
 
-- **The covered set is NOT the same in every repo.** Half of it is ttorch's own source, and
+- **The covered set is NOT the same in every repo.** Part of it is ttorch's own source, and
   in your repo those paths mean something else. `content/` is the clearest: here it is
   ttorch's embedded payload, but it is also where Hugo, Next and most CMS layouts keep
   articles, so gating on it would demand `--allow-gate-change` for every ordinary change.
@@ -275,16 +275,17 @@ invalidates the verdict — re-prep, re-review, re-record.
   internal/orchestrator/orchestrator.go
   ```
 
-  `internal/cli/` and `internal/db/` are left out on cost. What covering any entry above
-  would cost is in the generated table in `docs/ARCHITECTURE.md` (gate-cost block), and this
-  file does not restate or rank it. `TestGateCostFiguresMatchTheDoc` checks that the block
-  matches the matcher. Its check for hand-written figures elsewhere is partial: it catches a
-  number written on one line as a fraction of the corpus, a percentage, or "N commits", and
-  misses a figure split across lines, one with words between the number and its noun, one
-  spelled out, and a comparison with no number. Treat a cost claim you find anywhere else as
-  unverified. `internal/worktree/` used to be in this list and is now COVERED: it holds
-  `ChangedFiles`, the only input to the guard, plus the raw blob read the scope resolves
-  from, so an incomplete list or a desynced read there makes the guard match nothing at all.
+  `internal/cli/` and `internal/db/` are left out on cost. What covering any entry above would
+  cost is in the generated table in `docs/ARCHITECTURE.md` (gate-cost block), and this file
+  does not restate or rank it. `TestGateCostFiguresMatchTheDoc` checks that the block matches
+  the matcher. Its check for hand-written figures elsewhere is partial: it catches a number
+  written as a fraction of the corpus or a percentage, and "N commits" written on one line,
+  and misses a commit count split from its noun across lines, one with words between the
+  number and its noun, one spelled out, and a comparison with no number. Treat a cost claim
+  you find anywhere else as unverified. `internal/worktree/` used to be in this list and is
+  now COVERED: it holds `ChangedFiles`, the only input to the guard, plus the raw blob read
+  the scope resolves from, so an incomplete list or a desynced read there makes the guard
+  match nothing at all.
 
 - **What that claim does NOT cover**, stated so nobody reads it as wider than it is:
   - Gated means trusted mode or `--require-verdict`. A `local`/`validated` merge without

@@ -466,11 +466,13 @@ The same reasoning put `skipIfShort` in `gateconfig_test.go`. `TestFSIdentityKey
 `TestGateCostFiguresMatchTheDoc` call it, and while it lived in `orchestrator_test.go`, which
 the gate does not cover, a one-line edit there skipped both in every lane and merged unflagged.
 
-Two other parts of `orchestrator_test.go` sit in front of the gate's proofs and are still
-uncovered. `TestMain` is one: a version that skips `m.Run` runs no test in the package and
-still exits 0, which would make the package's `make test-gate` line vacuous. `deliveryHarness`
-is the other, and every end-to-end attack test goes through it. Covering them would put e2e
-setup behind `--allow-gate-change`; that was left as a decision, not an oversight.
+That move does not close the wider gap. Each uncovered `_test.go` file in
+`internal/orchestrator` compiles into the same test binary as the gate's proofs, and any of
+them can end that binary early: an `init()` that calls `os.Exit(0)`, or a `TestMain` that never
+calls `m.Run`, makes the package's `make test-gate` line report ok without running a proof.
+`TestMain` and `deliveryHarness`, which the end-to-end attack tests all go through, are two
+examples in `orchestrator_test.go`. Covering the package's test files would put e2e setup
+behind `--allow-gate-change`; that was left as a decision, not an oversight.
 
 **`internal/skills/` installs third-party code into `~/.claude/skills`.** `Recommended()`
 returns refs, `InstallCmd` turns each into `npx skills add <ref>`, and `EnsureInstalled` runs
@@ -494,23 +496,20 @@ generates. That part is complete: the block cannot drift from the guard.
 It also looks for hand-written figures, and that part checks much less than the rule above asks
 for. Outside the block, in this file, in `content/skills/ttorch-review/SKILL.md` and in the
 comments of the covered `.go` files, it fails on text shaped like `<n>/<corpus size>`, `<n> of
-<corpus size>`, `<n>%`, `<n> commits` or `<n> marginal` with a single space, or `(<n> commits)`,
-all on one line. It does not catch a figure split across a line break, a number with other words
-between it and its noun ("costs 0 additional commits"), a number written as a word, a cost
-stated as a comparison with no number ("the cheaper of the two"), a fraction over any other
-denominator, or anything in a file outside that list. All of those except the other-denominator
-case have occurred here and passed the check. They are held by the rule and by review. A green
-run means none of the checked shapes is present, not that no figure is.
+<corpus size>`, `<n>%`, `<n> commits` or `<n> marginal` with a single space, or `(<n> commits)`.
+The fraction is found across a line break on either side of the slash, and a percentage split
+inside the number still trips on its trailing digits; the other three shapes need the number and
+its word on one line. It does not catch those three split across a line break, a number with
+other words between it and its noun ("costs 0 additional commits"), a number written as a word,
+a cost stated as a comparison with no number ("the cheaper of the two"), a fraction over any
+other denominator, or anything in a file outside that list. All of those except the
+other-denominator case have occurred here and passed the check. They are held by the rule and by
+review. A green run means none of the checked shapes is present, not that no figure is.
 
 The whole test skips, rather than fails, when `gateCostBase` is unreachable. That includes CI's
-depth-1 clone and any copy of the tree without its git history, so it only proves anything
-where the full history is present.
-
-It derives the covered set from the code rather than restating it, so the table cannot drift
-from the guard. Its limit is the corpus: it needs the 196 non-merge commits reachable from
-`b642ba6`, and CI checks out shallow (`actions/checkout` defaults to depth 1), so there it
-skips and only a full clone exercises it. Raising `fetch-depth` would fix that but changes a
-covered file; it is a deliberate open item rather than an oversight.
+depth-1 clone (`actions/checkout` defaults to depth 1) and any copy of the tree without its git
+history, so it only proves anything where the full history is present. Raising `fetch-depth`
+would fix CI but changes a covered file; it is a deliberate open item rather than an oversight.
 
 ### The covered set is not universal
 
