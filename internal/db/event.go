@@ -22,6 +22,11 @@ func requireRows(res sql.Result, what string) error {
 
 const eventColumns = `id, ts, entity_type, entity_id, type, actor, from_status, to_status, actionable, payload`
 
+// actionableFilter narrows an events query to the rows that should wake the manager.
+// GLOB (not LIKE) keeps the actor match case-sensitive and prefix-only, exactly
+// mirroring isWorkerActor (HasPrefix "worker:").
+const actionableFilter = ` AND actionable = 1 AND NOT (type = 'status_changed' AND actor NOT GLOB 'worker:*')`
+
 func scanEvent(sc rowScanner) (Event, error) {
 	var (
 		e         Event
@@ -83,9 +88,7 @@ func (s *Store) AppendEvent(ctx context.Context, e Event) (int64, error) {
 func (s *Store) EventsSince(ctx context.Context, sinceID int64, onlyActionable bool) ([]Event, error) {
 	query := `SELECT ` + eventColumns + ` FROM events WHERE id > ?`
 	if onlyActionable {
-		// GLOB (not LIKE) so the actor match is case-sensitive and prefix-only,
-		// exactly mirroring isWorkerActor (HasPrefix "worker:").
-		query += ` AND actionable = 1 AND NOT (type = 'status_changed' AND actor NOT GLOB 'worker:*')`
+		query += actionableFilter
 	}
 	query += ` ORDER BY id ASC`
 	rows, err := s.db.QueryContext(ctx, query, sinceID)
