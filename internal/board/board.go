@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/nution101/ttorch/internal/db"
+	"github.com/nution101/ttorch/internal/review"
 )
 
 //go:embed page.html
@@ -299,34 +300,44 @@ func setSecurityHeaders(w http.ResponseWriter) {
 }
 
 // refuse answers a rejected request with a bare status and logs why, naming the path but
-// never the query string (which is where the page's token travels).
+// never the query string (which is where the page's token travels). Refusals run before the
+// token check, so the path is anyone's text: net/http has already percent-decoded it, and
+// %0A or %1B arrive as real bytes. It is logged quoted, so a newline or a terminal escape
+// shows as \n or \x1b inside the quotes and cannot start a line of its own.
 func (s *Server) refuse(w http.ResponseWriter, r *http.Request, code int, why string) {
-	s.logf("refused %s %s: %s", r.Method, r.URL.Path, why)
+	s.logf("refused %s %s: %s", safeText(r.Method), review.SafeQuote(r.URL.Path), why)
 	http.Error(w, http.StatusText(code), code)
 }
 
+// logf writes one board log line. It is the only way this package writes to the log, and it
+// forces the result onto a single printable line (review.SafeLine), so no argument, whatever
+// its origin, can put a line break or a control sequence into the lead's terminal. Text taken
+// from a request should still be quoted by the caller (review.SafeQuote), so a reader can see
+// where it starts and ends.
 func (s *Server) logf(format string, args ...any) {
 	line := fmt.Sprintf(format, args...)
 	// Belt and braces: nothing formats the token into a line, but a line that somehow held
 	// it is redacted rather than written.
 	line = strings.ReplaceAll(line, s.token, "[redacted]")
-	fmt.Fprintf(s.cfg.Log, "board: %s\n", line)
+	fmt.Fprintf(s.cfg.Log, "board: %s\n", review.SafeLine(line))
 }
 
-// redactor strips the token from anything written through it. The HTTP server's error log
-// goes through one, since its lines are formatted by net/http rather than by this package.
+// redactor is the HTTP server's error log. net/http formats those lines itself, and one can
+// carry request-derived text (a handler panic includes the panic value), so each write has
+// the token stripped and is forced onto one printable line, like logf.
 type redactor struct {
 	w      io.Writer
 	secret string
 }
 
-// Write reports len(p) on success, as io.Writer requires, whatever the redacted length.
+// Write reports len(p) on success, as io.Writer requires, whatever the rewritten length.
 func (r *redactor) Write(p []byte) (int, error) {
 	n := len(p)
 	if r.secret != "" {
 		p = bytes.ReplaceAll(p, []byte(r.secret), []byte("[redacted]"))
 	}
-	if _, err := r.w.Write(p); err != nil {
+	line := review.SafeLine(string(p)) + "\n"
+	if _, err := io.WriteString(r.w, line); err != nil {
 		return 0, err
 	}
 	return n, nil
@@ -435,7 +446,7 @@ func (s *Server) handleGatePrep(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) logAction(action, taskID string, res Result, err error) {
-	id := safeText(taskID)
+	id := review.SafeQuote(taskID) // from the request's form
 	switch {
 	case err != nil:
 		s.logf("%s %s: failed: %s", action, id, safeText(err.Error()))
