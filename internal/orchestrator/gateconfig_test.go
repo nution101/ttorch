@@ -70,12 +70,17 @@ var decidingFunctions = []string{
 	"validateCommitted", "stagedGreen", "hasDefaultBranchGateScript",
 	"validateForAuthority", "loadProcessValidate",
 	"validateCacheKey", "loadValidateCache", "storeValidateCache",
+	// the process-only memo that makes a green an authority, and the key it is stored under
+	"gateContentKey", "runAndRecordGate", "storeProcessValidate",
 	// the gate-config guard
 	"matchesGateConfig", "diffTouchesGateConfig",
 	// the approval token: what it grants, how it is read, and when it is re-minted
 	"Approve", "approvalPayload", "splitApprovalPayload", "remintFromVerdict",
 	// the merge and review decisions themselves
 	"MergeLocal", "TrustPrep", "TrustRecord", "carryVerdictForward", "gateCoversRebased",
+	// what a verdict must cover and fold, what a re-prep keeps, and the daemon that records
+	"requiredDimensions", "derivedFloor", "foldDimensions",
+	"archivePriorReports", "carryReportsPastStamp", "gateOnceAt",
 	// the audit record a trusted merge refuses to proceed without
 	"writeAudit", "sanitizeAuditLine",
 	// the path-spelling and collision controls the guard rests on
