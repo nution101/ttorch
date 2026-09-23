@@ -342,9 +342,6 @@ invalidates the verdict — re-prep, re-review, re-record.
   - Everything here is inside the `gated` branch of the merge, so a `local`/`validated` merge
     without `--require-verdict` gets none of it — not the name match, not the collision
     refusal, not the control-character refusal. Same pre-existing hole as the first bullet.
-  - **Coordination note for step 6:** `go.mod` and `go.sum` ARE now covered by this branch.
-    Step 6's not-covered list still names them; that line should go when the two land
-    together, the same way the fold is coordinated.
   - Git will not tell you. `git clone` warns about a collision; `git worktree add --detach` —
     what the gate uses to build the checkout it validates — exits 0 with nothing on stderr and
     silently drops the losing entry. The gate's own collision check is load-bearing, not a
