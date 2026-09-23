@@ -176,6 +176,7 @@ reference; this table covers the surface a lead and manager use day to day.
 | --- | --- |
 | `ttorch watch` | Block until an actionable DB event, print the batch + watermark, exit. Flags: `--since`, `--timeout`, `--coalesce`, `--reset`. The manager arms this each non-blocking turn |
 | `ttorch await-lead [--clear]` | Mark the manager as awaiting the lead (the watcher stays silent until cleared) |
+| `ttorch board` | Serve a local page (127.0.0.1, random port, access token in the printed URL) of pending decisions, live workers, recent completions and backlog. It can answer a needs-input worker, dispatch a backlog task and re-run gate prep; it never approves or merges, and shows the `ttorch approve` command instead |
 | `ttorch watchdog` | External manager-liveness net (run from launchd/cron). Flags: `--stall`, `--interval`, `--quiet` |
 | `ttorch scheduler` | The deterministic dispatch+gate+land+supervise daemon. Flags: `--dispatch` (on), `--gate`, `--land`, `--supervise`, `--interval`, `--once`, `--singleton` |
 

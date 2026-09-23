@@ -137,6 +137,8 @@ func Main(args []string) int {
 		return run(cmdWait(rest))
 	case "watch":
 		return run(cmdWatch(rest))
+	case "board":
+		return run(cmdBoard(rest))
 	case "await-lead":
 		return run(cmdAwaitLead(rest))
 	case "watchdog":
@@ -2381,6 +2383,10 @@ Supervision:
                             because a live watcher already holds the singleton prints
                             WATCH_SINGLETON_HELD with the holding pid and exits non-zero
   watch --reset           reap an orphan watcher and confirm the singleton is free
+  board                   serve a local page (127.0.0.1, free port, token in the printed
+                          URL) of pending decisions, live workers, recent completions
+                          and backlog; it can answer a needs-input worker, dispatch a
+                          backlog task and re-run gate prep, and never approves or merges
   await-lead [--clear]    mark the manager as awaiting the lead (the watcher stays
                           silent and never surfaces); --clear when the lead returns
   watchdog                external manager-liveness net: re-poke a STALLED manager that
