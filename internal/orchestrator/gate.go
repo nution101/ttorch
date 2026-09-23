@@ -1539,19 +1539,13 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 	// reaches the manager and in what words.
 	if err := review.ValidateDimensionSet(dims); err != nil {
 		m.surfaceGateBlocked(taskID, head, err.Error())
-		prog.Outcome = gateOutcomeBlocked
-		m.writeGateProgress(taskID, prog)
-		m.teardownReviewers(taskID, dims)
-		return GateBlocked, nil
+		return GateBlocked, m.endEpisode(taskID, prog, gateOutcomeBlocked, dims)
 	}
 	if len(dropped) > 0 {
 		// The set shrank after prep: the inputs dir was edited during the review, which is
 		// how a blocking report gets hidden. The manager adjudicates that, not the daemon.
 		m.surfaceGateBlocked(taskID, head, droppedDimensionFinding(dropped).Summary)
-		prog.Outcome = gateOutcomeBlocked
-		m.writeGateProgress(taskID, prog)
-		m.teardownReviewers(taskID, dims)
-		return GateBlocked, nil
+		return GateBlocked, m.endEpisode(taskID, prog, gateOutcomeBlocked, dims)
 	}
 	if prog.Attempts == nil {
 		prog.Attempts = map[string]int{}
@@ -1579,10 +1573,7 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 				reason += "; last dispatch error: " + prog.LastDispatchError
 			}
 			m.surfaceGateBlocked(taskID, head, reason)
-			prog.Outcome = gateOutcomeBlocked
-			m.writeGateProgress(taskID, prog)
-			m.teardownReviewers(taskID, unionDimensions(dims, dispatchedDimensions(prog)))
-			return GateBlocked, nil
+			return GateBlocked, m.endEpisode(taskID, prog, gateOutcomeBlocked, unionDimensions(dims, dispatchedDimensions(prog)))
 		}
 		toDispatch = append(toDispatch, dim)
 	}
@@ -1617,10 +1608,7 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 			}
 		}
 		m.surfaceGateBlocked(taskID, head, reason)
-		prog.Outcome = gateOutcomeBlocked
-		m.writeGateProgress(taskID, prog)
-		m.teardownReviewers(taskID, unionDimensions(dims, dispatchedDimensions(prog)))
-		return GateBlocked, nil
+		return GateBlocked, m.endEpisode(taskID, prog, gateOutcomeBlocked, unionDimensions(dims, dispatchedDimensions(prog)))
 	}
 
 	if len(toDispatch) > 0 {
@@ -1647,7 +1635,11 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 		if charged && prog.DispatchedAt == 0 {
 			prog.DispatchedAt = now.UnixNano()
 		}
-		m.writeGateProgress(taskID, prog)
+		// A lost write here loses the attempt count, so the next tick relaunches without
+		// charging it. Report it; the stall clock does not depend on this write.
+		if werr := m.writeGateProgress(taskID, prog); werr != nil {
+			return GateDispatched, fmt.Errorf("gate %q: could not save the dispatch: %w", taskID, werr)
+		}
 		return GateDispatched, nil
 	}
 
@@ -1674,10 +1666,7 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 		// FAIL CLOSED: a blocking verdict is NEVER recorded by the daemon. Surface it for the
 		// manager and mark the head terminal so the pass does not re-loop on the same reports.
 		m.surfaceGateBlocked(taskID, head, "adversarial review blocked: "+strings.Join(review.Describe(v), "; "))
-		prog.Outcome = gateOutcomeBlocked
-		m.writeGateProgress(taskID, prog)
-		m.teardownReviewers(taskID, unionDimensions(fold, dispatchedDimensions(prog)))
-		return GateBlocked, nil
+		return GateBlocked, m.endEpisode(taskID, prog, gateOutcomeBlocked, unionDimensions(fold, dispatchedDimensions(prog)))
 	}
 
 	// PASS. Record the durable verdict through the UNCHANGED TrustRecord, which re-aggregates,
@@ -1691,11 +1680,11 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 		fmt.Fprintf(os.Stderr, "ttorch: gate trust-record for %s deferred: %v\n", taskID, err)
 		return GateWaiting, nil
 	}
-	prog.Outcome = gateOutcomeRecorded
-	m.writeGateProgress(taskID, prog)
-	m.teardownReviewers(taskID, unionDimensions(fold, dispatchedDimensions(prog)))
+	// The verdict row is already durable, so a failed save here costs bookkeeping, not the
+	// decision: the next tick finds the verdict pinned to head and skips. It is still reported.
+	serr := m.endEpisode(taskID, prog, gateOutcomeRecorded, unionDimensions(fold, dispatchedDimensions(prog)))
 	m.audit(fmt.Sprintf("gate-record task=%s commit=%s verdict=pass actor=daemon", taskID, short(head)))
-	return GateRecorded, nil
+	return GateRecorded, serr
 }
 
 // Gateable reports whether repo is a daemon-gate candidate: a trusted repo, where a recorded
@@ -2003,9 +1992,26 @@ func (m *Manager) readGateProgress(taskID string) (gateProgress, bool, error) {
 	return p, true, nil
 }
 
-// writeGateProgress persists a task's episode. A failed write is reported rather than
-// swallowed: the record is manager-owned now, so losing it is a real fault in something the
-// gate controls, not a worker-reachable condition to be tolerated.
+// endEpisode marks the episode terminal for its head, tears down the given reviewers, and
+// returns the error from saving the outcome. The teardown runs either way: the outcome was
+// already surfaced or recorded, and leaving reviewer windows running over a failed write
+// helps nobody. A failed save is returned rather than dropped, so the scheduler logs it and
+// the next tick re-evaluates the head.
+func (m *Manager) endEpisode(taskID string, prog gateProgress, outcome string, reviewers []string) error {
+	prog.Outcome = outcome
+	werr := m.writeGateProgress(taskID, prog)
+	m.teardownReviewers(taskID, reviewers)
+	if werr != nil {
+		return fmt.Errorf("gate %q: could not save the %s outcome: %w", taskID, outcome, werr)
+	}
+	return nil
+}
+
+// writeGateProgress persists a task's episode and returns the store's error. Every caller
+// in gateOnceAt checks it, directly or through endEpisode. The row is in a store the
+// worker's uid can also write, so a successful write says the gate recorded something, not
+// that the value will still be there on the next tick; see foldDimensions and episodeStart
+// for what the gate does and does not trust it for.
 func (m *Manager) writeGateProgress(taskID string, p gateProgress) error {
 	dims, err := json.Marshal(p.Dims)
 	if err != nil {

@@ -1781,3 +1781,60 @@ func TestGateOnce_TheEpisodeBudgetRunsFromTheEpisodeNotTheDispatch(t *testing.T)
 		t.Fatalf("outcome = %q at +31m, want %q: the budget runs from the episode, not the dispatch", out, GateBlocked)
 	}
 }
+
+// TestGateOnce_AnOutcomeThatCannotBeSavedIsReported: seven of the nine episode writes in
+// gateOnceAt discarded the store's error, while the commit that moved the record claimed
+// write failures now surface. Each case drives the tick to a different one of those seven
+// write sites with the row made unwritable, and the tick must still reach its outcome and
+// return the failure.
+func TestGateOnce_AnOutcomeThatCannotBeSavedIsReported(t *testing.T) {
+	clean := func(t *testing.T, dir, head string) {
+		writeCleanReport(t, dir, review.DimensionCorrectness, head)
+		writeCleanReport(t, dir, review.DimensionScope, head)
+	}
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, dir, head string)
+		max   int           // maxReviewerAttempts
+		later time.Duration // how far past the episode's start the tick runs
+		want  GateOutcome
+	}{
+		{"dispatched", func(t *testing.T, dir, head string) {}, 2, 0, GateDispatched},
+		{"attempts exhausted", func(t *testing.T, dir, head string) {}, 1, 0, GateBlocked},
+		{"stalled", func(t *testing.T, dir, head string) {}, 2, 2 * time.Hour, GateBlocked},
+		{"set shrank after prep", func(t *testing.T, dir, head string) {
+			shrinkPreparedSet(t, dir, []string{review.DimensionCorrectness})
+		}, 2, 0, GateBlocked},
+		{"unusable dimension name", func(t *testing.T, dir, head string) {
+			addPreparedDimension(t, dir, "../escape")
+		}, 2, 0, GateBlocked},
+		{"review blocked", func(t *testing.T, dir, head string) {
+			clean(t, dir, head)
+			writeFindingReport(t, dir, review.DimensionSecurity, head, []review.Finding{{
+				Dimension: review.DimensionSecurity, Severity: review.SeverityCritical,
+				Reviewer: "ttorch-reviewer-security", Summary: "unauthenticated path traversal in the new handler",
+			}})
+		}, 2, 0, GateBlocked},
+		{"recorded", func(t *testing.T, dir, head string) {
+			clean(t, dir, head)
+			writeCleanReport(t, dir, review.DimensionSecurity, head)
+		}, 2, 0, GateRecorded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := "unsaved-" + strings.ReplaceAll(tc.name, " ", "-")
+			m, dir, head := shrunkSetHarness(t, id)
+			t.Cleanup(func() { _, _ = m.Teardown(id, true) })
+			recordingReviewer(t, false)
+			tc.setup(t, dir, head)
+			failEpisodeWrites(t, m)
+
+			out, err := m.gateOnceAt(id, time.Minute, tc.max, time.Hour, time.Now().Add(tc.later))
+			if out != tc.want {
+				t.Fatalf("outcome = %q, want %q (err %v)", out, tc.want, err)
+			}
+			if err == nil {
+				t.Fatalf("the %s outcome could not be saved and the tick reported no error", tc.want)
+			}
+		})
+	}
+}
