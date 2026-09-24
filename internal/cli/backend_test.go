@@ -11,8 +11,10 @@ import (
 // TestUnknownBackendRefusedAtStartup covers both places the CLI picks a session backend:
 // `ttorch watch`, which builds its watcher directly, and mgr(), which every
 // Manager-backed command goes through. Each must refuse TTORCH_BACKEND=bogus with an
-// error naming the variable before it opens the state store.
+// error naming the variable before it opens the state store. It runs as the manager:
+// `ttorch watch` refuses a worker context before it looks at the backend.
 func TestUnknownBackendRefusedAtStartup(t *testing.T) {
+	clearWorkerContext(t)
 	t.Setenv("TTORCH_HOME", t.TempDir())
 	t.Setenv("TTORCH_TMUX_SESSION", "ttorch-cli-backend-test-no-session")
 	t.Setenv("TTORCH_BACKEND", "bogus")

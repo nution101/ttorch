@@ -1456,6 +1456,9 @@ func cmdWait(_ []string) error {
 // `--reset` it). The refusal used to be a silent exit 0, indistinguishable from the
 // quiet timeout, so a manager whose arm was refused went on believing it was watching.
 func cmdWatch(args []string) error {
+	if err := refuseFromWorker("watch"); err != nil {
+		return err
+	}
 	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
 	since := fs.Int64("since", -1, "only surface events with id greater than this (default: manager.watch_watermark)")
 	timeout := fs.Duration("timeout", 0, "give up after this long with WATCH_TIMEOUT (0 = block forever)")
@@ -1511,6 +1514,9 @@ func cmdWatch(args []string) error {
 // put to the lead. The manager sets it as it surfaces a decision and clears it when
 // the lead returns (re-arming `ttorch watch` also clears it).
 func cmdAwaitLead(args []string) error {
+	if err := refuseFromWorker("await-lead"); err != nil {
+		return err
+	}
 	fs := flag.NewFlagSet("await-lead", flag.ContinueOnError)
 	clear := fs.Bool("clear", false, "clear the flag — the lead has returned; the watcher may be re-armed")
 	if err := fs.Parse(args); err != nil {
@@ -2462,7 +2468,9 @@ Supervision:
                           backlog task and re-run gate prep, and never approves or merges
   inbox                   print the manager's unread actionable updates and advance the
                             watermark past them (idempotent; what the manager runs when
-                            the scheduler wakes it). Also clears awaiting-lead
+                            the scheduler wakes it). Also clears awaiting-lead.
+                            inbox, watch and await-lead refuse to run from a worker
+                            context ($TTORCH_TASK_ID or a .ttorch/task above cwd)
   await-lead [--clear]    mark the manager as awaiting the lead (the watcher stays
                           silent and never surfaces); --clear when the lead returns
   watchdog                external manager-liveness net: re-poke a STALLED manager that
