@@ -8,8 +8,10 @@ package livestate
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
@@ -90,8 +92,22 @@ func WriteRecord(path string, r Record) error {
 // when the file is missing, unreadable, oversized or not valid JSON, when it names an
 // unknown event or carries no timestamp, or when it belongs to a different task. A bad
 // record never reads as busy or idle; the caller falls back to the pane.
+//
+// The watcher calls this for every worker on every sweep, so whatever sits at path must not
+// be able to stall it or fill its memory. A symlink there is refused rather than followed
+// (O_NOFOLLOW), the open never waits for a FIFO's writer (O_NONBLOCK), anything but a regular
+// file is refused on the open descriptor before a byte is read, and at most one byte past
+// maxRecordBytes is read.
 func ReadRecord(path, taskID string) (Record, bool) {
-	b, err := os.ReadFile(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return Record{}, false
+	}
+	defer f.Close()
+	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
+		return Record{}, false
+	}
+	b, err := io.ReadAll(io.LimitReader(f, maxRecordBytes+1))
 	if err != nil || len(b) > maxRecordBytes {
 		return Record{}, false
 	}
