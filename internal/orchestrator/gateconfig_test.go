@@ -80,7 +80,7 @@ var decidingFunctions = []string{
 	// the per-repo switch that waives the human approval for a trusted gate change
 	"gateChangeApprovalWaived",
 	// the merge and review decisions themselves
-	"MergeLocal", "TrustPrep", "TrustRecord", "carryVerdictForward", "gateCoversRebased",
+	"MergeLocal", "mergeLocal", "TrustPrep", "TrustRecord", "carryVerdictForward", "gateCoversRebased",
 	// what a verdict must cover and fold, what a re-prep keeps, and the daemon that records
 	"requiredDimensions", "derivedFloor", "foldDimensions",
 	"archivePriorReports", "carryReportsPastStamp", "gateOnceAt",
@@ -2981,6 +2981,47 @@ func TestMergeLocal_GateChangeApprovalOffAutoMergesGateChange(t *testing.T) {
 		if !strings.Contains(audit, want) {
 			t.Errorf("the merge audit line must carry %q:\n%s", want, audit)
 		}
+	}
+}
+
+// TestLand_GateChangeApprovalOffPrintsTheUnapprovedLine: the land path, which the scheduler's
+// land pass drives, reaches the same outcome and its output carries the same line, so
+// `ttorch land` says when it merged a gate change no human approved.
+func TestLand_GateChangeApprovalOffPrintsTheUnapprovedLine(t *testing.T) {
+	m, repo := gateChangeApprovalRepo(t, "gcaland", "trusted", "- gate-change-approval: off")
+	task, err := m.Spawn("gl1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = m.Teardown("gl1", true) }()
+	head := commitGateDefinitionEdit(t, task.Worktree)
+	writeReviewReports(t, m.P.ReviewInputsDir("gl1"), head, nil)
+	if _, err := m.TrustRecord("gl1", "", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	out, err := m.Land("gl1", true)
+	if err != nil {
+		t.Fatalf("with gate-change-approval off, land should merge the gate-definition change: %v", err)
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") != head {
+		t.Fatal("the default branch should have fast-forwarded to the worker's commit")
+	}
+	lines := 0
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, "gate-change-approval is off") {
+			lines++
+			for _, f := range gateEditFiles {
+				if !strings.Contains(l, f) {
+					t.Errorf("the land line must name %s: %q", f, l)
+				}
+			}
+		}
+	}
+	if lines != 1 {
+		t.Fatalf("land output must carry exactly one gate-change-approval line, got %d:\n%s", lines, out)
+	}
+	if evs := gateChangeUnapprovedEvents(t, m, "gl1"); len(evs) != 1 {
+		t.Fatalf("want exactly one gate_change_unapproved event, got %d", len(evs))
 	}
 }
 

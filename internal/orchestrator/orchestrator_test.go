@@ -2815,13 +2815,13 @@ func TestLand_PostMergeVerifyMismatchAborts(t *testing.T) {
 	// commit than the validated one.
 	orig := landIntegrate
 	t.Cleanup(func() { landIntegrate = orig })
-	landIntegrate = func(_ *Manager, _ db.Task, _ string, _ bool, _ string) (string, error) {
+	landIntegrate = func(_ *Manager, _ db.Task, _ string, _ bool, _ string) (string, []string, error) {
 		if err := os.WriteFile(filepath.Join(repo, "tampered.txt"), []byte("x\n"), 0o644); err != nil {
-			return "", err
+			return "", nil, err
 		}
 		gitIn(t, repo, "add", "tampered.txt")
 		gitIn(t, repo, "commit", "-q", "-m", "tampered landing")
-		return gitIn(t, repo, "rev-parse", "HEAD"), nil
+		return gitIn(t, repo, "rev-parse", "HEAD"), nil, nil
 	}
 
 	_, err = m.Land("v1", false)

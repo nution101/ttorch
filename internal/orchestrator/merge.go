@@ -175,6 +175,13 @@ func (m *Manager) recordDelivered(taskID, eventType, payload string) {
 // commit being merged (verdict.ReviewedSHA==workerHead), closing the TOCTOU window
 // where a commit lands after review. Every merge is recorded in the audit log.
 func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error) {
+	return m.mergeLocal(taskID, requireVerdict, nil)
+}
+
+// mergeLocal is MergeLocal. When a merge succeeds by relying on gate-change-approval: off and
+// unapproved is non-nil, it also stores the gate-definition files no human approved in
+// *unapproved, so Land can print the same line in its own summary.
+func (m *Manager) mergeLocal(taskID string, requireVerdict bool, unapproved *[]string) (string, error) {
 	t, ok, err := m.Store.GetTask(context.Background(), taskID)
 	if err != nil || !ok {
 		return "", fmt.Errorf("unknown task %q", taskID)
@@ -459,6 +466,9 @@ func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error)
 	if len(unapprovedGateChange) > 0 {
 		m.recordUnapprovedGateChange(taskID, def, workerHead, unapprovedGateChange)
 		out += "\n  " + unapprovedGateChangeNote(unapprovedGateChange)
+		if unapproved != nil {
+			*unapproved = unapprovedGateChange
+		}
 	}
 	return out, nil
 }
@@ -679,11 +689,13 @@ func splitApprovalPayload(data string) (by, sha string, gateChangeFiles []string
 }
 
 // landIntegrate performs the mode-appropriate integration step of Land and returns the
-// commit now on the local default branch's tip. It is a package-level seam so a test can
-// substitute a faulty integrator and exercise Land's post-merge verification abort path
-// (a clean local fast-forward can never land a tree different from the validated commit,
-// so the only way to drive the mismatch alarm in-process is to inject one).
-var landIntegrate = func(m *Manager, t db.Task, mode string, requireVerdict bool, rebasedHead string) (string, error) {
+// commit now on the local default branch's tip, plus the gate-definition files the merge
+// changed with no human approval (non-empty only when gate-change-approval: off carried it).
+// It is a package-level seam so a test can substitute a faulty integrator and exercise Land's
+// post-merge verification abort path (a clean local fast-forward can never land a tree
+// different from the validated commit, so the only way to drive the mismatch alarm in-process
+// is to inject one).
+var landIntegrate = func(m *Manager, t db.Task, mode string, requireVerdict bool, rebasedHead string) (string, []string, error) {
 	return m.integrate(t, mode, requireVerdict, rebasedHead)
 }
 
@@ -991,7 +1003,7 @@ func (m *Manager) landCommit(t db.Task, spec landSpec, prep landPrepResult) (str
 	// opens + merges a PR (GitHub's review/branch-protection is the gate); every other mode does
 	// an approval-gated local fast-forward via MergeLocal, whose approval and (trusted /
 	// --require-verdict) verdict checks are never bypassed.
-	landed, err := landIntegrate(m, t, spec.mode, spec.requireVerdict, prep.rebasedHead)
+	landed, unapprovedGateChange, err := landIntegrate(m, t, spec.mode, spec.requireVerdict, prep.rebasedHead)
 	if err != nil {
 		return "", err
 	}
@@ -1013,6 +1025,9 @@ func (m *Manager) landCommit(t db.Task, spec landSpec, prep landPrepResult) (str
 	m.audit(fmt.Sprintf("land task=%s repo=%s mode=%s %s -> %s verified", spec.taskID, spec.repo, spec.mode, spec.def, short(landed)))
 	out := fmt.Sprintf("landed %s (%s mode): %s; %s fast-forwarded to %s and verified",
 		spec.taskID, spec.mode, rebaseNote, spec.def, short(defAfter))
+	if len(unapprovedGateChange) > 0 {
+		out += "\n  " + unapprovedGateChangeNote(unapprovedGateChange)
+	}
 	// Surface the security-everywhere audit status. This is purely ADVISORY and never
 	// blocks: a gated land (trusted / --require-verdict) already ran the full review gate
 	// — which includes security — so it needs no extra note; the other modes get a
@@ -1159,20 +1174,24 @@ func (m *Manager) gateCoversRebased(t db.Task, rebasedHead string, gated bool) e
 	return nil
 }
 
-// integrate performs Land's mode-appropriate merge and returns the local default tip.
-func (m *Manager) integrate(t db.Task, mode string, requireVerdict bool, rebasedHead string) (string, error) {
+// integrate performs Land's mode-appropriate merge and returns the local default tip and the
+// gate-definition files the local merge changed with no human approval.
+func (m *Manager) integrate(t db.Task, mode string, requireVerdict bool, rebasedHead string) (string, []string, error) {
 	repo := t.Project
 	def := worktree.DefaultBranch(repo)
 	if mode == "pr" {
-		return m.integratePR(t, def, rebasedHead)
+		head, err := m.integratePR(t, def, rebasedHead)
+		return head, nil, err
 	}
 	// local / validated / trusted: an approval-gated local fast-forward. MergeLocal
 	// enforces the approval token and (in trusted mode or with --require-verdict) the
 	// adversarial-review verdict + a fresh green validate; Land never bypasses those.
-	if _, err := m.MergeLocal(t.ID, requireVerdict); err != nil {
-		return "", fmt.Errorf("land: local merge gate refused %q: %w", t.ID, err)
+	var unapproved []string
+	if _, err := m.mergeLocal(t.ID, requireVerdict, &unapproved); err != nil {
+		return "", nil, fmt.Errorf("land: local merge gate refused %q: %w", t.ID, err)
 	}
-	return worktree.Head(repo)
+	head, err := worktree.Head(repo)
+	return head, unapproved, err
 }
 
 // integratePR delivers via GitHub: it publishes EXACTLY the validated commit as a branch,
