@@ -2,6 +2,7 @@ package watch
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -98,5 +99,57 @@ func TestLiveness_GoesThroughBackend(t *testing.T) {
 	}
 	if got := tmuxCalls(); got != "" {
 		t.Fatalf("the watcher ran tmux directly instead of through the backend:\n%s", got)
+	}
+}
+
+// TestWake_GoesThroughBackend proves the manager-window seams NewDaemon wires reach the
+// manager through the Backend it is given, with a failing tmux on PATH that must record
+// nothing: the foreground check reads the pane pid, the wake is typed with TypeLine, and Enter
+// is pressed with SendKey only after a fresh capture shows exactly the wake at an idle prompt.
+// With the lead's draft in the input instead, the capture happens and no key is sent.
+func TestWake_GoesThroughBackend(t *testing.T) {
+	tmuxCalls := forbidTmux(t)
+	w, s, _, _ := newWatcher(t)
+	const sess = "wake-sess"
+	fake := backendtest.New(sess)
+	fake.AddWindow(sess, managerWindow, inputPane(wakeLine))
+	fake.SetPanePID(sess, managerWindow, os.Getpid())
+	d := NewDaemon(s, w.P, fake, sess, nil)
+
+	if err := d.pressEnter(); err != nil {
+		t.Fatalf("pressEnter with exactly the wake at an idle prompt: %v\nbackend calls: %v\ntmux was run directly:\n%s", err, fake.Calls(), tmuxCalls())
+	}
+	if err := d.typeWake(); err != nil {
+		t.Fatalf("typeWake: %v\ntmux was run directly:\n%s", err, tmuxCalls())
+	}
+	d.managerForeground()
+
+	capture := fmt.Sprintf("CapturePane(%s, %s, %d)", sess, managerWindow, captureLines)
+	enter := fmt.Sprintf("SendKey(%s, %s, Enter)", sess, managerWindow)
+	calls := fake.Calls()
+	for _, want := range []string{
+		capture,
+		enter,
+		fmt.Sprintf("TypeLine(%s, %s, %s)", sess, managerWindow, wakeLine),
+		fmt.Sprintf("PanePID(%s, %s)", sess, managerWindow),
+	} {
+		if !slices.Contains(calls, want) {
+			t.Errorf("backend was never asked %s\ncalls:\n  %s", want, strings.Join(calls, "\n  "))
+		}
+	}
+	if slices.Index(calls, capture) > slices.Index(calls, enter) {
+		t.Errorf("Enter was pressed before the pane was captured:\n  %s", strings.Join(calls, "\n  "))
+	}
+
+	draft := backendtest.New(sess)
+	draft.AddWindow(sess, managerWindow, inputPane("can you check the"))
+	if err := NewDaemon(s, w.P, draft, sess, nil).pressEnter(); err == nil {
+		t.Error("pressEnter with the lead's draft in the input returned nil, want a refusal")
+	}
+	if got := draft.Calls(); !slices.Contains(got, capture) || slices.Contains(got, enter) {
+		t.Errorf("with a draft: calls = %v, want a capture and no Enter", got)
+	}
+	if got := tmuxCalls(); got != "" {
+		t.Fatalf("the wake ran tmux directly instead of through the backend:\n%s", got)
 	}
 }

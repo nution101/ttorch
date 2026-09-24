@@ -48,7 +48,6 @@ import (
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/livestate"
 	"github.com/nution101/ttorch/internal/paths"
-	"github.com/nution101/ttorch/internal/tmux"
 )
 
 // EventManagerWoken records one wake line typed into the manager window. It is
@@ -131,7 +130,7 @@ func NewDaemon(store *db.Store, p paths.Paths, be backend.Backend, session strin
 	}
 	d.w = New(store, p, be, session)
 	d.w.Out = io.Discard // the Daemon never prints a watch batch; `ttorch inbox` does
-	wireManagerWake(d, session)
+	wireManagerWake(d, be, session)
 	return d
 }
 
@@ -147,12 +146,12 @@ func NewDaemon(store *db.Store, p paths.Paths, be backend.Backend, session strin
 //
 // Typing and submitting are separate sends so Tick can re-read the pane in between. Enter goes
 // through submitWakeIfConfirmed, which checks the pane itself right before pressing it.
-func wireManagerWake(d *Daemon, session string) {
-	d.managerForeground = func() string { return foregroundLeader(tmux.PanePID(session, managerWindow)) }
+func wireManagerWake(d *Daemon, be backend.Backend, session string) {
+	d.managerForeground = func() string { return foregroundLeader(be.PanePID(session, managerWindow)) }
 	d.typeWake = func() error {
-		return tmux.TypeLine(session, managerWindow, "Automated notice from the ttorch scheduler, not the lead: unread worker updates, run ttorch inbox")
+		return be.TypeLine(session, managerWindow, "Automated notice from the ttorch scheduler, not the lead: unread worker updates, run ttorch inbox")
 	}
-	d.pressEnter = func() error { return submitWakeIfConfirmed(session) }
+	d.pressEnter = func() error { return submitWakeIfConfirmed(be, session) }
 }
 
 // errWakeNotConfirmed is submitWakeIfConfirmed's refusal: the pane did not show exactly the wake
@@ -166,8 +165,8 @@ var errWakeNotConfirmed = errors.New("the manager's input no longer holds exactl
 // so the check that makes the key safe sits next to the send in the source instead of relying
 // on every caller having confirmed first. Tick's confirm loop still runs before it, to wait out
 // a lagging render; this is the last read before the key.
-func submitWakeIfConfirmed(session string) error {
-	pane, err := tmux.CapturePane(session, managerWindow, captureLines)
+func submitWakeIfConfirmed(be backend.Backend, session string) error {
+	pane, err := be.CapturePane(session, managerWindow, captureLines)
 	if err != nil {
 		return err
 	}
@@ -177,7 +176,7 @@ func submitWakeIfConfirmed(session string) error {
 	if input, ok := promptInput(pane); !ok || input != wakeLine {
 		return errWakeNotConfirmed
 	}
-	return tmux.SendKey(session, managerWindow, "Enter")
+	return be.SendKey(session, managerWindow, "Enter")
 }
 
 func (d *Daemon) poll() time.Duration {

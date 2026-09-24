@@ -5,12 +5,14 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/nution101/ttorch/internal/backend"
 )
 
-// fakeTmux is a stand-in tmux binary for the one function that talks to tmux directly. It logs
-// each invocation's arguments (tab-separated, one per line) to $WD_FAKE_LOG, answers
-// capture-pane with $WD_FAKE_CAPTURE (exiting $WD_FAKE_CAPTURE_EXIT), and succeeds silently on
-// everything else.
+// fakeTmux is a stand-in tmux binary for submitWakeIfConfirmed run through the tmux backend,
+// so the test sees the tmux commands the Enter press really runs. It logs each invocation's
+// arguments (tab-separated, one per line) to $WD_FAKE_LOG, answers capture-pane with
+// $WD_FAKE_CAPTURE (exiting $WD_FAKE_CAPTURE_EXIT), and succeeds silently on everything else.
 const fakeTmux = `#!/bin/sh
 { first=1; for a in "$@"; do if [ $first = 1 ]; then printf '%s' "$a"; first=0; else printf '\t%s' "$a"; fi; done; printf '\n'; } >>"$WD_FAKE_LOG"
 case "$1" in
@@ -74,7 +76,7 @@ func TestSubmitWakeIfConfirmed(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			log := installFakeTmux(t, c.capture, c.exit)
-			err := submitWakeIfConfirmed("wd-test-session")
+			err := submitWakeIfConfirmed(backend.Tmux{}, "wd-test-session")
 			sent := keysSent(t, log)
 			if c.enter {
 				if err != nil || len(sent) != 1 || !strings.HasSuffix(sent[0], "\t-t\twd-test-session:manager\tEnter") {

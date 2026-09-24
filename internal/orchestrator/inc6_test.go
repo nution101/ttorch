@@ -147,16 +147,15 @@ func mentionsManagerLaunch(n ast.Node) bool {
 // stall-recovery tests.
 //
 // (2) The scheduler watch loop's wake (watch.NewDaemon → wireManagerWake): the always-on
-// watcher types one fixed line (tmux.TypeLine, no Enter, in wireManagerWake) telling an idle
-// manager to run `ttorch inbox`, re-reads the pane, and presses Enter (tmux.SendKey "Enter")
-// only from submitWakeIfConfirmed, which takes its own capture and sends the key only if the
-// input holds exactly that line at an idle prompt. Those are two entries, each pinned to its
-// method and function, so the payload of the key is fixed and the check guarding it is in the
-// same function as the send. The RUNTIME guards
-// (only with unread updates, never while awaiting the lead, only when the harness leads the
-// pane's foreground, never into a busy pane or a non-empty prompt, Enter only after the typed
-// line is confirmed, at most one outstanding wake) live in watch.Daemon.Tick and are covered by
-// internal/watch/daemon_test.go.
+// watcher types one fixed line (TypeLine on the session backend, no Enter, in wireManagerWake)
+// telling an idle manager to run `ttorch inbox`, re-reads the pane, and presses Enter (SendKey
+// "Enter") only from submitWakeIfConfirmed, which takes its own capture and sends the key only
+// if the input holds exactly that line at an idle prompt. Those are two entries, each pinned to
+// its method and function, so the payload of the key is fixed and the check guarding it is in
+// the same function as the send. The RUNTIME guards (only with unread updates, never while
+// awaiting the lead, only when the harness leads the pane's foreground, never into a busy pane
+// or a non-empty prompt, Enter only after the typed line is confirmed, at most one outstanding
+// wake) live in watch.Daemon.Tick and are covered by internal/watch/daemon_test.go.
 //
 // This source-scan invariant guards the complementary property: that no OTHER write into the
 // manager window can be introduced.
@@ -171,8 +170,9 @@ const (
 	sanctionedWakePayload   = "Automated notice from the ttorch scheduler, not the lead: unread worker updates, run ttorch inbox"
 )
 
-// sanctionedManagerSend is one allow-listed send: the tmux function it calls, the file and
-// top-level function it sits in, and its literal payload (the key name, for SendKey).
+// sanctionedManagerSend is one allow-listed send: the method it calls (on package tmux or a
+// session backend), the file and top-level function it sits in, and its literal payload (the
+// key name, for SendKey).
 type sanctionedManagerSend struct{ method, file, fn, payload string }
 
 var sanctionedManagerSends = []sanctionedManagerSend{
@@ -181,7 +181,7 @@ var sanctionedManagerSends = []sanctionedManagerSend{
 	{"SendKey", sanctionedWakeFile, sanctionedWakeEnterFunc, "Enter"},
 }
 
-// managerSendFuncs are the tmux functions that write into a window, and so are scanned.
+// managerSendFuncs are the method names that write into a window, and so are scanned.
 var managerSendFuncs = map[string]bool{"SendLine": true, "SendKey": true, "TypeLine": true}
 
 // inTopLevelFunc reports whether pos lies inside the body of a TOP-LEVEL (non-method) FuncDecl
@@ -213,11 +213,11 @@ func isFixedLiteral(expr ast.Expr, want string) bool {
 	return err == nil && v == want
 }
 
-// isSanctionedManagerSend reports whether a manager-targeting tmux send is one of the
-// allow-listed sends: for a single entry, it calls that tmux function AND is in that file AND
-// inside that top-level function AND carries that fixed literal. Any of those failing — another
-// tmux function, a different file, a different/method function, an ident or
-// interpolated/arbitrary payload, or another entry's payload — leaves it flagged.
+// isSanctionedManagerSend reports whether a manager-targeting send is one of the allow-listed
+// sends: for a single entry, it calls that method AND is in that file AND inside that top-level
+// function AND carries that fixed literal. Any of those failing — another method, a different
+// file, a different/method function, an ident or interpolated/arbitrary payload, or another
+// entry's payload — leaves it flagged.
 func isSanctionedManagerSend(f *ast.File, filename, method string, call *ast.CallExpr) bool {
 	if len(call.Args) < 3 {
 		return false // Send…(session, window, payload) — no payload to verify
@@ -272,7 +272,7 @@ func detectManagerInjection(fset *token.FileSet, f *ast.File) []int {
 		if mentionsManagerLaunch(call) {
 			return true // the launch/resume bootstrap — exempt (it creates the session, never injects)
 		}
-		// An allow-listed send: that entry's tmux function, in its pinned file+function, carrying
+		// An allow-listed send: that entry's method, in its pinned file+function, carrying
 		// its fixed literal.
 		if isSanctionedManagerSend(f, fset.Position(call.Pos()).Filename, sel.Sel.Name, call) {
 			return true
@@ -393,6 +393,10 @@ func TestManagerInjectionDetector(t *testing.T) {
 		{name: "sanctioned wake (managerWindow ident)", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: "return tmux.TypeLine(session, managerWindow, " + strconv.Quote(sanctionedWakePayload) + ")", injection: false},
 		{name: "sanctioned wake (literal window)", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: "return tmux.TypeLine(session, \"manager\", " + strconv.Quote(sanctionedWakePayload) + ")", injection: false},
 		{name: "sanctioned wake Enter", file: sanctionedWakeFile, fn: sanctionedWakeEnterFunc, body: `return tmux.SendKey(session, managerWindow, "Enter")`, injection: false},
+		// The wake goes through the session backend, spelled as the daemon spells it.
+		{name: "sanctioned wake via backend", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: "return be.TypeLine(session, managerWindow, " + strconv.Quote(sanctionedWakePayload) + ")", injection: false},
+		{name: "sanctioned wake Enter via backend", file: sanctionedWakeFile, fn: sanctionedWakeEnterFunc, body: `return be.SendKey(session, managerWindow, "Enter")`, injection: false},
+		{name: "backend TypeLine poke", body: `_ = d.w.Backend.TypeLine(d.Session, "manager", "drain and advance")`, injection: true},
 		// TIGHT: Enter is exempt only from the function that checks the pane before sending it.
 		{name: "Enter from wireManagerWake", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: `return tmux.SendKey(session, managerWindow, "Enter")`, injection: true},
 		{name: "wake line typed from the Enter function", file: sanctionedWakeFile, fn: sanctionedWakeEnterFunc, body: "return tmux.TypeLine(session, managerWindow, " + strconv.Quote(sanctionedWakePayload) + ")", injection: true},
