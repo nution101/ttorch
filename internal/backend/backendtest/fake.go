@@ -249,6 +249,22 @@ func (f *Fake) PanePID(session, name string) int {
 	return 0
 }
 
+// PanePIDErr is PanePID with tmux's failures: a window that does not exist, or one with
+// no pid set, is an error.
+func (f *Fake) PanePIDErr(session, name string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("PanePIDErr", session, name)
+	w, err := f.target(session, name)
+	if err != nil {
+		return 0, err
+	}
+	if w.pid <= 0 {
+		return 0, fmt.Errorf("unexpected pane pid %d for %s", w.pid, key(session, name))
+	}
+	return w.pid, nil
+}
+
 func (f *Fake) KillWindow(session, name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

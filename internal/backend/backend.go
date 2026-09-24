@@ -58,6 +58,9 @@ type Backend interface {
 	PaneCurrentCommand(session, window string) string
 	// PanePID returns the pid of the process running in the window's pane, or 0.
 	PanePID(session, window string) int
+	// PanePIDErr is PanePID with the failure kept: a read that failed is an error, never
+	// a pid of 0, so a caller checking the pane's process can answer "cannot tell".
+	PanePIDErr(session, window string) (int, error)
 	// KillWindow removes the window.
 	KillWindow(session, window string) error
 	// Attach hands the caller's terminal to the session with the window focused.

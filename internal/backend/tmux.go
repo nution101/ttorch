@@ -52,6 +52,10 @@ func (Tmux) PaneCurrentCommand(session, window string) string {
 
 func (Tmux) PanePID(session, window string) int { return tmux.PanePID(session, window) }
 
+func (Tmux) PanePIDErr(session, window string) (int, error) {
+	return tmux.PanePIDErr(session, window)
+}
+
 func (Tmux) KillWindow(session, window string) error { return tmux.KillWindow(session, window) }
 
 func (Tmux) Attach(session, window string) error { return tmux.Attach(session, window) }

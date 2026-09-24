@@ -31,7 +31,9 @@ case "$1" in
     case "$*" in *window_id*) printf '@1 manager\n@2 wk-a\n' ;; *) printf 'manager\nwk-a\n' ;; esac ;;
   display-message)
     case "$*" in *pane_in_mode*) echo 0 ;; *pane_current_command*) echo sleep ;; esac ;;
-  list-panes) echo 4242 ;;
+  list-panes)
+    case "$*" in *:missing*) echo "can't find window: missing" >&2; exit 1 ;; esac
+    echo 4242 ;;
   capture-pane|kill-window)
     case "$*" in *:missing*) echo "can't find window: missing" >&2; exit 1 ;; esac
     [ "$1" = capture-pane ] && echo 'pane text' ;;
@@ -107,6 +109,9 @@ func TestTmux_SameCommandsAsDirectCalls(t *testing.T) {
 		{"CapturePane missing", func() []any { return results(b.CapturePane("s", "missing", 6)) }, func() []any { return results(tmux.CapturePane("s", "missing", 6)) }, true},
 		{"PaneCurrentCommand", func() []any { return results(b.PaneCurrentCommand("s", "wk-a")) }, func() []any { return results(tmux.PaneCurrentCommand("s", "wk-a")) }, true},
 		{"PanePID", func() []any { return results(b.PanePID("s", "wk-a")) }, func() []any { return results(tmux.PanePID("s", "wk-a")) }, true},
+		{"PanePID missing", func() []any { return results(b.PanePID("s", "missing")) }, func() []any { return results(tmux.PanePID("s", "missing")) }, true},
+		{"PanePIDErr", func() []any { return results(b.PanePIDErr("s", "wk-a")) }, func() []any { return results(tmux.PanePIDErr("s", "wk-a")) }, true},
+		{"PanePIDErr missing", func() []any { return results(b.PanePIDErr("s", "missing")) }, func() []any { return results(tmux.PanePIDErr("s", "missing")) }, true},
 		{"KillWindow", func() []any { return results(b.KillWindow("s", "wk-a")) }, func() []any { return results(tmux.KillWindow("s", "wk-a")) }, true},
 		{"KillWindow missing", func() []any { return results(b.KillWindow("s", "missing")) }, func() []any { return results(tmux.KillWindow("s", "missing")) }, true},
 		{"Attach", func() []any { return results(b.Attach("s", "manager")) }, func() []any { return results(tmux.Attach("s", "manager")) }, true},
