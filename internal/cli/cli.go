@@ -828,6 +828,9 @@ func cmdFollowOn(args []string) error {
 		return errors.New(followOnUsage)
 	}
 	newID := args[0]
+	if err := db.ValidateTaskID(newID); err != nil {
+		return fmt.Errorf("follow-on: %w", err)
+	}
 	fs := flag.NewFlagSet("follow-on", flag.ContinueOnError)
 	title := fs.String("title", "", "one-line title for the follow-on task (required)")
 	touches := fs.String("touches", "", "comma-separated files/prefixes the follow-on will touch")

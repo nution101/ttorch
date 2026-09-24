@@ -820,6 +820,9 @@ func cmdTaskAdd(args []string) error {
 		return errors.New(taskAddUsage)
 	}
 	id := args[0]
+	if err := db.ValidateTaskID(id); err != nil {
+		return fmt.Errorf("task add: %w", err)
+	}
 	fs := flag.NewFlagSet("task add", flag.ContinueOnError)
 	project := fs.Int64("project", 0, "project id (required)")
 	epic := fs.Int64("epic", 0, "optional epic id")
