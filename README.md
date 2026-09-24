@@ -395,8 +395,25 @@ commit-pinned verdict plus a fresh green validate auto-mints the approval. It is
 it **requires a `.ttorch/validate.sh` on the default branch** (the gate validates the
 committed sha with the default-branch script, so a worker can't weaken its own gate; "no
 checks detected" is a hard block), and a trusted auto-merge **cannot change the gate itself**
-(`.ttorch/validate.sh` or `AGENTS.md`) — that always requires a human. The delivery-mode
-block is an explicit, repo-scoped decision; changing it requires a human.
+(`.ttorch/validate.sh` or `AGENTS.md`, which holds the delivery-mode block) without the lead's
+`ttorch approve <id> --allow-gate-change`. The delivery-mode block is an explicit, repo-scoped
+decision.
+
+A trusted repo can drop the `--allow-gate-change` requirement by adding a line under the
+delivery mode in the ttorch-managed block of `AGENTS.md`:
+
+```markdown
+- delivery-mode: trusted
+- gate-change-approval: off
+```
+
+The default is `required`, and anything other than exactly `off` reads as `required`. The
+gate reads the line from the default branch's committed `AGENTS.md`, so it takes effect only
+after it lands, and a worker cannot switch it off for its own merge. With it off, a passing
+verdict and a fresh green validate merge a gate-definition change with no `ttorch approve`.
+Each such merge records a `gate_change_unapproved` event and prints one line saying so. The
+risk: a change to the reviewers or the validate step is then authorized by the gate that
+change modifies.
 
 ## Footprints & the worktree pool
 

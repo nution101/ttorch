@@ -171,7 +171,7 @@ invalidates the verdict — re-prep, re-review, re-record.
   | Covered | Why it is the gate |
   |---|---|
   | `.ttorch/**` | `validate.sh` is what "green" means, and `learnings.jsonl` is rendered verbatim into `AGENTS.md` by `ttorch learn` at every delivery |
-  | `AGENTS.md` | whether the gate runs at all (`projectinit.ReadMode`) |
+  | `AGENTS.md` | whether the gate runs at all (`projectinit.ReadMode`), and whether a gate change needs a human (`- gate-change-approval:`) |
   | `CLAUDE.md` | a **symlink** to `AGENTS.md`; replacing it with a real file reports only `CLAUDE.md`, and it is the instruction file every session loads, manager included |
   | `AGENTS.md` / `CLAUDE.md` **at any depth** | a nested one loads on demand for its directory, so it is an instruction file too |
   | `.claude/**`, `.mcp.json` | project-level agent config: a landed `.claude/agents/ttorch-reviewer-security.md` **replaces** the security reviewer, with no build and no install |
@@ -181,7 +181,7 @@ invalidates the verdict — re-prep, re-review, re-record.
   | `internal/review/**` | the findings contract, the severity-to-block rule, and the classifier that picks which reviewers run |
   | `internal/approval/**` | the approval token the `--allow-gate-change` scope rides on |
   | `internal/validate/**` | what counts as a passing check |
-  | `internal/projectinit/**` | parses `AGENTS.md` into the delivery mode and the auto-mint staleness bound |
+  | `internal/projectinit/**` | parses `AGENTS.md` into the delivery mode, the gate-change-approval switch and the auto-mint staleness bound |
   | `internal/orchestrator/{gate,merge,validate,validatecache}.go` | the Go code that resolves, enforces and caches the decision |
   | *(measured cost of each entry)* | see the generated table in `docs/ARCHITECTURE.md` (gate-cost block); this file does not restate it, because a second copy here is what let the figures diverge |
   | `.github/workflows/**` | the full suite: `.ttorch/validate.sh` runs lint, the fast lane and the gate's proofs (`make test-gate`), and defers the rest to CI by name. The gate runs the default branch's copy of that script, never the branch under review's, so a change to it takes effect only after it lands |
@@ -213,6 +213,17 @@ invalidates the verdict — re-prep, re-review, re-record.
   The lead still types a bare flag and does not name the paths, so a lead who passes it
   without reading grants the same set as one who read. What the binding adds is that the set
   is printed and fixed when the approval is given.
+
+  **A trusted repo can switch the human approval off** with `- gate-change-approval: off` in
+  the ttorch-managed block of `AGENTS.md` (the default is `required`, and any other value
+  reads as `required`). The gate reads the line from the default branch's committed copy,
+  never from the worker's branch, so a worker that writes `off` into its own `AGENTS.md` still
+  needs `--allow-gate-change` for that merge. With the switch off, a passing verdict and a
+  fresh green validate authorize a gate-definition change the way they authorize any other
+  diff, and the merge records a `gate_change_unapproved` event and an audit line naming the
+  files. The blocking refusals below stay blocking, and the switch has no effect outside
+  trusted mode. With the switch off, a change to the reviewers or the validate step is
+  authorized by the gate that change modifies, and your verdict is the only review it gets.
 
   **Matching on the name alone is not enough, so the guard does not rely on it.** Paths are
   compared under `fsIdentityKey` — NFD, Unicode FULL case folding, then SimpleFold

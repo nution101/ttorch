@@ -254,7 +254,7 @@ passing commit-pinned verdict plus a fresh green validate auto-mints the approva
   under `~/.claude` — the gate's live reviewer, manager, command and hook
   instructions, not documentation about the gate), `internal/review/**`,
   `internal/approval/**`, `internal/validate/**`, `internal/projectinit/**` (which parses
-  `AGENTS.md` into the delivery mode) and
+  `AGENTS.md` into the delivery mode and the gate-change-approval switch) and
   `internal/orchestrator/{gate,merge,validate,validatecache,audit}.go` (the Go code that
   decides, including the audit record a trusted merge refuses to proceed without),
   `internal/installer/**` and `content.go` (which decide which embedded file becomes which
@@ -276,6 +276,24 @@ passing commit-pinned verdict plus a fresh green validate auto-mints the approva
   any gate-definition path the grant does not name, including one that became covered after
   the approval. Approving for one file does not silently authorize another in the same
   commit. `--allow-gate-change` is refused at approve time for a diff with a blocking hit.
+- A trusted repo can switch that requirement off with `- gate-change-approval: off` in the
+  ttorch-managed block of `AGENTS.md`. The default is `required`, and anything other than
+  exactly `off` (a typo, `Off`, a trailing comment, two lines that disagree) reads as
+  `required`. `ttorch init` keeps the line when it regenerates the block. The gate reads the
+  line from the **default branch's committed** `AGENTS.md` through `worktree.ShowFile`, the
+  same way it reads `.ttorch/validate.sh`, and never from the worker's checkout. A worker that
+  writes `off` into its own `AGENTS.md` has made a gate change like any other, and that merge
+  still needs `--allow-gate-change` while the default branch says `required`; the line takes
+  effect for the merges after it lands. With the switch off, `TrustRecord` auto-mints for a
+  gate-definition diff and `MergeLocal` accepts it on the passing, commit-pinned verdict and
+  the fresh green validate, with no `ttorch approve`. Blocking hits are refused before the
+  switch is read, so they stay refused. In any mode other than trusted the switch does
+  nothing. `--allow-gate-change` is still accepted, and the files it names then count as
+  approved. Every merge that relies on the switch adds
+  `gate-change-approval=off unapproved=<files>` to the must-succeed audit line, records a
+  non-actionable `gate_change_unapproved` event naming the files, and prints one line in the
+  `merge-local` and `land` output. The risk is direct: with the switch off, a change to the
+  reviewers or the validate step is authorized by the gate that change modifies.
 - An ungated `local`/`validated` merge **does not run the check at all**. That path lands an
   `AGENTS.md` change on a plain human approval with no gate-config check and no audit line
   naming it, and `AGENTS.md` is what `projectinit.ReadMode` reads to decide trusted mode — so

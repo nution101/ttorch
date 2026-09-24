@@ -190,8 +190,17 @@ engages only in `trusted` mode or when you pass `--require-verdict`.)
 **Trusted mode is the only path that merges without a human reading the diff.** It is an
 explicit, repo-scoped decision and is guard-railed: it requires a `.ttorch/validate.sh` on
 the default branch (the gate validates the committed sha with the *default-branch* script, so
-a worker can't weaken its own gate), and a trusted auto-merge can never change the gate
-itself (`.ttorch/validate.sh` or the delivery-mode block) — that always needs a human.
+a worker can't weaken its own gate), and a trusted auto-merge cannot change the gate itself
+(`.ttorch/validate.sh` or the delivery-mode block) without your
+`ttorch approve <id> --allow-gate-change`.
+
+You can turn that approval off for a trusted repo by adding
+`- gate-change-approval: off` directly under `- delivery-mode: trusted` in `AGENTS.md`. The
+default is `required`, and any other value reads as `required`. The gate reads the line from
+the default branch, so it takes effect once that commit has landed, and `ttorch init` keeps
+it when it rewrites the block. With it off, a change to the reviewers or the validate step is
+authorized by the gate that change modifies; each such merge records a
+`gate_change_unapproved` event and prints one line saying so.
 
 `ttorch init` also derives a **project profile** (stack, exact build/test/lint commands,
 layout, and a few exemplar files) into `AGENTS.md` so workers match the repo's style; refresh
