@@ -145,10 +145,13 @@ func mentionsManagerLaunch(n ast.Node) bool {
 // bounded per episode, lives in scheduler.recoverStall and is covered by the scheduler's
 // stall-recovery tests.
 //
-// (2) The scheduler watch loop's wake line (watch.NewDaemon → wireManagerWake): the always-on
-// watcher types one fixed line telling an idle manager to run `ttorch inbox`. The RUNTIME guards
-// (only with unread updates, never while awaiting the lead, never into a busy pane, a non-empty
-// prompt or a shell, at most one outstanding wake) live in watch.Daemon.Tick and are covered by
+// (2) The scheduler watch loop's wake (watch.NewDaemon → wireManagerWake): the always-on
+// watcher types one fixed line (tmux.TypeLine, no Enter) telling an idle manager to run
+// `ttorch inbox`, re-reads the pane, and presses Enter (tmux.SendKey "Enter") only if the input
+// holds exactly that line. Those are two entries, each pinned to its method. The RUNTIME guards
+// (only with unread updates, never while awaiting the lead, only when the harness leads the
+// pane's foreground, never into a busy pane or a non-empty prompt, Enter only after the typed
+// line is confirmed, at most one outstanding wake) live in watch.Daemon.Tick and are covered by
 // internal/watch/daemon_test.go.
 //
 // This source-scan invariant guards the complementary property: that no OTHER write into the
@@ -163,13 +166,18 @@ const (
 	sanctionedWakePayload = "Automated notice from the ttorch scheduler, not the lead: unread worker updates, run ttorch inbox"
 )
 
-// sanctionedManagerSend is one allow-listed (file, top-level function, literal payload) triple.
-type sanctionedManagerSend struct{ file, fn, payload string }
+// sanctionedManagerSend is one allow-listed send: the tmux function it calls, the file and
+// top-level function it sits in, and its literal payload (the key name, for SendKey).
+type sanctionedManagerSend struct{ method, file, fn, payload string }
 
 var sanctionedManagerSends = []sanctionedManagerSend{
-	{sanctionedStallNudgeFile, sanctionedStallNudgeFunc, sanctionedNudgePayload},
-	{sanctionedWakeFile, sanctionedWakeFunc, sanctionedWakePayload},
+	{"SendLine", sanctionedStallNudgeFile, sanctionedStallNudgeFunc, sanctionedNudgePayload},
+	{"TypeLine", sanctionedWakeFile, sanctionedWakeFunc, sanctionedWakePayload},
+	{"SendKey", sanctionedWakeFile, sanctionedWakeFunc, "Enter"},
 }
+
+// managerSendFuncs are the tmux functions that write into a window, and so are scanned.
+var managerSendFuncs = map[string]bool{"SendLine": true, "SendKey": true, "TypeLine": true}
 
 // inTopLevelFunc reports whether pos lies inside the body of a TOP-LEVEL (non-method) FuncDecl
 // named name. A method of that name (Recv != nil), or pos outside every such function, is
@@ -201,16 +209,17 @@ func isFixedLiteral(expr ast.Expr, want string) bool {
 }
 
 // isSanctionedManagerSend reports whether a manager-targeting tmux send is one of the
-// allow-listed sends: for a single entry, it is in that file AND inside that top-level function
-// AND carries that fixed literal. Any of those failing — a different file, a different/method
-// function, an ident or interpolated/arbitrary payload, or another entry's payload — leaves it
-// flagged.
-func isSanctionedManagerSend(f *ast.File, filename string, call *ast.CallExpr) bool {
+// allow-listed sends: for a single entry, it calls that tmux function AND is in that file AND
+// inside that top-level function AND carries that fixed literal. Any of those failing — another
+// tmux function, a different file, a different/method function, an ident or
+// interpolated/arbitrary payload, or another entry's payload — leaves it flagged.
+func isSanctionedManagerSend(f *ast.File, filename, method string, call *ast.CallExpr) bool {
 	if len(call.Args) < 3 {
-		return false // SendLine(session, window, payload) — no payload to verify
+		return false // Send…(session, window, payload) — no payload to verify
 	}
 	for _, s := range sanctionedManagerSends {
-		if strings.HasSuffix(filepath.ToSlash(filename), s.file) &&
+		if method == s.method &&
+			strings.HasSuffix(filepath.ToSlash(filename), s.file) &&
 			inTopLevelFunc(f, s.fn, call.Pos()) &&
 			isFixedLiteral(call.Args[2], s.payload) {
 			return true
@@ -220,11 +229,11 @@ func isSanctionedManagerSend(f *ast.File, filename string, call *ast.CallExpr) b
 }
 
 // detectManagerInjection parses Go source and returns the 1-based line numbers of every
-// forbidden send into the manager session: a SendLine/SendKey call on any receiver (package
-// tmux, or a session backend.Backend however it is reached) whose window argument
+// forbidden send into the manager session: a SendLine/SendKey/TypeLine call on any receiver
+// (package tmux, or a session backend.Backend however it is reached) whose window argument
 // resolves to the manager window — directly OR through a local variable — carrying anything
-// other than (a) a harness.Manager… launch command or (b) one of the allow-listed sends (a
-// SendLine of an entry's fixed literal from that entry's file+function; see
+// other than (a) a harness.Manager… launch command or (b) one of the allow-listed sends (an
+// entry's method with its fixed literal, from that entry's file+function; see
 // isSanctionedManagerSend). Operating on the AST (rather than one line at a time) is what lets
 // it catch the indirect, variable-laundered form, and locate each send's file + enclosing function
 // for the allow-list.
@@ -241,13 +250,13 @@ func detectManagerInjection(fset *token.FileSet, f *ast.File) []int {
 		// w.Backend.SendLine), and a check pinned to the package name would pass a poke
 		// spelled either way.
 		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok || (sel.Sel.Name != "SendLine" && sel.Sel.Name != "SendKey") {
+		if !ok || !managerSendFuncs[sel.Sel.Name] {
 			return true
 		}
 		if len(call.Args) < 2 {
 			return true
 		}
-		win := call.Args[1] // SendLine/SendKey(session, window, payload)
+		win := call.Args[1] // SendLine/SendKey/TypeLine(session, window, payload)
 		toManager := isManagerWindowExpr(win)
 		if id, ok := win.(*ast.Ident); ok && mgrVars[id.Name] {
 			toManager = true
@@ -258,9 +267,9 @@ func detectManagerInjection(fset *token.FileSet, f *ast.File) []int {
 		if mentionsManagerLaunch(call) {
 			return true // the launch/resume bootstrap — exempt (it creates the session, never injects)
 		}
-		// An allow-listed send — restricted to SendLine (a SendKey to the manager is never
-		// sanctioned) in a pinned file+function carrying that entry's fixed literal.
-		if sel.Sel.Name == "SendLine" && isSanctionedManagerSend(f, fset.Position(call.Pos()).Filename, call) {
+		// An allow-listed send: that entry's tmux function, in its pinned file+function, carrying
+		// its fixed literal.
+		if isSanctionedManagerSend(f, fset.Position(call.Pos()).Filename, sel.Sel.Name, call) {
 			return true
 		}
 		lines = append(lines, fset.Position(call.Pos()).Line)
@@ -299,7 +308,7 @@ func TestNoInjectionIntoManagerSession(t *testing.T) {
 		}
 	}
 	if len(offenders) > 0 {
-		t.Fatalf("forbidden injection into the manager session — SendLine/SendKey to the manager "+
+		t.Fatalf("forbidden injection into the manager session — SendLine/SendKey/TypeLine to the manager "+
 			"window carrying something other than a harness.Manager… launch command:\n%s", strings.Join(offenders, "\n"))
 	}
 }
@@ -366,17 +375,28 @@ func TestManagerInjectionDetector(t *testing.T) {
 		{name: "backend sanctioned nudge", file: sanctionedStallNudgeFile, fn: sanctionedStallNudgeFunc, body: `return be.SendLine(session, managerWindow, "continue")`, injection: false},
 		// The watch loop's wake line: exempt only as the fixed literal from wireManagerWake in
 		// internal/watch/daemon.go.
-		{name: "sanctioned wake (managerWindow ident)", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: "return tmux.SendLine(session, managerWindow, " + strconv.Quote(sanctionedWakePayload) + ")", injection: false},
-		{name: "sanctioned wake (literal window)", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: "return tmux.SendLine(session, \"manager\", " + strconv.Quote(sanctionedWakePayload) + ")", injection: false},
-		// TIGHT: entries are matched whole, never as a cross-product of file/func/payload.
-		{name: "wake line from the stall-nudge site", file: sanctionedStallNudgeFile, fn: sanctionedStallNudgeFunc, body: "return tmux.SendLine(session, managerWindow, " + strconv.Quote(sanctionedWakePayload) + ")", injection: true},
+		{name: "sanctioned wake (managerWindow ident)", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: "return tmux.TypeLine(session, managerWindow, " + strconv.Quote(sanctionedWakePayload) + ")", injection: false},
+		{name: "sanctioned wake (literal window)", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: "return tmux.TypeLine(session, \"manager\", " + strconv.Quote(sanctionedWakePayload) + ")", injection: false},
+		{name: "sanctioned wake Enter", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: `return tmux.SendKey(session, managerWindow, "Enter")`, injection: false},
+		// TIGHT: TypeLine is scanned like the other sends, anywhere.
+		{name: "direct TypeLine poke", body: `_ = tmux.TypeLine(m.Session, "manager", "drain and advance")`, injection: true},
+		{name: "TypeLine via local var", body: "w := managerWindow\n_ = tmux.TypeLine(s.Session, w, directive)", injection: true},
+		// TIGHT: the wake must be typed and confirmed; submitting it in one SendLine skips the check.
+		{name: "wake line by SendLine from the wake site", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: "return tmux.SendLine(session, managerWindow, " + strconv.Quote(sanctionedWakePayload) + ")", injection: true},
+		// TIGHT: entries are matched whole, never as a cross-product of method/file/func/payload.
+		{name: "wake line from the stall-nudge site", file: sanctionedStallNudgeFile, fn: sanctionedStallNudgeFunc, body: "return tmux.TypeLine(session, managerWindow, " + strconv.Quote(sanctionedWakePayload) + ")", injection: true},
+		{name: "Enter from the stall-nudge site", file: sanctionedStallNudgeFile, fn: sanctionedStallNudgeFunc, body: `return tmux.SendKey(session, managerWindow, "Enter")`, injection: true},
 		{name: "continue from the wake site", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: `return tmux.SendLine(session, managerWindow, "continue")`, injection: true},
-		{name: "wake func+literal but wrong file", file: "internal/watch/other.go", fn: sanctionedWakeFunc, body: "return tmux.SendLine(session, managerWindow, " + strconv.Quote(sanctionedWakePayload) + ")", injection: true},
-		{name: "wake file+literal but wrong function", file: sanctionedWakeFile, fn: "somethingElse", body: "return tmux.SendLine(session, managerWindow, " + strconv.Quote(sanctionedWakePayload) + ")", injection: true},
-		{name: "wake name as a method is not exempt", file: sanctionedWakeFile, fn: sanctionedWakeFunc, recv: "d *Daemon", body: "return tmux.SendLine(session, managerWindow, " + strconv.Quote(sanctionedWakePayload) + ")", injection: true},
-		{name: "ident payload in wake site is not exempt", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: `return tmux.SendLine(session, managerWindow, wakeLine)`, injection: true},
-		{name: "event payload in wake site is not exempt", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: `return tmux.SendLine(session, managerWindow, "Automated notice: "+e.Payload)`, injection: true},
-		{name: "sendkey in wake site is not exempt", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: `tmux.SendKey(session, managerWindow, "Enter")`, injection: true},
+		{name: "continue typed from the wake site", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: `return tmux.TypeLine(session, managerWindow, "continue")`, injection: true},
+		{name: "Enter as typed text from the wake site", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: `return tmux.TypeLine(session, managerWindow, "Enter")`, injection: true},
+		{name: "wake func+literal but wrong file", file: "internal/watch/other.go", fn: sanctionedWakeFunc, body: "return tmux.TypeLine(session, managerWindow, " + strconv.Quote(sanctionedWakePayload) + ")", injection: true},
+		{name: "wake file+literal but wrong function", file: sanctionedWakeFile, fn: "somethingElse", body: "return tmux.TypeLine(session, managerWindow, " + strconv.Quote(sanctionedWakePayload) + ")", injection: true},
+		{name: "Enter from the wake file but wrong function", file: sanctionedWakeFile, fn: "somethingElse", body: `return tmux.SendKey(session, managerWindow, "Enter")`, injection: true},
+		{name: "wake name as a method is not exempt", file: sanctionedWakeFile, fn: sanctionedWakeFunc, recv: "d *Daemon", body: "return tmux.TypeLine(session, managerWindow, " + strconv.Quote(sanctionedWakePayload) + ")", injection: true},
+		{name: "ident payload in wake site is not exempt", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: `return tmux.TypeLine(session, managerWindow, wakeLine)`, injection: true},
+		{name: "event payload in wake site is not exempt", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: `return tmux.TypeLine(session, managerWindow, "Automated notice: "+e.Payload)`, injection: true},
+		{name: "another key in wake site is not exempt", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: `tmux.SendKey(session, managerWindow, "C-c")`, injection: true},
+		{name: "key name by ident in wake site is not exempt", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: `tmux.SendKey(session, managerWindow, key)`, injection: true},
 	}
 	for _, c := range cases {
 		fn := c.fn

@@ -64,7 +64,19 @@ const (
 	defaultDaemonPoll = 2 * time.Second  // sweep cadence
 	defaultRewake     = 3 * time.Minute  // repeat an unanswered wake no faster than this
 	defaultSendRetry  = 30 * time.Second // retry spacing after a send that failed (e.g. copy-mode)
+
+	// After typing the wake, the loop re-reads the pane before pressing Enter: first after
+	// wakeSettle (the pause SendLine used before its Enter), then every wakeRecheck while the
+	// input still shows only part of the line, for wakeConfirmReads reads in all.
+	wakeSettle       = 300 * time.Millisecond
+	wakeRecheck      = 200 * time.Millisecond
+	wakeConfirmReads = 5
 )
+
+// wakeLine is the text wireManagerWake types, for comparing against what the pane shows
+// before Enter is pressed. The send itself must use the literal (the injection invariant can
+// only prove a literal's value); TestWakeLiteralMatchesWakeLine keeps the two identical.
+const wakeLine = "Automated notice from the ttorch scheduler, not the lead: unread worker updates, run ttorch inbox"
 
 // Daemon is the scheduler-owned watch loop. NewDaemon wires the production seams; tests
 // replace them.
@@ -84,7 +96,8 @@ type Daemon struct {
 
 	// Seams (wired by wireManagerWake in production).
 	managerForeground func() string // argv of the manager pane's foreground process group leader ("" if unknown)
-	sendWake          func() error  // type the fixed wake line into the manager window
+	typeWake          func() error  // type the fixed wake line into the manager input, without Enter
+	pressEnter        func() error  // submit it, once the pane shows exactly wakeLine
 
 	retryAt time.Time // earliest next send after a failed one; in memory, a restart just retries
 }
@@ -125,10 +138,17 @@ func NewDaemon(store *db.Store, p paths.Paths, be backend.Backend, session strin
 // the command to run: it gives no instruction a reader could mistake for the lead's. It is
 // also inert if it ever reaches a shell (no backticks, $, quotes, pipes or separators; its
 // first word is not a command), which backs up the foreground check in Tick.
+//
+// Typing and submitting are separate sends so Tick can re-read the pane in between: Enter is
+// pressed only when the input holds exactly the wake line. Enter is the only key the loop ever
+// sends to the manager, and the allow-list pins that too.
 func wireManagerWake(d *Daemon, session string) {
 	d.managerForeground = func() string { return foregroundLeader(tmux.PanePID(session, managerWindow)) }
-	d.sendWake = func() error {
-		return tmux.SendLine(session, managerWindow, "Automated notice from the ttorch scheduler, not the lead: unread worker updates, run ttorch inbox")
+	d.typeWake = func() error {
+		return tmux.TypeLine(session, managerWindow, "Automated notice from the ttorch scheduler, not the lead: unread worker updates, run ttorch inbox")
+	}
+	d.pressEnter = func() error {
+		return tmux.SendKey(session, managerWindow, "Enter")
 	}
 }
 
@@ -228,9 +248,26 @@ func (d *Daemon) Tick(ctx context.Context) (DaemonTick, error) {
 	}
 
 	top := maxID(unread)
-	if err := d.sendWake(); err != nil {
+	if err := d.typeWake(); err != nil {
 		d.retryAt = now.Add(d.sendRetry())
 		d.logf("watch: could not wake the manager (retrying in %s): %v", d.sendRetry(), err)
+		res.Reason = "wake send failed"
+		return res, nil
+	}
+	// The lead may have started typing between the idle check and the keys landing. Enter is
+	// pressed only if the input now holds exactly the wake line. Otherwise the typed text is
+	// left unsubmitted: pressing Enter could send the lead's keystrokes, and clearing the line
+	// could erase them. A prompt holding text is not idle, so no further wake is typed until
+	// the line is cleared.
+	if why := d.confirmTypedWake(ctx); why != "" {
+		d.retryAt = now.Add(d.sendRetry())
+		d.logf("watch: typed the wake but did not submit it: %s", why)
+		res.Reason = "wake not submitted: " + why
+		return res, nil
+	}
+	if err := d.pressEnter(); err != nil {
+		d.retryAt = now.Add(d.sendRetry())
+		d.logf("watch: typed the wake but could not submit it (retrying in %s): %v", d.sendRetry(), err)
 		res.Reason = "wake send failed"
 		return res, nil
 	}
@@ -357,40 +394,107 @@ var spinnerLine = regexp.MustCompile(`^\s*[^\p{L}\p{N}\s]\s+\p{Lu}[\p{L}'-]*(?:�
 // promptBorders is the input box's border cutset, as livestate strips it.
 const promptBorders = " \t│┃┆┇┊┋╎╏║|"
 
-// managerAtEmptyPrompt reports whether a manager pane capture shows the harness idle at an
-// EMPTY input prompt, the only state the wake may type into. It starts from livestate.Busy
-// and is stricter than livestate.Idle in two ways that matter for a pane the lead also types
-// into:
-//
-//   - it rejects the harness's gerund spinner line, which the current harness shows while
-//     busy and which livestate.Busy's word list misses; and
-//   - it requires the input line to be empty (or showing the "Try …" placeholder). A
-//     prompt holding other text is the lead part-way through a message, and typing the
-//     wake plus Enter there would submit the lead's draft.
-//
-// It accepts both prompt carets: ">" (as livestate.Idle does) and "❯", which the current
-// harness renders. The input line is found bottom-up, so a quoted "> " line in the history
-// above the input box is never mistaken for it. Anything it cannot place reads as not idle.
-func managerAtEmptyPrompt(pane string) bool {
-	if livestate.Busy(pane) {
-		return false
-	}
-	lines := strings.Split(pane, "\n")
-	for _, l := range lines {
-		if spinnerLine.MatchString(l) {
-			return false
+// placeholderInput matches the harness's empty-input placeholder exactly: Try "<suggestion>"
+// and nothing else. A line that merely starts that way is the lead typing.
+var placeholderInput = regexp.MustCompile(`^Try "[^"]+"$`)
+
+// confirmTypedWake re-reads the manager pane after the wake was typed and returns "" when the
+// input holds exactly wakeLine and the harness is still idle, or why it does not. A strict
+// prefix of the line means the harness is still rendering the keys, so it reads again, up to
+// wakeConfirmReads times.
+func (d *Daemon) confirmTypedWake(ctx context.Context) string {
+	pause := wakeSettle
+	for i := 0; i < wakeConfirmReads; i++ {
+		if err := d.w.wait(ctx, pause); err != nil {
+			return "cancelled"
+		}
+		pause = wakeRecheck
+		obs := d.w.capture(managerWindow)
+		if !obs.present || !obs.captured {
+			return "manager pane unreadable after typing"
+		}
+		if harnessBusy(obs.pane) {
+			return "the manager became busy"
+		}
+		input, ok := promptInput(obs.pane)
+		switch {
+		case !ok:
+			return "no input prompt after typing"
+		case input == wakeLine:
+			return ""
+		case !strings.HasPrefix(wakeLine, input):
+			return "the input holds other text"
 		}
 	}
+	return "the typed wake never fully rendered"
+}
+
+// harnessBusy reports a pane mid-turn: a livestate.Busy marker or the gerund spinner line.
+func harnessBusy(pane string) bool {
+	if livestate.Busy(pane) {
+		return true
+	}
+	for _, l := range strings.Split(pane, "\n") {
+		if spinnerLine.MatchString(l) {
+			return true
+		}
+	}
+	return false
+}
+
+// promptInput returns the text in the harness's input box, whitespace-normalized, and whether
+// an input prompt was found. The prompt is the bottom-most line opening with a caret (">" or
+// "❯"), so a quoted "> " line in the history above is never mistaken for it. The input runs
+// from that line down to the box's closing border, or the end of the capture: a draft can
+// span several lines, and a long line wraps onto the next, so every line in that region
+// counts. Joining on whitespace lets a wake line that wrapped at a space compare equal to the
+// literal.
+func promptInput(pane string) (string, bool) {
+	lines := strings.Split(pane, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
-		s := strings.TrimSpace(strings.Trim(lines[i], promptBorders))
-		rest, ok := cutPromptCaret(s)
+		rest, ok := cutPromptCaret(strings.TrimSpace(strings.Trim(lines[i], promptBorders)))
 		if !ok {
 			continue
 		}
-		rest = strings.TrimSpace(rest)
-		return rest == "" || strings.HasPrefix(rest, `Try "`)
+		parts := []string{rest}
+		for _, l := range lines[i+1:] {
+			s := strings.TrimSpace(strings.Trim(l, promptBorders))
+			if isBorderLine(s) {
+				break
+			}
+			parts = append(parts, s)
+		}
+		return strings.Join(strings.Fields(strings.Join(parts, " ")), " "), true
 	}
-	return false
+	return "", false
+}
+
+// isBorderLine reports a line made only of box-drawing glyphs: the rule or box edge that
+// closes the input area. A blank line is not a border.
+func isBorderLine(s string) bool {
+	return s != "" && strings.Trim(s, "─━┄┅┈┉╌╍╭╮╰╯╴╵╶╷ ") == ""
+}
+
+// managerAtEmptyPrompt reports whether a manager pane capture shows the harness idle at an
+// EMPTY input prompt, the only state the wake may type into. It starts from livestate.Busy
+// and is stricter than livestate.Idle in ways that matter for a pane the lead also types
+// into:
+//
+//   - it rejects the harness's gerund spinner line, which the current harness shows while
+//     busy and which livestate.Busy's word list misses;
+//   - it requires the whole input area to be empty, or to show exactly the harness's
+//     placeholder. Text on the caret line, or on any line below it inside the input box, is
+//     the lead part-way through a message, and typing the wake plus Enter there would submit
+//     the lead's draft.
+//
+// It accepts both prompt carets: ">" (as livestate.Idle does) and "❯", which the current
+// harness renders. Anything it cannot place reads as not idle.
+func managerAtEmptyPrompt(pane string) bool {
+	if harnessBusy(pane) {
+		return false
+	}
+	input, ok := promptInput(pane)
+	return ok && (input == "" || placeholderInput.MatchString(input))
 }
 
 // cutPromptCaret strips a leading prompt caret from a border-stripped line.

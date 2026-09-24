@@ -511,6 +511,18 @@ func SendLine(session, window, text string) error {
 	return sendKeys("-t", t, "Enter")
 }
 
+// TypeLine types text into a window WITHOUT pressing Enter, refusing a pane in copy-mode for
+// the same reason SendLine does (copy-mode would swallow the keys, or read them as copy-mode
+// commands). It is for a caller that must see what landed before submitting: it types, captures
+// the pane, and sends Enter itself with SendKey only if the input holds exactly what it typed.
+func TypeLine(session, window, text string) error {
+	t := target(session, window)
+	if paneInMode(session, window) {
+		return fmt.Errorf("%s is in copy-mode, so typed text would be swallowed rather than reach the agent; press Escape in that pane and retry", t)
+	}
+	return sendKeys("-t", t, "-l", text)
+}
+
 // SendKey sends a single named key (e.g. "Escape", "C-c") to a window.
 func SendKey(session, window, key string) error {
 	return sendKeys("-t", target(session, window), key)

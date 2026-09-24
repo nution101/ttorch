@@ -49,13 +49,33 @@ const (
 )
 
 // fakeManager is the tmux the Daemon sees for the manager window: what its pane shows,
-// whether the window exists, the pane's foreground command, and every wake typed into it.
+// whether the window exists, the pane's foreground process, and every wake typed and
+// submitted.
 type fakeManager struct {
-	present bool
-	pane    string
-	fg      string // argv of the pane's foreground process group leader
-	sends   int
-	sendErr error
+	present  bool
+	pane     string
+	fg       string // argv of the pane's foreground process group leader
+	typed    int    // wake lines typed (attempts)
+	sends    int    // Enter presses: wakes submitted
+	typeErr  error
+	enterErr error
+	// afterType sets what the pane shows once the wake is typed; nil shows the wake alone in an
+	// otherwise idle input. It may queue frames in renders, which successive captures return
+	// in order before settling on the last.
+	afterType func(f *fakeManager)
+	renders   []string
+}
+
+// inputPane is an idle harness screen whose input box holds text: the first argument on the
+// caret line, any further arguments on continuation lines.
+func inputPane(first string, more ...string) string {
+	var b strings.Builder
+	b.WriteString("✻ Baked for 1m 18s · done 5:37 PM\n\n────────────────────────────────────────\n❯ " + first + "\n")
+	for _, m := range more {
+		b.WriteString("  " + m + "\n")
+	}
+	b.WriteString("────────────────────────────────────────\n  ⏵⏵ bypass permissions on · 1 shell")
+	return b.String()
 }
 
 // harnessArgs is the manager pane's foreground leader as ps reports it for a running harness.
@@ -83,14 +103,33 @@ func wireFakeDaemon(w *Watcher, s *db.Store, fake *fakeManager) *Daemon {
 		if !fake.present {
 			return paneObservation{}
 		}
+		if len(fake.renders) > 0 {
+			fake.pane, fake.renders = fake.renders[0], fake.renders[1:]
+		}
 		return paneObservation{present: true, captured: true, pane: fake.pane}
 	}
 	d := NewDaemon(s, w.P, w.Backend, w.Session, nil)
 	d.w = w
 	d.managerForeground = func() string { return fake.fg }
-	d.sendWake = func() error {
+	d.typeWake = func() error {
+		fake.typed++
+		if fake.typeErr != nil {
+			return fake.typeErr
+		}
+		if fake.afterType != nil {
+			fake.afterType(fake)
+		} else {
+			fake.pane = inputPane(wakeLine)
+		}
+		return nil
+	}
+	d.pressEnter = func() error {
 		fake.sends++
-		return fake.sendErr
+		if fake.enterErr != nil {
+			return fake.enterErr
+		}
+		fake.pane = idleManagerPane
+		return nil
 	}
 	return d
 }
@@ -184,8 +223,8 @@ func TestDaemon_NeverTypesIntoABusyPane(t *testing.T) {
 				}
 				clk.t = clk.t.Add(10 * time.Minute) // well past any re-wake cadence
 			}
-			if fake.sends != 0 {
-				t.Fatalf("typed %d wake(s) into a pane that must not be typed into", fake.sends)
+			if fake.typed != 0 {
+				t.Fatalf("typed %d wake(s) into a pane that must not be typed into", fake.typed)
 			}
 
 			fake.present, fake.pane, fake.fg = true, idleManagerPane, harnessArgs
@@ -340,10 +379,10 @@ func TestDaemon_FailedSendRetriesAfterBackoff(t *testing.T) {
 	d.SendRetry = 30 * time.Second
 	seedActiveTask(t, s, "alpha", "wk-alpha")
 	report(t, s, "alpha", db.StatusDone, "")
-	fake.sendErr = errors.New("pane is in copy-mode")
+	fake.typeErr = errors.New("pane is in copy-mode")
 
-	if res := tick(t, d); res.Woke || fake.sends != 1 {
-		t.Fatalf("failed send: %+v sends=%d; want one attempt, not woken", res, fake.sends)
+	if res := tick(t, d); res.Woke || fake.typed != 1 {
+		t.Fatalf("failed send: %+v typed=%d; want one attempt, not woken", res, fake.typed)
 	}
 	if _, ok, _ := s.LatestEvent(context.Background(), db.EntityTypeManager, managerEntityID, EventManagerWoken); ok {
 		t.Fatal("a failed send was recorded as a wake")
@@ -352,14 +391,14 @@ func TestDaemon_FailedSendRetriesAfterBackoff(t *testing.T) {
 		clk.t = clk.t.Add(10 * time.Second)
 		tick(t, d)
 	}
-	if fake.sends != 1 {
-		t.Fatalf("sends = %d inside the retry window, want 1", fake.sends)
+	if fake.typed != 1 {
+		t.Fatalf("typed = %d inside the retry window, want 1", fake.typed)
 	}
 
-	fake.sendErr = nil
+	fake.typeErr = nil
 	clk.t = clk.t.Add(10 * time.Second)
-	if res := tick(t, d); !res.Woke || fake.sends != 2 {
-		t.Fatalf("after the retry window: %+v sends=%d; want the wake", res, fake.sends)
+	if res := tick(t, d); !res.Woke || fake.typed != 2 || fake.sends != 1 {
+		t.Fatalf("after the retry window: %+v typed=%d sends=%d; want the wake", res, fake.typed, fake.sends)
 	}
 }
 
@@ -523,6 +562,12 @@ func TestManagerAtEmptyPrompt(t *testing.T) {
 		{"empty prompt above a draft is not what counts", "❯ \n❯ draft", false},
 		{"ascii spinner", "* Thinking... (3s)\n❯ ", false},
 		{"finished turn line is not a spinner", "✻ Worked for 2m 3s\n❯ ", true},
+		{"exact placeholder, current caret", inputPane(`Try "fix lint errors"`), true},
+		{"placeholder followed by the lead's text", inputPane(`Try "fix lint errors" and then`), false},
+		{"lead typing something that starts like the placeholder", inputPane(`Try "the other approach`), false},
+		{"multi-line draft", inputPane("first line of a draft", "second line"), false},
+		{"draft below an empty caret line", inputPane("", "continued text"), false},
+		{"blank lines inside the input box", inputPane("", ""), true},
 	}
 	for _, c := range cases {
 		if got := managerAtEmptyPrompt(c.pane); got != c.want {
@@ -536,7 +581,7 @@ func TestManagerAtEmptyPrompt(t *testing.T) {
 func TestNewDaemon_WiresProductionSeams(t *testing.T) {
 	w, s, _, _ := newWatcher(t)
 	d := NewDaemon(s, w.P, w.Backend, "test-session", nil)
-	if d.sendWake == nil || d.managerForeground == nil || d.w == nil {
+	if d.typeWake == nil || d.pressEnter == nil || d.managerForeground == nil || d.w == nil {
 		t.Fatal("NewDaemon left a production seam unwired")
 	}
 	if d.poll() != defaultDaemonPoll || d.rewake() != defaultRewake || d.sendRetry() != defaultSendRetry {
@@ -578,7 +623,7 @@ func wakeLiteralFromSource(t *testing.T) string {
 				return true
 			}
 			sel, ok := call.Fun.(*ast.SelectorExpr)
-			if !ok || sel.Sel.Name != "SendLine" || len(call.Args) != 3 {
+			if !ok || sel.Sel.Name != "TypeLine" || len(call.Args) != 3 {
 				return true
 			}
 			if lit, ok := call.Args[2].(*ast.BasicLit); ok && lit.Kind == token.STRING {
@@ -589,7 +634,7 @@ func wakeLiteralFromSource(t *testing.T) string {
 		})
 	}
 	if len(lines) != 1 {
-		t.Fatalf("found %d literal SendLine payload(s) in wireManagerWake, want 1", len(lines))
+		t.Fatalf("found %d literal TypeLine payload(s) in wireManagerWake, want 1", len(lines))
 	}
 	return lines[0]
 }
@@ -643,5 +688,86 @@ func TestIsHarnessCommand(t *testing.T) {
 		if got := isHarnessCommand(c.args); got != c.want {
 			t.Errorf("isHarnessCommand(%q) = %v, want %v", c.args, got, c.want)
 		}
+	}
+}
+
+// TestWakeLiteralMatchesWakeLine: Tick compares the pane against wakeLine before pressing
+// Enter, so it must be exactly the literal wireManagerWake types.
+func TestWakeLiteralMatchesWakeLine(t *testing.T) {
+	if got := wakeLiteralFromSource(t); got != wakeLine {
+		t.Fatalf("wireManagerWake types %q but Tick confirms against %q", got, wakeLine)
+	}
+}
+
+// TestDaemon_DoesNotSubmitWhenThePromptChanges: the lead starts typing in the gap between the
+// idle check and the wake's keys landing, or the manager wakes on its own. Whatever the input
+// then holds, if it is not exactly the wake line Enter is never pressed and nothing is recorded
+// as a wake. The prompt now holds text, so later sweeps type nothing more.
+func TestDaemon_DoesNotSubmitWhenThePromptChanges(t *testing.T) {
+	cases := map[string]string{
+		"lead keystroke before the wake": inputPane("x" + wakeLine),
+		"lead keystrokes after the wake": inputPane(wakeLine + " and also check"),
+		"lead's multi-line draft":        inputPane(wakeLine, "please look at this"),
+		"manager went busy":              strings.Replace(spinnerManagerPane, "❯ ", "❯ "+wakeLine, 1),
+		"prompt gone":                    "$ ",
+	}
+	for name, after := range cases {
+		t.Run(name, func(t *testing.T) {
+			d, s, fake, clk := newDaemon(t)
+			fake.afterType = func(f *fakeManager) { f.pane = after }
+			seedActiveTask(t, s, "alpha", "wk-alpha")
+			report(t, s, "alpha", db.StatusDone, "")
+
+			res := tick(t, d)
+			if res.Woke || fake.typed != 1 || fake.sends != 0 {
+				t.Fatalf("sweep = %+v typed=%d enters=%d; want typed once and never submitted", res, fake.typed, fake.sends)
+			}
+			if _, ok, _ := s.LatestEvent(context.Background(), db.EntityTypeManager, managerEntityID, EventManagerWoken); ok {
+				t.Fatal("an unsubmitted wake was recorded as a wake")
+			}
+			for i := 0; i < 3; i++ {
+				clk.t = clk.t.Add(10 * time.Minute)
+				tick(t, d)
+			}
+			if fake.typed != 1 || fake.sends != 0 {
+				t.Fatalf("later sweeps typed=%d enters=%d; want nothing more while the prompt holds text", fake.typed, fake.sends)
+			}
+		})
+	}
+}
+
+// TestDaemon_SubmitsOnceTheTypedWakeRenders: the input can lag the keys, showing only part of
+// the line at first. The loop reads again and presses Enter once the whole line is there; a
+// line that never completes is not submitted.
+func TestDaemon_SubmitsOnceTheTypedWakeRenders(t *testing.T) {
+	d, s, fake, _ := newDaemon(t)
+	fake.afterType = func(f *fakeManager) {
+		f.renders = []string{inputPane(wakeLine[:12]), inputPane(wakeLine[:50]), inputPane(wakeLine)}
+	}
+	seedActiveTask(t, s, "alpha", "wk-alpha")
+	report(t, s, "alpha", db.StatusDone, "")
+	if res := tick(t, d); !res.Woke || fake.sends != 1 {
+		t.Fatalf("lagging render: %+v enters=%d; want the wake submitted once complete", res, fake.sends)
+	}
+
+	d2, s2, fake2, _ := newDaemon(t)
+	fake2.afterType = func(f *fakeManager) { f.pane = inputPane(wakeLine[:40]) }
+	seedActiveTask(t, s2, "alpha", "wk-alpha")
+	report(t, s2, "alpha", db.StatusDone, "")
+	if res := tick(t, d2); res.Woke || fake2.sends != 0 {
+		t.Fatalf("never-complete render: %+v enters=%d; want no Enter", res, fake2.sends)
+	}
+}
+
+// TestDaemon_SubmitsAWrappedWake: in a narrow pane the wake wraps onto a second input line at a
+// space. That is still exactly the wake line, so it is submitted.
+func TestDaemon_SubmitsAWrappedWake(t *testing.T) {
+	d, s, fake, _ := newDaemon(t)
+	cut := strings.LastIndex(wakeLine[:60], " ")
+	fake.afterType = func(f *fakeManager) { f.pane = inputPane(wakeLine[:cut], wakeLine[cut+1:]) }
+	seedActiveTask(t, s, "alpha", "wk-alpha")
+	report(t, s, "alpha", db.StatusDone, "")
+	if res := tick(t, d); !res.Woke || fake.sends != 1 {
+		t.Fatalf("wrapped wake: %+v enters=%d; want it submitted", res, fake.sends)
 	}
 }
