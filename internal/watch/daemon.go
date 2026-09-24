@@ -118,13 +118,15 @@ func NewDaemon(store *db.Store, p paths.Paths, be backend.Backend, session strin
 // one send into the manager window that the watch loop makes, and the payload is a fixed
 // string LITERAL: the source-scan invariant orchestrator.TestNoInjectionIntoManagerSession
 // allow-lists exactly this file, this top-level function and this literal, so no event
-// payload or other content can ever be typed into the manager. The line is also inert if it
-// ever reaches a shell (no backticks, $, quotes, pipes or separators; its first word is not
-// a command), which backs up the shell check in Tick.
+// payload or other content can ever be typed into the manager. The line lands in the input
+// the lead types into, so it says it is automated and not from the lead, and it names only
+// the command to run: it gives no instruction a reader could mistake for the lead's. It is
+// also inert if it ever reaches a shell (no backticks, $, quotes, pipes or separators; its
+// first word is not a command), which backs up the foreground check in Tick.
 func wireManagerWake(d *Daemon, session string) {
 	d.managerCommand = func() string { return tmux.PaneCurrentCommand(session, managerWindow) }
 	d.sendWake = func() error {
-		return tmux.SendLine(session, managerWindow, "Scheduler wake: unread updates are waiting. Run ttorch inbox and act on them.")
+		return tmux.SendLine(session, managerWindow, "Automated notice from the ttorch scheduler, not the lead: unread worker updates, run ttorch inbox")
 	}
 }
 

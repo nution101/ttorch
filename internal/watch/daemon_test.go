@@ -543,6 +543,19 @@ func TestNewDaemon_WiresProductionSeams(t *testing.T) {
 // no shell metacharacter, so even a wake that reached a shell prompt could only print
 // "command not found". It parses daemon.go rather than trusting a copy of the string.
 func TestWakeLineIsInertInAShell(t *testing.T) {
+	line := wakeLiteralFromSource(t)
+	if strings.ContainsAny(line, "`$'\"|;&<>()*?\\#!{}[]~") {
+		t.Fatalf("wake line %q carries a shell metacharacter", line)
+	}
+	if !strings.Contains(line, "ttorch inbox") {
+		t.Fatalf("wake line %q does not tell the manager to run ttorch inbox", line)
+	}
+}
+
+// wakeLiteralFromSource returns the one literal payload wireManagerWake types into the
+// manager window, read from daemon.go's AST rather than a copy of the string.
+func wakeLiteralFromSource(t *testing.T) string {
+	t.Helper()
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "daemon.go", nil, 0)
 	if err != nil {
@@ -573,10 +586,24 @@ func TestWakeLineIsInertInAShell(t *testing.T) {
 	if len(lines) != 1 {
 		t.Fatalf("found %d literal SendLine payload(s) in wireManagerWake, want 1", len(lines))
 	}
-	if strings.ContainsAny(lines[0], "`$'\"|;&<>()*?\\#!{}[]~") {
-		t.Fatalf("wake line %q carries a shell metacharacter", lines[0])
+	return lines[0]
+}
+
+// TestWakeLineCannotPassForTheLead: the wake is typed into the input the lead uses, so it must
+// say it is automated and not from the lead, and must carry no instruction beyond naming the
+// command. A line ending "act on them" read as the lead telling the manager to act on whatever
+// worker text followed.
+func TestWakeLineCannotPassForTheLead(t *testing.T) {
+	line := wakeLiteralFromSource(t)
+	low := strings.ToLower(line)
+	for _, want := range []string{"automated", "not the lead", "run ttorch inbox"} {
+		if !strings.Contains(low, want) {
+			t.Errorf("wake line %q does not say %q", line, want)
+		}
 	}
-	if !strings.Contains(lines[0], "ttorch inbox") {
-		t.Fatalf("wake line %q does not tell the manager to run ttorch inbox", lines[0])
+	for _, banned := range []string{"act on", "approve", "land", "merge"} {
+		if strings.Contains(low, banned) {
+			t.Errorf("wake line %q carries an instruction (%q)", line, banned)
+		}
 	}
 }

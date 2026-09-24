@@ -36,7 +36,7 @@ func TestCmdInbox_PrintsUnreadAndClearsAwaitingLead(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("ttorch inbox exit = %d, want 0 (output: %q)", code, out)
 	}
-	if !strings.Contains(out, "task=inbox-t1") || !strings.Contains(out, "all green") {
+	if !strings.Contains(out, `task="inbox-t1"`) || !strings.Contains(out, `worker text: "all green"`) {
 		t.Fatalf("inbox output missing the done update:\n%s", out)
 	}
 

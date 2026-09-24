@@ -160,7 +160,7 @@ const (
 
 	sanctionedWakeFunc    = "wireManagerWake"
 	sanctionedWakeFile    = "internal/watch/daemon.go"
-	sanctionedWakePayload = "Scheduler wake: unread updates are waiting. Run ttorch inbox and act on them."
+	sanctionedWakePayload = "Automated notice from the ttorch scheduler, not the lead: unread worker updates, run ttorch inbox"
 )
 
 // sanctionedManagerSend is one allow-listed (file, top-level function, literal payload) triple.
@@ -375,7 +375,7 @@ func TestManagerInjectionDetector(t *testing.T) {
 		{name: "wake file+literal but wrong function", file: sanctionedWakeFile, fn: "somethingElse", body: "return tmux.SendLine(session, managerWindow, " + strconv.Quote(sanctionedWakePayload) + ")", injection: true},
 		{name: "wake name as a method is not exempt", file: sanctionedWakeFile, fn: sanctionedWakeFunc, recv: "d *Daemon", body: "return tmux.SendLine(session, managerWindow, " + strconv.Quote(sanctionedWakePayload) + ")", injection: true},
 		{name: "ident payload in wake site is not exempt", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: `return tmux.SendLine(session, managerWindow, wakeLine)`, injection: true},
-		{name: "event payload in wake site is not exempt", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: `return tmux.SendLine(session, managerWindow, "Scheduler wake: "+e.Payload)`, injection: true},
+		{name: "event payload in wake site is not exempt", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: `return tmux.SendLine(session, managerWindow, "Automated notice: "+e.Payload)`, injection: true},
 		{name: "sendkey in wake site is not exempt", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: `tmux.SendKey(session, managerWindow, "Enter")`, injection: true},
 	}
 	for _, c := range cases {
