@@ -41,6 +41,14 @@ const remintTTL = 30 * time.Minute
 // db treats Event.Type as an opaque string and the event originates solely from this gate.
 const eventApprovalRequired = "approval_required"
 
+// eventGateChangeUnapproved is the event a trusted merge records when its diff changed
+// gate-definition files that no human approved, because the default branch sets
+// `- gate-change-approval: off` (gateChangeApprovalWaived). Its payload names those files, so
+// the timeline shows every gate change that landed on the gate's own authority. It is not
+// actionable: it records a finished merge rather than asking anyone for anything. Defined here
+// for the same reason as eventApprovalRequired.
+const eventGateChangeUnapproved = "gate_change_unapproved"
+
 // ErrLandRebaseConflict marks a land that failed because rebasing the worker's branch onto the
 // CURRENT default tip hit genuine git merge conflicts — a real overlapping edit already on the
 // default — as distinct from the other land failures (a stale/uncarryable verdict, a red
@@ -59,7 +67,10 @@ var ErrLandRebaseConflict = errors.New("land rebase hit conflicts with the curre
 //
 // allowGateChange widens the grant to cover a diff that modifies the gate's own definition
 // (diffGateConfigHits). It is off by default: a gated merge of such a diff is refused unless
-// the lead asked for it, and the audit line for that merge records the files.
+// the lead asked for it, and the audit line for that merge records the files. A trusted repo
+// whose default branch sets gate-change-approval: off does not need the flag
+// (gateChangeApprovalWaived), and giving it there is still accepted: the merge then counts
+// the named files as approved by the lead rather than as unapproved.
 //
 // The grant is BOUND to the gate-definition paths this diff actually touches, and those paths
 // are returned so the caller can show the lead exactly what was authorized. A single boolean
@@ -206,10 +217,14 @@ func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error)
 	}
 	def := worktree.DefaultBranch(repo)
 	// The gate-definition files this merge changes, comma-separated, when it changes any and
-	// the approval explicitly authorized every one of them. Empty otherwise. It is recorded in
-	// the audit line so a merge that altered the gate is never reconstructable only by
-	// re-reading the diff.
+	// the approval explicitly authorized every one of them or the repo waives that approval.
+	// Empty otherwise. It is recorded in the audit line so a merge that altered the gate is
+	// never reconstructable only by re-reading the diff.
 	gateChange := ""
+	// The gate-definition files this merge changes that no human approved, because the default
+	// branch waives the approval (gateChangeApprovalWaived). Recorded in the audit line and as
+	// an event, and reported in the merge output.
+	var unapprovedGateChange []string
 	if gated {
 		// Defense in depth: the worktree must be clean (a clean signal that no worker is
 		// mid-edit), though correctness no longer depends on it — the gate validates the
@@ -242,9 +257,12 @@ func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error)
 		}
 		// A gated merge may not change the gate's own definition unless the approval says so
 		// by name. Checked against the COMMITTED diff, so reverting the bytes in the worktree
-		// cannot hide it. A trusted AUTO-merge can never alter its own gate. A HUMAN approval
+		// cannot hide it. A trusted AUTO-merge cannot alter its own gate. A HUMAN approval
 		// can, but only one minted with --allow-gate-change; a plain human token is refused
-		// and the refusal names the offending file.
+		// and the refusal names the offending file. The one exception is a trusted repo whose
+		// default branch sets gate-change-approval: off (gateChangeApprovalWaived): there any
+		// token the gate accepts may carry a gate change, and the merge records the files no
+		// human approved. Blocking hits are refused either way.
 		//
 		// This CLOSES NOTHING on its own. Any process running as the lead can still write the
 		// token file with the scope marker in it, and no change inside ttorch alters that. What
@@ -270,26 +288,34 @@ func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error)
 		}
 		if len(touchedGateFiles) > 0 {
 			reason := gateChangeReason(touchedGateFiles)
-			if tokBy == "auto" {
-				return "", fmt.Errorf("trust gate: %q %s; a trusted auto-merge cannot alter its own gate — the lead must approve it explicitly with 'ttorch approve %s --allow-gate-change'", taskID, reason, taskID)
-			}
-			if len(tokGrantedGateFiles) == 0 {
-				return "", fmt.Errorf("trust gate: %q %s, but its approval does not authorize a gate change; re-approve with 'ttorch approve %s --allow-gate-change'", taskID, reason, taskID)
-			}
 			// The grant is bound to the files it was issued for. Every gate-definition path
 			// in the diff must be one the token names, so an approval given because the diff
 			// touches AGENTS.md cannot carry a .ttorch/validate.sh change in the same commit:
 			// the lead approved one thing and would otherwise have granted two. The same holds
 			// for a path that became covered after the approval (a newer binary, or a default
 			// branch that now reads as ttorch's own source), since the covered set is evaluated
-			// here at merge time and not taken from the token.
+			// here at merge time and not taken from the token. An auto token names no files,
+			// so for it every path is ungranted.
 			var ungranted []string
 			for _, f := range touchedGateFiles {
 				if !slices.Contains(tokGrantedGateFiles, f) {
 					ungranted = append(ungranted, f)
 				}
 			}
-			if len(ungranted) > 0 {
+			switch {
+			case tokBy == "human" && len(ungranted) == 0:
+				// The lead approved every gate-definition path in the diff by name.
+			case gateChangeApprovalWaived(repo):
+				// The default branch turned the human approval off for this trusted repo, so
+				// the passing verdict above and the fresh green validate below authorize the
+				// gate change the way they authorize any other diff. The paths no human
+				// approved are recorded as such.
+				unapprovedGateChange = ungranted
+			case tokBy == "auto":
+				return "", fmt.Errorf("trust gate: %q %s; a trusted auto-merge cannot alter its own gate — the lead must approve it explicitly with 'ttorch approve %s --allow-gate-change'", taskID, reason, taskID)
+			case len(tokGrantedGateFiles) == 0:
+				return "", fmt.Errorf("trust gate: %q %s, but its approval does not authorize a gate change; re-approve with 'ttorch approve %s --allow-gate-change'", taskID, reason, taskID)
+			default:
 				return "", fmt.Errorf("trust gate: %q changes gate-definition files its approval does not cover (%s); the grant authorizes only %s. Re-approve with 'ttorch approve %s --allow-gate-change' to authorize the full set",
 					taskID, strings.Join(ungranted, ", "), strings.Join(tokGrantedGateFiles, ", "), taskID)
 			}
@@ -405,6 +431,9 @@ func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error)
 	if gateChange != "" {
 		auditLine += " gate-change=" + gateChange
 	}
+	if len(unapprovedGateChange) > 0 {
+		auditLine += " gate-change-approval=off unapproved=" + strings.Join(unapprovedGateChange, ",")
+	}
 	if err := m.writeAudit(auditLine); err != nil {
 		return "", fmt.Errorf("trust gate: cannot record the merge for %q in the audit log (%v); refusing to merge unaudited", taskID, err)
 	}
@@ -422,8 +451,36 @@ func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error)
 	if gateChange != "" {
 		payload += " gate-change=" + gateChange
 	}
+	if len(unapprovedGateChange) > 0 {
+		payload += " gate-change-approval=off unapproved=" + strings.Join(unapprovedGateChange, ",")
+	}
 	m.recordDelivered(taskID, db.EventDelivered, payload)
-	return fmt.Sprintf("fast-forwarded %s to %s for task %s", def, short(workerHead), taskID), nil
+	out := fmt.Sprintf("fast-forwarded %s to %s for task %s", def, short(workerHead), taskID)
+	if len(unapprovedGateChange) > 0 {
+		m.recordUnapprovedGateChange(taskID, def, workerHead, unapprovedGateChange)
+		out += "\n  " + unapprovedGateChangeNote(unapprovedGateChange)
+	}
+	return out, nil
+}
+
+// recordUnapprovedGateChange appends the gate_change_unapproved event for a merge that changed
+// gate-definition files no human approved. It is best-effort, like recordDelivered: the merge
+// has already happened, and the must-succeed record of it is the audit line written before the
+// fast-forward, which names the same files.
+func (m *Manager) recordUnapprovedGateChange(taskID, def, sha string, files []string) {
+	if _, err := m.Store.AppendEvent(context.Background(), db.Event{
+		EntityType: db.EntityTypeTask, EntityID: taskID, Type: eventGateChangeUnapproved,
+		Actor:   db.ActorSystem,
+		Payload: fmt.Sprintf("%s -> %s gate-change-approval=off: %s", def, short(sha), strings.Join(files, ", ")),
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "ttorch: could not record the %s event for %s: %v\n", eventGateChangeUnapproved, taskID, err)
+	}
+}
+
+// unapprovedGateChangeNote is the one line a merge prints when it changed gate-definition files
+// no human approved.
+func unapprovedGateChangeNote(files []string) string {
+	return "gate-change-approval is off: merged gate-definition changes no human approved (" + strings.Join(files, ", ") + ")"
 }
 
 // consumeApproval removes the approval token for taskID. It is called when the token is spent
@@ -537,6 +594,30 @@ func (m *Manager) surfaceApprovalRequired(taskID, reason string) {
 		fmt.Fprintf(os.Stderr, "ttorch: could not surface the approval_required event for %s: %v\n", taskID, err)
 	}
 	m.audit(fmt.Sprintf("approval-required task=%s %s", taskID, reason))
+}
+
+// gateChangeApprovalWaived reports whether a gated merge in repo may change gate-definition
+// files without the lead's --allow-gate-change: the repo is in trusted mode AND the DEFAULT
+// BRANCH's committed AGENTS.md sets `- gate-change-approval: off` in its managed block
+// (projectinit.ParseGateChangeApproval). In any other mode it is false, so the switch has no
+// effect there.
+//
+// The line is read from committed objects on the default branch (worktree.ShowFile), the way
+// resolveGateDefinition reads .ttorch/validate.sh, and never from the worker's checkout or the
+// repo's working tree. A worker that writes `off` into its own AGENTS.md has made a gate change
+// like any other, which still needs the approval while the default branch says required, so
+// the line takes effect only after a merge the requirement itself covered. A failed read
+// counts as required.
+//
+// It waives the human approval and nothing else. The blocking hits diffGateConfigHits reports
+// are refused before it is consulted, and the passing verdict, the default-branch validate
+// script and the fresh green run are all still required.
+func gateChangeApprovalWaived(repo string) bool {
+	if projectinit.ReadMode(repo) != "trusted" {
+		return false
+	}
+	text, ok := worktree.ShowFile(repo, worktree.DefaultBranch(repo), "AGENTS.md")
+	return ok && projectinit.ParseGateChangeApproval(text) == projectinit.GateChangeApprovalOff
 }
 
 // approvalScopeGateChange is the scope marker an approval token carries when the lead minted
