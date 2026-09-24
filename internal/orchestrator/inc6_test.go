@@ -128,8 +128,9 @@ func mentionsManagerLaunch(n ast.Node) bool {
 // pinned to THREE independent facts that must hold together, so the allow-list admits exactly
 // those sites and nothing else:
 //
-//   - file: the send must live in that exact source file, so a same-named function added in ANY
-//     other file/package is not exempt;
+//   - file: the send must live in that exact source file, compared as the path from the module
+//     root, so a same-named function added in ANY other file/package is not exempt, and neither
+//     is a copy of the sanctioned file under another directory (vendor/…/internal/watch/daemon.go);
 //   - fn, as a TOP-LEVEL (non-method) FuncDecl: a method of that name, or any other function, is
 //     not exempt; and
 //   - payload, as a fixed string LITERAL (isFixedLiteral): NOT an identifier (which a local could
@@ -219,7 +220,7 @@ func isSanctionedManagerSend(f *ast.File, filename, method string, call *ast.Cal
 	}
 	for _, s := range sanctionedManagerSends {
 		if method == s.method &&
-			strings.HasSuffix(filepath.ToSlash(filename), s.file) &&
+			filepath.ToSlash(filename) == s.file &&
 			inTopLevelFunc(f, s.fn, call.Pos()) &&
 			isFixedLiteral(call.Args[2], s.payload) {
 			return true
@@ -298,12 +299,22 @@ func TestNoInjectionIntoManagerSession(t *testing.T) {
 	fset := token.NewFileSet()
 	var offenders []string
 	for _, path := range goSourceFiles(t, root) {
-		f, err := parser.ParseFile(fset, path, nil, 0)
+		// Parse under the repo-relative name, so the allow-list's file check is an exact
+		// match against a path from the module root rather than a suffix of an absolute one.
+		rel, err := filepath.Rel(root, path)
 		if err != nil {
-			t.Fatalf("parsing %s: %v", path, err)
+			t.Fatal(err)
+		}
+		rel = filepath.ToSlash(rel)
+		src, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f, err := parser.ParseFile(fset, rel, src, 0)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", rel, err)
 		}
 		for _, line := range detectManagerInjection(fset, f) {
-			rel, _ := filepath.Rel(root, path)
 			offenders = append(offenders, fmt.Sprintf("%s:%d", rel, line))
 		}
 	}
@@ -390,6 +401,10 @@ func TestManagerInjectionDetector(t *testing.T) {
 		{name: "continue typed from the wake site", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: `return tmux.TypeLine(session, managerWindow, "continue")`, injection: true},
 		{name: "Enter as typed text from the wake site", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: `return tmux.TypeLine(session, managerWindow, "Enter")`, injection: true},
 		{name: "wake func+literal but wrong file", file: "internal/watch/other.go", fn: sanctionedWakeFunc, body: "return tmux.TypeLine(session, managerWindow, " + strconv.Quote(sanctionedWakePayload) + ")", injection: true},
+		// TIGHT: the file is anchored at the module root; a copy under another directory whose path
+		// merely ENDS in the sanctioned path is not exempt.
+		{name: "wake site copied under vendor/", file: "vendor/example.com/fork/" + sanctionedWakeFile, fn: sanctionedWakeFunc, body: "return tmux.TypeLine(session, managerWindow, " + strconv.Quote(sanctionedWakePayload) + ")", injection: true},
+		{name: "stall-nudge site copied under third_party/", file: "third_party/" + sanctionedStallNudgeFile, fn: sanctionedStallNudgeFunc, body: `return tmux.SendLine(session, managerWindow, "continue")`, injection: true},
 		{name: "wake file+literal but wrong function", file: sanctionedWakeFile, fn: "somethingElse", body: "return tmux.TypeLine(session, managerWindow, " + strconv.Quote(sanctionedWakePayload) + ")", injection: true},
 		{name: "Enter from the wake file but wrong function", file: sanctionedWakeFile, fn: "somethingElse", body: `return tmux.SendKey(session, managerWindow, "Enter")`, injection: true},
 		{name: "wake name as a method is not exempt", file: sanctionedWakeFile, fn: sanctionedWakeFunc, recv: "d *Daemon", body: "return tmux.TypeLine(session, managerWindow, " + strconv.Quote(sanctionedWakePayload) + ")", injection: true},
