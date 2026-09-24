@@ -115,6 +115,62 @@ func TestInit_PreservesUserContentAndUpdatesMode(t *testing.T) {
 	}
 }
 
+// TestInit_KeepsGateChangeApprovalLine: the gate-change-approval line lives in the managed
+// block, which Init regenerates. Re-running `ttorch init` (to refresh the block, or to change
+// the mode) must carry the lead's line through rather than silently dropping it. A fresh Init
+// writes no line, so the default stays required.
+func TestInit_KeepsGateChangeApprovalLine(t *testing.T) {
+	dir := t.TempDir()
+	agents := filepath.Join(dir, "AGENTS.md")
+	if _, err := Init(dir, "trusted"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(agents)
+	if strings.Contains(string(got), gateChangeApprovalKey) {
+		t.Fatalf("a fresh Init must not write a gate-change-approval line:\n%s", got)
+	}
+	if !strings.Contains(string(got), "gate-change-approval: off") {
+		t.Fatalf("the trusted block must tell the lead how to turn the gate-change approval off:\n%s", got)
+	}
+	if p := ParseGateChangeApproval(string(got)); p != GateChangeApprovalRequired {
+		t.Fatalf("fresh Init: ParseGateChangeApproval = %q, want required", p)
+	}
+
+	withLine := strings.Replace(string(got), "- delivery-mode: trusted\n", "- delivery-mode: trusted\n- gate-change-approval: off\n", 1)
+	if err := os.WriteFile(agents, []byte(withLine), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []string{"trusted", "local", "trusted"} {
+		if _, err := Init(dir, mode); err != nil {
+			t.Fatal(err)
+		}
+		got, _ = os.ReadFile(agents)
+		if n := strings.Count(string(got), gateChangeApprovalKey); n != 1 {
+			t.Fatalf("re-Init(%s) left %d gate-change-approval lines, want 1:\n%s", mode, n, got)
+		}
+		if p := ParseGateChangeApproval(string(got)); p != GateChangeApprovalOff {
+			t.Fatalf("re-Init(%s) dropped the lead's policy: ParseGateChangeApproval = %q\n%s", mode, p, got)
+		}
+		if ReadMode(dir) != mode {
+			t.Fatalf("re-Init(%s): ReadMode = %q", mode, ReadMode(dir))
+		}
+	}
+
+	// A disagreeing pair is carried through as-is, so it still reads as required rather than
+	// being collapsed into one of its values.
+	conflict := strings.Replace(string(got), "- gate-change-approval: off\n", "- gate-change-approval: off\n- gate-change-approval: required\n", 1)
+	if err := os.WriteFile(agents, []byte(conflict), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Init(dir, "trusted"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = os.ReadFile(agents)
+	if p := ParseGateChangeApproval(string(got)); p != GateChangeApprovalRequired {
+		t.Fatalf("re-Init turned a conflicting pair into %q:\n%s", p, got)
+	}
+}
+
 func TestInit_DoesNotClobberRealClaudeMD(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "CLAUDE.md"), []byte("hand-written"), 0o644); err != nil {

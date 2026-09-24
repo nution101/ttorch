@@ -180,10 +180,9 @@ func Init(dir, mode string) ([]string, error) {
 	var notes []string
 	agents := filepath.Join(dir, "AGENTS.md")
 	claude := filepath.Join(dir, "CLAUDE.md")
-	block := managedBlock(mode)
 
 	if _, err := os.Stat(agents); os.IsNotExist(err) {
-		body := "# Project guidance\n\nProject-specific notes for coding agents go here.\n\n" + block + "\n"
+		body := "# Project guidance\n\nProject-specific notes for coding agents go here.\n\n" + managedBlock(mode) + "\n"
 		if err := atomicWrite(agents, []byte(body)); err != nil {
 			return nil, err
 		}
@@ -191,7 +190,7 @@ func Init(dir, mode string) ([]string, error) {
 	} else if err != nil {
 		return nil, err
 	} else {
-		note, err := upsertBlock(agents, block, mode)
+		note, err := upsertBlock(agents, mode)
 		if err != nil {
 			return nil, err
 		}
@@ -202,24 +201,48 @@ func Init(dir, mode string) ([]string, error) {
 	return notes, nil
 }
 
-func managedBlock(mode string) string {
+// managedBlock renders the ttorch-managed block for mode. kept are policy lines carried over
+// from the block being replaced (see keptBlockLines); they go directly under the delivery-mode
+// line.
+func managedBlock(mode string, kept ...string) string {
 	b := markerBegin + "\n" +
 		"This repository is managed by ttorch. The manager reads the delivery mode below.\n\n" +
 		"- delivery-mode: " + mode + "\n"
+	for _, line := range kept {
+		b += line + "\n"
+	}
 	if mode == "trusted" {
 		b += "\nTrusted mode: worker output may be merged through the ttorch-review adversarial-review\n" +
 			"gate (a passing verdict plus a fresh green validate, commit-pinned and enforced in Go)\n" +
 			"WITHOUT a separate human approval. This is an explicit, repo-scoped decision; the default\n" +
 			"is pr. Auto-merge REQUIRES a .ttorch/validate.sh on this default branch (the gate's\n" +
 			"validation authority); without it, auto-merge is refused and a human approval is needed.\n" +
-			"A change to the gate itself (this block or .ttorch/validate.sh) always requires a human.\n"
+			"A change to the gate itself (this block or .ttorch/validate.sh) requires a human's\n" +
+			"`ttorch approve --allow-gate-change` unless the default branch's copy of this block sets\n" +
+			"gate-change-approval: off. With it off, a change to the reviewers or the validate step is\n" +
+			"authorized by the gate that change modifies.\n"
 	}
 	return b + markerEnd
 }
 
+// keptBlockLines returns the lines of an existing managed block that Init carries into the
+// block it regenerates: every `- gate-change-approval:` line, trimmed, in order. That line is
+// the lead's decision rather than ttorch's text, so re-running `ttorch init` must not erase it.
+// All of them are kept, so a pair that disagrees still reads as required afterwards.
+func keptBlockLines(block string) []string {
+	var kept []string
+	for _, line := range strings.Split(block, "\n") {
+		if l := strings.TrimSpace(line); strings.HasPrefix(l, gateChangeApprovalKey) {
+			kept = append(kept, l)
+		}
+	}
+	return kept
+}
+
 // upsertBlock replaces the ttorch-managed block in an existing AGENTS.md, or appends
-// it, preserving all developer content outside the markers.
-func upsertBlock(path, block, mode string) (string, error) {
+// it, preserving all developer content outside the markers and the policy lines
+// keptBlockLines names inside them.
+func upsertBlock(path, mode string) (string, error) {
 	existing, err := os.ReadFile(path)
 	if err != nil {
 		return "", err
@@ -228,6 +251,7 @@ func upsertBlock(path, block, mode string) (string, error) {
 	bi := strings.Index(text, markerBegin)
 	ei := strings.Index(text, markerEnd)
 	if bi >= 0 && ei > bi {
+		block := managedBlock(mode, keptBlockLines(text[bi:ei])...)
 		updated := text[:bi] + block + text[ei+len(markerEnd):]
 		if err := atomicWrite(path, []byte(updated)); err != nil {
 			return "", err
@@ -238,7 +262,7 @@ func upsertBlock(path, block, mode string) (string, error) {
 	if !strings.HasSuffix(text, "\n") {
 		sep = "\n\n"
 	}
-	if err := atomicWrite(path, []byte(text+sep+block+"\n")); err != nil {
+	if err := atomicWrite(path, []byte(text+sep+managedBlock(mode)+"\n")); err != nil {
 		return "", err
 	}
 	return "added ttorch block to AGENTS.md (delivery-mode: " + mode + ")", nil
