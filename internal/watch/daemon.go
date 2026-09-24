@@ -43,6 +43,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/nution101/ttorch/internal/backend"
 	"github.com/nution101/ttorch/internal/db"
@@ -501,37 +502,65 @@ func harnessBusy(pane string) bool {
 }
 
 // promptInput returns the text in the harness's input box, whitespace-normalized, and whether
-// an input prompt was found. The prompt is the bottom-most line opening with a caret (">" or
-// "❯"), so a quoted "> " line in the history above is never mistaken for it. The input runs
-// from that line down to the box's closing border, or the end of the capture: a draft can
-// span several lines, and a long line wraps onto the next, so every line in that region
-// counts. Joining on whitespace lets a wake line that wrapped at a space compare equal to the
-// literal.
+// the box was found with its prompt where the harness puts it. The box is anchored on its
+// edges, not on a caret: inputBox finds the rules the harness draws above and below the input,
+// and the FIRST line between them must be the caret line. Every line from there to the bottom
+// rule is input, so a draft can span several lines and a long line can wrap onto the next.
+// Anchoring on the box is what keeps the lead's multi-line draft from reading as an empty
+// prompt when one of its lines starts with "> " (a markdown quote): that line is inside the
+// box below the caret line, so it counts as text, never as the prompt. Joining on whitespace
+// lets a wake line that wrapped at a space compare equal to the literal. Without a box, or
+// with anything but the caret line first inside it, there is no prompt (fail closed).
 func promptInput(pane string) (string, bool) {
-	lines := strings.Split(pane, "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		rest, ok := cutPromptCaret(strings.TrimSpace(strings.Trim(lines[i], promptBorders)))
-		if !ok {
-			continue
-		}
-		parts := []string{rest}
-		for _, l := range lines[i+1:] {
-			s := strings.TrimSpace(strings.Trim(l, promptBorders))
-			if isBorderLine(s) {
-				break
-			}
-			parts = append(parts, s)
-		}
-		return strings.Join(strings.Fields(strings.Join(parts, " ")), " "), true
+	box, ok := inputBox(strings.Split(pane, "\n"))
+	if !ok || len(box) == 0 {
+		return "", false
 	}
-	return "", false
+	rest, ok := cutPromptCaret(strings.TrimSpace(strings.Trim(box[0], promptBorders)))
+	if !ok {
+		return "", false
+	}
+	parts := []string{rest}
+	for _, l := range box[1:] {
+		parts = append(parts, strings.TrimSpace(strings.Trim(l, promptBorders)))
+	}
+	return strings.Join(strings.Fields(strings.Join(parts, " ")), " "), true
 }
 
-// isBorderLine reports a line made only of box-drawing glyphs: the rule or box edge that
-// closes the input area. A blank line is not a border.
-func isBorderLine(s string) bool {
-	return s != "" && strings.Trim(s, "─━┄┅┈┉╌╍╭╮╰╯╴╵╶╷ ") == ""
+// inputBox returns the lines between the harness's input-box rules: the bottom-most rule in
+// the capture and the next rule above it, which must be as wide. The status lines below the
+// box carry no rule, so the bottom-most one closes the box. A rule starts at the left edge;
+// the harness indents every draft line after the first, so a rule the lead pasted into a
+// draft never starts there and is never taken for an edge. ok is false when either rule is
+// missing or the two differ in width.
+func inputBox(lines []string) ([]string, bool) {
+	bottom := -1
+	for i := len(lines) - 1; i >= 0; i-- {
+		if isBoxRule(lines[i]) {
+			bottom = i
+			break
+		}
+	}
+	for top := bottom - 1; bottom > 0 && top >= 0; top-- {
+		if !isBoxRule(lines[top]) {
+			continue
+		}
+		if ruleWidth(lines[top]) != ruleWidth(lines[bottom]) {
+			return nil, false
+		}
+		return lines[top+1 : bottom], true
+	}
+	return nil, false
 }
+
+// isBoxRule reports a line that is one of the input box's horizontal edges: box-drawing
+// glyphs only, starting at the left edge. A blank line is not a rule.
+func isBoxRule(line string) bool {
+	s := strings.TrimRight(line, " \t\r")
+	return s != "" && s == strings.TrimLeft(s, " \t") && strings.Trim(s, "─━┄┅┈┉╌╍╭╮╰╯") == ""
+}
+
+func ruleWidth(line string) int { return utf8.RuneCountInString(strings.TrimRight(line, " \t\r")) }
 
 // managerAtEmptyPrompt reports whether a manager pane capture shows the harness idle at an
 // EMPTY input prompt, the only state the wake may type into. It starts from livestate.Busy
@@ -540,13 +569,16 @@ func isBorderLine(s string) bool {
 //
 //   - it rejects the harness's gerund spinner line, which the current harness shows while
 //     busy and which livestate.Busy's word list misses;
-//   - it requires the whole input area to be empty, or to show exactly the harness's
-//     placeholder. Text on the caret line, or on any line below it inside the input box, is
-//     the lead part-way through a message, and typing the wake plus Enter there would submit
-//     the lead's draft.
+//   - it requires the whole input box to be empty, or to show exactly the harness's
+//     placeholder, with the caret on the box's first line (promptInput). Text on the caret
+//     line, or on any line below it inside the box, is the lead part-way through a message,
+//     and typing the wake plus Enter there would submit the lead's draft. A draft line that
+//     looks empty, such as a bare "> " quote marker at the end of a multi-line draft, sits
+//     below the caret line and so never counts as the prompt.
 //
 // It accepts both prompt carets: ">" (as livestate.Idle does) and "❯", which the current
-// harness renders. Anything it cannot place reads as not idle.
+// harness renders. A pane without an input box, or anything else it cannot place, reads as
+// not idle.
 func managerAtEmptyPrompt(pane string) bool {
 	if harnessBusy(pane) {
 		return false

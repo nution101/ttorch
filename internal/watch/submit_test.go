@@ -72,6 +72,10 @@ func TestSubmitWakeIfConfirmed(t *testing.T) {
 		{"empty input", inputPane(""), "0", false},
 		{"manager went busy", strings.Replace(spinnerManagerPane, "❯ ", "❯ "+wakeLine, 1), "0", false},
 		{"capture failed", "", "1", false},
+		{"wake after the draft's quote-marker line", inputPane("can you check", "> "+wakeLine), "0", false},
+		{"wake after a blank line and a quote marker", inputPane("can you check", "", "> "+wakeLine), "0", false},
+		{"text after the wake before the bottom rule", inputPane(wakeLine, "and this"), "0", false},
+		{"wake at a caret with no input box", "done\n❯ " + wakeLine, "0", false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
