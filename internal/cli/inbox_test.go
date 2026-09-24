@@ -176,3 +176,18 @@ func TestManagerCommandsRefuseWorkerContext(t *testing.T) {
 		}
 	}
 }
+
+// TestRenderWatchStandby: `ttorch status` names the holder while the watch loop stands by, and
+// prints nothing otherwise.
+func TestRenderWatchStandby(t *testing.T) {
+	var b strings.Builder
+	renderWatchStandby(&b, 4242, true)
+	if !strings.Contains(b.String(), "daemon watch: standby, held by pid 4242") {
+		t.Fatalf("standby line = %q", b.String())
+	}
+	b.Reset()
+	renderWatchStandby(&b, 0, false)
+	if b.String() != "" {
+		t.Fatalf("printed %q when not standing by", b.String())
+	}
+}

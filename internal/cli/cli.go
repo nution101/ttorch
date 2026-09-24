@@ -999,10 +999,21 @@ func cmdStatus() error {
 	rows, free := statusView(live, m.TaskState, m.Pool)
 	if len(rows) == 0 {
 		fmt.Println("no active workers. dispatch with: ttorch spawn <task-id> <repo-path>")
-		return nil
+	} else {
+		renderStatus(os.Stdout, rows, free)
 	}
-	renderStatus(os.Stdout, rows, free)
+	pid, standby := watch.StandbyHolder(m.P)
+	renderWatchStandby(os.Stdout, pid, standby)
 	return nil
+}
+
+// renderWatchStandby adds a line to `ttorch status` while the scheduler's watch loop stands by
+// because a hand-armed `ttorch watch` holds the watch lock, so the lead can see why no wake
+// is being typed. It prints nothing otherwise.
+func renderWatchStandby(w io.Writer, pid int, standby bool) {
+	if standby {
+		fmt.Fprintf(w, "daemon watch: standby, held by pid %d (a hand-armed ttorch watch reports updates instead)\n", pid)
+	}
 }
 
 // statusView assembles what `ttorch status` renders, from the FULL live task set: the

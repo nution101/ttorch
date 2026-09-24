@@ -100,14 +100,19 @@ type Daemon struct {
 	pressEnter        func() error  // submit it, once the pane shows exactly wakeLine
 
 	retryAt time.Time // earliest next send after a failed one; in memory, a restart just retries
+
+	// inStandby is true from the first sweep that found the watch lock held by someone else
+	// until the next sweep that takes it, so each standby episode is logged once.
+	inStandby bool
 }
 
 // DaemonTick reports what one sweep did, for the scheduler log and the tests.
 type DaemonTick struct {
-	Standby bool   // an armed `ttorch watch` holds the singleton; this sweep did nothing
-	Unread  int    // actionable updates above the watermark after the sweep
-	Woke    bool   // a wake line was typed into the manager window
-	Reason  string // why no wake was typed (empty when Woke)
+	Standby   bool   // an armed `ttorch watch` holds the singleton; this sweep did nothing
+	HolderPID int    // with Standby: the holder's recorded pid (0 if the pid file could not be read)
+	Unread    int    // actionable updates above the watermark after the sweep
+	Woke      bool   // a wake line was typed into the manager window
+	Reason    string // why no wake was typed (empty when Woke)
 }
 
 // NewDaemon builds the scheduler's watch loop with production seams. be is the session
@@ -197,12 +202,25 @@ func (d *Daemon) Tick(ctx context.Context) (DaemonTick, error) {
 	path := d.P.WatchPIDFile()
 	lock, err := acquireFlock(path, daemonToken)
 	if err == errLockHeld {
-		return DaemonTick{Standby: true, Reason: "an armed ttorch watch holds the singleton and will report"}, nil
+		rec, _ := readWatchRecord(path)
+		if !d.inStandby {
+			d.inStandby = true
+			holder := "another process"
+			if rec.pid > 0 {
+				holder = "pid " + strconv.Itoa(rec.pid)
+			}
+			d.logf("watch: standing by: the watch lock is held by %s, and that watcher reports updates instead", holder)
+		}
+		return DaemonTick{Standby: true, HolderPID: rec.pid, Reason: "an armed ttorch watch holds the singleton and will report"}, nil
 	}
 	if err != nil {
 		return DaemonTick{}, err
 	}
 	defer releaseFlock(lock, path)
+	if d.inStandby {
+		d.inStandby = false
+		d.logf("watch: resumed: the watch lock is free again")
+	}
 
 	if err := d.w.pollArmedPRs(ctx); err != nil {
 		return DaemonTick{}, err
@@ -288,6 +306,23 @@ func (d *Daemon) Tick(ctx context.Context) (DaemonTick, error) {
 	}
 	d.logf("watch: woke the manager: %d unread update(s) up to #%d", len(unread), top)
 	return res, nil
+}
+
+// StandbyHolder reports whether a hand-armed `ttorch watch` holds the watch singleton, which
+// is when the scheduler's watch loop stands by, and that watcher's pid. It only reads the pid
+// file and probes the recorded pid; it never takes the flock, so `ttorch status` can call it
+// without colliding with a sweep or an arm. A record left by the loop itself, a dead pid, or
+// a pid that is no longer a `ttorch watch` (reused) all report false.
+func StandbyHolder(p paths.Paths) (int, bool) {
+	return standbyHolder(p.WatchPIDFile(), processAlive, isWatchProcess)
+}
+
+func standbyHolder(path string, alive, isWatch func(int) bool) (int, bool) {
+	rec, ok := readWatchRecord(path)
+	if !ok || rec.token == daemonToken || !alive(rec.pid) || !isWatch(rec.pid) {
+		return 0, false
+	}
+	return rec.pid, true
 }
 
 // managerNotWakeable returns why the manager window must not be typed into right now, or ""
