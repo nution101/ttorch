@@ -1,5 +1,47 @@
 # Changelog
 
+## [0.19.0](https://github.com/nution101/ttorch/compare/v0.18.0...v0.19.0) (2026-09-24)
+
+
+### Features
+
+* **backend:** add a session-backend interface with a tmux implementation ([6a5bcfb](https://github.com/nution101/ttorch/commit/6a5bcfbbce8342492708f9a19a914ebc26bfd7b4))
+* **board:** serve pending decisions and fleet state on a local page ([ae702f6](https://github.com/nution101/ttorch/commit/ae702f60d86d797be09b9cbbc15e16e0edc1883c))
+* **cli:** add ttorch board ([35a7ce6](https://github.com/nution101/ttorch/commit/35a7ce6d3ef89071d3e3eb9ceb85a19dbee637a8))
+* **cli:** record harness lifecycle events with ttorch hook ([0d99d99](https://github.com/nution101/ttorch/commit/0d99d99c2a204f6c8227a37bb8843354e0638ec6))
+* **db:** add an atomic one-time claim on the event spine ([8de1d76](https://github.com/nution101/ttorch/commit/8de1d768da7af457a6e84b2131b875be596b1252))
+* **db:** read a task's stall clock and ladder off the event spine ([e294648](https://github.com/nution101/ttorch/commit/e2946488281e7346d1e824b725ddb12a596f1f24))
+* **db:** read recent task events of given types across all tasks ([b61ec50](https://github.com/nution101/ttorch/commit/b61ec500355dd09fe047601bc3a0a37321981731))
+* **harness:** wire Claude Code's lifecycle hooks into worker settings ([78b052e](https://github.com/nution101/ttorch/commit/78b052eb96e09f244c21c4d44c8f01353c46a441))
+* **herdr:** add a Unix-socket client for Herdr's JSON API ([2c311fe](https://github.com/nution101/ttorch/commit/2c311fee5a82d7e73eef8188d7f79a135faa8381))
+* **herdr:** add SendLiteral and warn that SendText and SendInput are raw ([d582a75](https://github.com/nution101/ttorch/commit/d582a75b988c62467d9c30f32db1f5a1b3fda5e5))
+* **herdr:** add the worker-hosting calls and status subscription ([71bca67](https://github.com/nution101/ttorch/commit/71bca67e6dd5f47342ae1eda168aab06a7d74d25))
+* **installer:** carry model and effort across updates of a managed agent ([e3fb5eb](https://github.com/nution101/ttorch/commit/e3fb5eb1fde1c7d9b2959431a6d019a63bbdcbe7))
+* **livestate:** reconcile a hook turn record with the pane heuristic ([4687d69](https://github.com/nution101/ttorch/commit/4687d696fc7e87e7818fa60edfc32a50b4f814c4))
+* **scheduler:** export the serialize-overlap setting ([a835b61](https://github.com/nution101/ttorch/commit/a835b61657fce9c9d3e386ebf90f0a13ca9cc0cb))
+* **status:** read the hook record in ttorch status ([6a0ce57](https://github.com/nution101/ttorch/commit/6a0ce573f090b95a3d1b6587808c503eebb4f476))
+* **watch:** keep raising a worker that sits silent at an idle prompt ([c899f1d](https://github.com/nution101/ttorch/commit/c899f1d946e0334bb8902b6d71e7a38e887a40f1))
+* **watch:** read the hook record in the liveness sweep ([7682b6e](https://github.com/nution101/ttorch/commit/7682b6edf6c2d521b8b87aa8fbac6e7ed510c33f))
+
+
+### Bug Fixes
+
+* **board:** answer each question once across boards on one DB ([e358473](https://github.com/nution101/ttorch/commit/e358473b4d459ecfc97a20088b8c8e2a22cb31cb))
+* **board:** force overlap on a board dispatch only for a real conflict ([68342ca](https://github.com/nution101/ttorch/commit/68342ca8e212cd0755d9da2f58ce30983726ce51))
+* **board:** log request-derived text quoted on one line ([078f449](https://github.com/nution101/ttorch/commit/078f449e371364b19ba9c999c185b358fdd789f5))
+* **board:** refuse to answer an ad-hoc cc session ([78c2ba0](https://github.com/nution101/ttorch/commit/78c2ba0ab6b502a6225ddefbb80d77aab2b851f9))
+* **cli:** record nothing from a hook in a review workspace ([2ad20b0](https://github.com/nution101/ttorch/commit/2ad20b0c22d92404ece76adad2c911a5429a1f03))
+* **herdr:** match ErrWaitTimeout only for agent.wait's timeout ([f3098e3](https://github.com/nution101/ttorch/commit/f3098e336834567a11c15e16d08dbf893197e236))
+* **herdr:** quote server-supplied text in error strings ([bd662d3](https://github.com/nution101/ttorch/commit/bd662d3de29015a495d8a810b06545aecad2f95d))
+* **herdr:** refuse a server not run by the current user after connecting ([696abd1](https://github.com/nution101/ttorch/commit/696abd1cf4f9ce0ec19bb4fc13e8276f0be0f062))
+* **herdr:** refuse a socket another local user could have planted ([c154599](https://github.com/nution101/ttorch/commit/c154599ed7c88f68e27ba96989ee08a30de89ed3))
+* **herdr:** reject session names that could leave the sessions directory ([0ae5ded](https://github.com/nution101/ttorch/commit/0ae5ded6ef5b3012dd902019063eae19198b44bb))
+* **livestate:** refuse a hook record that is not a small regular file ([9f19f0c](https://github.com/nution101/ttorch/commit/9f19f0cc5fa6ce4d8fac26ca7f7303d581eb7362))
+* **watch:** put a one-minute floor under the stall thresholds ([126baec](https://github.com/nution101/ttorch/commit/126baecdac908d812bdd5609d87ca2e9ac554c27))
+* **watch:** read a worker's commit time without running its git config ([7af7e40](https://github.com/nution101/ttorch/commit/7af7e40508a669bab0ef4411ede792b177e35105))
+* **watch:** read a worker's HEAD from files instead of running git there ([bf0f17e](https://github.com/nution101/ttorch/commit/bf0f17e0e2e576e6724b7c39b933120ba4fb2eb3))
+* **watch:** read the hook record in the stall ladder ([948a5e1](https://github.com/nution101/ttorch/commit/948a5e195dd7488a2a5fa2b221a93081e07b7e34))
+
 ## [0.18.0](https://github.com/nution101/ttorch/compare/v0.17.0...v0.18.0) (2026-09-23)
 
 
