@@ -191,6 +191,43 @@ func TestReadMode(t *testing.T) {
 	}
 }
 
+// TestParseGateChangeApproval pins the fail-closed reading of the gate-change-approval line:
+// only an exact `off` inside the managed block turns the requirement off, and every other
+// shape, including a line that disagrees with another, reads as required.
+func TestParseGateChangeApproval(t *testing.T) {
+	block := func(lines ...string) string {
+		return "# notes\n\n" + markerBegin + "\n- delivery-mode: trusted\n" + strings.Join(lines, "\n") + "\n" + markerEnd + "\n"
+	}
+	for _, tc := range []struct {
+		name, text, want string
+	}{
+		{"empty text", "", GateChangeApprovalRequired},
+		{"no managed block", "- gate-change-approval: off\n", GateChangeApprovalRequired},
+		{"block without the line", block(), GateChangeApprovalRequired},
+		{"off", block("- gate-change-approval: off"), GateChangeApprovalOff},
+		{"off with CRLF", strings.ReplaceAll(block("- gate-change-approval: off"), "\n", "\r\n"), GateChangeApprovalOff},
+		{"off indented", block("  - gate-change-approval:   off  "), GateChangeApprovalOff},
+		{"required", block("- gate-change-approval: required"), GateChangeApprovalRequired},
+		{"capitalized Off", block("- gate-change-approval: Off"), GateChangeApprovalRequired},
+		{"upper OFF", block("- gate-change-approval: OFF"), GateChangeApprovalRequired},
+		{"trailing comment", block("- gate-change-approval: off # for now"), GateChangeApprovalRequired},
+		{"empty value", block("- gate-change-approval:"), GateChangeApprovalRequired},
+		{"synonym", block("- gate-change-approval: no"), GateChangeApprovalRequired},
+		{"off twice", block("- gate-change-approval: off", "- gate-change-approval: off"), GateChangeApprovalOff},
+		{"off then required", block("- gate-change-approval: off", "- gate-change-approval: required"), GateChangeApprovalRequired},
+		{"garbage then off", block("- gate-change-approval: maybe", "- gate-change-approval: off"), GateChangeApprovalRequired},
+		{"off only outside the block", block() + "- gate-change-approval: off\n", GateChangeApprovalRequired},
+		{"off outside disagrees with nothing inside", "- gate-change-approval: off\n" + block("- gate-change-approval: required"), GateChangeApprovalRequired},
+		{"end marker before begin", markerEnd + "\n- gate-change-approval: off\n" + markerBegin + "\n", GateChangeApprovalRequired},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ParseGateChangeApproval(tc.text); got != tc.want {
+				t.Fatalf("ParseGateChangeApproval = %q, want %q\ntext:\n%s", got, tc.want, tc.text)
+			}
+		})
+	}
+}
+
 func TestLiveMode(t *testing.T) {
 	// A readable, initialized repo reports the same mode the gate's ReadMode resolves.
 	dir := t.TempDir()

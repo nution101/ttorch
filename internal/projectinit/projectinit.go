@@ -45,13 +45,7 @@ func ReadMode(dir string) string {
 	if err != nil {
 		return def
 	}
-	text := string(b)
-	bi := strings.Index(text, markerBegin)
-	ei := strings.Index(text, markerEnd)
-	if bi < 0 || ei <= bi {
-		return def
-	}
-	for _, line := range strings.Split(text[bi:ei], "\n") {
+	for _, line := range managedBlockLines(string(b)) {
 		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), "- delivery-mode:"); ok {
 			mode := strings.TrimSpace(rest)
 			if ValidMode(mode) {
@@ -61,6 +55,56 @@ func ReadMode(dir string) string {
 		}
 	}
 	return def
+}
+
+// managedBlockLines returns the lines of text's ttorch-managed block, or nil when the block
+// is absent or its markers are out of order.
+func managedBlockLines(text string) []string {
+	bi := strings.Index(text, markerBegin)
+	ei := strings.Index(text, markerEnd)
+	if bi < 0 || ei <= bi {
+		return nil
+	}
+	return strings.Split(text[bi:ei], "\n")
+}
+
+// gateChangeApprovalKey is the per-repo policy line that decides whether a trusted merge whose
+// diff changes a gate-definition file still needs the lead's `ttorch approve
+// --allow-gate-change`. It sits in the ttorch-managed block beside `- delivery-mode:`.
+const gateChangeApprovalKey = "- gate-change-approval:"
+
+// The two gate-change-approval policies. Required is the default and keeps the human
+// approval; Off lets a trusted repo's passing verdict and green validate authorize a gate
+// change on their own.
+const (
+	GateChangeApprovalRequired = "required"
+	GateChangeApprovalOff      = "off"
+)
+
+// ParseGateChangeApproval returns the gate-change-approval policy recorded in the
+// ttorch-managed block of agentsMD, the text of an AGENTS.md. It returns GateChangeApprovalOff
+// only when the block has a `- gate-change-approval: off` line and no other
+// `- gate-change-approval:` line in the block says anything else. A missing block or line, any
+// other value, and two lines that disagree all read as GateChangeApprovalRequired. The value is
+// compared exactly, case included, for the reason ValidMode gives: "Off" must not turn the
+// requirement off. A line outside the managed block is ignored.
+//
+// It takes the file's text rather than a directory, unlike ReadMode, because the gate that
+// consumes it must read the DEFAULT BRANCH's committed AGENTS.md, never a checkout a worker
+// can edit. A directory-reading variant would make the wrong read the easy one.
+func ParseGateChangeApproval(agentsMD string) string {
+	policy := GateChangeApprovalRequired
+	for _, line := range managedBlockLines(agentsMD) {
+		rest, ok := strings.CutPrefix(strings.TrimSpace(line), gateChangeApprovalKey)
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(rest) != GateChangeApprovalOff {
+			return GateChangeApprovalRequired
+		}
+		policy = GateChangeApprovalOff
+	}
+	return policy
 }
 
 // autoMintMaxAgeKey is the per-repo policy line that bounds how stale a trusted,
