@@ -125,3 +125,59 @@ func TestPollLiveness_HookTurnStartedLeavesStallAutoResume(t *testing.T) {
 		t.Fatalf("a stalled worker should be nudged once despite a turn-started record, got %d", nudged)
 	}
 }
+
+// ladderCase runs the stall ladder over a Claude Code worker whose pane is a static busy line
+// the heuristic does not know, with a turn-started record written at the start when started
+// is true, sweeping every 30s until end. It returns the stalled raises and the start time.
+func ladderCase(t *testing.T, started bool, end time.Duration) ([]raised, time.Time) {
+	t.Helper()
+	w, s, _, clk := newWatcher(t)
+	task := seedHarnessTask(t, s, "ld", "claude")
+	w.stall.policy = testStallPolicy
+	w.stall.headIdentity = func(string) (string, bool) { return "", false }
+	w.capture = func(string) paneObservation {
+		return paneObservation{present: true, captured: true, pane: paneBrewing}
+	}
+	clk.t = task.Created.Add(time.Second)
+	start := clk.t
+	if started {
+		if err := livestate.WriteRecord(w.P.HookRecordFile(task.ID), livestate.Record{
+			Event: livestate.TurnStarted, TaskID: task.ID, At: start,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sweepUntil(t, w, clk, start.Add(end), 30*time.Second)
+	return stallRaises(t, s, task.ID), start
+}
+
+// TestStallLadder_HookTurnStartedHoldsTheClock: the stall ladder reads a worker as busy the
+// same way the rest of the liveness sweep does. A worker whose hook record says a turn started
+// is not raised as stalled while that record is believed, however still its pane.
+func TestStallLadder_HookTurnStartedHoldsTheClock(t *testing.T) {
+	window := livestate.StartedMaxAge - time.Minute
+	if got, _ := ladderCase(t, false, window); len(got) == 0 {
+		t.Fatalf("control: with no hook record the ladder should raise within %v", window)
+	}
+	if got, start := ladderCase(t, true, window); len(got) != 0 {
+		t.Fatalf("a worker the hook record says is mid-turn was raised as stalled %d time(s), first %v after the turn started",
+			len(got), got[0].at.Sub(start))
+	}
+}
+
+// TestStallLadder_StartsWhenTheRecordAgesOut: once a turn-started record passes
+// StartedMaxAge the pane decides again, the ladder's clock starts from that moment, and the
+// first raise comes one threshold later.
+func TestStallLadder_StartsWhenTheRecordAgesOut(t *testing.T) {
+	got, start := ladderCase(t, true, livestate.StartedMaxAge+testStallPolicy.After+2*time.Minute)
+	if len(got) == 0 {
+		t.Fatal("the ladder should raise once the turn-started record has aged out")
+	}
+	earliest := livestate.StartedMaxAge + testStallPolicy.After
+	if at := got[0].at.Sub(start); at < earliest {
+		t.Fatalf("first raise came %v after the turn started, want no earlier than %v (age-out plus one threshold)", at, earliest)
+	}
+	if got[0].p.Raise != 1 {
+		t.Fatalf("first raise numbered %d, want 1", got[0].p.Raise)
+	}
+}

@@ -962,23 +962,23 @@ notification and never stdin or a keystroke, a watcher firing cannot disturb an 
 *worker* window with a plain "continue" to recover it from an API stall — but never the
 manager.)
 
-The watcher's stale/gone net, and `ttorch status`, decide whether a worker is mid-turn from
-two signals: the text on its pane, and a record its harness's own lifecycle hooks write. A
-Claude Code worker's worktree-local settings wire `UserPromptSubmit`, `Stop`, `StopFailure`
-and `SessionEnd` to `ttorch hook <event>`, which records turn-started, turn-ended or
-session-ended in `~/.ttorch/state/tasks/<id>/hook.json`. `Stop` and `StopFailure` both
-record turn-ended. Claude Code does not fire `Stop` for a turn that ends on an API error; it
-fires `StopFailure`, and without that hook such a worker's record would stay at turn-started
-and read as busy for up to 30 minutes. The gate's reviewer sessions get the same settings,
-so `ttorch hook` records nothing for a session that started in a review workspace, and a
-reviewer's hooks never write the record of the worker it reviews. `livestate.Reconcile`
-combines the pane and the record in a fixed order. Busy text on the pane always reads as busy, and stall
-text always leaves the decision to the pane. Otherwise a turn-started record less than 30
-minutes old reads as busy whatever the pane shows, so a change to the harness's screen
-format no longer makes a working worker look idle, and a turn-ended record reads as idle.
-With no record, a corrupt one, or a harness that has no lifecycle hooks, the pane-only
-reading is unchanged. The full precedence table, and why each row is there, is on
-`Reconcile`.
+The watcher's stale/gone net and stall ladder, and `ttorch status`, decide whether a worker
+is mid-turn from two signals: the text on its pane, and a record its harness's own lifecycle
+hooks write. A Claude Code worker's worktree-local settings wire `UserPromptSubmit`, `Stop`,
+`StopFailure` and `SessionEnd` to `ttorch hook <event>`, which records turn-started,
+turn-ended or session-ended in `~/.ttorch/state/tasks/<id>/hook.json`. `Stop` and
+`StopFailure` both record turn-ended. Claude Code does not fire `Stop` for a turn that ends
+on an API error; it fires `StopFailure`, and without that hook such a worker's record would
+stay at turn-started and read as busy for up to 30 minutes. The gate's reviewer sessions get
+the same settings, so `ttorch hook` records nothing for a session that started in a review
+workspace, and a reviewer's hooks never write the record of the worker it reviews.
+`livestate.Reconcile` combines the pane and the record in a fixed order. Busy text on the
+pane always reads as busy, and stall text always leaves the decision to the pane. Otherwise
+a turn-started record less than 30 minutes old reads as busy whatever the pane shows, so a
+change to the harness's screen format no longer makes a working worker look idle, and a
+turn-ended record reads as idle. With no record, a corrupt one, or a harness that has no
+lifecycle hooks, the pane-only reading is unchanged. The full precedence table, and why each
+row is there, is on `Reconcile`.
 
 - **`ttorch await-lead`** sets a flag that keeps a running watcher **silent** while a
   decision sits with the lead, so the manager isn't pulled off a pending question. Arming

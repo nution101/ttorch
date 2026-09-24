@@ -29,7 +29,6 @@ import (
 	"time"
 
 	"github.com/nution101/ttorch/internal/db"
-	"github.com/nution101/ttorch/internal/livestate"
 )
 
 // Ladder defaults, each overridable by the environment variable named beside it.
@@ -134,7 +133,7 @@ func (w *Watcher) trackStall(ctx context.Context, now time.Time, t db.Task, obs 
 	if err != nil {
 		return err
 	}
-	busy := livestate.Busy(obs.pane)
+	busy := w.busy(t, obs.pane) // the same reading as the rest of the sweep (hooksignal.go)
 	pane := ""
 	if !busy {
 		pane = hashPane(obs.pane)
