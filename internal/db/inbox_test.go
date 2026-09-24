@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 // TestConsumeActionable covers the inbox claim: it takes only rows that should wake the
@@ -79,6 +80,11 @@ func TestConsumeActionable_FloorAboveWatermark(t *testing.T) {
 // TestConsumeActionable_RacingConsumersTakeEachRowOnce runs two stores on one database
 // file (two processes, as `ttorch inbox` and `ttorch watch` are) against updates that
 // keep arriving while they read. Every update must be taken by exactly one of them.
+//
+// Each consumer pauses a millisecond between reads. Real consumers are one-shot commands;
+// two goroutines taking the write lock back to back with no pause can starve the writer past
+// busy_timeout on a loaded machine, which failed this test with SQLITE_BUSY under load without
+// saying anything about the consume itself.
 func TestConsumeActionable_RacingConsumersTakeEachRowOnce(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 	writer, err := Open(path)
@@ -94,6 +100,14 @@ func TestConsumeActionable_RacingConsumersTakeEachRowOnce(t *testing.T) {
 	taken := map[int64]int{}
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
+	var once sync.Once
+	// finish stops the consumers and waits for them, so no goroutine can report into this test
+	// after it returns, whichever way it returns.
+	finish := func() {
+		once.Do(func() { close(stop) })
+		wg.Wait()
+	}
+	defer finish()
 	for c := 0; c < 2; c++ {
 		s, err := Open(path)
 		if err != nil {
@@ -121,6 +135,7 @@ func TestConsumeActionable_RacingConsumersTakeEachRowOnce(t *testing.T) {
 					}
 				default:
 				}
+				time.Sleep(time.Millisecond)
 			}
 		}(s)
 	}
@@ -129,16 +144,17 @@ func TestConsumeActionable_RacingConsumersTakeEachRowOnce(t *testing.T) {
 	for i := 0; i < n; i++ {
 		id := fmt.Sprintf("t%02d", i)
 		if _, err := writer.CreateTask(ctx, Task{ID: id, ProjectID: proj.ID, Status: StatusActive}, ActorManager); err != nil {
+			finish()
 			t.Fatal(err)
 		}
 		ev, err := writer.ReportStatus(ctx, id, StatusDone, "worker:"+id, "")
 		if err != nil {
+			finish()
 			t.Fatal(err)
 		}
 		ids = append(ids, ev.ID)
 	}
-	close(stop)
-	wg.Wait()
+	finish()
 
 	for _, id := range ids {
 		if taken[id] != 1 {
