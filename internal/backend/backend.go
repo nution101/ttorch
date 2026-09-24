@@ -15,8 +15,8 @@ import (
 
 // Backend is what ttorch does to a session host. The method set is taken from the call
 // sites in internal/orchestrator and internal/watch, nothing more: session lifecycle,
-// creating a window in the session, typing into it, reading it back, asking whether it
-// is still there, killing it, and reading its pane process.
+// creating a window in the session, typing into it or pressing a key in it, reading it
+// back, asking whether it is still there, killing it, and reading its pane process.
 //
 // A session is addressed by name and a window by (session, name). Window names are the
 // stable targets ttorch keys on ("manager", "wk-<id>", "rv-<id>-<dim>"); a label is only
@@ -51,6 +51,11 @@ type Backend interface {
 	WindowExistsErr(session, window string) (bool, error)
 	// SendLine types text into the window's pane and presses Enter.
 	SendLine(session, window, text string) error
+	// TypeLine types text into the window's pane without pressing Enter, so a caller can
+	// read the pane back and submit only what it confirmed landed.
+	TypeLine(session, window, text string) error
+	// SendKey sends one named key ("Enter", "Escape", "C-c") to the window's pane.
+	SendKey(session, window, key string) error
 	// CapturePane returns the last n lines of the window's pane.
 	CapturePane(session, window string, n int) (string, error)
 	// PaneCurrentCommand returns the name of the pane's foreground process, or "" when

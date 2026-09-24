@@ -42,6 +42,14 @@ func (Tmux) SendLine(session, window, text string) error {
 	return tmux.SendLine(session, window, text)
 }
 
+func (Tmux) TypeLine(session, window, text string) error {
+	return tmux.TypeLine(session, window, text)
+}
+
+func (Tmux) SendKey(session, window, key string) error {
+	return tmux.SendKey(session, window, key)
+}
+
 func (Tmux) CapturePane(session, window string, n int) (string, error) {
 	return tmux.CapturePane(session, window, n)
 }

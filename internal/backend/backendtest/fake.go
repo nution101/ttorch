@@ -214,6 +214,29 @@ func (f *Fake) SendLine(session, name, text string) error {
 	return nil
 }
 
+// TypeLine appends text to the pane like SendLine, but leaves the foreground program alone:
+// nothing was submitted, so the pane's program has not changed.
+func (f *Fake) TypeLine(session, name, text string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("TypeLine", session, name, text)
+	w, err := f.target(session, name)
+	if err != nil {
+		return err
+	}
+	w.pane = append(w.pane, text)
+	return nil
+}
+
+// SendKey only records the key: a key changes nothing the Fake models.
+func (f *Fake) SendKey(session, name, key string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("SendKey", session, name, key)
+	_, err := f.target(session, name)
+	return err
+}
+
 func (f *Fake) CapturePane(session, name string, n int) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

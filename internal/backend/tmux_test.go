@@ -105,6 +105,8 @@ func TestTmux_SameCommandsAsDirectCalls(t *testing.T) {
 		{"WindowExistsErr", func() []any { return results(b.WindowExistsErr("s", "wk-a")) }, func() []any { return results(tmux.WindowExistsErr("s", "wk-a")) }, true},
 		{"WindowExistsErr broken", func() []any { return results(b.WindowExistsErr("broken", "wk-a")) }, func() []any { return results(tmux.WindowExistsErr("broken", "wk-a")) }, true},
 		{"SendLine", func() []any { return results(b.SendLine("s", "wk-a", "hello")) }, func() []any { return results(tmux.SendLine("s", "wk-a", "hello")) }, true},
+		{"TypeLine", func() []any { return results(b.TypeLine("s", "manager", "hello")) }, func() []any { return results(tmux.TypeLine("s", "manager", "hello")) }, true},
+		{"SendKey", func() []any { return results(b.SendKey("s", "manager", "Enter")) }, func() []any { return results(tmux.SendKey("s", "manager", "Enter")) }, true},
 		{"CapturePane", func() []any { return results(b.CapturePane("s", "wk-a", 6)) }, func() []any { return results(tmux.CapturePane("s", "wk-a", 6)) }, true},
 		{"CapturePane missing", func() []any { return results(b.CapturePane("s", "missing", 6)) }, func() []any { return results(tmux.CapturePane("s", "missing", 6)) }, true},
 		{"PaneCurrentCommand", func() []any { return results(b.PaneCurrentCommand("s", "wk-a")) }, func() []any { return results(tmux.PaneCurrentCommand("s", "wk-a")) }, true},
