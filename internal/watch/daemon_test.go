@@ -53,10 +53,13 @@ const (
 type fakeManager struct {
 	present bool
 	pane    string
-	cmd     string
+	fg      string // argv of the pane's foreground process group leader
 	sends   int
 	sendErr error
 }
+
+// harnessArgs is the manager pane's foreground leader as ps reports it for a running harness.
+const harnessArgs = "claude --dangerously-skip-permissions --effort medium --model opus"
 
 // newDaemon builds a Daemon over a fresh temp-home store with every tmux/gh seam faked:
 // the watcher seams from newWatcher, plus a manager window that starts idle. Nothing here
@@ -64,7 +67,7 @@ type fakeManager struct {
 func newDaemon(t *testing.T) (*Daemon, *db.Store, *fakeManager, *fakeClock) {
 	t.Helper()
 	w, s, _, clk := newWatcher(t)
-	fake := &fakeManager{present: true, pane: idleManagerPane, cmd: "2.1.281"}
+	fake := &fakeManager{present: true, pane: idleManagerPane, fg: harnessArgs}
 	return wireFakeDaemon(w, s, fake), s, fake, clk
 }
 
@@ -84,7 +87,7 @@ func wireFakeDaemon(w *Watcher, s *db.Store, fake *fakeManager) *Daemon {
 	}
 	d := NewDaemon(s, w.P, w.Backend, w.Session, nil)
 	d.w = w
-	d.managerCommand = func() string { return fake.cmd }
+	d.managerForeground = func() string { return fake.fg }
 	d.sendWake = func() error {
 		fake.sends++
 		return fake.sendErr
@@ -155,20 +158,22 @@ func TestDaemon_NeverTypesIntoABusyPane(t *testing.T) {
 		name    string
 		present bool
 		pane    string
-		cmd     string
+		fg      string
 	}{
-		{"spinner line", true, spinnerManagerPane, "2.1.281"},
-		{"esc to interrupt", true, interruptManagerPane, "2.1.281"},
-		{"lead typing a draft", true, draftManagerPane, "2.1.281"},
+		{"spinner line", true, spinnerManagerPane, harnessArgs},
+		{"esc to interrupt", true, interruptManagerPane, harnessArgs},
+		{"lead typing a draft", true, draftManagerPane, harnessArgs},
 		{"harness exited to a shell", true, idleManagerPane, "zsh"},
 		{"login shell", true, idleManagerPane, "-zsh"},
-		{"unknown foreground command", true, idleManagerPane, ""},
-		{"no manager window", false, idleManagerPane, "2.1.281"},
+		{"ssh in the foreground", true, idleManagerPane, "ssh buildhost"},
+		{"sudo in the foreground", true, idleManagerPane, "sudo -s"},
+		{"unknown foreground", true, idleManagerPane, ""},
+		{"no manager window", false, idleManagerPane, harnessArgs},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			d, s, fake, clk := newDaemon(t)
-			fake.present, fake.pane, fake.cmd = c.present, c.pane, c.cmd
+			fake.present, fake.pane, fake.fg = c.present, c.pane, c.fg
 			seedActiveTask(t, s, "alpha", "wk-alpha")
 			report(t, s, "alpha", db.StatusDone, "")
 
@@ -183,7 +188,7 @@ func TestDaemon_NeverTypesIntoABusyPane(t *testing.T) {
 				t.Fatalf("typed %d wake(s) into a pane that must not be typed into", fake.sends)
 			}
 
-			fake.present, fake.pane, fake.cmd = true, idleManagerPane, "2.1.281"
+			fake.present, fake.pane, fake.fg = true, idleManagerPane, harnessArgs
 			if res := tick(t, d); !res.Woke || fake.sends != 1 {
 				t.Fatalf("once idle: %+v sends=%d; want the wake now", res, fake.sends)
 			}
@@ -531,7 +536,7 @@ func TestManagerAtEmptyPrompt(t *testing.T) {
 func TestNewDaemon_WiresProductionSeams(t *testing.T) {
 	w, s, _, _ := newWatcher(t)
 	d := NewDaemon(s, w.P, w.Backend, "test-session", nil)
-	if d.sendWake == nil || d.managerCommand == nil || d.w == nil {
+	if d.sendWake == nil || d.managerForeground == nil || d.w == nil {
 		t.Fatal("NewDaemon left a production seam unwired")
 	}
 	if d.poll() != defaultDaemonPoll || d.rewake() != defaultRewake || d.sendRetry() != defaultSendRetry {
@@ -604,6 +609,39 @@ func TestWakeLineCannotPassForTheLead(t *testing.T) {
 	for _, banned := range []string{"act on", "approve", "land", "merge"} {
 		if strings.Contains(low, banned) {
 			t.Errorf("wake line %q carries an instruction (%q)", line, banned)
+		}
+	}
+}
+
+// TestIsHarnessCommand pins the foreground allowlist: only the harness itself passes; shells,
+// ssh, sudo, editors, other node programs and an unreadable leader all refuse.
+func TestIsHarnessCommand(t *testing.T) {
+	cases := []struct {
+		args string
+		want bool
+	}{
+		{harnessArgs, true},
+		{"/Users/x/.local/bin/claude --resume abc", true},
+		{"/Users/x/.local/share/claude/versions/2.1.281 --model opus", true},
+		{"node /usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js", true},
+		{"node --no-warnings /opt/homebrew/bin/claude", true},
+		{"bun /Users/x/.bun/bin/claude", true},
+		{"", false},
+		{"zsh", false},
+		{"-zsh", false},
+		{"bash --login", false},
+		{"ssh buildhost", false},
+		{"sudo -s", false},
+		{"sudo claude", false},
+		{"vim claude.md", false},
+		{"node server.js", false},
+		{"node --inspect", false},
+		{"claude-wrapper --x", false},
+		{"python3 claude", false},
+	}
+	for _, c := range cases {
+		if got := isHarnessCommand(c.args); got != c.want {
+			t.Errorf("isHarnessCommand(%q) = %v, want %v", c.args, got, c.want)
 		}
 	}
 }

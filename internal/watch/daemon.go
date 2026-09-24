@@ -36,6 +36,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -81,8 +83,8 @@ type Daemon struct {
 	w *Watcher
 
 	// Seams (wired by wireManagerWake in production).
-	managerCommand func() string // the manager pane's foreground command (tmux pane_current_command)
-	sendWake       func() error  // type the fixed wake line into the manager window
+	managerForeground func() string // argv of the manager pane's foreground process group leader ("" if unknown)
+	sendWake          func() error  // type the fixed wake line into the manager window
 
 	retryAt time.Time // earliest next send after a failed one; in memory, a restart just retries
 }
@@ -124,7 +126,7 @@ func NewDaemon(store *db.Store, p paths.Paths, be backend.Backend, session strin
 // also inert if it ever reaches a shell (no backticks, $, quotes, pipes or separators; its
 // first word is not a command), which backs up the foreground check in Tick.
 func wireManagerWake(d *Daemon, session string) {
-	d.managerCommand = func() string { return tmux.PaneCurrentCommand(session, managerWindow) }
+	d.managerForeground = func() string { return foregroundLeader(tmux.PanePID(session, managerWindow)) }
 	d.sendWake = func() error {
 		return tmux.SendLine(session, managerWindow, "Automated notice from the ttorch scheduler, not the lead: unread worker updates, run ttorch inbox")
 	}
@@ -252,7 +254,7 @@ func (d *Daemon) Tick(ctx context.Context) (DaemonTick, error) {
 }
 
 // managerNotWakeable returns why the manager window must not be typed into right now, or ""
-// when it may be: the window exists and was read, its foreground process is not a shell,
+// when it may be: the window exists and was read, its foreground process is the harness,
 // and the pane sits at an empty Claude Code prompt.
 func (d *Daemon) managerNotWakeable() string {
 	obs := d.w.capture(managerWindow)
@@ -262,8 +264,8 @@ func (d *Daemon) managerNotWakeable() string {
 	if !obs.captured {
 		return "manager pane unreadable"
 	}
-	if cmd := d.managerCommand(); unsafeToType(cmd) {
-		return fmt.Sprintf("manager pane is running %q, not the harness", cmd)
+	if fg := d.managerForeground(); !isHarnessCommand(fg) {
+		return fmt.Sprintf("manager pane foreground is %q, not the harness", firstField(fg))
 	}
 	if !managerAtEmptyPrompt(obs.pane) {
 		return "manager is busy or the prompt is not empty"
@@ -281,15 +283,68 @@ func announcedID(e db.Event) int64 {
 	return n
 }
 
-// unsafeToType reports whether the manager pane's foreground command rules out typing into
-// it. A shell there means the harness exited and anything typed would be executed; an empty
-// answer means tmux could not say, and the wake fails closed.
-func unsafeToType(cmd string) bool {
-	switch strings.TrimPrefix(strings.TrimSpace(cmd), "-") {
-	case "", "sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "nu":
+// isHarnessCommand reports whether args, the command line of the manager pane's foreground
+// process group leader, is the Claude Code harness. It is an allowlist: the program is
+// `claude` (by name, or the versioned native binary under .../claude/versions/), or `node` /
+// `bun` whose script is `claude` or lives in the @anthropic-ai/claude-code package. Anything
+// else refuses, including a shell (the harness exited, and typed text would be executed),
+// ssh, sudo, an editor, or an empty answer because the leader could not be read.
+func isHarnessCommand(args string) bool {
+	fields := strings.Fields(args)
+	if len(fields) == 0 {
+		return false
+	}
+	if isClaudeProgram(fields[0]) {
 		return true
 	}
+	switch filepath.Base(fields[0]) {
+	case "node", "bun":
+		for _, a := range fields[1:] {
+			if strings.HasPrefix(a, "-") {
+				continue // runtime flags before the script
+			}
+			return isClaudeProgram(a) || strings.Contains(filepath.ToSlash(a), "/@anthropic-ai/claude-code/")
+		}
+	}
 	return false
+}
+
+func isClaudeProgram(path string) bool {
+	return filepath.Base(path) == "claude" || strings.Contains(filepath.ToSlash(path), "/claude/versions/")
+}
+
+// foregroundLeader returns the command line of the process group leader in the foreground of
+// the terminal that panePID (the manager pane's first process, normally the shell that
+// launched the harness) is attached to, or "" when any step cannot be read. tmux's
+// pane_current_command gives only a process name (the native harness shows up as its version
+// number), so the allowlist needs the leader's argv. The foreground group also holds the
+// harness's own children (MCP servers), which is why only the leader is read.
+func foregroundLeader(panePID int) string {
+	if panePID <= 0 {
+		return ""
+	}
+	out, err := exec.Command("ps", "-o", "tpgid=", "-p", strconv.Itoa(panePID)).Output()
+	if err != nil {
+		return ""
+	}
+	tpgid, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil || tpgid <= 0 {
+		return ""
+	}
+	out, err = exec.Command("ps", "-o", "args=", "-p", strconv.Itoa(tpgid)).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// firstField is the program part of a command line, for log lines that must not echo the
+// harness's full argument list.
+func firstField(args string) string {
+	if f := strings.Fields(args); len(f) > 0 {
+		return filepath.Base(f[0])
+	}
+	return ""
 }
 
 // spinnerLine matches the harness's in-progress status line, e.g.
