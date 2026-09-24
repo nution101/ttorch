@@ -229,6 +229,7 @@ func (d *Daemon) Tick(ctx context.Context) (DaemonTick, error) {
 		return DaemonTick{}, err
 	}
 
+	// Two separate reads: an inbox read landing between them can cost one superfluous wake (the manager finds an empty inbox). Accepted.
 	m, _, err := d.Store.GetManager(ctx)
 	if err != nil {
 		return DaemonTick{}, err
