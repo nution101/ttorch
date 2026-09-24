@@ -147,9 +147,12 @@ func mentionsManagerLaunch(n ast.Node) bool {
 // stall-recovery tests.
 //
 // (2) The scheduler watch loop's wake (watch.NewDaemon → wireManagerWake): the always-on
-// watcher types one fixed line (tmux.TypeLine, no Enter) telling an idle manager to run
-// `ttorch inbox`, re-reads the pane, and presses Enter (tmux.SendKey "Enter") only if the input
-// holds exactly that line. Those are two entries, each pinned to its method. The RUNTIME guards
+// watcher types one fixed line (tmux.TypeLine, no Enter, in wireManagerWake) telling an idle
+// manager to run `ttorch inbox`, re-reads the pane, and presses Enter (tmux.SendKey "Enter")
+// only from submitWakeIfConfirmed, which takes its own capture and sends the key only if the
+// input holds exactly that line at an idle prompt. Those are two entries, each pinned to its
+// method and function, so the payload of the key is fixed and the check guarding it is in the
+// same function as the send. The RUNTIME guards
 // (only with unread updates, never while awaiting the lead, only when the harness leads the
 // pane's foreground, never into a busy pane or a non-empty prompt, Enter only after the typed
 // line is confirmed, at most one outstanding wake) live in watch.Daemon.Tick and are covered by
@@ -162,9 +165,10 @@ const (
 	sanctionedStallNudgeFile = "internal/scheduler/scheduler.go"
 	sanctionedNudgePayload   = "continue"
 
-	sanctionedWakeFunc    = "wireManagerWake"
-	sanctionedWakeFile    = "internal/watch/daemon.go"
-	sanctionedWakePayload = "Automated notice from the ttorch scheduler, not the lead: unread worker updates, run ttorch inbox"
+	sanctionedWakeFunc      = "wireManagerWake"
+	sanctionedWakeEnterFunc = "submitWakeIfConfirmed"
+	sanctionedWakeFile      = "internal/watch/daemon.go"
+	sanctionedWakePayload   = "Automated notice from the ttorch scheduler, not the lead: unread worker updates, run ttorch inbox"
 )
 
 // sanctionedManagerSend is one allow-listed send: the tmux function it calls, the file and
@@ -174,7 +178,7 @@ type sanctionedManagerSend struct{ method, file, fn, payload string }
 var sanctionedManagerSends = []sanctionedManagerSend{
 	{"SendLine", sanctionedStallNudgeFile, sanctionedStallNudgeFunc, sanctionedNudgePayload},
 	{"TypeLine", sanctionedWakeFile, sanctionedWakeFunc, sanctionedWakePayload},
-	{"SendKey", sanctionedWakeFile, sanctionedWakeFunc, "Enter"},
+	{"SendKey", sanctionedWakeFile, sanctionedWakeEnterFunc, "Enter"},
 }
 
 // managerSendFuncs are the tmux functions that write into a window, and so are scanned.
@@ -388,7 +392,11 @@ func TestManagerInjectionDetector(t *testing.T) {
 		// internal/watch/daemon.go.
 		{name: "sanctioned wake (managerWindow ident)", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: "return tmux.TypeLine(session, managerWindow, " + strconv.Quote(sanctionedWakePayload) + ")", injection: false},
 		{name: "sanctioned wake (literal window)", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: "return tmux.TypeLine(session, \"manager\", " + strconv.Quote(sanctionedWakePayload) + ")", injection: false},
-		{name: "sanctioned wake Enter", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: `return tmux.SendKey(session, managerWindow, "Enter")`, injection: false},
+		{name: "sanctioned wake Enter", file: sanctionedWakeFile, fn: sanctionedWakeEnterFunc, body: `return tmux.SendKey(session, managerWindow, "Enter")`, injection: false},
+		// TIGHT: Enter is exempt only from the function that checks the pane before sending it.
+		{name: "Enter from wireManagerWake", file: sanctionedWakeFile, fn: sanctionedWakeFunc, body: `return tmux.SendKey(session, managerWindow, "Enter")`, injection: true},
+		{name: "wake line typed from the Enter function", file: sanctionedWakeFile, fn: sanctionedWakeEnterFunc, body: "return tmux.TypeLine(session, managerWindow, " + strconv.Quote(sanctionedWakePayload) + ")", injection: true},
+		{name: "another key from the Enter function", file: sanctionedWakeFile, fn: sanctionedWakeEnterFunc, body: `return tmux.SendKey(session, managerWindow, "C-c")`, injection: true},
 		// TIGHT: TypeLine is scanned like the other sends, anywhere.
 		{name: "direct TypeLine poke", body: `_ = tmux.TypeLine(m.Session, "manager", "drain and advance")`, injection: true},
 		{name: "TypeLine via local var", body: "w := managerWindow\n_ = tmux.TypeLine(s.Session, w, directive)", injection: true},

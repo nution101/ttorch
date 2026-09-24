@@ -34,6 +34,7 @@ package watch
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
@@ -97,7 +98,7 @@ type Daemon struct {
 	// Seams (wired by wireManagerWake in production).
 	managerForeground func() string // argv of the manager pane's foreground process group leader ("" if unknown)
 	typeWake          func() error  // type the fixed wake line into the manager input, without Enter
-	pressEnter        func() error  // submit it, once the pane shows exactly wakeLine
+	pressEnter        func() error  // submit it; production re-checks the pane in submitWakeIfConfirmed
 
 	retryAt time.Time // earliest next send after a failed one; in memory, a restart just retries
 
@@ -144,17 +145,39 @@ func NewDaemon(store *db.Store, p paths.Paths, be backend.Backend, session strin
 // also inert if it ever reaches a shell (no backticks, $, quotes, pipes or separators; its
 // first word is not a command), which backs up the foreground check in Tick.
 //
-// Typing and submitting are separate sends so Tick can re-read the pane in between: Enter is
-// pressed only when the input holds exactly the wake line. Enter is the only key the loop ever
-// sends to the manager, and the allow-list pins that too.
+// Typing and submitting are separate sends so Tick can re-read the pane in between. Enter goes
+// through submitWakeIfConfirmed, which checks the pane itself right before pressing it.
 func wireManagerWake(d *Daemon, session string) {
 	d.managerForeground = func() string { return foregroundLeader(tmux.PanePID(session, managerWindow)) }
 	d.typeWake = func() error {
 		return tmux.TypeLine(session, managerWindow, "Automated notice from the ttorch scheduler, not the lead: unread worker updates, run ttorch inbox")
 	}
-	d.pressEnter = func() error {
-		return tmux.SendKey(session, managerWindow, "Enter")
+	d.pressEnter = func() error { return submitWakeIfConfirmed(session) }
+}
+
+// errWakeNotConfirmed is submitWakeIfConfirmed's refusal: the pane did not show exactly the wake
+// line at an idle prompt, so Enter was not pressed.
+var errWakeNotConfirmed = errors.New("the manager's input no longer holds exactly the wake line")
+
+// submitWakeIfConfirmed is the only place the watch loop presses a key in the manager window.
+// It takes its own fresh capture, not one handed in, and presses Enter only if the harness is
+// idle and the input holds exactly wakeLine (TestWakeLiteralMatchesWakeLine keeps that equal
+// to the literal wireManagerWake types). The allow-list pins SendKey "Enter" to this function,
+// so the check that makes the key safe sits next to the send in the source instead of relying
+// on every caller having confirmed first. Tick's confirm loop still runs before it, to wait out
+// a lagging render; this is the last read before the key.
+func submitWakeIfConfirmed(session string) error {
+	pane, err := tmux.CapturePane(session, managerWindow, captureLines)
+	if err != nil {
+		return err
 	}
+	if harnessBusy(pane) {
+		return errWakeNotConfirmed
+	}
+	if input, ok := promptInput(pane); !ok || input != wakeLine {
+		return errWakeNotConfirmed
+	}
+	return tmux.SendKey(session, managerWindow, "Enter")
 }
 
 func (d *Daemon) poll() time.Duration {
