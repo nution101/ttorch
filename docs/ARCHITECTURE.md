@@ -966,8 +966,10 @@ The watcher's stale/gone net, and `ttorch status`, decide whether a worker is mi
 two signals: the text on its pane, and a record its harness's own lifecycle hooks write. A
 Claude Code worker's worktree-local settings wire `UserPromptSubmit`, `Stop`, `StopFailure`
 and `SessionEnd` to `ttorch hook <event>`, which records turn-started, turn-ended or
-session-ended in `~/.ttorch/state/tasks/<id>/hook.json`. `livestate.Reconcile` combines the
-two in a fixed order. Busy text on the pane always reads as busy, and stall text always
+session-ended in `~/.ttorch/state/tasks/<id>/hook.json`. The gate's reviewer sessions get the
+same settings, so `ttorch hook` records nothing for a session that started in a review
+workspace, and a reviewer's hooks never write the record of the worker it reviews.
+`livestate.Reconcile` combines the two in a fixed order. Busy text on the pane always reads as busy, and stall text always
 leaves the decision to the pane. Otherwise a turn-started record less than 30 minutes old
 reads as busy whatever the pane shows, so a change to the harness's screen format no longer
 makes a working worker look idle, and a turn-ended record reads as idle. With no record, a

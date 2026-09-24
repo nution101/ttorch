@@ -17,6 +17,7 @@ func hookWorker(t *testing.T, id string) string {
 	t.Helper()
 	t.Setenv("TTORCH_HOME", t.TempDir())
 	t.Setenv("TTORCH_TASK_ID", id)
+	t.Setenv("CLAUDE_PROJECT_DIR", "")
 	t.Chdir(t.TempDir()) // no .ttorch/task up the tree
 	return paths.Default().HookRecordFile(id)
 }
@@ -168,5 +169,120 @@ func TestHook_WriteFailureFailsOpen(t *testing.T) {
 	t.Chdir(t.TempDir())
 	if err := cmdHook([]string{"turn-started"}, strings.NewReader("")); err != nil {
 		t.Fatalf("a failed write should fail open, got %v", err)
+	}
+}
+
+// workerWorktree makes a directory holding .ttorch/task for id, as spawn writes it.
+func workerWorktree(t *testing.T, id string) string {
+	t.Helper()
+	wt := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(wt, ".ttorch"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, ".ttorch", "task"), []byte("task_id="+id+"\ndb=/nowhere\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return wt
+}
+
+// TestHook_ReviewWorkspaceRecordsNothing: a reviewer session runs from a review workspace
+// with the same worker settings, so it carries the lifecycle hooks. It has no task of its
+// own, and must never write the record of the worker it reviews: not if it inherits that
+// worker's TTORCH_TASK_ID, and not if it cds into the worker's worktree and so finds its
+// .ttorch/task. Claude Code's CLAUDE_PROJECT_DIR stays where the session started when it
+// cds, so it is what the hook checks; the process's cwd is the fallback when it is unset.
+func TestHook_ReviewWorkspaceRecordsNothing(t *testing.T) {
+	cases := []struct {
+		name string
+		// envTask is TTORCH_TASK_ID; projectInReview puts CLAUDE_PROJECT_DIR in the review
+		// workspace; cwd is "review", "worktree" (the worker's, with its .ttorch/task) or "".
+		envTask         string
+		projectInReview bool
+		cwd             string
+	}{
+		{"inherited task id, project dir in the review workspace", "wt1", true, ""},
+		{"cd into the worker's worktree, project dir in the review workspace", "", true, "worktree"},
+		{"inherited task id, no project dir, cwd in the review workspace", "wt1", false, "review"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			path := hookWorker(t, "wt1")
+			review := filepath.Join(paths.Default().ReviewWorkspaceDir("wt1"), "correctness")
+			if err := os.MkdirAll(review, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("TTORCH_TASK_ID", c.envTask)
+			if c.projectInReview {
+				t.Setenv("CLAUDE_PROJECT_DIR", review)
+			}
+			switch c.cwd {
+			case "review":
+				t.Chdir(review)
+			case "worktree":
+				t.Chdir(workerWorktree(t, "wt1"))
+			}
+			if err := cmdHook([]string{"turn-ended"}, strings.NewReader("")); err != nil {
+				t.Fatalf("a hook in a review workspace should succeed, got %v", err)
+			}
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Fatalf("a hook in a review workspace wrote the worker's record (stat err = %v)", err)
+			}
+		})
+	}
+}
+
+// TestHook_OutsideReviewWorkspaceStillRecords: the refusal is scoped to the review workspaces.
+// A worker whose project dir is its own worktree records, and so does one in a directory whose
+// name only starts with the review workspaces' name.
+func TestHook_OutsideReviewWorkspaceStillRecords(t *testing.T) {
+	for _, name := range []string{"worktree", "lookalike"} {
+		t.Run(name, func(t *testing.T) {
+			path := hookWorker(t, "wt1")
+			dir := workerWorktree(t, "wt1")
+			if name == "lookalike" {
+				// A sibling of the review workspaces root: <home>/review-workspaces-old.
+				dir = filepath.Dir(paths.Default().ReviewWorkspaceDir("x")) + "-old"
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("CLAUDE_PROJECT_DIR", dir)
+			t.Chdir(dir)
+			if err := cmdHook([]string{"turn-started"}, strings.NewReader("")); err != nil {
+				t.Fatal(err)
+			}
+			if r, ok := livestate.ReadRecord(path, "wt1"); !ok || r.Event != livestate.TurnStarted {
+				t.Fatalf("project dir %s: record = (%+v, %v), want turn-started", dir, r, ok)
+			}
+		})
+	}
+}
+
+// TestHook_ReviewWorkspaceThroughASymlinkedHome: the ttorch home is reached through a symlink
+// and the session's project dir is given as the real path, as a harness that resolves its cwd
+// would report it. The two spellings still name a review workspace, so nothing is recorded.
+func TestHook_ReviewWorkspaceThroughASymlinkedHome(t *testing.T) {
+	real := t.TempDir()
+	link := filepath.Join(t.TempDir(), "home-link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TTORCH_HOME", link)
+	t.Setenv("TTORCH_TASK_ID", "wt1")
+	t.Chdir(t.TempDir())
+	rel, err := filepath.Rel(link, filepath.Join(paths.Default().ReviewWorkspaceDir("wt1"), "correctness"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	review := filepath.Join(real, rel)
+	if err := os.MkdirAll(review, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_PROJECT_DIR", review)
+	if err := cmdHook([]string{"turn-ended"}, strings.NewReader("")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(paths.Default().HookRecordFile("wt1")); !os.IsNotExist(err) {
+		t.Fatalf("a hook in a review workspace reached through a symlink wrote the record (stat err = %v)", err)
 	}
 }
