@@ -818,6 +818,14 @@ func (m *Manager) ArmPRCheck(taskID, url string) error {
 
 // FleetSync refreshes a repo's local default branch from origin when safe and
 // prunes local branches whose upstream is gone.
+//
+// The branch is the recorded default branch (see Manager.gateBase), and it is fast-forwarded to
+// the commit origin itself reports for it (worktree.RemoteBranchSHA), and only when
+// refs/remotes/origin/<branch> agrees. It used to run `git merge --ff-only origin/<def>`, and git
+// resolves a bare origin/<def> to refs/tags/origin/<def> ahead of the remote-tracking ref, which
+// `fetch --prune` never removes: a worker's tag of that name moved the lead's branch to the
+// worker's commit. The remote-tracking ref is a local ref too, and the fetch resets it only when
+// its refspec covers it, so a disagreement with origin skips the fast-forward and says why.
 func (m *Manager) FleetSync(repoPath string) ([]string, error) {
 	repo, err := worktree.RepoRoot(repoPath)
 	if err != nil {
@@ -838,11 +846,13 @@ func (m *Manager) FleetSync(repoPath string) ([]string, error) {
 			}
 		}
 	}
-	def := worktree.DefaultBranch(repo)
-	if cur, _ := worktree.CurrentBranch(repo); cur == def {
+	def := m.recordedDefaultBranch(repo)
+	if def == "" {
+		notes = append(notes, fmt.Sprintf("no default branch is recorded for %s, so none was fast-forwarded; run '%s %s <branch>'", repo, SetBranchCommand, repo))
+	} else if cur, _ := worktree.CurrentBranch(repo); cur == def {
 		if dirty, _ := worktree.IsDirty(repo); !dirty {
-			if err := worktree.MergeFastForward(repo, "origin/"+def); err == nil {
-				notes = append(notes, def+" fast-forwarded to origin/"+def)
+			if note := syncDefaultBranch(repo, def); note != "" {
+				notes = append(notes, note)
 			}
 		}
 	}
@@ -850,6 +860,32 @@ func (m *Manager) FleetSync(repoPath string) ([]string, error) {
 		notes = append(notes, "already up to date")
 	}
 	return notes, nil
+}
+
+// syncDefaultBranch fast-forwards the checked-out def to the commit origin reports for it, when
+// refs/remotes/origin/<def> (which the fetch just refreshed) agrees with origin, and returns a
+// note for anything it did or declined to do. An offline origin, or a branch origin lacks, is
+// a quiet no-op.
+func syncDefaultBranch(repo, def string) string {
+	remote, ok, err := worktree.RemoteBranchSHA(repo, "origin", def)
+	if err != nil || !ok {
+		return ""
+	}
+	tracking, err := worktree.ResolveCommit(repo, "refs/remotes/origin/"+def)
+	if err != nil || tracking != remote {
+		if err != nil {
+			tracking = "nothing"
+		}
+		return fmt.Sprintf("%s not fast-forwarded: refs/remotes/origin/%s is at %s but origin reports %s", def, def, short(tracking), short(remote))
+	}
+	local, err := worktree.ResolveCommit(repo, "refs/heads/"+def)
+	if err != nil || local == remote || !worktree.IsAncestor(repo, local, remote) {
+		return ""
+	}
+	if err := worktree.MergeFastForward(repo, remote); err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%s fast-forwarded to origin/%s (%s)", def, def, short(remote))
 }
 
 // Recovery reconciles tracked tasks against live tmux windows and reports drift.
