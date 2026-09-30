@@ -76,5 +76,8 @@ gate (a passing verdict plus a fresh green validate, commit-pinned and enforced 
 WITHOUT a separate human approval. This is an explicit, repo-scoped decision; the default
 is pr. Auto-merge REQUIRES a .ttorch/validate.sh on this default branch (the gate's
 validation authority); without it, auto-merge is refused and a human approval is needed.
-A change to the gate itself (this block or .ttorch/validate.sh) always requires a human.
+A change to the gate itself (this block or .ttorch/validate.sh) is authorized the same
+way, so a change to the reviewers or the validate step is authorized by the gate that
+change modifies. To require a human's `ttorch approve --allow-gate-change` for those
+changes, set gate-change-approval: required in this block on the default branch.
 <!-- END ttorch-managed -->
