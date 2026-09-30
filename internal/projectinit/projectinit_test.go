@@ -277,6 +277,30 @@ func TestValidMode(t *testing.T) {
 	}
 }
 
+// TestHasGateChangeApprovalLine: any recognized line, whatever its value, and any malformed
+// attempt count as the repo having set the approval; prose and a block without one do not.
+func TestHasGateChangeApprovalLine(t *testing.T) {
+	block := func(lines ...string) string {
+		return markerBegin + "\n- delivery-mode: trusted\n" + strings.Join(lines, "\n") + "\n" + markerEnd + "\n"
+	}
+	for _, text := range []string{
+		block("- gate-change-approval: off"),
+		block("- gate-change-approval: required"),
+		block("- gate-change-approval: requird"),
+		block("* gate-change-approval: required"),
+		block() + "- gate-change-approval: required\n",
+	} {
+		if !HasGateChangeApprovalLine(text) {
+			t.Errorf("HasGateChangeApprovalLine = false, want true:\n%s", text)
+		}
+	}
+	for _, text := range []string{"", block(), "x\n" + managedBlock("trusted")} {
+		if HasGateChangeApprovalLine(text) {
+			t.Errorf("HasGateChangeApprovalLine = true, want false:\n%s", text)
+		}
+	}
+}
+
 // TestParseMode: the text reader agrees with ReadMode, and a symlink's committed text (a path,
 // with no managed block) reads as the pr default, as a missing file does.
 func TestParseMode(t *testing.T) {

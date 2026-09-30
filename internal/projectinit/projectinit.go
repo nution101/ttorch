@@ -146,6 +146,19 @@ func ParseGateChangeApproval(agentsMD string) (policy string, unrecognized, malf
 	return policy, unrecognized, malformed
 }
 
+// HasGateChangeApprovalLine reports whether agentsMD says anything about the gate-change
+// approval: a `- gate-change-approval:` line with any value, or a line anywhere that
+// ParseGateChangeApproval reads as an attempt at one. A trusted repo without one runs under
+// the default, which is off.
+func HasGateChangeApprovalLine(agentsMD string) bool {
+	for _, line := range strings.Split(agentsMD, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), gateChangeApprovalKey) || looksLikeGateChangeApprovalKey(line) {
+			return true
+		}
+	}
+	return false
+}
+
 // gateChangeApprovalLetters is the key's letters, lower-cased, which is what a line has to
 // resemble to count as an attempt at it.
 const gateChangeApprovalLetters = "gatechangeapproval"
