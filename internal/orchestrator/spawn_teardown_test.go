@@ -217,3 +217,34 @@ func TestBriefForLaunch_WritesStubWhenAbsent(t *testing.T) {
 		t.Fatalf("expected the generic stub, got: %s", got)
 	}
 }
+
+// TestTeardown_TagCannotMakeUnmergedWorkLookMerged: teardown's check for unmerged work compared
+// the task branch against a bare `main` and `origin/main`, and git resolves either to a tag of
+// that name first. A tag at the worker's tip made its unmerged commits look merged, so a teardown
+// without --force deleted the branch, and a forced one saved no recovery ref. The check reads
+// the recorded branch and the remote-tracking ref fully qualified.
+func TestTeardown_TagCannotMakeUnmergedWorkLookMerged(t *testing.T) {
+	for _, tag := range []string{"main", "origin/main"} {
+		t.Run(tag, func(t *testing.T) {
+			m, repo := deliveryHarness(t, "tdtag"+strings.ReplaceAll(tag, "/", ""))
+			task, err := m.Spawn("tt1", repo, false, "sleep 60")
+			if err != nil {
+				t.Fatal(err)
+			}
+			tip := commitFeature(t, task.Worktree, "feature.txt", "work\n")
+			gitIn(t, task.Worktree, "tag", tag, tip)
+
+			_, err = m.Teardown("tt1", false)
+			if err == nil || !strings.Contains(err.Error(), "not merged into") {
+				t.Fatalf("a tag named %s must not make unmerged work look merged, got: %v", tag, err)
+			}
+			notes, err := m.Teardown("tt1", true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(strings.Join(notes, "\n"), "refs/ttorch/discarded/tt1-") {
+				t.Fatalf("a forced teardown must save the unmerged commits despite the tag, notes: %q", notes)
+			}
+		})
+	}
+}

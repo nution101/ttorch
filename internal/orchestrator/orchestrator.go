@@ -283,9 +283,9 @@ func (m *Manager) Teardown(taskID string, force bool) ([]string, error) {
 		// and Pool.Release deletes the task branch — so without this guard those commits
 		// are lost. Refuse, naming the commits; --force (which stashes a recovery ref
 		// below) is the explicit override.
-		if gitDir != "" && worktree.RefExists(gitDir, branch) {
-			def := worktree.DefaultBranch(gitDir)
-			unmerged, uerr := worktree.UnmergedCommits(gitDir, branch, def, "origin/"+def)
+		if gitDir != "" && worktree.RefExists(gitDir, "refs/heads/"+branch) {
+			def := m.defaultBranch(gitDir)
+			unmerged, uerr := worktree.UnmergedCommits(gitDir, "refs/heads/"+branch, unmergedBases(def)...)
 			if uerr != nil {
 				return nil, fmt.Errorf("task %q: could not verify %s is merged into %s (%v); review it, then 'ttorch teardown %s --force' to discard", taskID, branch, def, uerr, taskID)
 			}
@@ -294,7 +294,7 @@ func (m *Manager) Teardown(taskID string, force bool) ([]string, error) {
 					taskID, len(unmerged), branch, def, strings.Join(unmerged, "\n  "), taskID)
 			}
 		}
-	} else if gitDir != "" && worktree.RefExists(gitDir, branch) {
+	} else if gitDir != "" && worktree.RefExists(gitDir, "refs/heads/"+branch) {
 		// --force: stash any committed-but-unmerged work under a recovery ref BEFORE the
 		// branch is deleted, so a forced discard stays recoverable.
 		if note := m.stashDiscardedBranch(gitDir, taskID, branch); note != "" {
@@ -351,8 +351,8 @@ func (m *Manager) Teardown(taskID string, force bool) ([]string, error) {
 // unrecoverable delete, so an "unknown" status must fail safe toward preservation — the
 // mirror of the non-force path, which refuses on that same error.
 func (m *Manager) stashDiscardedBranch(gitDir, taskID, branch string) string {
-	def := worktree.DefaultBranch(gitDir)
-	unmerged, err := worktree.UnmergedCommits(gitDir, branch, def, "origin/"+def)
+	def := m.defaultBranch(gitDir)
+	unmerged, err := worktree.UnmergedCommits(gitDir, "refs/heads/"+branch, unmergedBases(def)...)
 	if err == nil && len(unmerged) == 0 {
 		return "" // provably merged/landed — its commits live on a base ref already
 	}
@@ -361,7 +361,7 @@ func (m *Manager) stashDiscardedBranch(gitDir, taskID, branch string) string {
 	// cannot be resolved, surface that loudly (mirroring the SetRef-failure path) rather
 	// than returning "" — a silent "" reads as "nothing to preserve" and the branch is
 	// then deleted, the exact unrecoverable delete this feature exists to prevent.
-	tip, rerr := worktree.ResolveRef(gitDir, branch)
+	tip, rerr := worktree.ResolveCommit(gitDir, "refs/heads/"+branch)
 	if rerr != nil {
 		return "could not save discarded commits: " + rerr.Error()
 	}
@@ -373,6 +373,15 @@ func (m *Manager) stashDiscardedBranch(gitDir, taskID, branch string) string {
 		return fmt.Sprintf("could not verify %s is merged (%v); saved its tip to %s (recover with: git -C %s log %s)", branch, err, ref, gitDir, ref)
 	}
 	return fmt.Sprintf("saved %d discarded commit(s) to %s (recover with: git -C %s log %s)", len(unmerged), ref, gitDir, ref)
+}
+
+// unmergedBases are the refs teardown counts a task branch's commits as landed on: the default
+// branch and its remote-tracking ref, fully qualified. A bare name resolves to a tag of the same
+// name first, and a worker's tag named main or origin/main at its own tip made its unmerged
+// commits read as landed, so teardown deleted them without --force and saved no recovery ref
+// with it.
+func unmergedBases(def string) []string {
+	return []string{"refs/heads/" + def, "refs/remotes/origin/" + def}
 }
 
 // uninitNotice returns the one-line nudge to print when path is inside a git repo that
