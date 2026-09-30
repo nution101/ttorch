@@ -21,7 +21,6 @@ import (
 	"os"
 	"os/exec"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -691,43 +690,15 @@ func maxID(rows []db.Event) int64 {
 	return max
 }
 
-// printBatch renders the coalesced batch in the §4.3 format, ending with the
-// machine-readable WATCH_WATERMARK line the manager's harness keys on.
+// printBatch renders the coalesced batch, ending with the machine-readable WATCH_WATERMARK
+// line the manager's harness keys on. The updates themselves go through writeUpdateBlock, the
+// same worker-data block `ttorch inbox` prints, so a hand-armed watcher never prints a
+// worker-supplied field bare.
 func (w *Watcher) printBatch(since, max int64, batch []db.Event) {
 	fmt.Fprintf(w.Out, "ttorch watch: %d actionable update(s) since #%d (now #%d)\n", len(batch), since, max)
-	for _, e := range batch {
-		fmt.Fprintln(w.Out, "  "+formatEventLine(e))
-	}
+	writeUpdateBlock(w.Out, batch)
 	fmt.Fprintln(w.Out, "next: ttorch tasks --status done,blocked,needs_input ; then land / answer / dispatch")
 	fmt.Fprintf(w.Out, "WATCH_WATERMARK=%d\n", max)
-}
-
-// formatEventLine renders one surfaced event (§4.3). Status transitions show
-// from → to plus the owner or the worker's message; the watcher-generated external
-// events get their own one-liners.
-func formatEventLine(e db.Event) string {
-	id := " (#" + strconv.FormatInt(e.ID, 10) + ")"
-	switch e.Type {
-	case db.EventPRMerged:
-		return fmt.Sprintf("pr-merged             task=%-18s %s%s", e.EntityID, e.Payload, id)
-	case db.EventWindowGone:
-		return fmt.Sprintf("window-gone           task=%-18s window=%s%s", e.EntityID, e.Payload, id)
-	case db.EventIdleUnreported:
-		return fmt.Sprintf("idle-unreported       task=%-18s window=%s%s", e.EntityID, e.Payload, id)
-	case db.EventAgentExited:
-		return fmt.Sprintf("agent-exited          task=%-18s window=%s; peek it, then respawn or tear down%s", e.EntityID, e.Payload, id)
-	case db.EventStalled:
-		return formatStallLine(e, id)
-	case db.EventManagerStalled:
-		return fmt.Sprintf("manager-stalled       re-derive the board and advance outstanding work%s", id)
-	default:
-		detail := ""
-		if e.Payload != "" {
-			detail = fmt.Sprintf("%q", e.Payload)
-		}
-		return fmt.Sprintf("task=%-18s %s → %-12s %s%s",
-			e.EntityID, derefStatus(e.FromStatus), derefStatus(e.ToStatus), detail, id)
-	}
 }
 
 func derefStatus(s *string) string {

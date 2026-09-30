@@ -26,7 +26,6 @@ package watch
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -225,15 +224,4 @@ func (w *Watcher) restartStallClock(ctx context.Context, now time.Time, t db.Tas
 		Actor: db.ActorSystem, Payload: string(payload),
 	})
 	return err
-}
-
-// formatStallLine renders a stalled event for the watch batch.
-func formatStallLine(e db.Event, id string) string {
-	var p stallPayload
-	_ = json.Unmarshal([]byte(e.Payload), &p) // a malformed payload still renders, with blanks
-	level := p.Level
-	if level == "" {
-		level = stallLevelStalled
-	}
-	return fmt.Sprintf("%-21s task=%-18s window=%s idle=%s raise=%d%s", level, e.EntityID, p.Window, p.Idle, p.Raise, id)
 }

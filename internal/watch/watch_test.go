@@ -145,7 +145,7 @@ func TestRun_ReturnsOnActionableEvent(t *testing.T) {
 	if !strings.Contains(out, fmt.Sprintf("WATCH_WATERMARK=%d", done.ID)) {
 		t.Fatalf("output missing WATCH_WATERMARK=%d:\n%s", done.ID, out)
 	}
-	if !strings.Contains(out, "→ done") || !strings.Contains(out, "task=alpha") {
+	if !strings.Contains(out, "→ done") || !strings.Contains(out, `task="alpha"`) {
 		t.Fatalf("output missing the alpha→done line:\n%s", out)
 	}
 }

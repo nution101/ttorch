@@ -1,6 +1,7 @@
 package watch
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -46,10 +47,11 @@ func TestPollLiveness_AgentExited(t *testing.T) {
 	if len(exited) != 1 {
 		t.Fatalf("agent_exited events = %d, want exactly 1", len(exited))
 	}
-	line := formatEventLine(exited[0])
-	for _, want := range []string{"agent-exited", "task=fp", "wk-fp", "agent process 4242 has exited"} {
-		if !strings.Contains(line, want) {
-			t.Errorf("event line %q does not contain %q", line, want)
+	var entry bytes.Buffer
+	writeUpdateEntry(&entry, exited[0])
+	for _, want := range []string{`agent-exited task="fp"`, "peek it, then respawn or tear down", `window: "wk-fp (agent process 4242 has exited)"`} {
+		if !strings.Contains(entry.String(), want) {
+			t.Errorf("update entry %q does not contain %q", entry.String(), want)
 		}
 	}
 }

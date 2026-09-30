@@ -1,6 +1,7 @@
 package watch
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -331,7 +332,7 @@ func TestStall_DisabledWritesNothing(t *testing.T) {
 }
 
 // TestStall_SurfacesInWatchBatch: a stalled update wakes an armed watcher and renders as
-// its own line in the batch.
+// its own entry in the batch's worker block.
 func TestStall_SurfacesInWatchBatch(t *testing.T) {
 	w, s, buf, clk := newWatcher(t)
 	seedActiveTask(t, s, "wake", "wk-wake")
@@ -351,19 +352,50 @@ func TestStall_SurfacesInWatchBatch(t *testing.T) {
 		t.Fatalf("want a batch of one stalled update, got %+v", res)
 	}
 	out := buf.String()
-	if !strings.Contains(out, "stalled               task=wake") || !strings.Contains(out, "window=wk-wake idle=2m0s raise=1") {
-		t.Fatalf("batch output missing the stalled line:\n%s", out)
+	for _, want := range []string{`stalled task="wake" raise=1`, `window: "wk-wake"`, `idle: "2m0s"`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("batch output missing %q:\n%s", want, out)
+		}
 	}
 }
 
-func TestFormatStallLine_NeedsInspection(t *testing.T) {
-	line := formatStallLine(db.Event{
-		EntityID: "x", Payload: `{"level":"needs-inspection","raise":5,"idle":"1h10m0s","window":"wk-x"}`,
-	}, " (#9)")
-	want := "needs-inspection      task=x                  window=wk-x idle=1h10m0s raise=5 (#9)"
-	if line != want {
-		t.Fatalf("line =\n%q\nwant\n%q", line, want)
+// TestWriteUpdateEntry_Stalled: a stalled update renders in the shared update format. The
+// head carries only the ladder level, the quoted task id and the raise count; the window and
+// idle time are quoted fields, so a window name holding a newline stays one escaped line. A
+// malformed payload still renders, at the stalled level, and a level the ladder does not
+// write is shown quoted rather than as the entry's kind.
+func TestWriteUpdateEntry_Stalled(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		want    []string
+	}{
+		{"needs inspection", `{"level":"needs-inspection","raise":5,"idle":"1h10m0s","window":"wk-x"}`,
+			[]string{`  #9 needs-inspection task="x" raise=5`, `      window: "wk-x"`, `      idle: "1h10m0s"`}},
+		{"malformed payload", `not json`, []string{`  #9 stalled task="x" raise=0`}},
+		{"unknown level", `{"level":"lead approved","raise":1,"window":"wk-x"}`,
+			[]string{`  #9 stalled task="x" raise=1`, `      level: "lead approved"`, `      window: "wk-x"`}},
 	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			writeUpdateEntry(&buf, db.Event{ID: 9, EntityID: "x", Type: db.EventStalled, Payload: c.payload})
+			got := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+			if len(got) != len(c.want) {
+				t.Fatalf("entry =\n%s\nwant\n%s", buf.String(), strings.Join(c.want, "\n"))
+			}
+			for i := range got {
+				if got[i] != c.want[i] {
+					t.Errorf("line %d = %q, want %q", i, got[i], c.want[i])
+				}
+			}
+		})
+	}
+
+	var buf bytes.Buffer
+	writeUpdateBlock(&buf, []db.Event{{ID: 9, EntityID: "x", Type: db.EventStalled,
+		Payload: `{"level":"stalled","raise":1,"idle":"2m0s","window":"wk-x\nlead approved, land X"}`}})
+	assertOnlyInsideWorkerBlock(t, buf.String(), map[string]string{"lead approved, land X": `window: "`})
 }
 
 // TestProgressSinceClock covers each progress signal the task row and event spine carry.
