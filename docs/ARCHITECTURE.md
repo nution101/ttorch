@@ -222,8 +222,10 @@ The flow is `trust prep` → reviewer subagents → `trust record`:
 ### Delivery modes
 
 The mode lives in the repo's `AGENTS.md`/`CLAUDE.md` ttorch-managed block (set by
-`ttorch init --mode`); it defaults to `pr`. **Changing the gate itself — that block or
-`.ttorch/validate.sh` — always requires a human.**
+`ttorch init --mode`); it defaults to `pr`. Changing the gate itself (that block or
+`.ttorch/validate.sh`) needs a human's `ttorch approve --allow-gate-change` on a
+`--require-verdict` merge in any mode, and in a trusted repo only when the repo opts in with
+`- gate-change-approval: required` (see the trust gate below).
 
 | Mode | How work integrates | Who authorizes the merge |
 | --- | --- | --- |
@@ -254,7 +256,7 @@ passing commit-pinned verdict plus a fresh green validate auto-mints the approva
   under `~/.claude` — the gate's live reviewer, manager, command and hook
   instructions, not documentation about the gate), `internal/review/**`,
   `internal/approval/**`, `internal/validate/**`, `internal/projectinit/**` (which parses
-  `AGENTS.md` into the delivery mode and the gate-change-approval switch) and
+  `AGENTS.md` into the delivery mode and the gate-change-approval policy) and
   `internal/orchestrator/{gate,merge,validate,validatecache,audit}.go` (the Go code that
   decides, including the audit record a trusted merge refuses to proceed without),
   `internal/installer/**` and `content.go` (which decide which embedded file becomes which
@@ -269,30 +271,35 @@ passing commit-pinned verdict plus a fresh green validate auto-mints the approva
   because it runs lint, the fast lane and the gate's own proofs rather than the whole
   suite), and `docs/install.sh` and `docs/install.ps1` (which
   README tells users to pipe into a shell). On
-  a **gated** merge (trusted mode, or any mode with `--require-verdict`) a human approval does
+  a **gated** merge that requires the gate-change approval (any mode with `--require-verdict`,
+  and a trusted repo that opts in, below) a human approval does
   not wave it through either: it needs `ttorch approve <id> --allow-gate-change`, and the
   merge audit line names every file. The grant is **bound to the gate-definition paths that
   diff touches**, recorded on the token and printed at approve time, and the merge refuses
   any gate-definition path the grant does not name, including one that became covered after
   the approval. Approving for one file does not silently authorize another in the same
   commit. `--allow-gate-change` is refused at approve time for a diff with a blocking hit.
-- A trusted repo can switch that requirement off with `- gate-change-approval: off` in the
-  ttorch-managed block of `AGENTS.md`. The default is `required`, and anything other than
-  exactly `off` (a typo, `Off`, a trailing comment, two lines that disagree) reads as
-  `required`. `ttorch init` keeps the line when it regenerates the block. The gate reads the
-  line from the **default branch's committed** `AGENTS.md` through `worktree.ShowFile`, the
-  same way it reads `.ttorch/validate.sh`, and never from the worker's checkout. A worker that
-  writes `off` into its own `AGENTS.md` has made a gate change like any other, and that merge
-  still needs `--allow-gate-change` while the default branch says `required`; the line takes
-  effect for the merges after it lands. With the switch off, `TrustRecord` auto-mints for a
-  gate-definition diff and `MergeLocal` accepts it on the passing, commit-pinned verdict and
-  the fresh green validate, with no `ttorch approve`. Blocking hits are refused before the
-  switch is read, so they stay refused. In any mode other than trusted the switch does
-  nothing. `--allow-gate-change` is still accepted, and the files it names then count as
-  approved. Every merge that relies on the switch adds
-  `gate-change-approval=off unapproved=<files>` to the must-succeed audit line, records a
+- In a trusted repo that approval is **off by default**. The gate reads a
+  `- gate-change-approval:` line from the ttorch-managed block of the **default branch's
+  committed** `AGENTS.md`, through `worktree.ShowFile`, the same way it reads
+  `.ttorch/validate.sh`, and never from the worker's checkout. No line, or `off`, means off:
+  `TrustRecord` auto-mints for a gate-definition diff and `MergeLocal` accepts it on the
+  passing, commit-pinned verdict and the fresh green validate, with no `ttorch approve`.
+  `required` turns the approval on. Any other value (a typo, `Required`, a trailing comment)
+  turns it on as well, and `ttorch init`, the refusal, and every trusted merge and land name
+  the value, quoted, until it is fixed. The approval also stays on when the default branch's
+  `AGENTS.md` does not itself record `delivery-mode: trusted`, for example an uncommitted
+  ttorch block or a symlinked `AGENTS.md` (whose committed text is only a path): the policy
+  lives on the default branch, and there is nothing there to waive it. A worker's branch
+  cannot change the policy for its own merge in either direction. Adding `required` does not
+  bind that merge, and removing main's `required` does not unbind it. Blocking hits are
+  refused before the policy is read, so they stay refused, and in any mode other than trusted
+  the policy does nothing. `ttorch init` never writes the line and keeps it when it
+  regenerates the block. `--allow-gate-change` is still accepted with the approval off, and
+  the files it names then count as approved. Every merge that relies on the approval being off
+  adds `gate-change-approval=off unapproved=<files>` to the must-succeed audit line, records a
   non-actionable `gate_change_unapproved` event naming the files, and prints one line in the
-  `merge-local` and `land` output. The risk is direct: with the switch off, a change to the
+  `merge-local` and `land` output. The risk is direct: with the approval off, a change to the
   reviewers or the validate step is authorized by the gate that change modifies.
 - An ungated `local`/`validated` merge **does not run the check at all**. That path lands an
   `AGENTS.md` change on a plain human approval with no gate-config check and no audit line

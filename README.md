@@ -394,26 +394,27 @@ diff.** A passing
 commit-pinned verdict plus a fresh green validate auto-mints the approval. It is guard-railed:
 it **requires a `.ttorch/validate.sh` on the default branch** (the gate validates the
 committed sha with the default-branch script, so a worker can't weaken its own gate; "no
-checks detected" is a hard block), and a trusted auto-merge **cannot change the gate itself**
-(`.ttorch/validate.sh` or `AGENTS.md`, which holds the delivery-mode block) without the lead's
-`ttorch approve <id> --allow-gate-change`. The delivery-mode block is an explicit, repo-scoped
-decision.
+checks detected" is a hard block). A trusted auto-merge can change the gate itself
+(`.ttorch/validate.sh` or `AGENTS.md`, which holds the delivery-mode block) on the same
+passing verdict and fresh validate, unless the repo requires a human approval for that. The
+delivery-mode block is an explicit, repo-scoped decision.
 
-A trusted repo can drop the `--allow-gate-change` requirement by adding a line under the
-delivery mode in the ttorch-managed block of `AGENTS.md`:
+The human approval for gate changes is off by default. To require the lead's
+`ttorch approve <id> --allow-gate-change` for them, add a line under the delivery mode in the
+ttorch-managed block of `AGENTS.md`:
 
 ```markdown
 - delivery-mode: trusted
-- gate-change-approval: off
+- gate-change-approval: required
 ```
 
-The default is `required`, and anything other than exactly `off` reads as `required`. The
-gate reads the line from the default branch's committed `AGENTS.md`, so it takes effect only
-after it lands, and a worker cannot switch it off for its own merge. With it off, a passing
-verdict and a fresh green validate merge a gate-definition change with no `ttorch approve`.
-Each such merge records a `gate_change_unapproved` event and prints one line saying so. The
-risk: a change to the reviewers or the validate step is then authorized by the gate that
-change modifies.
+`off`, or no line, means off. Any other value also means required, and ttorch names it in the
+`ttorch init` output, the refusal and every trusted land until it is fixed. The gate reads the
+line from the default branch's committed `AGENTS.md`, so it takes effect once it lands, and a
+worker's branch cannot change it for its own merge. With the approval off, each merge of a
+gate-definition change records a `gate_change_unapproved` event and prints one line saying so.
+The risk: with the approval off, a change to the reviewers or the validate step is authorized
+by the gate that change modifies.
 
 ## Footprints & the worktree pool
 

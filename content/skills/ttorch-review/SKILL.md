@@ -181,7 +181,7 @@ invalidates the verdict — re-prep, re-review, re-record.
   | `internal/review/**` | the findings contract, the severity-to-block rule, and the classifier that picks which reviewers run |
   | `internal/approval/**` | the approval token the `--allow-gate-change` scope rides on |
   | `internal/validate/**` | what counts as a passing check |
-  | `internal/projectinit/**` | parses `AGENTS.md` into the delivery mode, the gate-change-approval switch and the auto-mint staleness bound |
+  | `internal/projectinit/**` | parses `AGENTS.md` into the delivery mode, the gate-change-approval policy and the auto-mint staleness bound |
   | `internal/orchestrator/{gate,merge,validate,validatecache}.go` | the Go code that resolves, enforces and caches the decision |
   | *(measured cost of each entry)* | see the generated table in `docs/ARCHITECTURE.md` (gate-cost block); this file does not restate it, because a second copy here is what let the figures diverge |
   | `.github/workflows/**` | the full suite: `.ttorch/validate.sh` runs lint, the fast lane and the gate's proofs (`make test-gate`), and defers the rest to CI by name. The gate runs the default branch's copy of that script, never the branch under review's, so a change to it takes effect only after it lands |
@@ -199,8 +199,9 @@ invalidates the verdict — re-prep, re-review, re-record.
   binary, after a build and an install — which is a real difference but a thin one, since the
   maintainer self-updates routinely.
 
-  If a worker's diff touches any of these, an auto-merge is refused outright, and a plain
-  `ttorch approve` is refused too — the lead must run
+  If a worker's diff touches any of these on a merge that requires the gate-change approval
+  (see below), an auto-merge is refused outright, and a plain `ttorch approve` is refused
+  too: the lead must run
   `ttorch approve <id> --allow-gate-change`, and the merge's audit line then names every
   file that changed. **The grant is bound to those files.** Approving records every
   gate-definition path in that diff on the token and prints them, and a merge is refused if
@@ -214,16 +215,17 @@ invalidates the verdict — re-prep, re-review, re-record.
   without reading grants the same set as one who read. What the binding adds is that the set
   is printed and fixed when the approval is given.
 
-  **A trusted repo can switch the human approval off** with `- gate-change-approval: off` in
-  the ttorch-managed block of `AGENTS.md` (the default is `required`, and any other value
-  reads as `required`). The gate reads the line from the default branch's committed copy,
-  never from the worker's branch, so a worker that writes `off` into its own `AGENTS.md` still
-  needs `--allow-gate-change` for that merge. With the switch off, a passing verdict and a
-  fresh green validate authorize a gate-definition change the way they authorize any other
-  diff, and the merge records a `gate_change_unapproved` event and an audit line naming the
-  files. The blocking refusals below stay blocking, and the switch has no effect outside
-  trusted mode. With the switch off, a change to the reviewers or the validate step is
-  authorized by the gate that change modifies, and your verdict is the only review it gets.
+  **In a trusted repo the approval is off by default.** With no `- gate-change-approval:`
+  line in the ttorch-managed block of the default branch's committed `AGENTS.md`, or with
+  `off`, a passing verdict and a fresh green validate authorize a gate-definition change the
+  way they authorize any other diff, and the merge records a `gate_change_unapproved` event
+  and an audit line naming the files. `- gate-change-approval: required` turns the approval
+  on, and so does any value the gate does not recognize, which it names in the refusal and
+  the land output. The gate reads the line from the default branch only, so a worker's branch
+  cannot add `required` to bind its own merge or remove it to unbind its own. The blocking
+  refusals below stay blocking, and the setting has no effect outside trusted mode. With the
+  approval off, a change to the reviewers or the validate step is authorized by the gate that
+  change modifies, and your verdict is the only review it gets.
 
   **Matching on the name alone is not enough, so the guard does not rely on it.** Paths are
   compared under `fsIdentityKey` — NFD, Unicode FULL case folding, then SimpleFold
