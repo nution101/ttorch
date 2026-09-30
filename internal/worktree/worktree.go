@@ -480,6 +480,102 @@ func DefaultBranch(repo string) string {
 	return "main"
 }
 
+// GateBase is the default branch as the trust gate reads it: the branch name and the commit
+// refs/heads/<Name> pointed at when it was resolved. The gate makes every read it takes from
+// the default branch (its validate script, its gate-change-approval policy, the base of the
+// diff it checks for gate-definition changes) at SHA, so one gate run reads one commit.
+type GateBase struct {
+	Name string
+	SHA  string
+}
+
+// ResolveGateBase resolves the default branch for the trust gate without trusting a ref a
+// worker can move from its own worktree.
+//
+// Refs are shared between a repository and its linked worktrees, so two things DefaultBranch
+// relies on can be written from any worker's checkout. A tag named after the branch shadows it
+// for every bare-name lookup, because git resolves refs/tags/<name> ahead of refs/heads/<name>
+// and says so only in an "ambiguous refname" warning. And refs/remotes/origin/HEAD, which
+// DefaultBranch reads first, can be repointed with `git remote set-head` or `git symbolic-ref`.
+//
+// So the name comes from the repository's own checkout, whose HEAD belongs to that worktree
+// alone and which a gated merge already requires to be on the default branch. When that
+// checkout is on a branch that is plausibly the default (the target of refs/remotes/origin/HEAD
+// that exists as a local branch, or main, or master), that branch is the name. Otherwise the
+// name is main, then master, whichever exists; the origin/HEAD target on its own never decides
+// it, and when nothing qualifies this fails rather than guess. The name is then resolved fully
+// qualified, as refs/heads/<name>, so no tag or remote-tracking ref can stand in for it, and it
+// is an error if that ref does not resolve to a commit.
+func ResolveGateBase(repo string) (GateBase, error) {
+	name, err := gateBranchName(repo)
+	if err != nil {
+		return GateBase{}, err
+	}
+	sha, ok := localBranchCommit(repo, name)
+	if !ok {
+		return GateBase{}, fmt.Errorf("the default branch refs/heads/%s does not resolve to a commit in %s", escapeForTerminal(name), repo)
+	}
+	return GateBase{Name: name, SHA: sha}, nil
+}
+
+// gateBranchName picks the default branch's name for ResolveGateBase.
+func gateBranchName(repo string) (string, error) {
+	var candidates []string
+	if out, err := git("-C", repo, "symbolic-ref", "-q", "refs/remotes/origin/HEAD"); err == nil {
+		if b, ok := strings.CutPrefix(strings.TrimSpace(out), "refs/remotes/origin/"); ok && b != "" {
+			if _, exists := localBranchCommit(repo, b); exists {
+				candidates = append(candidates, b)
+			}
+		}
+	}
+	for _, b := range []string{"main", "master"} {
+		if _, exists := localBranchCommit(repo, b); exists {
+			candidates = append(candidates, b)
+		}
+	}
+	if out, err := git("-C", repo, "symbolic-ref", "-q", "HEAD"); err == nil {
+		if cur, ok := strings.CutPrefix(strings.TrimSpace(out), "refs/heads/"); ok {
+			for _, c := range candidates {
+				if c == cur {
+					return cur, nil
+				}
+			}
+		}
+	}
+	for _, b := range []string{"main", "master"} {
+		if _, exists := localBranchCommit(repo, b); exists {
+			return b, nil
+		}
+	}
+	return "", fmt.Errorf("cannot determine the default branch of %s without trusting refs/remotes/origin/HEAD: "+
+		"there is no main or master, and the checkout is not on the branch origin/HEAD names; check out the default branch there", repo)
+}
+
+// localBranchCommit resolves refs/heads/<branch>, fully qualified, to the commit it points at.
+// ok is false when the ref does not exist or does not name a commit. The result is checked to
+// be a bare object id, since git() folds stderr into its output and a warning must never be
+// read as a sha.
+func localBranchCommit(repo, branch string) (sha string, ok bool) {
+	out, err := git("-C", repo, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch+"^{commit}")
+	if err != nil || !isObjectID(out) {
+		return "", false
+	}
+	return out, true
+}
+
+// isObjectID reports whether s is a full hex object id (SHA-1 or SHA-256).
+func isObjectID(s string) bool {
+	if len(s) != 40 && len(s) != 64 {
+		return false
+	}
+	for _, r := range s {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // Head returns the HEAD commit of a repo or worktree.
 func Head(path string) (string, error) { return git("-C", path, "rev-parse", "HEAD") }
 

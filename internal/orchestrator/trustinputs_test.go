@@ -256,7 +256,7 @@ func TestValidateAuthority_IgnoresForgedStagedPairAndCache(t *testing.T) {
 	// (b) a green cache entry under the real key for this tree + this gate script.
 	forgeValidateCacheEntry(t, repo, head, greenGateResults)
 
-	green, results, _, err := validateForAuthority(repo, head)
+	green, results, _, err := validateForAuthority(repo, gateBaseFor(t, repo), head)
 	if err != nil {
 		t.Fatalf("validateForAuthority: %v", err)
 	}
@@ -273,7 +273,7 @@ func TestValidateAuthority_IgnoresForgedStagedPairAndCache(t *testing.T) {
 // and write, since both inputs to the key are readable by the worker.
 func forgeValidateCacheEntry(t *testing.T, repo, sha string, results []validate.Result) {
 	t.Helper()
-	def := resolveGateDefinition(repo)
+	def := resolveGateDefinition(repo, gateBaseFor(t, repo))
 	if !def.hasScript {
 		t.Fatal("the harness repo must define a default-branch gate script")
 	}
@@ -292,7 +292,7 @@ func forgeValidateCacheEntry(t *testing.T, repo, sha string, results []validate.
 func TestValidateAuthority_HonestTreeStaysGreen(t *testing.T) {
 	_, repo, wt := trustHarness(t, "v2", "trusted", "exit 0")
 	head := commitCodeFiles(t, wt)
-	green, results, _, err := validateForAuthority(repo, head)
+	green, results, _, err := validateForAuthority(repo, gateBaseFor(t, repo), head)
 	if err != nil {
 		t.Fatalf("validateForAuthority: %v", err)
 	}
@@ -310,7 +310,7 @@ func TestValidateAuthority_ReusesThisProcessRun(t *testing.T) {
 	_, repo, wt := trustHarness(t, "v3", "trusted", "printf x >> '"+counter+"'\nexit 0")
 	head := commitCodeFiles(t, wt)
 
-	_, _, reused, err := validateForAuthority(repo, head)
+	_, _, reused, err := validateForAuthority(repo, gateBaseFor(t, repo), head)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,7 +320,7 @@ func TestValidateAuthority_ReusesThisProcessRun(t *testing.T) {
 	if got := gateRunCount(t, counter); got != 1 {
 		t.Fatalf("the first authority validate must run the real suite once, ran %d", got)
 	}
-	_, _, reused, err = validateForAuthority(repo, head)
+	_, _, reused, err = validateForAuthority(repo, gateBaseFor(t, repo), head)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,7 +355,7 @@ func TestProcessValidate_MemoDropsCheckOutput(t *testing.T) {
 	_, repo, wt := trustHarness(t, "pm1", "trusted", "printf '"+bulky+"'\nexit 0")
 	head := commitCodeFiles(t, wt)
 
-	green, results, _, err := validateForAuthority(repo, head)
+	green, results, _, err := validateForAuthority(repo, gateBaseFor(t, repo), head)
 	if err != nil || !green {
 		t.Fatalf("the honest tree must be green: green=%v err=%v", green, err)
 	}
@@ -364,7 +364,7 @@ func TestProcessValidate_MemoDropsCheckOutput(t *testing.T) {
 	}
 
 	// The on-disk cache keeps the output: it is a reviewer input.
-	def := resolveGateDefinition(repo)
+	def := resolveGateDefinition(repo, gateBaseFor(t, repo))
 	tree, err := worktree.TreeHash(repo, head)
 	if err != nil {
 		t.Fatal(err)
@@ -389,7 +389,7 @@ func TestProcessValidate_MemoDropsCheckOutput(t *testing.T) {
 		t.Fatalf("the memo must reproduce the decision: green=%v len=%d want len=%d", stagedGreen(memo), len(memo), len(results))
 	}
 	green, reused := false, false
-	green, _, reused, err = validateForAuthority(repo, head)
+	green, _, reused, err = validateForAuthority(repo, gateBaseFor(t, repo), head)
 	if err != nil || !green || !reused {
 		t.Fatalf("the memoized green must still authorize on reuse: green=%v reused=%v err=%v", green, reused, err)
 	}
@@ -448,7 +448,7 @@ func TestLandPrep_AMemoHitLeavesTheStagedValidateIntact(t *testing.T) {
 		t.Fatalf("three clean reports over a green validate must pass: %q (%+v)", v.Overall, v.Findings)
 	}
 	// The premise: this process already ran the suite for this tree, so the land reuses it.
-	_, key, keyed := gateContentKey(repo, head)
+	_, key, keyed := gateContentKey(repo, gateBaseFor(t, repo), head)
 	if _, ok := loadProcessValidate(key); !keyed || !ok {
 		t.Fatal("prep's run must be memoized, or the land runs the suite fresh and this proves nothing")
 	}

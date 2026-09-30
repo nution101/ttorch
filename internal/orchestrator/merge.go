@@ -101,7 +101,11 @@ func (m *Manager) Approve(taskID string, ttl time.Duration, allowGateChange bool
 		return nil, err
 	}
 	if allowGateChange {
-		blocking, matched, err := diffGateConfigHits(t.Project, worktree.DefaultBranch(t.Project), head)
+		base, err := worktree.ResolveGateBase(t.Project)
+		if err != nil {
+			return nil, fmt.Errorf("could not resolve the default branch to check which gate-definition files %q changes: %w", taskID, err)
+		}
+		blocking, matched, err := diffGateConfigHits(t.Project, base.SHA, head)
 		if err != nil {
 			return nil, fmt.Errorf("could not determine which gate-definition files %q changes: %w", taskID, err)
 		}
@@ -224,6 +228,20 @@ func (m *Manager) mergeLocal(taskID string, requireVerdict bool, unapproved *[]s
 		return "", fmt.Errorf("%q carries an auto-approval that is only valid through the trust gate, but the gate is not active (repo not in trusted mode and no --require-verdict); refusing to merge ungated", taskID)
 	}
 	def := worktree.DefaultBranch(repo)
+	// The default branch as the gate reads it, resolved ONCE for this merge: every read the
+	// gate takes from the default branch (the validate script, the gate-change-approval
+	// policy, the base of the gate-definition diff) is made at base.SHA, and the fast-forward
+	// below is refused unless the default branch still sits there. worktree.ResolveGateBase
+	// reads refs/heads/<name> fully qualified, so a worker's tag named after the branch, or a
+	// repointed origin/HEAD, cannot change what the gate reads.
+	var base worktree.GateBase
+	if gated {
+		b, err := worktree.ResolveGateBase(repo)
+		if err != nil {
+			return "", fmt.Errorf("trust gate: %w; refusing to merge %q without a default branch to read the gate from", err, taskID)
+		}
+		base, def = b, b.Name
+	}
 	// The gate-definition files this merge changes, comma-separated, when it changes any and
 	// the approval explicitly authorized every one of them or the repo waives that approval.
 	// Empty otherwise. It is recorded in the audit line so a merge that altered the gate is
@@ -245,7 +263,7 @@ func (m *Manager) mergeLocal(taskID string, requireVerdict bool, unapproved *[]s
 		// the worker controls). Without it, require a human approval; refuse here before
 		// any worker-defined validation runs. (A human-approved gated merge may use the
 		// detection fallback.)
-		if tokBy == "auto" && !hasDefaultBranchGateScript(repo) {
+		if tokBy == "auto" && !hasDefaultBranchGateScript(repo, base) {
 			return "", fmt.Errorf("trust gate: %q has no .ttorch/validate.sh on the default branch, so a trusted auto-merge's checks would be worker-defined; the lead must approve it explicitly with 'ttorch approve %s'", taskID, taskID)
 		}
 		// Require a passing verdict from the durable DB row (read, not yet consume — a
@@ -286,7 +304,7 @@ func (m *Manager) mergeLocal(taskID string, requireVerdict bool, unapproved *[]s
 		// so validating first would run the suite against the wrong bytes and, worse, cache
 		// that result green under the real tree's hash. Refuse the diff before anything reads
 		// it.
-		blocking, touchedGateFiles, terr := diffGateConfigHits(repo, def, workerHead)
+		blocking, touchedGateFiles, terr := diffGateConfigHits(repo, base.SHA, workerHead)
 		if terr != nil {
 			return "", terr
 		}
@@ -311,7 +329,7 @@ func (m *Manager) mergeLocal(taskID string, requireVerdict bool, unapproved *[]s
 					ungranted = append(ungranted, f)
 				}
 			}
-			policy := readGateChangePolicy(repo)
+			policy := readGateChangePolicy(repo, base)
 			switch {
 			case tokBy == "human" && len(ungranted) == 0:
 				// The lead approved every gate-definition path in the diff by name.
@@ -337,7 +355,7 @@ func (m *Manager) mergeLocal(taskID string, requireVerdict bool, unapproved *[]s
 		// process running as the lead can write (see validateForAuthority). When this process
 		// already ran the suite for this exact tree and gate — prep or the land pass normally
 		// has — the run is reused and the suite does not run twice.
-		green, results, _, err := validateForAuthority(repo, workerHead)
+		green, results, _, err := validateForAuthority(repo, base, workerHead)
 		if err != nil {
 			return "", err
 		}
@@ -366,6 +384,11 @@ func (m *Manager) mergeLocal(taskID string, requireVerdict bool, unapproved *[]s
 	defHead, err := worktree.Head(repo)
 	if err != nil {
 		return "", err
+	}
+	// The gate read the default branch at base.SHA. If it has moved since, what was checked
+	// is not what this fast-forward starts from, so refuse and let the land be re-run.
+	if gated && defHead != base.SHA {
+		return "", fmt.Errorf("trust gate: %s moved from %s to %s while %q was being gated; re-run the land", def, short(base.SHA), short(defHead), taskID)
 	}
 	if !worktree.IsAncestor(repo, defHead, workerHead) {
 		return "", fmt.Errorf("worker %q is not a fast-forward of %q; have the worker rebase first", taskID, def)
@@ -472,10 +495,21 @@ func (m *Manager) mergeLocal(taskID string, requireVerdict bool, unapproved *[]s
 			*unapproved = unapprovedGateChange
 		}
 	}
-	if w := readGateChangePolicy(repo).warning; w != "" {
+	if w := gateChangePolicyWarning(repo); w != "" {
 		out += "\n  " + w
 	}
 	return out, nil
+}
+
+// gateChangePolicyWarning is readGateChangePolicy's warning for the default branch as it
+// stands now, for the line a trusted merge or land prints after it lands. It reads nothing
+// when the default branch cannot be resolved; the refusals already cover that case.
+func gateChangePolicyWarning(repo string) string {
+	base, err := worktree.ResolveGateBase(repo)
+	if err != nil {
+		return ""
+	}
+	return readGateChangePolicy(repo, base).warning
 }
 
 // recordUnapprovedGateChange appends the gate_change_unapproved event for a merge that changed
@@ -632,18 +666,20 @@ func (p gateChangePolicy) because() string {
 	return " (" + p.reason + ")"
 }
 
-// readGateChangePolicy reports the gate-change-approval policy for a gated merge in repo. The
-// approval is waived, so a trusted merge may change gate-definition files without the lead's
-// --allow-gate-change, when the repo is in trusted mode, the DEFAULT BRANCH's committed
-// AGENTS.md records `- delivery-mode: trusted` in its managed block, and that block does not
+// readGateChangePolicy reports the gate-change-approval policy for a gated merge in repo, read
+// at base (worktree.ResolveGateBase). The approval is waived, so a trusted merge may change
+// gate-definition files without the lead's --allow-gate-change, when the repo is in trusted
+// mode, the DEFAULT BRANCH's committed AGENTS.md records `- delivery-mode: trusted` in its
+// managed block, and that block does not
 // ask for the approval (projectinit.ParseGateChangeApproval): no gate-change-approval line,
 // or `off`. A `required` line keeps the approval, and so does any value the parser does not
 // recognize, which the policy also names in its warning. In any mode other than trusted
 // nothing is waived, so the policy has no effect there.
 //
-// The policy is read from committed objects on the default branch (worktree.ShowFile), the
-// way resolveGateDefinition reads .ttorch/validate.sh, and never from the worker's checkout or
-// the repo's working tree. A worker that adds `required` to its own AGENTS.md does not bind
+// The policy is read from committed objects at base.SHA (worktree.ShowFile), the way
+// resolveGateDefinition reads .ttorch/validate.sh, and never from the worker's checkout or
+// the repo's working tree. base.SHA is refs/heads/<default> resolved fully qualified, so a tag
+// a worker names after the branch cannot supply a different AGENTS.md. A worker that adds `required` to its own AGENTS.md does not bind
 // its own merge, and one that removes main's `required` line does not unbind its own: either
 // edit is a gate change, judged by what the default branch says before it lands.
 //
@@ -655,12 +691,12 @@ func (p gateChangePolicy) because() string {
 // It waives the human approval and nothing else. The blocking hits diffGateConfigHits reports
 // are refused before it is consulted, and the passing verdict, the default-branch validate
 // script and the fresh green run are all still required.
-func readGateChangePolicy(repo string) gateChangePolicy {
+func readGateChangePolicy(repo string, base worktree.GateBase) gateChangePolicy {
 	if projectinit.ReadMode(repo) != "trusted" {
 		return gateChangePolicy{}
 	}
-	def := worktree.DefaultBranch(repo)
-	text, ok := worktree.ShowFile(repo, def, "AGENTS.md")
+	def := base.Name
+	text, ok := worktree.ShowFile(repo, base.SHA, "AGENTS.md")
 	if !ok || projectinit.ParseMode(text) != "trusted" {
 		return gateChangePolicy{reason: fmt.Sprintf("the AGENTS.md committed on %s does not record delivery-mode: trusted, so the gate-change approval stays required until the ttorch block is committed there", def)}
 	}
@@ -970,7 +1006,11 @@ func (m *Manager) landPrep(t db.Task, spec landSpec, fetchMu *sync.Mutex) (landP
 	// (3) Validate the REBASED tree. Must be green; no checks detected is a hard block. This
 	// green gates the land, so it goes through validateForAuthority — a result this process
 	// produced, never one read back from the on-disk cache.
-	green, results, reused, err := validateForAuthority(spec.repo, rebasedHead)
+	gb, err := worktree.ResolveGateBase(spec.repo)
+	if err != nil {
+		return zero, fmt.Errorf("land: %w; refusing to validate %q without a default branch to read the gate from", err, spec.taskID)
+	}
+	green, results, reused, err := validateForAuthority(spec.repo, gb, rebasedHead)
 	if err != nil {
 		return zero, fmt.Errorf("land: could not validate the rebased tree for %q: %w", spec.taskID, err)
 	}
@@ -1077,7 +1117,7 @@ func (m *Manager) landCommit(t db.Task, spec landSpec, prep landPrepResult) (str
 	if len(unapprovedGateChange) > 0 {
 		out += "\n  " + unapprovedGateChangeNote(unapprovedGateChange)
 	}
-	if w := readGateChangePolicy(spec.repo).warning; w != "" {
+	if w := gateChangePolicyWarning(spec.repo); w != "" {
 		out += "\n  " + w
 	}
 	// Surface the security-everywhere audit status. This is purely ADVISORY and never

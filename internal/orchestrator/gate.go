@@ -626,7 +626,11 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 	}
 	// validate.json reflects the gate's own check of the committed sha (default-branch
 	// definition, immutable checkout) — the same notion of "green" the gate enforces.
-	_, results, _ := validateCommitted(t.Project, head) // nil when no checks are detected
+	gb, err := worktree.ResolveGateBase(t.Project)
+	if err != nil {
+		return "", fmt.Errorf("trust prep %q: %w", taskID, err)
+	}
+	_, results, _ := validateCommitted(t.Project, gb, head) // nil when no checks are detected
 	vb, err := json.MarshalIndent(results, "", "  ")
 	if err != nil {
 		return "", err
@@ -914,10 +918,17 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 	// are re-checked at the merge in MergeLocal — minting here is an optimization, not the
 	// authority. Any non-trusted mode leaves the verdict advisory.
 	if verdict.Overall == review.Pass && projectinit.ReadMode(t.Project) == "trusted" {
-		base := worktree.DefaultBranch(t.Project)
+		// One resolution of the default branch for this decision (see worktree.ResolveGateBase):
+		// the gate-definition diff, the policy and the validate all read base.SHA. If it cannot
+		// be resolved, nothing is minted and a human approves.
+		base, berr := worktree.ResolveGateBase(t.Project)
 		clean, cerr := worktree.IsClean(t.Worktree)
-		hit, terr := diffTouchesGateConfig(t.Project, base, sha)
-		touched := hit != nil && (hit.Blocking || !readGateChangePolicy(t.Project).waived)
+		var hit *gateConfigHit
+		var terr error
+		if berr == nil {
+			hit, terr = diffTouchesGateConfig(t.Project, base.SHA, sha)
+		}
+		touched := hit != nil && (hit.Blocking || !readGateChangePolicy(t.Project, base).waived)
 		green := false
 		// A trusted auto-mint's green authority MUST be the default-branch gate script,
 		// never ecosystem detection on the worker's checkout (which the worker controls
@@ -925,8 +936,8 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 		// approve — and skip validation entirely so no worker-defined checks run. The green
 		// comes from validateForAuthority, so it is one this process ran: the on-disk
 		// validate cache is a file the worker can write and cannot mint an approval.
-		if cerr == nil && terr == nil && clean && !touched && hasDefaultBranchGateScript(t.Project) {
-			green, _, _, _ = validateForAuthority(t.Project, sha)
+		if berr == nil && cerr == nil && terr == nil && clean && !touched && hasDefaultBranchGateScript(t.Project, base) {
+			green, _, _, _ = validateForAuthority(t.Project, base, sha)
 		}
 		if green {
 			if err := approval.Grant(m.P.ApprovalFile(taskID), ttl, approvalPayload("auto", sha, nil)); err != nil {

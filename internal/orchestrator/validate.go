@@ -681,13 +681,14 @@ type gateDefinition struct {
 }
 
 // resolveGateDefinition reads the trust gate's validation DEFINITION from the repo's DEFAULT
-// BRANCH: the .ttorch/validate.sh as it exists there (via worktree.ShowFile — committed
+// BRANCH: the .ttorch/validate.sh as it exists at base.SHA (via worktree.ShowFile — committed
 // objects, never the worker-controlled worktree copy, so a worker cannot weaken its own gate
-// by editing the script on its branch). hasScript is false when the default branch defines
-// none; runGate then falls back to the built-in ecosystem steps and validateCommitted does
-// NOT cache the result.
-func resolveGateDefinition(repo string) gateDefinition {
-	if script, ok := worktree.ShowFile(repo, worktree.DefaultBranch(repo), ".ttorch/validate.sh"); ok {
+// by editing the script on its branch). base comes from worktree.ResolveGateBase, which reads
+// refs/heads/<default> fully qualified, so a tag a worker names after the branch cannot stand
+// in for it. hasScript is false when the default branch defines none; runGate then falls back
+// to the built-in ecosystem steps and validateCommitted does NOT cache the result.
+func resolveGateDefinition(repo string, base worktree.GateBase) gateDefinition {
+	if script, ok := worktree.ShowFile(repo, base.SHA, ".ttorch/validate.sh"); ok {
 		return gateDefinition{script: script, hasScript: true}
 	}
 	return gateDefinition{}
@@ -762,8 +763,8 @@ var runGateOnCommitted = func(repo, sha string, def gateDefinition) (bool, []val
 // .ttorch/validate.sh (the ecosystem-detection fallback depends on the worker's own tree and
 // is not a hashable authority), or the tree hash cannot be read. Both callers then run fresh
 // with no reuse of any kind.
-func gateContentKey(repo, sha string) (def gateDefinition, key string, keyed bool) {
-	def = resolveGateDefinition(repo)
+func gateContentKey(repo string, base worktree.GateBase, sha string) (def gateDefinition, key string, keyed bool) {
+	def = resolveGateDefinition(repo, base)
 	if !def.hasScript {
 		return def, "", false
 	}
@@ -811,8 +812,8 @@ func runAndRecordGate(repo, sha string, def gateDefinition, key string) (bool, [
 // The "no checks detected => NOT green (a hard block)" rule is preserved on every path: a
 // no-checks run is never green, so is never recorded, so a hit is always green (stagedGreen
 // faithfully mirrors gateGreen for a persisted GREEN set).
-func validateCommitted(repo, sha string) (bool, []validate.Result, error) {
-	def, key, keyed := gateContentKey(repo, sha)
+func validateCommitted(repo string, base worktree.GateBase, sha string) (bool, []validate.Result, error) {
+	def, key, keyed := gateContentKey(repo, base, sha)
 	if !keyed {
 		return runGateOnCommitted(repo, sha, def)
 	}
@@ -842,8 +843,8 @@ func validateCommitted(repo, sha string) (bool, []validate.Result, error) {
 // real suite run across prep, record and merge, so removing the on-disk cache and the staged
 // pair from the authority path costs at most one extra run per episode rather than one per
 // step.
-func validateForAuthority(repo, sha string) (green bool, results []validate.Result, reused bool, err error) {
-	def, key, keyed := gateContentKey(repo, sha)
+func validateForAuthority(repo string, base worktree.GateBase, sha string) (green bool, results []validate.Result, reused bool, err error) {
+	def, key, keyed := gateContentKey(repo, base, sha)
 	if !keyed {
 		green, results, err = runGateOnCommitted(repo, sha, def)
 		return green, results, false, err
@@ -872,8 +873,8 @@ func stagedGreen(results []validate.Result) bool {
 // human `ttorch approve` is still allowed to use the detection fallback (a human is then in
 // the loop). It mirrors resolveGateDefinition's hasScript, which validateCommitted uses to
 // decide whether the result is cacheable.
-func hasDefaultBranchGateScript(repo string) bool {
-	_, ok := worktree.ShowFile(repo, worktree.DefaultBranch(repo), ".ttorch/validate.sh")
+func hasDefaultBranchGateScript(repo string, base worktree.GateBase) bool {
+	_, ok := worktree.ShowFile(repo, base.SHA, ".ttorch/validate.sh")
 	return ok
 }
 

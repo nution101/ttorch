@@ -3618,7 +3618,7 @@ func TestMergeValidate_IgnoresStagedPrepValidate(t *testing.T) {
 	stageValidate(t, m.P.ReviewInputsDir("rz1"), head, []validate.Result{{Name: "gate", Passed: true}})
 
 	c0 := gateRunCount(t, counter)
-	green, results, reused, err := validateForAuthority(repo, head)
+	green, results, reused, err := validateForAuthority(repo, gateBaseFor(t, repo), head)
 	if err != nil {
 		t.Fatalf("validateForAuthority: %v", err)
 	}
@@ -3657,7 +3657,7 @@ func TestMergeValidate_RevalidatesWhenHeadMoved(t *testing.T) {
 	stageValidate(t, m.P.ReviewInputsDir("rv1"), head1, []validate.Result{{Name: "gate", Passed: false}})
 
 	c0 := gateRunCount(t, counter)
-	green, results, reused, err := validateForAuthority(repo, head2)
+	green, results, reused, err := validateForAuthority(repo, gateBaseFor(t, repo), head2)
 	if err != nil {
 		t.Fatalf("validateForAuthority: %v", err)
 	}
@@ -3763,7 +3763,7 @@ func TestMergeValidate_IgnoresStagedEmptyResult(t *testing.T) {
 	stageValidate(t, m.P.ReviewInputsDir("ze1"), head, nil)
 
 	c0 := gateRunCount(t, counter)
-	green, results, _, err := validateForAuthority(repo, head)
+	green, results, _, err := validateForAuthority(repo, gateBaseFor(t, repo), head)
 	if err != nil {
 		t.Fatalf("validateForAuthority: %v", err)
 	}

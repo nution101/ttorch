@@ -75,7 +75,7 @@ func TestValidateCache_Hit(t *testing.T) {
 	repo, head := cacheRepo(t)
 	calls := installGateStub(t, func() (bool, []validate.Result, error) { return true, greenGateResults, nil })
 
-	green, results, err := validateCommitted(repo, head)
+	green, results, err := validateCommitted(repo, gateBaseFor(t, repo), head)
 	if err != nil || !green || len(results) != 1 {
 		t.Fatalf("first validate: green=%v results=%v err=%v", green, results, err)
 	}
@@ -86,7 +86,7 @@ func TestValidateCache_Hit(t *testing.T) {
 		t.Fatalf("a green result must be cached (want 1 entry), got %v", got)
 	}
 
-	green, results, err = validateCommitted(repo, head)
+	green, results, err = validateCommitted(repo, gateBaseFor(t, repo), head)
 	if err != nil || !green || len(results) != 1 || !results[0].Passed {
 		t.Fatalf("second validate must return the cached green: green=%v results=%v err=%v", green, results, err)
 	}
@@ -101,7 +101,7 @@ func TestValidateCache_TreeMiss(t *testing.T) {
 	repo, head1 := cacheRepo(t)
 	calls := installGateStub(t, func() (bool, []validate.Result, error) { return true, greenGateResults, nil })
 
-	if _, _, err := validateCommitted(repo, head1); err != nil {
+	if _, _, err := validateCommitted(repo, gateBaseFor(t, repo), head1); err != nil {
 		t.Fatalf("validate head1: %v", err)
 	}
 	if *calls != 1 {
@@ -112,7 +112,7 @@ func TestValidateCache_TreeMiss(t *testing.T) {
 	if head2 == head1 {
 		t.Fatal("the second commit must produce a new head/tree")
 	}
-	green, _, err := validateCommitted(repo, head2)
+	green, _, err := validateCommitted(repo, gateBaseFor(t, repo), head2)
 	if err != nil || !green {
 		t.Fatalf("validate head2: green=%v err=%v", green, err)
 	}
@@ -128,7 +128,7 @@ func TestValidateCache_GateMiss(t *testing.T) {
 	repo, head := cacheRepo(t) // default-branch gate v1 ("exit 0")
 	calls := installGateStub(t, func() (bool, []validate.Result, error) { return true, greenGateResults, nil })
 
-	if _, _, err := validateCommitted(repo, head); err != nil {
+	if _, _, err := validateCommitted(repo, gateBaseFor(t, repo), head); err != nil {
 		t.Fatalf("validate under gate v1: %v", err)
 	}
 	if *calls != 1 {
@@ -138,7 +138,7 @@ func TestValidateCache_GateMiss(t *testing.T) {
 	// Advance the default branch's gate script. head's TREE is unchanged, but the resolved gate
 	// definition now differs, so its cache key differs.
 	commitGateScript(t, repo, "exit 0 # v2")
-	green, _, err := validateCommitted(repo, head)
+	green, _, err := validateCommitted(repo, gateBaseFor(t, repo), head)
 	if err != nil || !green {
 		t.Fatalf("validate under gate v2: green=%v err=%v", green, err)
 	}
@@ -158,7 +158,7 @@ func TestValidateCache_NoScriptNeverCached(t *testing.T) {
 	calls := installGateStub(t, func() (bool, []validate.Result, error) { return true, greenGateResults, nil })
 
 	for i := 1; i <= 2; i++ {
-		if _, _, err := validateCommitted(repo, head); err != nil {
+		if _, _, err := validateCommitted(repo, gateBaseFor(t, repo), head); err != nil {
 			t.Fatalf("validate call %d: %v", i, err)
 		}
 		if *calls != i {
@@ -176,7 +176,7 @@ func TestValidateCache_RedNotCached(t *testing.T) {
 	repo, head := cacheRepo(t)
 	calls := installGateStub(t, func() (bool, []validate.Result, error) { return false, redGateResults, nil })
 
-	green, results, err := validateCommitted(repo, head)
+	green, results, err := validateCommitted(repo, gateBaseFor(t, repo), head)
 	if err != nil || green || len(results) != 1 {
 		t.Fatalf("first validate should be red: green=%v results=%v err=%v", green, results, err)
 	}
@@ -184,7 +184,7 @@ func TestValidateCache_RedNotCached(t *testing.T) {
 		t.Fatalf("a red result must NOT be cached, found: %v", got)
 	}
 
-	green, _, err = validateCommitted(repo, head)
+	green, _, err = validateCommitted(repo, gateBaseFor(t, repo), head)
 	if err != nil || green {
 		t.Fatalf("second validate should still be red: green=%v err=%v", green, err)
 	}
@@ -200,7 +200,7 @@ func TestValidateCache_FailClosedOnCorrupt(t *testing.T) {
 	repo, head := cacheRepo(t)
 	calls := installGateStub(t, func() (bool, []validate.Result, error) { return true, greenGateResults, nil })
 
-	if _, _, err := validateCommitted(repo, head); err != nil {
+	if _, _, err := validateCommitted(repo, gateBaseFor(t, repo), head); err != nil {
 		t.Fatalf("first validate: %v", err)
 	}
 	entries := cacheEntries(t)
@@ -211,7 +211,7 @@ func TestValidateCache_FailClosedOnCorrupt(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	green, results, err := validateCommitted(repo, head)
+	green, results, err := validateCommitted(repo, gateBaseFor(t, repo), head)
 	if err != nil || !green || len(results) != 1 {
 		t.Fatalf("a corrupt entry must fail closed to a fresh, correct run: green=%v results=%v err=%v", green, results, err)
 	}
