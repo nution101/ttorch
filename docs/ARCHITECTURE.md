@@ -224,8 +224,9 @@ The flow is `trust prep` → reviewer subagents → `trust record`:
 The mode lives in the repo's `AGENTS.md`/`CLAUDE.md` ttorch-managed block (set by
 `ttorch init --mode`); it defaults to `pr`. Changing the gate itself (that block or
 `.ttorch/validate.sh`) needs a human's `ttorch approve --allow-gate-change` on a
-`--require-verdict` merge in any mode, and in a trusted repo only when the repo opts in with
-`- gate-change-approval: required` (see the trust gate below).
+`--require-verdict` merge outside trusted mode. In a trusted repo it needs one only when the
+repo opts in with `- gate-change-approval: required`, with or without `--require-verdict` (see
+the trust gate below).
 
 | Mode | How work integrates | Who authorizes the merge |
 | --- | --- | --- |
@@ -271,8 +272,8 @@ passing commit-pinned verdict plus a fresh green validate auto-mints the approva
   because it runs lint, the fast lane and the gate's own proofs rather than the whole
   suite), and `docs/install.sh` and `docs/install.ps1` (which
   README tells users to pipe into a shell). On
-  a **gated** merge that requires the gate-change approval (any mode with `--require-verdict`,
-  and a trusted repo that opts in, below) a human approval does
+  a **gated** merge that requires the gate-change approval (a `--require-verdict` merge outside
+  trusted mode, and any gated merge in a trusted repo that opts in, below) a human approval does
   not wave it through either: it needs `ttorch approve <id> --allow-gate-change`, and the
   merge audit line names every file. The grant is **bound to the gate-definition paths that
   diff touches**, recorded on the token and printed at approve time, and the merge refuses
@@ -286,8 +287,11 @@ passing commit-pinned verdict plus a fresh green validate auto-mints the approva
   `TrustRecord` auto-mints for a gate-definition diff and `MergeLocal` accepts it on the
   passing, commit-pinned verdict and the fresh green validate, with no `ttorch approve`.
   `required` turns the approval on. Any other value (a typo, `Required`, a trailing comment)
-  turns it on as well, and `ttorch init`, the refusal, and every trusted merge and land name
-  the value, quoted, until it is fixed. The approval also stays on when the default branch's
+  turns it on as well, and so does a line anywhere in `AGENTS.md` that is an attempt at the key
+  but not its recognized form (a `*` bullet, a misspelled or re-cased key, a space before the
+  colon, the line outside the block): the letters before its colon are within two edits of the
+  key's. `ttorch init`, the refusal, and every trusted merge and land name the value or the
+  line, quoted, until it is fixed. The approval also stays on when the default branch's
   `AGENTS.md` does not itself record `delivery-mode: trusted`, for example an uncommitted
   ttorch block or a symlinked `AGENTS.md` (whose committed text is only a path): the policy
   lives on the default branch, and there is nothing there to waive it. A worker's branch
@@ -295,12 +299,27 @@ passing commit-pinned verdict plus a fresh green validate auto-mints the approva
   bind that merge, and removing main's `required` does not unbind it. Blocking hits are
   refused before the policy is read, so they stay refused, and in any mode other than trusted
   the policy does nothing. `ttorch init` never writes the line and keeps it when it
-  regenerates the block. `--allow-gate-change` is still accepted with the approval off, and
+  regenerates the block, and `ttorch update` and `ttorch doctor` print one line for each
+  trusted project that has none, since the default removed the approval there.
+  `--allow-gate-change` is still accepted with the approval off, and
   the files it names then count as approved. Every merge that relies on the approval being off
   adds `gate-change-approval=off unapproved=<files>` to the must-succeed audit line, records a
   non-actionable `gate_change_unapproved` event naming the files, and prints one line in the
   `merge-local` and `land` output. The risk is direct: with the approval off, a change to the
   reviewers or the validate step is authorized by the gate that change modifies.
+- Every read the gate takes from the default branch (the gate-change-approval line,
+  `.ttorch/validate.sh`, and the base of the gate-definition diff) is made at **one commit per
+  gate run**, which `worktree.ResolveGateBase` resolves as `refs/heads/<name>`, fully qualified.
+  Refs are shared with every worker's worktree, and git resolves a bare `main` to
+  `refs/tags/main` ahead of the branch, with only an "ambiguous refname" warning: a worker's tag
+  named `main` would otherwise supply the policy and the validate script, and at the worker's
+  own HEAD would empty the diff and hide every gate hit, blocking ones included. The name is
+  not taken from `refs/remotes/origin/HEAD` alone either, since a worker can repoint that: it is
+  the branch the repository's own checkout is on when that is the `origin/HEAD` target, `main`
+  or `master`, and otherwise `main`, then `master`, and resolution fails closed when neither
+  exists. `MergeLocal` refuses the fast-forward if the default branch has moved off that commit
+  since the gate read it. The base of the diff the reviewers are shown, the land's rebase base,
+  the post-merge verify and `ttorch review-diff` use the same name and fully qualified refs.
 - An ungated `local`/`validated` merge **does not run the check at all**. That path lands an
   `AGENTS.md` change on a plain human approval with no gate-config check and no audit line
   naming it, and `AGENTS.md` is what `projectinit.ReadMode` reads to decide trusted mode — so

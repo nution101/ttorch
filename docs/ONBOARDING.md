@@ -195,8 +195,10 @@ delivery-mode block) are authorized the same way by default.
 
 To require your `ttorch approve <id> --allow-gate-change` for those changes, add
 `- gate-change-approval: required` directly under `- delivery-mode: trusted` in `AGENTS.md`.
-`off`, or no line, means off. Any other value means required, and `ttorch init`, the refusal
-and the land output name it. The gate reads the line from the default branch, so it takes
+`off`, or no line, means off. Any other value means required, as does a line that looks like
+this one but is written differently (a `*` bullet, a misspelled key, outside the ttorch block),
+and `ttorch init`, the refusal and the land output name it. `ttorch update` and `ttorch doctor`
+list each trusted project that has no line. The gate reads the line from the default branch, so it takes
 effect once that commit has landed, and `ttorch init` keeps it when it rewrites the block.
 With the approval off, a change to the reviewers or the validate step is authorized by the
 gate that change modifies; each such merge records a `gate_change_unapproved` event and prints

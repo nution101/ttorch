@@ -408,8 +408,10 @@ ttorch-managed block of `AGENTS.md`:
 - gate-change-approval: required
 ```
 
-`off`, or no line, means off. Any other value also means required, and ttorch names it in the
-`ttorch init` output, the refusal and every trusted land until it is fixed. The gate reads the
+`off`, or no line, means off. Any other value also means required, and so does a line that looks
+like this one but is written differently (a `*` bullet, a misspelled key, outside the ttorch
+block). ttorch names either in the `ttorch init` output, the refusal and every trusted land until
+it is fixed, and `ttorch update` and `ttorch doctor` list the trusted projects that have no line. The gate reads the
 line from the default branch's committed `AGENTS.md`, so it takes effect once it lands, and a
 worker's branch cannot change it for its own merge. With the approval off, each merge of a
 gate-definition change records a `gate_change_unapproved` event and prints one line saying so.

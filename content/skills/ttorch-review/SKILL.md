@@ -220,9 +220,13 @@ invalidates the verdict — re-prep, re-review, re-record.
   `off`, a passing verdict and a fresh green validate authorize a gate-definition change the
   way they authorize any other diff, and the merge records a `gate_change_unapproved` event
   and an audit line naming the files. `- gate-change-approval: required` turns the approval
-  on, and so does any value the gate does not recognize, which it names in the refusal and
-  the land output. The gate reads the line from the default branch only, so a worker's branch
-  cannot add `required` to bind its own merge or remove it to unbind its own. The blocking
+  on, and so does any value the gate does not recognize, or a line that is an attempt at the key
+  but not its exact form (a `*` bullet, a misspelled key, the line outside the ttorch block),
+  each named in the refusal and the land output. The gate reads the line from the default
+  branch only, so a worker's branch cannot add `required` to bind its own merge or remove it to
+  unbind its own. It reads the default branch as `refs/heads/<name>` at one commit per gate run,
+  so a worker's tag named `main` or a repointed `origin/HEAD` cannot supply the line, the
+  validate script, or the base of the diff you are shown. The blocking
   refusals below stay blocking, and the setting has no effect outside trusted mode. With the
   approval off, a change to the reviewers or the validate step is authorized by the gate that
   change modifies, and your verdict is the only review it gets.
