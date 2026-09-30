@@ -5,20 +5,24 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/nution101/ttorch/internal/db"
+	"github.com/nution101/ttorch/internal/orchestrator"
 	"github.com/nution101/ttorch/internal/paths"
 	"github.com/nution101/ttorch/internal/projectinit"
 	"github.com/nution101/ttorch/internal/worktree"
 )
 
-// printGateChangeApprovalNotices prints one line for every trusted project whose default
-// branch has no gate-change-approval line. The human gate-change approval became off by
-// default, so installing a binary with that default silently drops the approval for exactly
-// these projects; `ttorch update` (through the `install` it re-executes) and `ttorch doctor`
-// say so until the project sets the line either way. It is best-effort and silent on any
-// read failure, and it never creates the state database.
-func printGateChangeApprovalNotices(w io.Writer, p paths.Paths) {
+// printGateNotices prints the trust-gate lines `ttorch update` (through the `install` it
+// re-executes) and `ttorch doctor` show. For each project it says, once, which default branch a
+// seed recorded (see orchestrator.SeedDefaultBranches), so a wrong guess is seen and can be
+// changed; it names every git project with no default branch recorded, since the gate refuses
+// those; and it names every trusted project whose default branch has no gate-change-approval
+// line, since the human gate-change approval became off by default and installing a binary
+// with that default silently drops the approval for exactly those. It is best-effort and silent
+// on any read failure, and it never creates the state database.
+func printGateNotices(w io.Writer, p paths.Paths) {
 	if _, err := os.Stat(p.StateDB()); err != nil {
 		return
 	}
@@ -27,15 +31,41 @@ func printGateChangeApprovalNotices(w io.Writer, p paths.Paths) {
 		return
 	}
 	defer store.Close()
-	projects, err := store.ListProjects(context.Background())
+	ctx := context.Background()
+	_ = orchestrator.SeedDefaultBranches(ctx, store)
+	projects, err := store.ListProjects(ctx)
 	if err != nil {
 		return
 	}
 	for _, proj := range projects {
+		switch {
+		case proj.DefaultBranchSeed == db.DefaultBranchSeedNotice && proj.DefaultBranch != "":
+			fmt.Fprintf(w, "recorded %s as the default branch the trust gate reads for %s; if that is wrong, run '%s %d <branch>'\n",
+				proj.DefaultBranch, proj.RepoPath, orchestrator.SetBranchCommand, proj.ID)
+			_ = store.SetProjectDefaultBranchSeed(ctx, proj.ID, "")
+		case proj.DefaultBranch == "" && isRepoRoot(proj.RepoPath):
+			fmt.Fprintf(w, "no default branch is recorded for %s, so the trust gate refuses it; run '%s %d <branch>'\n",
+				proj.RepoPath, orchestrator.SetBranchCommand, proj.ID)
+		}
 		if gateChangeApprovalDefaulted(proj.RepoPath) {
 			fmt.Fprintf(w, "gate-change approval is now off by default for %s; add '- gate-change-approval: required' to its AGENTS.md to keep it\n", proj.RepoPath)
 		}
 	}
+}
+
+// isRepoRoot reports whether dir is the top level of a git repository. Project rows are keyed
+// by repo root, but a cc session registers its own directory, which need not be one. git
+// reports the root with symlinks resolved, so dir is compared the same way.
+func isRepoRoot(dir string) bool {
+	root, err := worktree.RepoRoot(dir)
+	if err != nil {
+		return false
+	}
+	if root == dir {
+		return true
+	}
+	real, err := filepath.EvalSymlinks(dir)
+	return err == nil && real == root
 }
 
 // gateChangeApprovalDefaulted reports whether repo is trusted and its gate-change approval is

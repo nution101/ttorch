@@ -75,3 +75,15 @@ func checkApproveCaller(stdin *os.File) error {
 	}
 	return nil
 }
+
+// checkLeadCaller is checkApproveCaller for the lead's other commands that change what the
+// trust gate reads, such as `ttorch project set-branch`. action completes "refusing to ...".
+func checkLeadCaller(action string, stdin *os.File) error {
+	if signal := workerContextSignal(); signal != "" {
+		return fmt.Errorf("refusing to %s from inside a worker context (%s): it is the lead's action. Run it from your own shell, outside the worktree", action, signal)
+	}
+	if !stdinIsInteractiveDevice(stdin, os.DevNull) {
+		return fmt.Errorf("refusing to %s without an interactive terminal: run it yourself at a terminal, not through a wrapper, a script, or an agent's shell tool", action)
+	}
+	return nil
+}

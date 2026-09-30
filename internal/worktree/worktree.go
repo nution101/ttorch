@@ -480,6 +480,49 @@ func DefaultBranch(repo string) string {
 	return "main"
 }
 
+// DetectDefaultBranch picks the branch to record as a project's default branch when it is
+// registered, or when a project registered before the branch was recorded is seeded: the
+// branch refs/remotes/origin/HEAD names, when refs/heads/<that branch> exists, else the branch
+// repo's own checkout is on. It fails when neither gives a branch (no origin/HEAD, or one that
+// names a branch with no local ref, and a detached checkout).
+//
+// Both inputs are ones a worker can change from its own worktree, which is why the gate never
+// calls this: it reads the branch recorded in the project row (see ResolveGateBase). The
+// recorded branch is taken at registration, before any worker exists for the repository, and
+// the lead can change it afterwards with `ttorch project set-branch`.
+func DetectDefaultBranch(repo string) (string, error) {
+	if out, err := git("-C", repo, "symbolic-ref", "-q", "refs/remotes/origin/HEAD"); err == nil {
+		if b, ok := strings.CutPrefix(strings.TrimSpace(out), "refs/remotes/origin/"); ok && b != "" {
+			if _, exists := localBranchCommit(repo, b); exists {
+				return b, nil
+			}
+		}
+	}
+	if out, err := git("-C", repo, "symbolic-ref", "-q", "HEAD"); err == nil {
+		if b, ok := strings.CutPrefix(strings.TrimSpace(out), "refs/heads/"); ok && b != "" {
+			if _, exists := localBranchCommit(repo, b); exists {
+				return b, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("cannot tell the default branch of %s: refs/remotes/origin/HEAD does not name a local branch and the checkout is not on a branch with a commit", repo)
+}
+
+// IsBranchName reports whether name is a valid branch name (`git check-ref-format --branch`).
+func IsBranchName(repo, name string) bool {
+	if name == "" || strings.HasPrefix(name, "-") {
+		return false
+	}
+	out, err := git("-C", repo, "check-ref-format", "--branch", name)
+	return err == nil && out == name
+}
+
+// BranchExists reports whether refs/heads/<name> exists and points at a commit.
+func BranchExists(repo, name string) bool {
+	_, ok := localBranchCommit(repo, name)
+	return ok
+}
+
 // GateBase is the default branch as the trust gate reads it: the branch name and the commit
 // refs/heads/<Name> pointed at when it was resolved. The gate makes every read it takes from
 // the default branch (its validate script, its gate-change-approval policy, the base of the

@@ -66,13 +66,17 @@ func TestGateChangeApprovalNotices(t *testing.T) {
 	gone := filepath.Join(t.TempDir(), "gone")
 	withSeedDB(t, func(ctx context.Context, s *db.Store) {
 		for _, r := range []string{unset, required, off, malformed, prMode, uncommitted, gone} {
-			if _, err := s.UpsertProject(ctx, r, ""); err != nil {
+			p, err := s.UpsertProject(ctx, r, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.SetProjectDefaultBranch(ctx, p.ID, "main"); err != nil {
 				t.Fatal(err)
 			}
 		}
 	})
 	var out bytes.Buffer
-	printGateChangeApprovalNotices(&out, paths.Default())
+	printGateNotices(&out, paths.Default())
 	want := "gate-change approval is now off by default for " + unset + "; add '- gate-change-approval: required' to its AGENTS.md to keep it\n"
 	if out.String() != want {
 		t.Fatalf("notices:\n%s\nwant exactly:\n%s", out.String(), want)
@@ -85,7 +89,7 @@ func TestGateChangeApprovalNotices_NoStateDB(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "state.db")
 	t.Setenv("TTORCH_DB", dbPath)
 	var out bytes.Buffer
-	printGateChangeApprovalNotices(&out, paths.Default())
+	printGateNotices(&out, paths.Default())
 	if out.Len() != 0 {
 		t.Fatalf("want no notices without a state database, got %q", out.String())
 	}

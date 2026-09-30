@@ -24,6 +24,7 @@ import (
 
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/harness"
+	"github.com/nution101/ttorch/internal/orchestrator"
 	"github.com/nution101/ttorch/internal/projectinit"
 	"github.com/nution101/ttorch/internal/worktree"
 )
@@ -345,7 +346,7 @@ func renderTreeTask(w io.Writer, indent string, t db.Task) {
 
 // --- ttorch project ----------------------------------------------------------
 
-const projectUsage = `usage: ttorch project add <repo> [--name n] | ttorch project ls`
+const projectUsage = `usage: ttorch project add <repo> [--name n] | ttorch project ls | ttorch project set-branch <project-id|repo> <branch>`
 
 func cmdProject(args []string) error {
 	if len(args) < 1 {
@@ -356,6 +357,8 @@ func cmdProject(args []string) error {
 		return cmdProjectAdd(args[1:])
 	case "ls", "list":
 		return cmdProjectLs(args[1:])
+	case "set-branch":
+		return cmdProjectSetBranch(args[1:])
 	default:
 		return errors.New(projectUsage)
 	}
@@ -396,8 +399,104 @@ func cmdProjectAdd(args []string) error {
 	if err := m.Store.SetProjectMode(ctx, proj.ID, mode); err != nil {
 		return err
 	}
-	fmt.Printf("project %d: %s (%s) · mode=%s\n", proj.ID, proj.RepoPath, projectDisplayName(proj), mode)
+	branch, why, err := recordProjectDefaultBranch(ctx, m.Store, proj)
+	if err != nil {
+		return err
+	}
+	if branch == "" {
+		branch = fmt.Sprintf("none (%v; run '%s %d <branch>')", why, orchestrator.SetBranchCommand, proj.ID)
+	}
+	fmt.Printf("project %d: %s (%s) · mode=%s · default-branch=%s\n", proj.ID, proj.RepoPath, projectDisplayName(proj), mode, branch)
 	return nil
+}
+
+// recordProjectDefaultBranch records the default branch the trust gate reads for proj when
+// none is recorded, taking it from the lead's checkout (worktree.DetectDefaultBranch), and
+// returns the branch recorded now. A recorded branch is kept: only `ttorch project set-branch`
+// changes it. When no branch can be detected it returns "" and why, and the gate refuses the
+// project until the lead records one.
+func recordProjectDefaultBranch(ctx context.Context, store *db.Store, proj db.Project) (branch string, why, err error) {
+	if proj.DefaultBranch != "" {
+		return proj.DefaultBranch, nil, nil
+	}
+	b, derr := worktree.DetectDefaultBranch(proj.RepoPath)
+	if derr != nil {
+		return "", derr, nil
+	}
+	if _, err := store.FillProjectDefaultBranch(ctx, proj.ID, b, false); err != nil {
+		return "", nil, err
+	}
+	cur, _, err := store.GetProject(ctx, proj.ID)
+	if err != nil {
+		return "", nil, err
+	}
+	return cur.DefaultBranch, nil, nil
+}
+
+// cmdProjectSetBranch records the default branch the trust gate reads for a project. The
+// branch has to exist as a local branch in the project's repository. It is the lead's command,
+// so it refuses to run from a worker's context or without a terminal, the same guard
+// `ttorch approve` uses (see checkApproveCaller): that guard narrows who runs it by accident
+// and is not a boundary.
+func cmdProjectSetBranch(args []string) error {
+	if len(args) != 2 {
+		return errors.New("usage: ttorch project set-branch <project-id|repo> <branch>")
+	}
+	if err := checkLeadCaller("set a project's default branch", os.Stdin); err != nil {
+		return err
+	}
+	m, err := mgr()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	ctx := context.Background()
+	proj, err := lookupProject(ctx, m.Store, args[0])
+	if err != nil {
+		return err
+	}
+	branch := args[1]
+	if !worktree.IsBranchName(proj.RepoPath, branch) {
+		return fmt.Errorf("project set-branch: %q is not a valid branch name", branch)
+	}
+	if !worktree.BranchExists(proj.RepoPath, branch) {
+		return fmt.Errorf("project set-branch: %s has no local branch refs/heads/%s", proj.RepoPath, branch)
+	}
+	if err := m.Store.SetProjectDefaultBranch(ctx, proj.ID, branch); err != nil {
+		return err
+	}
+	was := proj.DefaultBranch
+	if was == "" {
+		was = "none"
+	}
+	fmt.Printf("project %d: %s · default-branch=%s (was %s)\n", proj.ID, proj.RepoPath, branch, was)
+	return nil
+}
+
+// lookupProject resolves a project by its id or by a path inside its repository.
+func lookupProject(ctx context.Context, store *db.Store, arg string) (db.Project, error) {
+	if id, err := strconv.ParseInt(arg, 10, 64); err == nil {
+		p, ok, err := store.GetProject(ctx, id)
+		if err != nil {
+			return db.Project{}, err
+		}
+		if !ok {
+			return db.Project{}, fmt.Errorf("no such project %d (see 'ttorch project ls')", id)
+		}
+		return p, nil
+	}
+	root, err := worktree.RepoRoot(arg)
+	if err != nil {
+		return db.Project{}, fmt.Errorf("%q is neither a project id nor inside a git repository", arg)
+	}
+	p, ok, err := store.GetProjectByRepo(ctx, root)
+	if err != nil {
+		return db.Project{}, err
+	}
+	if !ok {
+		return db.Project{}, fmt.Errorf("%s is not a registered project (run 'ttorch project add %s')", root, root)
+	}
+	return p, nil
 }
 
 func cmdProjectLs(args []string) error {
@@ -447,10 +546,14 @@ func renderProjects(w io.Writer, projects []db.Project) {
 		fmt.Fprintln(w, "no projects yet. add one with: ttorch project add <repo>")
 		return
 	}
-	const format = "%-4s %-16s %-18s %-9s %s\n"
-	fmt.Fprintf(w, format, "ID", "NAME", "MODE", "STATUS", "REPO")
+	const format = "%-4s %-16s %-18s %-9s %-12s %s\n"
+	fmt.Fprintf(w, format, "ID", "NAME", "MODE", "STATUS", "BRANCH", "REPO")
 	for _, p := range projects {
-		fmt.Fprintf(w, format, fmtID(p.ID), projectDisplayName(p), projectDisplayMode(p), p.Status, p.RepoPath)
+		branch := p.DefaultBranch
+		if branch == "" {
+			branch = "-"
+		}
+		fmt.Fprintf(w, format, fmtID(p.ID), projectDisplayName(p), projectDisplayMode(p), p.Status, branch, p.RepoPath)
 	}
 }
 

@@ -133,6 +133,10 @@ func (m *Manager) spawnWorker(taskID, projectPath string, scout bool, rawCmd str
 	// Placed AFTER the window and overlap refusal gates so a refused spawn — like the
 	// read-only notice it replaced — leaves the lead's checkout untouched.
 	autoInit(repo)
+	// Record the repository's default branch for the trust gate while no worker has a checkout
+	// of it, so no worker ref can have decided it (see registerDefaultBranch). This is before
+	// the worktree below is acquired and the worker launched.
+	m.registerDefaultBranch(context.Background(), repo)
 
 	// Fail closed: if the in-use worktree set can't be read, refuse rather than acquire on an
 	// incomplete view (which could reuse a worktree a live worker still holds). This is after the

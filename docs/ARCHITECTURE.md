@@ -364,6 +364,7 @@ once if it touches any covered path.
 | `internal/approval/` | 6 | +0 |
 | `internal/installer/` | 5 | +1 |
 | `internal/orchestrator/audit.go` | 1 | +0 |
+| `internal/orchestrator/defaultbranch.go` | 0 | +0 |
 | `internal/orchestrator/gate.go` | 5 | +2 |
 | `internal/orchestrator/gateattacks_test.go` | 0 | +0 |
 | `internal/orchestrator/gateconfig_test.go` | 0 | +0 |

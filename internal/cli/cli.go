@@ -219,7 +219,7 @@ func cmdDoctor(args []string) error {
 		return err
 	}
 	err := doctor.Run(os.Stdout, os.Stdin, *yes)
-	printGateChangeApprovalNotices(os.Stdout, paths.Default())
+	printGateNotices(os.Stdout, paths.Default())
 	return err
 }
 
@@ -231,7 +231,7 @@ func cmdInstall() error {
 	}
 	printResult(os.Stdout, res)
 	fmt.Printf("Installed into %s and %s.\n", p.Claude, p.Agents)
-	printGateChangeApprovalNotices(os.Stdout, p)
+	printGateNotices(os.Stdout, p)
 	return nil
 }
 
@@ -344,6 +344,11 @@ func cmdInit(args []string) error {
 	} else if note != "" {
 		fmt.Println("  " + note)
 	}
+	if note, err := syncProjectDefaultBranch(dir); err != nil {
+		fmt.Printf("  note: could not record the project's default branch: %v\n", err)
+	} else if note != "" {
+		fmt.Println("  " + note)
+	}
 	if p, err := profile.Apply(dir); err == nil {
 		stack := p.Stack
 		if stack == "" {
@@ -388,6 +393,35 @@ func syncProjectModeCache(dir, mode string) (string, error) {
 		return "", nil // repo not registered as a project (run `ttorch project add`)
 	}
 	return "synced project delivery-mode cache → " + mode, nil
+}
+
+// syncProjectDefaultBranch records the default branch the trust gate reads for the registered
+// project at dir, when none is recorded, from the lead's checkout (see
+// recordProjectDefaultBranch), and returns a note naming the branch the gate reads. An
+// unregistered repo is a no-op: its branch is recorded when it is registered.
+func syncProjectDefaultBranch(dir string) (string, error) {
+	repoRoot, err := worktree.RepoRoot(dir)
+	if err != nil {
+		return "", nil
+	}
+	m, err := mgr()
+	if err != nil {
+		return "", err
+	}
+	defer m.Close()
+	ctx := context.Background()
+	proj, ok, err := m.Store.GetProjectByRepo(ctx, repoRoot)
+	if err != nil || !ok {
+		return "", err
+	}
+	branch, why, err := recordProjectDefaultBranch(ctx, m.Store, proj)
+	if err != nil {
+		return "", err
+	}
+	if branch == "" {
+		return fmt.Sprintf("no default branch recorded (%v); the trust gate refuses this project until you run '%s %d <branch>'", why, orchestrator.SetBranchCommand, proj.ID), nil
+	}
+	return fmt.Sprintf("default branch the trust gate reads: %s (change it with '%s %d <branch>')", branch, orchestrator.SetBranchCommand, proj.ID), nil
 }
 
 func cmdProfile(args []string) error {
@@ -2271,7 +2305,7 @@ func reapplyContent(p paths.Paths) error {
 		return err
 	}
 	printResult(os.Stdout, res)
-	printGateChangeApprovalNotices(os.Stdout, p)
+	printGateNotices(os.Stdout, p)
 	return nil
 }
 
