@@ -553,9 +553,16 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 	// raw local <default> which may be behind origin (see reviewBase). A best-effort fetch
 	// refreshes origin/<default> first so a release that landed after the worker spawned is
 	// caught here too.
-	base, err := reviewBase(t.Project, def, true)
+	baseRef, err := reviewBase(t.Project, def, true)
 	if err != nil {
 		return "", fmt.Errorf("trust prep %q: could not resolve the branch's base against %s: %w", taskID, def, err)
+	}
+	// Everything below reads the base at one commit, resolved here, so the diff the reviewers
+	// are shown and the base recorded for the verdict cannot come from two different reads of a
+	// ref a worker can move in between.
+	base, err := worktree.ResolveCommit(t.Project, baseRef)
+	if err != nil {
+		return "", fmt.Errorf("trust prep %q: %w", taskID, err)
 	}
 
 	// Stale-base guard — run BEFORE staging any inputs or dispatching reviewers. If the base
@@ -572,6 +579,13 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 	}
 	if behind = strings.TrimSpace(behind); behind != "" {
 		return "", fmt.Errorf("trust prep: the branch for %q is %d commit(s) behind %s and its base is stale; have the worker rebase onto the current %s before review, then re-run 'ttorch trust prep %s'", taskID, len(strings.Split(behind, "\n")), def, def, taskID)
+	}
+	// Record the commit the reviewers' diff starts from, in the store rather than the inputs
+	// dir the worker can write. TrustRecord pins the verdict to it, and the merge refuses a
+	// verdict whose review started from a commit the default branch does not contain, which is
+	// what a worker that moves the base ref to its own head during review leaves behind.
+	if err := m.Store.SaveReviewPrep(context.Background(), taskID, head, base); err != nil {
+		return "", fmt.Errorf("trust prep %q: could not record the review base: %w", taskID, err)
 	}
 
 	dir := m.P.ReviewInputsDir(taskID)
@@ -917,7 +931,7 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 	if berr != nil {
 		return zero, fmt.Errorf("trust record %q: %w", taskID, berr)
 	}
-	reviewedBase, berr := reviewBase(t.Project, recorded.Name, false)
+	reviewedBase, berr := m.reviewedBase(t, recorded.Name, sha)
 	if berr != nil {
 		return zero, fmt.Errorf("trust record %q: could not resolve the reviewed diff base: %w", taskID, berr)
 	}
@@ -975,6 +989,7 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 	if err != nil {
 		return zero, err
 	}
+	dv.BaseSHA = reviewedBase
 	if err := m.Store.RecordDelivery(context.Background(), taskID, db.Delivery{
 		GatePassed: t.GatePassed, ApprovedBy: t.ApprovedBy, ReviewedSHA: t.ReviewedSHA,
 		EventType: db.EventReviewRecorded, Actor: db.ActorManager, Verdict: &dv,
@@ -992,10 +1007,30 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 	// outcome beside this commit's verdict, nor call a state green that the fold blocked on.
 	// It names the folded set too: the set is composed from three sources now, so a reader
 	// cannot reconstruct it from any one of them.
-	m.audit(fmt.Sprintf("trust-record task=%s commit=%s verdict=%s reviewers=%s mode=%s auto-approved=%s validate=%s",
-		taskID, short(sha), verdict.Overall, strings.Join(required, "+"), projectinit.ReadMode(t.Project), autoMinted,
+	m.audit(fmt.Sprintf("trust-record task=%s commit=%s base=%s verdict=%s reviewers=%s mode=%s auto-approved=%s validate=%s",
+		taskID, short(sha), short(reviewedBase), verdict.Overall, strings.Join(required, "+"), projectinit.ReadMode(t.Project), autoMinted,
 		review.ValidateState(m.P.ReviewInputsDir(taskID), sha)))
 	return verdict, nil
+}
+
+// reviewedBase returns the commit the reviewers' diff for sha was staged against: the base
+// TrustPrep recorded in the store for this head. When no prep row matches sha it resolves the
+// base now, the way prep does, from def, the recorded default branch. Prep writes the row
+// before it stamps an episode, so a record over a real prep always finds it; a missing row is
+// reachable only by editing the store, which could as well rewrite the verdict itself.
+func (m *Manager) reviewedBase(t db.Task, def, sha string) (string, error) {
+	rp, ok, err := m.Store.GetReviewPrep(context.Background(), t.ID)
+	if err != nil {
+		return "", err
+	}
+	if ok && rp.Head == sha && rp.BaseSHA != "" {
+		return rp.BaseSHA, nil
+	}
+	ref, err := reviewBase(t.Project, def, false)
+	if err != nil {
+		return "", err
+	}
+	return worktree.ResolveCommit(t.Project, ref)
 }
 
 // TrustShow returns the current durable verdict for taskID, if any, without consuming

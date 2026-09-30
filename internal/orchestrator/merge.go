@@ -179,13 +179,18 @@ func (m *Manager) recordDelivered(taskID, eventType, payload string) {
 // commit being merged (verdict.ReviewedSHA==workerHead), closing the TOCTOU window
 // where a commit lands after review. Every merge is recorded in the audit log.
 func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error) {
-	return m.mergeLocal(taskID, requireVerdict, nil)
+	return m.mergeLocal(taskID, requireVerdict, "", nil)
 }
 
 // mergeLocal is MergeLocal. When a merge succeeds by relying on gate-change-approval: off and
 // unapproved is non-nil, it also stores the gate-definition files no human approved in
 // *unapproved, so Land can print the same line in its own summary.
-func (m *Manager) mergeLocal(taskID string, requireVerdict bool, unapproved *[]string) (string, error) {
+//
+// landBase is, for a Land, the commit the land rebased or fast-forwarded the worker onto,
+// verified against origin when it came from the remote-tracking ref (see verifyRemoteBase), and
+// "" for a direct merge. The verdict's review may start from it as well as from the default
+// branch (see verdictBaseCovers).
+func (m *Manager) mergeLocal(taskID string, requireVerdict bool, landBase string, unapproved *[]string) (string, error) {
 	t, ok, err := m.Store.GetTask(context.Background(), taskID)
 	if err != nil || !ok {
 		return "", fmt.Errorf("unknown task %q", taskID)
@@ -279,6 +284,9 @@ func (m *Manager) mergeLocal(taskID string, requireVerdict bool, unapproved *[]s
 		}
 		if v.Overall != review.Pass {
 			return "", fmt.Errorf("trust gate: the review verdict for %q is %q, not pass; resolve the blocking findings and re-record", taskID, v.Overall)
+		}
+		if err := verdictBaseCovers(repo, taskID, v.BaseSHA, base.SHA, landBase); err != nil {
+			return "", err
 		}
 		// A gated merge may not change the gate's own definition unless the approval says so
 		// by name. Checked against the COMMITTED diff, so reverting the bytes in the worktree
@@ -444,6 +452,9 @@ func (m *Manager) mergeLocal(taskID string, requireVerdict bool, unapproved *[]s
 	if cv.ReviewedSHA != workerHead {
 		return "", fmt.Errorf("trust gate: the verdict for %q covers %s but the worker is now %s; re-review and re-record", taskID, short(cv.ReviewedSHA), short(workerHead))
 	}
+	if err := verdictBaseCovers(repo, taskID, cv.BaseSHA, base.SHA, landBase); err != nil {
+		return "", err
+	}
 	// Attribute the audit to the approval token's provenance, and fail closed if it is
 	// unknown (a legacy token with no provenance must not merge through the gate).
 	var approver string
@@ -498,6 +509,42 @@ func (m *Manager) mergeLocal(taskID string, requireVerdict bool, unapproved *[]s
 		out += "\n  " + w
 	}
 	return out, nil
+}
+
+// verdictBaseCovers refuses a verdict whose review did not start from the branch this merge
+// fast-forwards. verdictBase is the commit the reviewers' diff was staged against, recorded on
+// the verdict; defSHA is the default branch as the gate resolved it for this merge; landBase is
+// the land's own base, or "" for a direct merge.
+//
+// The reviewers saw verdictBase...head. Everything the fast-forward brings in beyond that was
+// already in verdictBase, so verdictBase has to be something the merge would bring in anyway:
+// the default branch or one of its ancestors, or, for a land whose base is ahead of the local
+// branch (origin had commits the local branch did not), that base or one of its ancestors. A
+// worker that moves the base ref to its own head while the reviewers are prepared, then moves it
+// back, leaves a verdictBase that is its own head, which neither contains, and the merge is
+// refused. A verdict with no base recorded predates the record and is refused too.
+func verdictBaseCovers(repo, taskID, verdictBase, defSHA, landBase string) error {
+	if verdictBase == "" {
+		return fmt.Errorf("trust gate: the verdict for %q records no review base (it was recorded before ttorch pinned one); re-run 'ttorch trust prep %s', review, and 'ttorch trust record %s'", taskID, taskID, taskID)
+	}
+	contains := func(tip string) bool {
+		return tip != "" && (verdictBase == tip || worktree.IsAncestor(repo, verdictBase, tip))
+	}
+	if contains(defSHA) {
+		return nil
+	}
+	if contains(landBase) && worktree.IsAncestor(repo, defSHA, landBase) {
+		return nil
+	}
+	if landBase == "" && worktree.IsAncestor(repo, defSHA, verdictBase) {
+		// A base ahead of the local branch is either origin with commits the local branch has
+		// not pulled, which a land fetches and checks, or the worker's own commits. The message
+		// cannot tell them apart, so it names both.
+		return fmt.Errorf("trust gate: the verdict for %q was reviewed against %s, which the default branch at %s does not contain. If that commit is on origin ahead of the local branch, land it with 'ttorch land %s', which checks it against origin; otherwise the reviewers' diff did not start from the branch this merges into, so re-run 'ttorch trust prep %s', review, and 'ttorch trust record %s'",
+			taskID, short(verdictBase), short(defSHA), taskID, taskID, taskID)
+	}
+	return fmt.Errorf("trust gate: the verdict for %q was reviewed against %s, which the default branch at %s does not contain, so the reviewers' diff did not start from the branch this merges into; re-run 'ttorch trust prep %s', review, and 'ttorch trust record %s'",
+		taskID, short(verdictBase), short(defSHA), taskID, taskID)
 }
 
 // gateChangePolicyWarning is readGateChangePolicy's warning for the default branch as it
@@ -775,8 +822,8 @@ func splitApprovalPayload(data string) (by, sha string, gateChangeFiles []string
 // post-merge verification abort path (a clean local fast-forward can never land a tree
 // different from the validated commit, so the only way to drive the mismatch alarm in-process
 // is to inject one).
-var landIntegrate = func(m *Manager, t db.Task, mode string, requireVerdict bool, rebasedHead string) (string, []string, error) {
-	return m.integrate(t, mode, requireVerdict, rebasedHead)
+var landIntegrate = func(m *Manager, t db.Task, spec landSpec, prep landPrepResult) (string, []string, error) {
+	return m.integrate(t, spec, prep)
 }
 
 // landRebase rebases the worker's worktree onto base during landPrep. It is a package-level
@@ -944,6 +991,32 @@ func landBase(repo, def string, hasOrigin bool) (ref, sha string, err error) {
 	return ref, sha, nil
 }
 
+// verifyRemoteBase checks, when landBase chose refs/remotes/origin/<def> because it is ahead of
+// the local branch, that origin itself holds that commit (worktree.RemoteBranchSHA). The
+// remote-tracking ref is a local ref every worker's worktree can write, and the land's fetch
+// resets it only when the fetch covers it. A land that took it on trust would rebase onto, and
+// accept a verdict reviewed against, a commit origin never had. When the local branch is the
+// base, or the two agree, there is nothing to check.
+func verifyRemoteBase(repo, def, ref, sha string) error {
+	if ref != "refs/remotes/origin/"+def {
+		return nil
+	}
+	if local, err := worktree.ResolveCommit(repo, "refs/heads/"+def); err == nil && local == sha {
+		return nil
+	}
+	remote, ok, err := worktree.RemoteBranchSHA(repo, "origin", def)
+	if err != nil {
+		return fmt.Errorf("could not ask origin which commit %s is at: %w", def, err)
+	}
+	if !ok {
+		remote = "nothing"
+	}
+	if remote != sha {
+		return fmt.Errorf("refs/remotes/origin/%s is at %s but origin reports %s; refusing to land onto a remote-tracking ref that does not match origin", def, short(sha), short(remote))
+	}
+	return nil
+}
+
 // landPrepResult is the committed-object output of landPrep that landCommit needs: the rebase
 // base and its sha (for the post-merge verify), and the worker HEAD before and after the
 // rebase (the after is the validated, staged commit that will fast-forward).
@@ -995,13 +1068,18 @@ func (m *Manager) landPrep(t db.Task, spec landSpec, fetchMu *sync.Mutex) (landP
 	if err != nil {
 		return zero, fmt.Errorf("land: %w", err)
 	}
+	if err := verifyRemoteBase(spec.repo, spec.def, base, baseSha); err != nil {
+		return zero, fmt.Errorf("land: %w", err)
+	}
 	preRebase, err := worktree.Head(spec.wt)
 	if err != nil {
 		return zero, err
 	}
 	rebasedHead := preRebase
 	if !worktree.IsAncestor(spec.repo, baseSha, preRebase) {
-		if err := landRebase(spec.wt, base); err != nil {
+		// Onto the commit landBase resolved and verifyRemoteBase checked, not the ref again,
+		// which could have moved since.
+		if err := landRebase(spec.wt, baseSha); err != nil {
 			// Genuine rebase conflict: ALWAYS abort and report — never blind-merge a conflicted
 			// result. Tag the returned error with ErrLandRebaseConflict (via a second %w) so the
 			// autonomous land pass can recognise it and surface an actionable land_rebase_conflict
@@ -1063,7 +1141,7 @@ func (m *Manager) landPrep(t db.Task, spec landSpec, fetchMu *sync.Mutex) (landP
 	// MergeLocal remains the consuming authority.
 	if spec.mode != "pr" {
 		if spec.gated && rebasedHead != preRebase {
-			if _, err := m.carryVerdictForward(t, base, rebasedHead); err != nil {
+			if _, err := m.carryVerdictForward(t, base, baseSha, rebasedHead); err != nil {
 				return zero, err
 			}
 		}
@@ -1106,7 +1184,7 @@ func (m *Manager) landCommit(t db.Task, spec landSpec, prep landPrepResult) (str
 	// opens + merges a PR (GitHub's review/branch-protection is the gate); every other mode does
 	// an approval-gated local fast-forward via MergeLocal, whose approval and (trusted /
 	// --require-verdict) verdict checks are never bypassed.
-	landed, unapprovedGateChange, err := landIntegrate(m, t, spec.mode, spec.requireVerdict, prep.rebasedHead)
+	landed, unapprovedGateChange, err := landIntegrate(m, t, spec, prep)
 	if err != nil {
 		return "", err
 	}
@@ -1190,7 +1268,7 @@ func (m *Manager) securityAuditNote(taskID, landedSHA string, gated bool) string
 // the usual re-gate/re-approve demand. MergeLocal re-validates and re-consumes the re-pinned
 // verdict against the commit it fast-forwards, so carry-forward is an optimization, never the
 // authority.
-func (m *Manager) carryVerdictForward(t db.Task, base, rebasedHead string) (bool, error) {
+func (m *Manager) carryVerdictForward(t db.Task, base, baseSha, rebasedHead string) (bool, error) {
 	v, ok, err := m.Store.GetVerdict(context.Background(), t.ID)
 	if err != nil {
 		return false, fmt.Errorf("land: could not read the verdict for %q to carry it forward: %w", t.ID, err)
@@ -1204,7 +1282,7 @@ func (m *Manager) carryVerdictForward(t db.Task, base, rebasedHead string) (bool
 	if v.DiffID == "" {
 		return false, nil // a verdict recorded before content identities — fail safe to re-gate
 	}
-	patch, err := mergeBaseDiff(t.Worktree, base, rebasedHead)
+	patch, err := mergeBaseDiff(t.Worktree, baseSha, rebasedHead)
 	if err != nil {
 		return false, fmt.Errorf("land: could not compute the rebased diff for %q to carry its verdict forward: %w", t.ID, err)
 	}
@@ -1228,6 +1306,8 @@ func (m *Manager) carryVerdictForward(t db.Task, base, rebasedHead string) (bool
 	reviewedSHA := v.ReviewedSHA
 	approver := v.ApprovedBy
 	v.ReviewedSHA = rebasedHead
+	// The diff now starts from the base the land rebased onto, which contains the old one.
+	v.BaseSHA = baseSha
 	if approver == "auto" || approver == "human" {
 		v.ApprovalSHA = rebasedHead
 	}
@@ -1281,19 +1361,19 @@ func (m *Manager) gateCoversRebased(t db.Task, rebasedHead string, gated bool) e
 }
 
 // integrate performs Land's mode-appropriate merge and returns the local default tip and the
-// gate-definition files the local merge changed with no human approval.
-func (m *Manager) integrate(t db.Task, mode string, requireVerdict bool, rebasedHead string) (string, []string, error) {
+// gate-definition files the local merge changed with no human approval. The branch it merges
+// into is the land's own (spec.def, the recorded default branch for a gated land).
+func (m *Manager) integrate(t db.Task, spec landSpec, prep landPrepResult) (string, []string, error) {
 	repo := t.Project
-	def := worktree.DefaultBranch(repo)
-	if mode == "pr" {
-		head, err := m.integratePR(t, def, rebasedHead)
+	if spec.mode == "pr" {
+		head, err := m.integratePR(t, spec.def, prep.rebasedHead)
 		return head, nil, err
 	}
 	// local / validated / trusted: an approval-gated local fast-forward. MergeLocal
 	// enforces the approval token and (in trusted mode or with --require-verdict) the
 	// adversarial-review verdict + a fresh green validate; Land never bypasses those.
 	var unapproved []string
-	if _, err := m.mergeLocal(t.ID, requireVerdict, &unapproved); err != nil {
+	if _, err := m.mergeLocal(t.ID, spec.requireVerdict, prep.baseSha, &unapproved); err != nil {
 		return "", nil, fmt.Errorf("land: local merge gate refused %q: %w", t.ID, err)
 	}
 	head, err := worktree.Head(repo)

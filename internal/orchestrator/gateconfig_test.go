@@ -27,6 +27,7 @@ import (
 	"github.com/nution101/ttorch/internal/approval"
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/projectinit"
+	"github.com/nution101/ttorch/internal/review"
 	"github.com/nution101/ttorch/internal/worktree"
 )
 
@@ -3797,5 +3798,248 @@ func TestGate_RefusesWithoutARecordedDefaultBranch(t *testing.T) {
 	}
 	if _, err := m.TrustPrep("nb1"); err == nil || !strings.Contains(err.Error(), "refs/heads/gone") {
 		t.Fatalf("prep with a recorded branch that has no ref: %v, want a refusal naming refs/heads/gone", err)
+	}
+}
+
+// movedBaseRepo builds a trusted repository whose default branch is develop, recorded at
+// registration, with a worker "id" that has committed one ordinary change. With origin set it
+// also has an origin in sync with develop. It returns the manager, the repo, the worker's
+// worktree, the worker's head, and develop's tip.
+func movedBaseRepo(t *testing.T, tag, id string, origin bool) (m *Manager, repo, wt, head, def string) {
+	t.Helper()
+	m, repo = gateChangeApprovalRepo(t, tag, "trusted", "")
+	gitIn(t, repo, "branch", "-m", "main", "develop")
+	if origin {
+		bare := t.TempDir()
+		gitIn(t, bare, "init", "--bare", "-q", "-b", "develop")
+		gitIn(t, repo, "remote", "add", "origin", bare)
+		gitIn(t, repo, "push", "-q", "origin", "develop")
+		gitIn(t, repo, "fetch", "-q", "origin")
+	}
+	task, err := m.Spawn(id, repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = m.Teardown(id, true) })
+	wt = task.Worktree
+	head = commitFeature(t, wt, "feature.txt", "worker change\n")
+	def = gitIn(t, repo, "rev-parse", "refs/heads/develop")
+	return m, repo, wt, head, def
+}
+
+// reviewAgainstMovedBase runs the gate's prep and record for id while ref, a ref the worker has
+// moved to its own head, is in place, and asserts the premise: the reviewers were shown an empty
+// diff and the record passed and auto-approved.
+func reviewAgainstMovedBase(t *testing.T, m *Manager, id, head string) {
+	t.Helper()
+	dir, err := m.TrustPrep(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	patch, err := os.ReadFile(filepath.Join(dir, "diff.patch"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(patch), "feature.txt") {
+		t.Fatalf("setup: the moved ref was meant to empty the reviewers' diff; diff.patch:\n%s", patch)
+	}
+	writeReportsForPreppedInputs(t, dir, head, nil)
+	v, err := m.TrustRecord(id, "", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Overall != review.Pass || !approval.Valid(m.P.ApprovalFile(id)) {
+		t.Fatalf("setup: the record over the empty diff was meant to pass and auto-approve: %+v", v)
+	}
+}
+
+// TestMergeLocal_VerdictFromAMovedDefaultBranchCannotMerge is the rest of the reported sequence,
+// with the branch now recorded. A worker can still move refs/heads/<default> itself from its
+// worktree: pointed at the worker's head while the reviewers are prepared, it empties their
+// diff, and the record passes. The worker then puts the branch back. The verdict records the
+// base its diff started from, the worker's own head, and the default branch does not contain it,
+// so the merge is refused.
+func TestMergeLocal_VerdictFromAMovedDefaultBranchCannotMerge(t *testing.T) {
+	m, repo, wt, head, def := movedBaseRepo(t, "movedlocal", "ml1", false)
+	gitIn(t, wt, "update-ref", "refs/heads/develop", head)
+	reviewAgainstMovedBase(t, m, "ml1", head)
+	gitIn(t, wt, "update-ref", "refs/heads/develop", def)
+
+	_, err := m.MergeLocal("ml1", false)
+	if err == nil || !strings.Contains(err.Error(), "reviewed against") {
+		t.Fatalf("a verdict whose review started at the worker's own head must not merge, got: %v", err)
+	}
+	if got := gitIn(t, repo, "rev-parse", "refs/heads/develop"); got != def {
+		t.Fatalf("develop moved to %s; the unreviewed change must not have merged", got)
+	}
+}
+
+// TestLand_RefusesARemoteTrackingRefTheFetchDidNotSet: the reviewers' base prefers
+// refs/remotes/origin/develop when it is ahead of the local branch, and prep's fetch resets that
+// ref only when the fetch covers it. With the fetch refspec narrowed (standing in for any way of
+// keeping a moved ref in place), a worker's move of the ref to its own head survives both the
+// prep and the land. Without a check, the land would take that ref as its base, the verdict's
+// base would be inside it, and the change would merge unreviewed. The land has to notice that
+// the ref is not what origin holds.
+func TestLand_RefusesARemoteTrackingRefTheFetchDidNotSet(t *testing.T) {
+	m, repo, wt, head, def := movedBaseRepo(t, "unfetched", "uf1", true)
+	gitIn(t, wt, "config", "remote.origin.fetch", "+refs/heads/elsewhere/*:refs/remotes/origin/elsewhere/*")
+	gitIn(t, wt, "update-ref", "refs/remotes/origin/develop", head)
+	reviewAgainstMovedBase(t, m, "uf1", head)
+
+	_, err := m.Land("uf1", false)
+	if err == nil || !strings.Contains(err.Error(), "origin reports") {
+		t.Fatalf("a remote-tracking ref origin does not hold must not be the land's base, got: %v", err)
+	}
+	if got := gitIn(t, repo, "rev-parse", "refs/heads/develop"); got != def {
+		t.Fatalf("develop moved to %s; the unreviewed change must not have landed", got)
+	}
+}
+
+// TestLand_RebaseOntoAnOriginAheadOfLocalStillLands: the base check must leave the ordinary land
+// alone. Here origin is ahead of the local default branch when the worker is cut and reviewed,
+// and advances again before the land. The land rebases onto the new origin tip, carries the
+// verdict and its base forward over the unchanged diff, and fast-forwards the local branch past
+// both origin commits.
+func TestLand_RebaseOntoAnOriginAheadOfLocalStillLands(t *testing.T) {
+	m, repo := gateChangeApprovalRepo(t, "originahead", "trusted", "")
+	originAheadRepo(t, repo)
+	task, err := m.Spawn("oa1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = m.Teardown("oa1", true) }()
+	head := commitFeature(t, task.Worktree, "feature.txt", "worker change\n")
+	dir, err := m.TrustPrep("oa1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeReportsForPreppedInputs(t, dir, head, nil)
+	if v, err := m.TrustRecord("oa1", "", time.Minute); err != nil || v.Overall != review.Pass {
+		t.Fatalf("record: %+v, %v", v, err)
+	}
+	scratch := filepath.Join(t.TempDir(), "scratch")
+	gitIn(t, repo, "worktree", "add", "-q", "--detach", scratch, "refs/remotes/origin/main")
+	if err := os.WriteFile(filepath.Join(scratch, "other.txt"), []byte("someone else\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, scratch, "add", "other.txt")
+	gitIn(t, scratch, "commit", "-q", "-m", "another change on origin")
+	gitIn(t, scratch, "push", "-q", "origin", "HEAD:refs/heads/main")
+	gitIn(t, repo, "worktree", "remove", "--force", scratch)
+
+	out, err := m.Land("oa1", false)
+	if err != nil {
+		t.Fatalf("an ordinary rebased land onto an origin ahead of local must still land: %v", err)
+	}
+	if !strings.Contains(out, "rebased") {
+		t.Fatalf("setup: the land was meant to rebase, got: %s", out)
+	}
+	for _, f := range []string{"feature.txt", "other.txt", "CHANGELOG.md"} {
+		if _, ok := worktree.ShowFile(repo, "refs/heads/main", f); !ok {
+			t.Fatalf("main must carry %s after the land", f)
+		}
+	}
+}
+
+// TestMergeLocal_VerdictBaseIsTheOnePrepStaged: the worker can also put the branch back between
+// the prep and the record, so that the base resolved at record time is the real one. The
+// verdict's base is the one prep staged the reviewers' diff against and stored, not a second
+// read, so the merge is still refused.
+func TestMergeLocal_VerdictBaseIsTheOnePrepStaged(t *testing.T) {
+	m, repo, wt, head, def := movedBaseRepo(t, "prepbase", "pb1", false)
+	gitIn(t, wt, "update-ref", "refs/heads/develop", head)
+	dir, err := m.TrustPrep("pb1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, wt, "update-ref", "refs/heads/develop", def)
+	writeReportsForPreppedInputs(t, dir, head, nil)
+	if _, err := m.TrustRecord("pb1", "", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	v, ok, err := m.Store.GetVerdict(context.Background(), "pb1")
+	if err != nil || !ok || v.BaseSHA != head {
+		t.Fatalf("the verdict must record the base prep staged (%s), got %+v ok=%v err=%v", short(head), v, ok, err)
+	}
+	if err := approval.Grant(m.P.ApprovalFile("pb1"), time.Minute, approvalPayload("auto", head, nil)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.MergeLocal("pb1", false); err == nil || !strings.Contains(err.Error(), "reviewed against") {
+		t.Fatalf("a verdict over the prep's empty diff must not merge, got: %v", err)
+	}
+	if got := gitIn(t, repo, "rev-parse", "refs/heads/develop"); got != def {
+		t.Fatalf("develop moved to %s", got)
+	}
+}
+
+// TestMergeLocal_VerdictWithNoReviewBaseIsRefused: a verdict recorded before the base was
+// pinned carries none, and nothing says what its reviewers were shown, so it cannot merge.
+func TestMergeLocal_VerdictWithNoReviewBaseIsRefused(t *testing.T) {
+	m, repo := gateChangeApprovalRepo(t, "nobase", "trusted", "")
+	task, err := m.Spawn("nv1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = m.Teardown("nv1", true) }()
+	head := commitFeature(t, task.Worktree, "feature.txt", "worker change\n")
+	writeReviewReports(t, m.P.ReviewInputsDir("nv1"), head, nil)
+	if _, err := m.TrustRecord("nv1", "", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	v, ok, err := m.Store.GetVerdict(context.Background(), "nv1")
+	if err != nil || !ok || v.BaseSHA == "" {
+		t.Fatalf("setup: the record must pin a base: %+v ok=%v err=%v", v, ok, err)
+	}
+	v.BaseSHA = ""
+	if err := m.Store.SaveVerdict(context.Background(), v); err != nil {
+		t.Fatal(err)
+	}
+	defHead := gitIn(t, repo, "rev-parse", "refs/heads/main")
+	if _, err := m.MergeLocal("nv1", false); err == nil || !strings.Contains(err.Error(), "records no review base") {
+		t.Fatalf("a verdict with no review base must be refused, got: %v", err)
+	}
+	if gitIn(t, repo, "rev-parse", "refs/heads/main") != defHead {
+		t.Fatal("nothing may merge on a verdict with no review base")
+	}
+}
+
+// TestVerdictBaseCovers walks the rule on a small history: main at c1, origin ahead at c2, and a
+// worker's head w on top of c2.
+func TestVerdictBaseCovers(t *testing.T) {
+	repo := newRepoMain(t)
+	c1 := gitIn(t, repo, "rev-parse", "HEAD")
+	gitIn(t, repo, "commit", "-q", "--allow-empty", "-m", "c2")
+	c2 := gitIn(t, repo, "rev-parse", "HEAD")
+	gitIn(t, repo, "commit", "-q", "--allow-empty", "-m", "w")
+	head := gitIn(t, repo, "rev-parse", "HEAD")
+	gitIn(t, repo, "reset", "-q", "--hard", c1)
+	for _, c := range []struct {
+		name                     string
+		verdictBase, def, landAt string
+		want                     string // "" passes; otherwise a substring of the refusal
+	}{
+		{"base is the default branch", c1, c1, "", ""},
+		{"base is an ancestor of the default branch", c1, c2, "", ""},
+		{"land base ahead of local contains the base", c2, c1, c2, ""},
+		{"land base contains an older base", c1, c1, c2, ""},
+		{"direct merge of a base ahead of local", c2, c1, "", "ttorch land"},
+		{"base is the worker's own head", head, c1, "", "reviewed against"},
+		{"base is the worker's own head, land base below it", head, c1, c2, "reviewed against"},
+		{"no base recorded", "", c1, c2, "records no review base"},
+		{"base is not a commit", "0123456789012345678901234567890123456789", c1, c2, "reviewed against"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			err := verdictBaseCovers(repo, "vc1", c.verdictBase, c.def, c.landAt)
+			if c.want == "" {
+				if err != nil {
+					t.Fatalf("want a pass, got %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("want a refusal containing %q, got %v", c.want, err)
+			}
+		})
 	}
 }

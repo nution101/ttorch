@@ -151,7 +151,8 @@ func TestCarryVerdictForward_CarriesHumanApprovalAndVerdict(t *testing.T) {
 	}
 
 	reloaded, _, _ := m.Store.GetTask(context.Background(), "cu1")
-	carried, err := m.carryVerdictForward(reloaded, def, rebased)
+	defSha := gitIn(t, repo, "rev-parse", "refs/heads/"+def)
+	carried, err := m.carryVerdictForward(reloaded, def, defSha, rebased)
 	if err != nil {
 		t.Fatalf("carryVerdictForward should carry a clean human-approved rebase: %v", err)
 	}
@@ -163,6 +164,10 @@ func TestCarryVerdictForward_CarriesHumanApprovalAndVerdict(t *testing.T) {
 	v, ok, _ := m.Store.GetVerdict(context.Background(), "cu1")
 	if !ok || v.ReviewedSHA != rebased || v.ApprovalSHA != rebased || v.ApprovedBy != "human" {
 		t.Fatalf("the carried verdict must pin the rebased commit as human: %+v ok=%v", v, ok)
+	}
+	// Its review base moves to the base the rebase went onto, which contains the old one.
+	if v.BaseSHA != defSha {
+		t.Fatalf("the carried verdict must record the rebase's base %s as its review base, got %s", short(defSha), short(v.BaseSHA))
 	}
 	// carryVerdictForward re-pins JUST the verdict; the derived token is re-minted at the gate
 	// check, so the pre-carry human token still pins the ORIGINAL commit at this point.

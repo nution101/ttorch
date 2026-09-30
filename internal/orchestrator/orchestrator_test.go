@@ -2815,7 +2815,7 @@ func TestLand_PostMergeVerifyMismatchAborts(t *testing.T) {
 	// commit than the validated one.
 	orig := landIntegrate
 	t.Cleanup(func() { landIntegrate = orig })
-	landIntegrate = func(_ *Manager, _ db.Task, _ string, _ bool, _ string) (string, []string, error) {
+	landIntegrate = func(_ *Manager, _ db.Task, _ landSpec, _ landPrepResult) (string, []string, error) {
 		if err := os.WriteFile(filepath.Join(repo, "tampered.txt"), []byte("x\n"), 0o644); err != nil {
 			return "", nil, err
 		}
