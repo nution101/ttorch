@@ -246,6 +246,14 @@ func (m *Manager) mergeLocal(taskID string, requireVerdict bool, landBase string
 		}
 		base, def = b, b.Name
 	}
+	// The default branch no longer containing the last land's commit is a warning, not a
+	// refusal: it is recorded in the audit log now and printed with the merge's result.
+	lastLanded := ""
+	if gated {
+		if lastLanded = m.lastLandedWarning(repo, base); lastLanded != "" {
+			m.audit(fmt.Sprintf("last-landed task=%s repo=%s %s", taskID, repo, lastLanded))
+		}
+	}
 	// The gate-definition files this merge changes, comma-separated, when it changes any and
 	// the approval explicitly authorized every one of them or the repo waives that approval.
 	// Empty otherwise. It is recorded in the audit line so a merge that altered the gate is
@@ -432,6 +440,7 @@ func (m *Manager) mergeLocal(taskID string, requireVerdict bool, landBase string
 		// lingering token is pinned to the just-merged commit, so the most it could ever
 		// re-authorize is re-merging that identical commit (a no-op), never unreviewed content.
 		m.consumeApproval(taskID)
+		m.recordLastLanded(repo, workerHead)
 		m.audit(fmt.Sprintf("merge-local task=%s repo=%s %s -> %s", taskID, repo, def, short(workerHead)))
 		m.recordDelivered(taskID, db.EventDelivered, fmt.Sprintf("%s -> %s", def, short(workerHead)))
 		return fmt.Sprintf("fast-forwarded %s to %s for task %s", def, short(workerHead), taskID), nil
@@ -489,6 +498,7 @@ func (m *Manager) mergeLocal(taskID string, requireVerdict bool, landBase string
 	// advance moves its HEAD off the pinned sha and is refused, so unreviewed content never rides.
 	m.consumeApproval(taskID)
 	m.consumeVerdict(taskID)
+	m.recordLastLanded(repo, workerHead)
 	payload := fmt.Sprintf("%s -> %s gate=verdict approver=%s", def, short(workerHead), approver)
 	if gateChange != "" {
 		payload += " gate-change=" + gateChange
@@ -507,6 +517,9 @@ func (m *Manager) mergeLocal(taskID string, requireVerdict bool, landBase string
 	}
 	if w := m.gateChangePolicyWarning(repo); w != "" {
 		out += "\n  " + w
+	}
+	if lastLanded != "" {
+		out += "\n  " + lastLanded
 	}
 	return out, nil
 }
@@ -1180,6 +1193,14 @@ func (m *Manager) stagePrepValidate(taskID, sha string, results []validate.Resul
 // (else another landing advanced it and this prep is stale — re-prep first); the single Land,
 // with no concurrent lander, calls it directly.
 func (m *Manager) landCommit(t db.Task, spec landSpec, prep landPrepResult) (string, error) {
+	// Taken before the integration moves the branch: the gated merge inside it audits the same
+	// warning, and this copy is for the land's own summary.
+	lastLanded := ""
+	if spec.gated {
+		if gb, err := m.gateBase(spec.repo); err == nil {
+			lastLanded = m.lastLandedWarning(spec.repo, gb)
+		}
+	}
 	// (1) Integrate, honoring the delivery mode and the existing merge gates. pr mode pushes +
 	// opens + merges a PR (GitHub's review/branch-protection is the gate); every other mode does
 	// an approval-gated local fast-forward via MergeLocal, whose approval and (trusted /
@@ -1211,6 +1232,9 @@ func (m *Manager) landCommit(t db.Task, spec landSpec, prep landPrepResult) (str
 	}
 	if w := m.gateChangePolicyWarning(spec.repo); w != "" {
 		out += "\n  " + w
+	}
+	if lastLanded != "" {
+		out += "\n  " + lastLanded
 	}
 	// Surface the security-everywhere audit status. This is purely ADVISORY and never
 	// blocks: a gated land (trusted / --require-verdict) already ran the full review gate
@@ -1419,7 +1443,11 @@ func (m *Manager) integratePR(t db.Task, def, rebasedHead string) (string, error
 	// typed, non-actionable `merged` event (the PR-path counterpart of MergeLocal's
 	// `delivered`, §3.4). Best-effort — the merge is already irreversible.
 	m.recordDelivered(t.ID, db.EventMerged, fmt.Sprintf("pr merged: %s -> %s", branch, def))
-	return worktree.Head(repo)
+	head, err := worktree.Head(repo)
+	if err == nil {
+		m.recordLastLanded(repo, head)
+	}
+	return head, err
 }
 
 // verifyLanded asserts the worker's reviewed changes landed intact on the default branch and

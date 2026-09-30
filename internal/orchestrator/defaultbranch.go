@@ -111,6 +111,33 @@ func (m *Manager) gateBase(repo string) (worktree.GateBase, error) {
 	return b, nil
 }
 
+// lastLandedWarning returns a warning when base, the default branch as the gate resolved it, no
+// longer contains the commit the last successful land left it at (projects.last_landed_sha), and
+// "" otherwise. A worker can move refs/heads/<default> itself from its worktree, and nothing in
+// ttorch prevents that; this is how the move is noticed when it drops a commit a land put there.
+// A move forward onto commits no land brought in still contains the last landed commit, so it
+// is not noticed.
+func (m *Manager) lastLandedWarning(repo string, base worktree.GateBase) string {
+	p, ok, err := m.Store.GetProjectByRepo(context.Background(), repo)
+	if err != nil || !ok || p.LastLandedSHA == "" {
+		return ""
+	}
+	if p.LastLandedSHA == base.SHA || worktree.IsAncestor(repo, p.LastLandedSHA, base.SHA) {
+		return ""
+	}
+	return fmt.Sprintf("warning: %s is at %s, which does not contain %s, the commit the last land left it at; something other than a ttorch land moved the branch",
+		base.Name, short(base.SHA), short(p.LastLandedSHA))
+}
+
+// recordLastLanded records sha as the commit a successful merge or land left repo's default
+// branch at. Best-effort, like recordDelivered: the merge has happened, and a failure only
+// costs the next gate run its lastLandedWarning.
+func (m *Manager) recordLastLanded(repo, sha string) {
+	if _, err := m.Store.SetProjectLastLanded(context.Background(), repo, sha); err != nil {
+		fmt.Fprintf(os.Stderr, "ttorch: could not record the last landed commit for %s: %v\n", repo, err)
+	}
+}
+
 // defaultBranch is the default branch for the paths that are not gate reads: the recorded one
 // when there is one, else worktree.DefaultBranch's guess.
 func (m *Manager) defaultBranch(repo string) string {

@@ -4043,3 +4043,51 @@ func TestVerdictBaseCovers(t *testing.T) {
 		})
 	}
 }
+
+// TestLand_WarnsWhenTheDefaultBranchLostTheLastLandedCommit: a worker can move refs/heads/main
+// itself from its worktree, and nothing prevents that. Each land records where it left the
+// branch, and when the branch no longer contains that commit the next gated land warns, in its
+// output and the audit log, without refusing.
+func TestLand_WarnsWhenTheDefaultBranchLostTheLastLandedCommit(t *testing.T) {
+	m, repo := gateChangeApprovalRepo(t, "lastlanded", "trusted", "")
+	land := func(id, file string) (string, db.Task) {
+		t.Helper()
+		task, err := m.Spawn(id, repo, false, "sleep 60")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _, _ = m.Teardown(id, true) })
+		head := commitFeature(t, task.Worktree, file, "change\n")
+		dir, err := m.TrustPrep(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeReportsForPreppedInputs(t, dir, head, nil)
+		if _, err := m.TrustRecord(id, "", time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		out, err := m.Land(id, false)
+		if err != nil {
+			t.Fatalf("land %s: %v", id, err)
+		}
+		return out, task
+	}
+	first, task := land("ll1", "one.txt")
+	landed := gitIn(t, repo, "rev-parse", "refs/heads/main")
+	if p := projectByRepo(t, m.Store, task.Project); p.LastLandedSHA != landed {
+		t.Fatalf("the land must record where it left main (%s), got %q", short(landed), p.LastLandedSHA)
+	}
+	if strings.Contains(first, "does not contain") {
+		t.Fatalf("an ordinary land must not warn:\n%s", first)
+	}
+
+	// Something other than a land rewinds main past the landed commit.
+	gitIn(t, repo, "reset", "-q", "--hard", "HEAD~1")
+	second, _ := land("ll2", "two.txt")
+	if want := "does not contain " + short(landed); !strings.Contains(second, want) {
+		t.Fatalf("the next land must warn that main no longer contains %s, got:\n%s", short(landed), second)
+	}
+	if b, _ := os.ReadFile(m.P.AuditLog()); !strings.Contains(string(b), "last-landed task=ll2") {
+		t.Fatalf("the warning must be in the audit log:\n%s", b)
+	}
+}
