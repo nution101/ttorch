@@ -224,9 +224,12 @@ invalidates the verdict — re-prep, re-review, re-record.
   but not its exact form (a `*` bullet, a misspelled key, the line outside the ttorch block),
   each named in the refusal and the land output. The gate reads the line from the default
   branch only, so a worker's branch cannot add `required` to bind its own merge or remove it to
-  unbind its own. It reads the default branch as `refs/heads/<name>` at one commit per gate run,
-  so a worker's tag named `main` or a repointed `origin/HEAD` cannot supply the line, the
-  validate script, or the base of the diff you are shown. The blocking
+  unbind its own. It reads the default branch recorded for the project (set at registration,
+  changed only by the lead with `ttorch project set-branch`) as `refs/heads/<branch>` at one
+  commit per gate run, so no tag, local `main`, or repointed `origin/HEAD` a worker creates can
+  supply the line, the validate script, or the base of the diff you are shown. The verdict you
+  record is pinned to the commit that diff started from, and the merge refuses it when the
+  default branch does not contain that commit. The blocking
   refusals below stay blocking, and the setting has no effect outside trusted mode. With the
   approval off, a change to the reviewers or the validate step is authorized by the gate that
   change modifies, and your verdict is the only review it gets.

@@ -309,17 +309,43 @@ passing commit-pinned verdict plus a fresh green validate auto-mints the approva
   reviewers or the validate step is authorized by the gate that change modifies.
 - Every read the gate takes from the default branch (the gate-change-approval line,
   `.ttorch/validate.sh`, and the base of the gate-definition diff) is made at **one commit per
-  gate run**, which `worktree.ResolveGateBase` resolves as `refs/heads/<name>`, fully qualified.
-  Refs are shared with every worker's worktree, and git resolves a bare `main` to
-  `refs/tags/main` ahead of the branch, with only an "ambiguous refname" warning: a worker's tag
-  named `main` would otherwise supply the policy and the validate script, and at the worker's
-  own HEAD would empty the diff and hide every gate hit, blocking ones included. The name is
-  not taken from `refs/remotes/origin/HEAD` alone either, since a worker can repoint that: it is
-  the branch the repository's own checkout is on when that is the `origin/HEAD` target, `main`
-  or `master`, and otherwise `main`, then `master`, and resolution fails closed when neither
-  exists. `MergeLocal` refuses the fast-forward if the default branch has moved off that commit
-  since the gate read it. The base of the diff the reviewers are shown, the land's rebase base,
-  the post-merge verify and `ttorch review-diff` use the same name and fully qualified refs.
+  gate run**, on the **default branch recorded on the project row**, which
+  `worktree.ResolveGateBase` resolves as `refs/heads/<branch>`, fully qualified. The gate never
+  derives the branch. Refs and config are shared with every worker's worktree, so a worker can
+  repoint `refs/remotes/origin/HEAD`, create or move a local `main` or `master`, and tag any
+  name, and git resolves a bare `main` to `refs/tags/main` ahead of the branch with only an
+  "ambiguous refname" warning. A derived branch let a worker choose what the gate read: a
+  planted `main` at its own head emptied the reviewers' diff, and a stale `main` in a repository
+  whose default is another branch supplied an old policy. The branch is recorded when the
+  project is registered, from the lead's checkout (the branch `origin/HEAD` names when that
+  branch exists locally, else the branch the checkout is on): by `ttorch project add`, by
+  `ttorch init` for a registered project that has none, or by the first spawn, but only while no
+  worker has had a checkout of the repository. Only the lead changes it, with
+  `ttorch project set-branch <project> <branch>`, which refuses a worker context and a
+  non-interactive stdin. Projects registered before the branch was recorded are seeded once by
+  the same detection, and `ttorch update` and `ttorch doctor` print each seeded branch once, so
+  a wrong seed is seen. A project with no recorded branch, or one whose recorded branch has no
+  local ref, is refused at every gate read with the command that fixes it. `MergeLocal` refuses
+  the fast-forward if the branch has moved off that commit since the gate read it. The base of
+  the diff the reviewers are shown, the land's rebase base, the post-merge verify and
+  `ttorch review-diff` use the same branch and fully qualified refs.
+- The verdict records the **commit the reviewers' diff started from**. `TrustPrep` stores it in
+  the state database rather than the worker-writable inputs directory, `TrustRecord` pins it on the
+  verdict and computes the diff identity against it, and a land that rebases carries it forward
+  to the base it rebased onto. `MergeLocal` refuses a verdict whose base the default branch does
+  not contain, or, for a land whose base is ahead of the local branch, the land's base does not
+  contain. A worker that points the base at its own head while the reviewers are prepared
+  empties their diff, and the base it leaves on the verdict is its own head, so the merge is
+  refused after it puts the ref back. A land prefers `refs/remotes/origin/<branch>` over a local
+  branch behind it only when origin itself (`git ls-remote`) reports that commit. `ttorch fleet-sync`
+  fast-forwards the default branch to the commit origin reports, and only when the
+  remote-tracking ref matches it, and teardown's check for unmerged work compares fully
+  qualified refs.
+- A worker can still move `refs/heads/<default>` itself, since `git update-ref` works from any
+  linked worktree. That is a same-uid residual, detected rather than prevented: every successful
+  merge and land records the commit it left the branch at, and the next gated merge or land warns
+  and writes an audit line when the branch no longer contains it. A move forward onto commits
+  no land brought in still contains that commit, and is not detected.
 - An ungated `local`/`validated` merge **does not run the check at all**. That path lands an
   `AGENTS.md` change on a plain human approval with no gate-config check and no audit line
   naming it, and `AGENTS.md` is what `projectinit.ReadMode` reads to decide trusted mode — so

@@ -157,7 +157,8 @@ reference; this table covers the surface a lead and manager use day to day.
 | `ttorch tasks` | List tasks. Flags: `--project`, `--epic`, `--status s[,s…]`, `--tree` (projects→epics→phases→tasks), `--timeline <id>` |
 | `ttorch task add <id> --project <id>` | Create a pending backlog task (does not spawn). A supplied brief is lint-checked first. Flags: `--epic`, `--phase`, `--title`, `--touches`, `--brief`/`--brief-file`, `--citations-ref`, `--brief-lint-offline`, `--no-brief-lint` |
 | `ttorch brief-lint <file>` | Check a brief before it is stored on a task. Flags: `--repo`, `--remote`, `--ref`, `--citations-ref`, `--offline` |
-| `ttorch project add <repo>` / `project ls` | Register / list repos (caches delivery mode for display) |
+| `ttorch project add <repo>` / `project ls` | Register / list repos (caches delivery mode for display; records the default branch the trust gate reads) |
+| `ttorch project set-branch <project> <branch>` | Change the recorded default branch the trust gate reads (the lead's command; refuses a worker context) |
 | `ttorch epic add` / `epic ls` / `epic set-status` | Manage epics under a project |
 | `ttorch phase add` / `phase ls` / `phase set-status` | Manage phases under an epic |
 
@@ -195,7 +196,7 @@ reference; this table covers the surface a lead and manager use day to day.
 | `ttorch land <id>… \| --all [--require-verdict]` | One safe atomic delivery: fetch, rebase, re-validate, integrate per delivery mode, fast-forward. `--all` lands the whole done set concurrently |
 | `ttorch promote <id>` | Turn a scout task into a ship task |
 | `ttorch pr-check <id> <url>` | Arm a PR-merge check (surfaced by `ttorch watch`) |
-| `ttorch fleet-sync [dir]` / `recovery` | Refresh local default + prune gone branches / reconcile tracked tasks against live windows |
+| `ttorch fleet-sync [dir]` / `recovery` | Fast-forward the recorded default branch to the commit origin reports + prune gone branches / reconcile tracked tasks against live windows |
 | `ttorch learn "<lesson>"` / `learnings` | Record / list durable repo lessons |
 
 **Setup**
