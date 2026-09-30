@@ -908,8 +908,8 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 	// the lead need not read the diff — but ONLY when the worktree is clean (reviewed
 	// state == the committed HEAD that will merge), the worktree passes the gate's fresh
 	// validate resolved from the DEFAULT BRANCH (not the worker's own copy), and the diff
-	// does not touch the gate definition itself (changing the gate requires a human, unless
-	// the default branch sets gate-change-approval: off; a blocking hit is never minted). The
+	// does not touch the gate definition itself (changing the gate requires a human only where
+	// the repo's gate-change-approval policy requires it; a blocking hit is never minted). The
 	// token is bound to the reviewed sha so a later commit invalidates it. All of these
 	// are re-checked at the merge in MergeLocal — minting here is an optimization, not the
 	// authority. Any non-trusted mode leaves the verdict advisory.
@@ -917,7 +917,7 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 		base := worktree.DefaultBranch(t.Project)
 		clean, cerr := worktree.IsClean(t.Worktree)
 		hit, terr := diffTouchesGateConfig(t.Project, base, sha)
-		touched := hit != nil && (hit.Blocking || !gateChangeApprovalWaived(t.Project))
+		touched := hit != nil && (hit.Blocking || !readGateChangePolicy(t.Project).waived)
 		green := false
 		// A trusted auto-mint's green authority MUST be the default-branch gate script,
 		// never ecosystem detection on the worker's checkout (which the worker controls

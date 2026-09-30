@@ -3,6 +3,7 @@ package projectinit
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -115,10 +116,11 @@ func TestInit_PreservesUserContentAndUpdatesMode(t *testing.T) {
 	}
 }
 
-// TestInit_KeepsGateChangeApprovalLine: the gate-change-approval line lives in the managed
-// block, which Init regenerates. Re-running `ttorch init` (to refresh the block, or to change
-// the mode) must carry the lead's line through rather than silently dropping it. A fresh Init
-// writes no line, so the default stays required.
+// TestInit_KeepsGateChangeApprovalLine: Init writes no gate-change-approval line, so a fresh
+// repo gets the default (off), and the trusted block says how to turn the approval on. The
+// line lives in the managed block, which Init regenerates, so re-running `ttorch init` (to
+// refresh the block, or to change the mode) must carry the lead's line through. Dropping a
+// `required` line would silently remove the approval the lead asked for.
 func TestInit_KeepsGateChangeApprovalLine(t *testing.T) {
 	dir := t.TempDir()
 	agents := filepath.Join(dir, "AGENTS.md")
@@ -129,14 +131,14 @@ func TestInit_KeepsGateChangeApprovalLine(t *testing.T) {
 	if strings.Contains(string(got), gateChangeApprovalKey) {
 		t.Fatalf("a fresh Init must not write a gate-change-approval line:\n%s", got)
 	}
-	if !strings.Contains(string(got), "gate-change-approval: off") {
-		t.Fatalf("the trusted block must tell the lead how to turn the gate-change approval off:\n%s", got)
+	if !strings.Contains(string(got), "gate-change-approval: required") {
+		t.Fatalf("the trusted block must tell the lead how to turn the gate-change approval on:\n%s", got)
 	}
-	if p := ParseGateChangeApproval(string(got)); p != GateChangeApprovalRequired {
-		t.Fatalf("fresh Init: ParseGateChangeApproval = %q, want required", p)
+	if p, u := ParseGateChangeApproval(string(got)); p != GateChangeApprovalOff || u != nil {
+		t.Fatalf("fresh Init: ParseGateChangeApproval = %q, %q; want off with nothing unrecognized (the prose must not parse as a line)", p, u)
 	}
 
-	withLine := strings.Replace(string(got), "- delivery-mode: trusted\n", "- delivery-mode: trusted\n- gate-change-approval: off\n", 1)
+	withLine := strings.Replace(string(got), "- delivery-mode: trusted\n", "- delivery-mode: trusted\n- gate-change-approval: required\n", 1)
 	if err := os.WriteFile(agents, []byte(withLine), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -148,26 +150,26 @@ func TestInit_KeepsGateChangeApprovalLine(t *testing.T) {
 		if n := strings.Count(string(got), gateChangeApprovalKey); n != 1 {
 			t.Fatalf("re-Init(%s) left %d gate-change-approval lines, want 1:\n%s", mode, n, got)
 		}
-		if p := ParseGateChangeApproval(string(got)); p != GateChangeApprovalOff {
-			t.Fatalf("re-Init(%s) dropped the lead's policy: ParseGateChangeApproval = %q\n%s", mode, p, got)
+		if p, _ := ParseGateChangeApproval(string(got)); p != GateChangeApprovalRequired {
+			t.Fatalf("re-Init(%s) dropped the lead's required line: ParseGateChangeApproval = %q\n%s", mode, p, got)
 		}
 		if ReadMode(dir) != mode {
 			t.Fatalf("re-Init(%s): ReadMode = %q", mode, ReadMode(dir))
 		}
 	}
 
-	// A disagreeing pair is carried through as-is, so it still reads as required rather than
-	// being collapsed into one of its values.
-	conflict := strings.Replace(string(got), "- gate-change-approval: off\n", "- gate-change-approval: off\n- gate-change-approval: required\n", 1)
-	if err := os.WriteFile(agents, []byte(conflict), 0o644); err != nil {
+	// A misspelled value is carried through as-is, so it still reads as required and can still
+	// be named, rather than being dropped and turning the approval off.
+	typo := strings.Replace(string(got), "- gate-change-approval: required\n", "- gate-change-approval: requird\n", 1)
+	if err := os.WriteFile(agents, []byte(typo), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Init(dir, "trusted"); err != nil {
 		t.Fatal(err)
 	}
 	got, _ = os.ReadFile(agents)
-	if p := ParseGateChangeApproval(string(got)); p != GateChangeApprovalRequired {
-		t.Fatalf("re-Init turned a conflicting pair into %q:\n%s", p, got)
+	if p, u := ParseGateChangeApproval(string(got)); p != GateChangeApprovalRequired || !slices.Equal(u, []string{"requird"}) {
+		t.Fatalf("re-Init lost a misspelled line: ParseGateChangeApproval = %q, %q\n%s", p, u, got)
 	}
 }
 
@@ -205,6 +207,21 @@ func TestValidMode(t *testing.T) {
 	for _, m := range []string{"", "bogus", "PR", "trust"} {
 		if ValidMode(m) {
 			t.Errorf("ValidMode(%q) = true, want false", m)
+		}
+	}
+}
+
+// TestParseMode: the text reader agrees with ReadMode, and a symlink's committed text (a path,
+// with no managed block) reads as the pr default, as a missing file does.
+func TestParseMode(t *testing.T) {
+	for _, mode := range []string{"pr", "local", "validated", "trusted"} {
+		if got := ParseMode("x\n" + managedBlock(mode)); got != mode {
+			t.Errorf("ParseMode(block %s) = %q", mode, got)
+		}
+	}
+	for _, text := range []string{"", "docs/AGENTS.md", "- delivery-mode: trusted\n"} {
+		if got := ParseMode(text); got != "pr" {
+			t.Errorf("ParseMode(%q) = %q, want pr", text, got)
 		}
 	}
 }
@@ -247,38 +264,43 @@ func TestReadMode(t *testing.T) {
 	}
 }
 
-// TestParseGateChangeApproval pins the fail-closed reading of the gate-change-approval line:
-// only an exact `off` inside the managed block turns the requirement off, and every other
-// shape, including a line that disagrees with another, reads as required.
+// TestParseGateChangeApproval pins the reading of the gate-change-approval line. The approval
+// is off unless the managed block asks for it: an exact `required` turns it on, and so does
+// any value the reader does not recognize, which it also returns so the gate can name it. A
+// typo in a line someone added to require the approval must not leave it off.
 func TestParseGateChangeApproval(t *testing.T) {
 	block := func(lines ...string) string {
 		return "# notes\n\n" + markerBegin + "\n- delivery-mode: trusted\n" + strings.Join(lines, "\n") + "\n" + markerEnd + "\n"
 	}
 	for _, tc := range []struct {
 		name, text, want string
+		unrecognized     []string
 	}{
-		{"empty text", "", GateChangeApprovalRequired},
-		{"no managed block", "- gate-change-approval: off\n", GateChangeApprovalRequired},
-		{"block without the line", block(), GateChangeApprovalRequired},
-		{"off", block("- gate-change-approval: off"), GateChangeApprovalOff},
-		{"off with CRLF", strings.ReplaceAll(block("- gate-change-approval: off"), "\n", "\r\n"), GateChangeApprovalOff},
-		{"off indented", block("  - gate-change-approval:   off  "), GateChangeApprovalOff},
-		{"required", block("- gate-change-approval: required"), GateChangeApprovalRequired},
-		{"capitalized Off", block("- gate-change-approval: Off"), GateChangeApprovalRequired},
-		{"upper OFF", block("- gate-change-approval: OFF"), GateChangeApprovalRequired},
-		{"trailing comment", block("- gate-change-approval: off # for now"), GateChangeApprovalRequired},
-		{"empty value", block("- gate-change-approval:"), GateChangeApprovalRequired},
-		{"synonym", block("- gate-change-approval: no"), GateChangeApprovalRequired},
-		{"off twice", block("- gate-change-approval: off", "- gate-change-approval: off"), GateChangeApprovalOff},
-		{"off then required", block("- gate-change-approval: off", "- gate-change-approval: required"), GateChangeApprovalRequired},
-		{"garbage then off", block("- gate-change-approval: maybe", "- gate-change-approval: off"), GateChangeApprovalRequired},
-		{"off only outside the block", block() + "- gate-change-approval: off\n", GateChangeApprovalRequired},
-		{"off outside disagrees with nothing inside", "- gate-change-approval: off\n" + block("- gate-change-approval: required"), GateChangeApprovalRequired},
-		{"end marker before begin", markerEnd + "\n- gate-change-approval: off\n" + markerBegin + "\n", GateChangeApprovalRequired},
+		{"empty text", "", GateChangeApprovalOff, nil},
+		{"no managed block", "- gate-change-approval: required\n", GateChangeApprovalOff, nil},
+		{"block without the line", block(), GateChangeApprovalOff, nil},
+		{"off", block("- gate-change-approval: off"), GateChangeApprovalOff, nil},
+		{"off twice", block("- gate-change-approval: off", "- gate-change-approval: off"), GateChangeApprovalOff, nil},
+		{"required", block("- gate-change-approval: required"), GateChangeApprovalRequired, nil},
+		{"required with CRLF", strings.ReplaceAll(block("- gate-change-approval: required"), "\n", "\r\n"), GateChangeApprovalRequired, nil},
+		{"required indented", block("  - gate-change-approval:   required  "), GateChangeApprovalRequired, nil},
+		{"off then required", block("- gate-change-approval: off", "- gate-change-approval: required"), GateChangeApprovalRequired, nil},
+		{"required then off", block("- gate-change-approval: required", "- gate-change-approval: off"), GateChangeApprovalRequired, nil},
+		{"misspelled required", block("- gate-change-approval: requird"), GateChangeApprovalRequired, []string{"requird"}},
+		{"capitalized Required", block("- gate-change-approval: Required"), GateChangeApprovalRequired, []string{"Required"}},
+		{"capitalized Off", block("- gate-change-approval: Off"), GateChangeApprovalRequired, []string{"Off"}},
+		{"trailing comment", block("- gate-change-approval: off # for now"), GateChangeApprovalRequired, []string{"off # for now"}},
+		{"empty value", block("- gate-change-approval:"), GateChangeApprovalRequired, []string{""}},
+		{"synonym", block("- gate-change-approval: yes"), GateChangeApprovalRequired, []string{"yes"}},
+		{"garbage then off", block("- gate-change-approval: maybe", "- gate-change-approval: off"), GateChangeApprovalRequired, []string{"maybe"}},
+		{"two unrecognized", block("- gate-change-approval: a", "- gate-change-approval: b"), GateChangeApprovalRequired, []string{"a", "b"}},
+		{"required only outside the block", block() + "- gate-change-approval: required\n", GateChangeApprovalOff, nil},
+		{"end marker before begin", markerEnd + "\n- gate-change-approval: required\n" + markerBegin + "\n", GateChangeApprovalOff, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := ParseGateChangeApproval(tc.text); got != tc.want {
-				t.Fatalf("ParseGateChangeApproval = %q, want %q\ntext:\n%s", got, tc.want, tc.text)
+			got, unrecognized := ParseGateChangeApproval(tc.text)
+			if got != tc.want || !slices.Equal(unrecognized, tc.unrecognized) {
+				t.Fatalf("ParseGateChangeApproval = %q, %q; want %q, %q\ntext:\n%s", got, unrecognized, tc.want, tc.unrecognized, tc.text)
 			}
 		})
 	}

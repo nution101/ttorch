@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -42,8 +43,8 @@ const remintTTL = 30 * time.Minute
 const eventApprovalRequired = "approval_required"
 
 // eventGateChangeUnapproved is the event a trusted merge records when its diff changed
-// gate-definition files that no human approved, because the default branch sets
-// `- gate-change-approval: off` (gateChangeApprovalWaived). Its payload names those files, so
+// gate-definition files that no human approved, because the repo's gate-change-approval
+// policy is off (readGateChangePolicy). Its payload names those files, so
 // the timeline shows every gate change that landed on the gate's own authority. It is not
 // actionable: it records a finished merge rather than asking anyone for anything. Defined here
 // for the same reason as eventApprovalRequired.
@@ -68,9 +69,9 @@ var ErrLandRebaseConflict = errors.New("land rebase hit conflicts with the curre
 // allowGateChange widens the grant to cover a diff that modifies the gate's own definition
 // (diffGateConfigHits). It is off by default: a gated merge of such a diff is refused unless
 // the lead asked for it, and the audit line for that merge records the files. A trusted repo
-// whose default branch sets gate-change-approval: off does not need the flag
-// (gateChangeApprovalWaived), and giving it there is still accepted: the merge then counts
-// the named files as approved by the lead rather than as unapproved.
+// whose gate-change-approval policy is off, the default, does not need the flag
+// (readGateChangePolicy), and giving it there is still accepted: the merge then counts the
+// named files as approved by the lead rather than as unapproved.
 //
 // The grant is BOUND to the gate-definition paths this diff actually touches, and those paths
 // are returned so the caller can show the lead exactly what was authorized. A single boolean
@@ -228,9 +229,9 @@ func (m *Manager) mergeLocal(taskID string, requireVerdict bool, unapproved *[]s
 	// Empty otherwise. It is recorded in the audit line so a merge that altered the gate is
 	// never reconstructable only by re-reading the diff.
 	gateChange := ""
-	// The gate-definition files this merge changes that no human approved, because the default
-	// branch waives the approval (gateChangeApprovalWaived). Recorded in the audit line and as
-	// an event, and reported in the merge output.
+	// The gate-definition files this merge changes that no human approved, because the repo's
+	// gate-change-approval policy is off (readGateChangePolicy). Recorded in the audit line and
+	// as an event, and reported in the merge output.
 	var unapprovedGateChange []string
 	if gated {
 		// Defense in depth: the worktree must be clean (a clean signal that no worker is
@@ -266,10 +267,11 @@ func (m *Manager) mergeLocal(taskID string, requireVerdict bool, unapproved *[]s
 		// by name. Checked against the COMMITTED diff, so reverting the bytes in the worktree
 		// cannot hide it. A trusted AUTO-merge cannot alter its own gate. A HUMAN approval
 		// can, but only one minted with --allow-gate-change; a plain human token is refused
-		// and the refusal names the offending file. The one exception is a trusted repo whose
-		// default branch sets gate-change-approval: off (gateChangeApprovalWaived): there any
-		// token the gate accepts may carry a gate change, and the merge records the files no
-		// human approved. Blocking hits are refused either way.
+		// and the refusal names the offending file. That is the rule only where the approval is
+		// required. A trusted repo's gate-change-approval policy is off unless its default
+		// branch sets it to required (readGateChangePolicy), and while it is off any token the
+		// gate accepts may carry a gate change and the merge records the files no human
+		// approved. Blocking hits are refused either way.
 		//
 		// This CLOSES NOTHING on its own. Any process running as the lead can still write the
 		// token file with the scope marker in it, and no change inside ttorch alters that. What
@@ -309,22 +311,22 @@ func (m *Manager) mergeLocal(taskID string, requireVerdict bool, unapproved *[]s
 					ungranted = append(ungranted, f)
 				}
 			}
+			policy := readGateChangePolicy(repo)
 			switch {
 			case tokBy == "human" && len(ungranted) == 0:
 				// The lead approved every gate-definition path in the diff by name.
-			case gateChangeApprovalWaived(repo):
-				// The default branch turned the human approval off for this trusted repo, so
-				// the passing verdict above and the fresh green validate below authorize the
-				// gate change the way they authorize any other diff. The paths no human
-				// approved are recorded as such.
+			case policy.waived:
+				// The approval is off for this trusted repo, so the passing verdict above and
+				// the fresh green validate below authorize the gate change the way they
+				// authorize any other diff. The paths no human approved are recorded as such.
 				unapprovedGateChange = ungranted
 			case tokBy == "auto":
-				return "", fmt.Errorf("trust gate: %q %s; a trusted auto-merge cannot alter its own gate — the lead must approve it explicitly with 'ttorch approve %s --allow-gate-change'", taskID, reason, taskID)
+				return "", fmt.Errorf("trust gate: %q %s; a trusted auto-merge cannot alter its own gate — the lead must approve it explicitly with 'ttorch approve %s --allow-gate-change'%s", taskID, reason, taskID, policy.because())
 			case len(tokGrantedGateFiles) == 0:
-				return "", fmt.Errorf("trust gate: %q %s, but its approval does not authorize a gate change; re-approve with 'ttorch approve %s --allow-gate-change'", taskID, reason, taskID)
+				return "", fmt.Errorf("trust gate: %q %s, but its approval does not authorize a gate change; re-approve with 'ttorch approve %s --allow-gate-change'%s", taskID, reason, taskID, policy.because())
 			default:
-				return "", fmt.Errorf("trust gate: %q changes gate-definition files its approval does not cover (%s); the grant authorizes only %s. Re-approve with 'ttorch approve %s --allow-gate-change' to authorize the full set",
-					taskID, strings.Join(ungranted, ", "), strings.Join(tokGrantedGateFiles, ", "), taskID)
+				return "", fmt.Errorf("trust gate: %q changes gate-definition files its approval does not cover (%s); the grant authorizes only %s. Re-approve with 'ttorch approve %s --allow-gate-change' to authorize the full set%s",
+					taskID, strings.Join(ungranted, ", "), strings.Join(tokGrantedGateFiles, ", "), taskID, policy.because())
 			}
 			gateChange = strings.Join(touchedGateFiles, ",")
 		}
@@ -470,6 +472,9 @@ func (m *Manager) mergeLocal(taskID string, requireVerdict bool, unapproved *[]s
 			*unapproved = unapprovedGateChange
 		}
 	}
+	if w := readGateChangePolicy(repo).warning; w != "" {
+		out += "\n  " + w
+	}
 	return out, nil
 }
 
@@ -606,28 +611,72 @@ func (m *Manager) surfaceApprovalRequired(taskID, reason string) {
 	m.audit(fmt.Sprintf("approval-required task=%s %s", taskID, reason))
 }
 
-// gateChangeApprovalWaived reports whether a gated merge in repo may change gate-definition
-// files without the lead's --allow-gate-change: the repo is in trusted mode AND the DEFAULT
-// BRANCH's committed AGENTS.md sets `- gate-change-approval: off` in its managed block
-// (projectinit.ParseGateChangeApproval). In any other mode it is false, so the switch has no
-// effect there.
+// gateChangePolicy is the gate-change-approval policy a gated merge in one repo runs under.
+type gateChangePolicy struct {
+	// waived reports that a trusted merge may change gate-definition files without the lead's
+	// --allow-gate-change.
+	waived bool
+	// reason says why the approval is required, for a trusted repo where waived is false. It
+	// is appended to the refusal so the lead can see what on the default branch decided it.
+	reason string
+	// warning names gate-change-approval values on the default branch that are neither off
+	// nor required. It is printed after every trusted merge and land until the line is fixed.
+	warning string
+}
+
+// because renders reason as a suffix for a refusal, or "" when there is none.
+func (p gateChangePolicy) because() string {
+	if p.reason == "" {
+		return ""
+	}
+	return " (" + p.reason + ")"
+}
+
+// readGateChangePolicy reports the gate-change-approval policy for a gated merge in repo. The
+// approval is waived, so a trusted merge may change gate-definition files without the lead's
+// --allow-gate-change, when the repo is in trusted mode, the DEFAULT BRANCH's committed
+// AGENTS.md records `- delivery-mode: trusted` in its managed block, and that block does not
+// ask for the approval (projectinit.ParseGateChangeApproval): no gate-change-approval line,
+// or `off`. A `required` line keeps the approval, and so does any value the parser does not
+// recognize, which the policy also names in its warning. In any mode other than trusted
+// nothing is waived, so the policy has no effect there.
 //
-// The line is read from committed objects on the default branch (worktree.ShowFile), the way
-// resolveGateDefinition reads .ttorch/validate.sh, and never from the worker's checkout or the
-// repo's working tree. A worker that writes `off` into its own AGENTS.md has made a gate change
-// like any other, which still needs the approval while the default branch says required, so
-// the line takes effect only after a merge the requirement itself covered. A failed read
-// counts as required.
+// The policy is read from committed objects on the default branch (worktree.ShowFile), the
+// way resolveGateDefinition reads .ttorch/validate.sh, and never from the worker's checkout or
+// the repo's working tree. A worker that adds `required` to its own AGENTS.md does not bind
+// its own merge, and one that removes main's `required` line does not unbind its own: either
+// edit is a gate change, judged by what the default branch says before it lands.
+//
+// The approval is also kept when the default branch's AGENTS.md cannot be read or does not
+// itself record trusted mode, for example when the ttorch block was never committed or the
+// file is a symlink, whose committed text is only a path. The policy lives on the default
+// branch, so a default branch with no trusted block has no policy to waive anything.
 //
 // It waives the human approval and nothing else. The blocking hits diffGateConfigHits reports
 // are refused before it is consulted, and the passing verdict, the default-branch validate
 // script and the fresh green run are all still required.
-func gateChangeApprovalWaived(repo string) bool {
+func readGateChangePolicy(repo string) gateChangePolicy {
 	if projectinit.ReadMode(repo) != "trusted" {
-		return false
+		return gateChangePolicy{}
 	}
-	text, ok := worktree.ShowFile(repo, worktree.DefaultBranch(repo), "AGENTS.md")
-	return ok && projectinit.ParseGateChangeApproval(text) == projectinit.GateChangeApprovalOff
+	def := worktree.DefaultBranch(repo)
+	text, ok := worktree.ShowFile(repo, def, "AGENTS.md")
+	if !ok || projectinit.ParseMode(text) != "trusted" {
+		return gateChangePolicy{reason: fmt.Sprintf("the AGENTS.md committed on %s does not record delivery-mode: trusted, so the gate-change approval stays required until the ttorch block is committed there", def)}
+	}
+	policy, unrecognized := projectinit.ParseGateChangeApproval(text)
+	if len(unrecognized) > 0 {
+		quoted := make([]string, len(unrecognized))
+		for i, v := range unrecognized {
+			quoted[i] = strconv.Quote(v)
+		}
+		w := fmt.Sprintf("gate-change-approval on %s has an unrecognized value (%s), so the gate-change approval is required; set it to off or required", def, strings.Join(quoted, ", "))
+		return gateChangePolicy{reason: w, warning: w}
+	}
+	if policy == projectinit.GateChangeApprovalRequired {
+		return gateChangePolicy{reason: fmt.Sprintf("%s sets gate-change-approval: required", def)}
+	}
+	return gateChangePolicy{waived: true}
 }
 
 // approvalScopeGateChange is the scope marker an approval token carries when the lead minted
@@ -1027,6 +1076,9 @@ func (m *Manager) landCommit(t db.Task, spec landSpec, prep landPrepResult) (str
 		spec.taskID, spec.mode, rebaseNote, spec.def, short(defAfter))
 	if len(unapprovedGateChange) > 0 {
 		out += "\n  " + unapprovedGateChangeNote(unapprovedGateChange)
+	}
+	if w := readGateChangePolicy(spec.repo).warning; w != "" {
+		out += "\n  " + w
 	}
 	// Surface the security-everywhere audit status. This is purely ADVISORY and never
 	// blocks: a gated land (trusted / --require-verdict) already ran the full review gate

@@ -40,12 +40,18 @@ func ValidMode(mode string) bool {
 // manager has so far only consulted as prose, so a typed gate can require behavior
 // per mode instead of trusting the LLM to honor it.
 func ReadMode(dir string) string {
-	const def = "pr"
 	b, err := os.ReadFile(filepath.Join(dir, "AGENTS.md"))
 	if err != nil {
-		return def
+		return "pr"
 	}
-	for _, line := range managedBlockLines(string(b)) {
+	return ParseMode(string(b))
+}
+
+// ParseMode is ReadMode over the text of an AGENTS.md rather than a directory, for a caller
+// that reads the file from a git ref instead of a working tree.
+func ParseMode(agentsMD string) string {
+	const def = "pr"
+	for _, line := range managedBlockLines(agentsMD) {
 		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), "- delivery-mode:"); ok {
 			mode := strings.TrimSpace(rest)
 			if ValidMode(mode) {
@@ -69,42 +75,50 @@ func managedBlockLines(text string) []string {
 }
 
 // gateChangeApprovalKey is the per-repo policy line that decides whether a trusted merge whose
-// diff changes a gate-definition file still needs the lead's `ttorch approve
-// --allow-gate-change`. It sits in the ttorch-managed block beside `- delivery-mode:`.
+// diff changes a gate-definition file needs the lead's `ttorch approve --allow-gate-change`.
+// It sits in the ttorch-managed block beside `- delivery-mode:`. `ttorch init` never writes
+// it, so a repo gets the default until the lead adds it.
 const gateChangeApprovalKey = "- gate-change-approval:"
 
-// The two gate-change-approval policies. Required is the default and keeps the human
-// approval; Off lets a trusted repo's passing verdict and green validate authorize a gate
-// change on their own.
+// The two gate-change-approval policies. Off is the default: a trusted repo's passing verdict
+// and fresh green validate authorize a gate change the way they authorize any other diff.
+// Required is the opt-in that keeps the lead's --allow-gate-change.
 const (
-	GateChangeApprovalRequired = "required"
 	GateChangeApprovalOff      = "off"
+	GateChangeApprovalRequired = "required"
 )
 
 // ParseGateChangeApproval returns the gate-change-approval policy recorded in the
-// ttorch-managed block of agentsMD, the text of an AGENTS.md. It returns GateChangeApprovalOff
-// only when the block has a `- gate-change-approval: off` line and no other
-// `- gate-change-approval:` line in the block says anything else. A missing block or line, any
-// other value, and two lines that disagree all read as GateChangeApprovalRequired. The value is
-// compared exactly, case included, for the reason ValidMode gives: "Off" must not turn the
-// requirement off. A line outside the managed block is ignored.
+// ttorch-managed block of agentsMD, the text of an AGENTS.md, and every value in the block it
+// did not recognize, in order.
+//
+// No block, no line, and lines that all say `off` read as GateChangeApprovalOff. A `required`
+// line reads as GateChangeApprovalRequired, and so does any other value: a typo in a line
+// someone added to switch the approval ON must not leave it off. Those values are returned so
+// the caller can name them. A block with both `off` and `required` is required, for the same
+// reason. Values are compared exactly, case included, so "Required" is unrecognized (and
+// therefore required) rather than folded. A line outside the managed block is ignored.
 //
 // It takes the file's text rather than a directory, unlike ReadMode, because the gate that
 // consumes it must read the DEFAULT BRANCH's committed AGENTS.md, never a checkout a worker
 // can edit. A directory-reading variant would make the wrong read the easy one.
-func ParseGateChangeApproval(agentsMD string) string {
-	policy := GateChangeApprovalRequired
+func ParseGateChangeApproval(agentsMD string) (policy string, unrecognized []string) {
+	policy = GateChangeApprovalOff
 	for _, line := range managedBlockLines(agentsMD) {
 		rest, ok := strings.CutPrefix(strings.TrimSpace(line), gateChangeApprovalKey)
 		if !ok {
 			continue
 		}
-		if strings.TrimSpace(rest) != GateChangeApprovalOff {
-			return GateChangeApprovalRequired
+		switch v := strings.TrimSpace(rest); v {
+		case GateChangeApprovalOff:
+		case GateChangeApprovalRequired:
+			policy = GateChangeApprovalRequired
+		default:
+			policy = GateChangeApprovalRequired
+			unrecognized = append(unrecognized, v)
 		}
-		policy = GateChangeApprovalOff
 	}
-	return policy
+	return policy, unrecognized
 }
 
 // autoMintMaxAgeKey is the per-repo policy line that bounds how stale a trusted,
@@ -217,18 +231,20 @@ func managedBlock(mode string, kept ...string) string {
 			"WITHOUT a separate human approval. This is an explicit, repo-scoped decision; the default\n" +
 			"is pr. Auto-merge REQUIRES a .ttorch/validate.sh on this default branch (the gate's\n" +
 			"validation authority); without it, auto-merge is refused and a human approval is needed.\n" +
-			"A change to the gate itself (this block or .ttorch/validate.sh) requires a human's\n" +
-			"`ttorch approve --allow-gate-change` unless the default branch's copy of this block sets\n" +
-			"gate-change-approval: off. With it off, a change to the reviewers or the validate step is\n" +
-			"authorized by the gate that change modifies.\n"
+			"A change to the gate itself (this block or .ttorch/validate.sh) is authorized the same\n" +
+			"way, so a change to the reviewers or the validate step is authorized by the gate that\n" +
+			"change modifies. To require a human's `ttorch approve --allow-gate-change` for those\n" +
+			"changes, set gate-change-approval: required in this block on the default branch.\n"
 	}
 	return b + markerEnd
 }
 
 // keptBlockLines returns the lines of an existing managed block that Init carries into the
 // block it regenerates: every `- gate-change-approval:` line, trimmed, in order. That line is
-// the lead's decision rather than ttorch's text, so re-running `ttorch init` must not erase it.
-// All of them are kept, so a pair that disagrees still reads as required afterwards.
+// the lead's decision rather than ttorch's text, so re-running `ttorch init` must not erase it:
+// dropping a `required` line would silently remove the approval the lead asked for. All of
+// them are kept, so a pair that disagrees, or a misspelled value, still reads as required
+// afterwards.
 func keptBlockLines(block string) []string {
 	var kept []string
 	for _, line := range strings.Split(block, "\n") {

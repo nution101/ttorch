@@ -534,6 +534,7 @@ func TestGateGuard_ToolchainRedirectNeedsAllowGateChange(t *testing.T) {
 			if _, err := projectinit.Init(repo, "trusted"); err != nil {
 				t.Fatal(err)
 			}
+			requireGateChangeApproval(t, repo)
 			gitIn(t, repo, "add", "-A")
 			gitIn(t, repo, "commit", "-q", "-m", "init")
 			task, err := m.Spawn("tc1", repo, false, "sleep 60")
@@ -608,6 +609,7 @@ func TestGateGuard_SymlinkSwapNeedsAllowGateChange(t *testing.T) {
 	if _, err := projectinit.Init(repo, "trusted"); err != nil {
 		t.Fatal(err)
 	}
+	requireGateChangeApproval(t, repo)
 	gitIn(t, repo, "add", "-A")
 	gitIn(t, repo, "commit", "-q", "-m", "init with the CLAUDE.md symlink")
 
@@ -806,6 +808,7 @@ func TestGateGuard_ProjectConfigAndNestedInstructions(t *testing.T) {
 			if _, err := projectinit.Init(repo, "trusted"); err != nil {
 				t.Fatal(err)
 			}
+			requireGateChangeApproval(t, repo)
 			gitIn(t, repo, "add", "-A")
 			gitIn(t, repo, "commit", "-q", "-m", "init")
 			task, err := m.Spawn("r61", repo, false, "sleep 60")
@@ -961,6 +964,7 @@ func TestGateGuard_LearningsLedgerIsAWriteChannelIntoAGENTS(t *testing.T) {
 			if _, err := projectinit.Init(repo, "trusted"); err != nil {
 				t.Fatal(err)
 			}
+			requireGateChangeApproval(t, repo)
 			gitIn(t, repo, "add", "-A")
 			gitIn(t, repo, "commit", "-q", "-m", "init")
 			task, err := m.Spawn("ld1", repo, false, "sleep 60")
@@ -1039,6 +1043,7 @@ func TestGateGuard_PublishedInstallersNeedAllowGateChange(t *testing.T) {
 			if _, err := projectinit.Init(repo, "trusted"); err != nil {
 				t.Fatal(err)
 			}
+			requireGateChangeApproval(t, repo)
 			gitIn(t, repo, "add", "-A")
 			gitIn(t, repo, "commit", "-q", "-m", "init")
 			task, err := m.Spawn("in1", repo, false, "sleep 60")
@@ -1129,6 +1134,7 @@ func TestGateGuard_RenameReportsBothSides(t *testing.T) {
 			if _, err := projectinit.Init(repo, "trusted"); err != nil {
 				t.Fatal(err)
 			}
+			requireGateChangeApproval(t, repo)
 			if tc.seed != "" {
 				if dir := filepath.Dir(filepath.FromSlash(tc.from)); dir != "." {
 					if err := os.MkdirAll(filepath.Join(repo, dir), 0o755); err != nil {
@@ -1346,6 +1352,7 @@ func TestGateGuard_EmbeddedContentInstallChannels(t *testing.T) {
 			if _, err := projectinit.Init(repo, "trusted"); err != nil {
 				t.Fatal(err)
 			}
+			requireGateChangeApproval(t, repo)
 			// Seed the path so the attack is an EDIT of a shipped file, which is the real
 			// shape: these all exist in the tree already.
 			if err := os.MkdirAll(filepath.Join(repo, filepath.Dir(filepath.FromSlash(tc.path))), 0o755); err != nil {

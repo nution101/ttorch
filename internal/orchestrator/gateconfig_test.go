@@ -77,8 +77,8 @@ var decidingFunctions = []string{
 	"matchesGateConfig", "diffTouchesGateConfig",
 	// the approval token: what it grants, how it is read, and when it is re-minted
 	"Approve", "approvalPayload", "splitApprovalPayload", "remintFromVerdict",
-	// the per-repo switch that waives the human approval for a trusted gate change
-	"gateChangeApprovalWaived",
+	// the per-repo policy that waives the human approval for a trusted gate change
+	"readGateChangePolicy",
 	// the merge and review decisions themselves
 	"MergeLocal", "mergeLocal", "TrustPrep", "TrustRecord", "carryVerdictForward", "gateCoversRebased",
 	// what a verdict must cover and fold, what a re-prep keeps, and the daemon that records
@@ -2438,6 +2438,7 @@ func TestMergeLocal_GateChangeGrantIsBoundToItsFiles(t *testing.T) {
 	if _, err := projectinit.Init(repo, "trusted"); err != nil {
 		t.Fatal(err)
 	}
+	requireGateChangeApproval(t, repo)
 	gitIn(t, repo, "add", "AGENTS.md")
 	gitIn(t, repo, "commit", "-q", "-m", "track the delivery-mode config")
 	task, err := m.Spawn("gb1", repo, false, "sleep 60")
@@ -2543,6 +2544,7 @@ func TestMergeLocal_GateChangeGrantRefusesPathCoveredAfterApproval(t *testing.T)
 	if _, err := projectinit.Init(repo, "trusted"); err != nil {
 		t.Fatal(err)
 	}
+	requireGateChangeApproval(t, repo)
 	gitIn(t, repo, "add", "AGENTS.md")
 	gitIn(t, repo, "commit", "-q", "-m", "track the delivery-mode config")
 	// deliveryHarness seeds the marker; take it out so the base is an ordinary repo.
@@ -2809,8 +2811,9 @@ func TestMergeLocal_GateInstructionChangeNeedsAllowGateChange(t *testing.T) {
 
 // gateChangeApprovalRepo builds a delivery harness whose default branch carries a passing
 // .ttorch/validate.sh and a COMMITTED AGENTS.md in the given delivery mode. A non-empty policy
-// line (e.g. "- gate-change-approval: off") goes directly under the delivery-mode line before
-// the commit, so it is on the default branch the gate reads, not only in a working tree.
+// line (e.g. "- gate-change-approval: required") goes directly under the delivery-mode line
+// before the commit, so it is on the default branch the gate reads, not only in a working tree.
+// An empty policy leaves the line out, which is the default: the approval is off.
 func gateChangeApprovalRepo(t *testing.T, tag, mode, policy string) (*Manager, string) {
 	t.Helper()
 	m, repo := deliveryHarness(t, tag)
@@ -2841,6 +2844,15 @@ func setGateChangeApprovalLine(t *testing.T, dir, mode, policy string) {
 	if err := os.WriteFile(p, []byte(strings.Replace(string(b), modeLine, modeLine+policy+"\n", 1)), 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// requireGateChangeApproval opts repo into `- gate-change-approval: required`. The approval is
+// off by default, so a test of the approval machinery itself (a refusal naming the file, a
+// grant bound to its files) has to run in a repo that asks for it. The line goes into the
+// working tree, and the test's own commit of AGENTS.md puts it on the default branch.
+func requireGateChangeApproval(t *testing.T, repo string) {
+	t.Helper()
+	setGateChangeApprovalLine(t, repo, "trusted", "- gate-change-approval: required")
 }
 
 // commitGateDefinitionEdit changes two gate-definition files in the worker's worktree, the
@@ -2882,16 +2894,17 @@ func gateChangeUnapprovedEvents(t *testing.T, m *Manager, id string) []db.Event 
 // gateEditFiles are the gate-definition paths commitGateDefinitionEdit changes.
 var gateEditFiles = []string{".ttorch/validate.sh", "content/skills/ttorch-review/SKILL.md"}
 
-// TestMergeLocal_GateChangeApprovalRequiredOnMainNeedsAllowGateChange: unless the default
-// branch says exactly `- gate-change-approval: off`, a trusted gate-definition change keeps
-// today's behaviour. It does not auto-approve, a plain human approval does not merge it, and
-// the refusal asks for --allow-gate-change. Absent, explicit and misspelled lines all read as
-// required.
+// TestMergeLocal_GateChangeApprovalRequiredOnMainNeedsAllowGateChange: a trusted repo whose
+// default branch opts in with `- gate-change-approval: required` keeps the human approval. A
+// gate-definition change does not auto-approve, a plain human approval does not merge it, and
+// the refusal asks for --allow-gate-change and says why. A value the reader does not recognize
+// is required too, and the refusal names it, so a typo in the line cannot turn the approval
+// off.
 func TestMergeLocal_GateChangeApprovalRequiredOnMainNeedsAllowGateChange(t *testing.T) {
-	for _, tc := range []struct{ name, policy string }{
-		{"absent", ""},
-		{"required", "- gate-change-approval: required"},
-		{"garbage", "- gate-change-approval: Off"},
+	for _, tc := range []struct{ name, policy, why string }{
+		{"required", "- gate-change-approval: required", "sets gate-change-approval: required"},
+		{"misspelled", "- gate-change-approval: requird", `unrecognized value ("requird")`},
+		{"capitalized", "- gate-change-approval: Off", `unrecognized value ("Off")`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m, repo := gateChangeApprovalRepo(t, "gcareq"+tc.name, "trusted", tc.policy)
@@ -2916,6 +2929,9 @@ func TestMergeLocal_GateChangeApprovalRequiredOnMainNeedsAllowGateChange(t *test
 			if err == nil || !strings.Contains(err.Error(), "--allow-gate-change") {
 				t.Fatalf("a plain approval must not merge a gate change while main requires the approval, got: %v", err)
 			}
+			if !strings.Contains(err.Error(), tc.why) {
+				t.Fatalf("the refusal must say why the approval is required (%q), got: %v", tc.why, err)
+			}
 			if gitIn(t, repo, "rev-parse", "HEAD") != defHead {
 				t.Fatal("the gate-definition change must not have merged")
 			}
@@ -2926,69 +2942,76 @@ func TestMergeLocal_GateChangeApprovalRequiredOnMainNeedsAllowGateChange(t *test
 	}
 }
 
-// TestMergeLocal_GateChangeApprovalOffAutoMergesGateChange: with `- gate-change-approval: off`
-// on the default branch of a trusted repo, a passing verdict and a green validate authorize a
-// gate-definition change on their own, exactly like any other diff. TrustRecord auto-mints,
-// MergeLocal fast-forwards with no `ttorch approve`, and the merge leaves a trail: an event
-// naming every gate-definition file, an audit line saying the switch was off, and one line in
-// the merge output.
+// TestMergeLocal_GateChangeApprovalOffAutoMergesGateChange: the approval is off by default.
+// With no gate-change-approval line on the default branch of a trusted repo, or with an
+// explicit `off`, a passing verdict and a green validate authorize a gate-definition change on
+// their own, exactly like any other diff. TrustRecord auto-mints, MergeLocal fast-forwards with
+// no `ttorch approve`, and the merge leaves a trail: an event naming every gate-definition
+// file, an audit line saying the approval was off, and one line in the merge output.
 func TestMergeLocal_GateChangeApprovalOffAutoMergesGateChange(t *testing.T) {
-	m, repo := gateChangeApprovalRepo(t, "gcaoff", "trusted", "- gate-change-approval: off")
-	task, err := m.Spawn("go1", repo, false, "sleep 60")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _, _ = m.Teardown("go1", true) }()
-	head := commitGateDefinitionEdit(t, task.Worktree)
-	writeReviewReports(t, m.P.ReviewInputsDir("go1"), head, nil)
-	if _, err := m.TrustRecord("go1", "", time.Minute); err != nil {
-		t.Fatal(err)
-	}
-	if !approval.Valid(m.P.ApprovalFile("go1")) {
-		t.Fatal("with gate-change-approval off, a passing verdict must auto-approve a gate-definition change")
-	}
-	if reloaded, _, _ := m.Store.GetTask(context.Background(), "go1"); reloaded.ApprovedBy != "auto" {
-		t.Fatalf("the approval must be the gate's own (auto), got %q", reloaded.ApprovedBy)
-	}
-	out, err := m.MergeLocal("go1", false)
-	if err != nil {
-		t.Fatalf("with gate-change-approval off, the gate-definition change should merge with no ttorch approve: %v", err)
-	}
-	if gitIn(t, repo, "rev-parse", "HEAD") != head {
-		t.Fatal("the default branch should have fast-forwarded to the worker's commit")
-	}
-	if !strings.Contains(out, "gate-change-approval is off") {
-		t.Fatalf("the merge output must say no human approved the gate change, got: %q", out)
-	}
-	evs := gateChangeUnapprovedEvents(t, m, "go1")
-	if len(evs) != 1 {
-		t.Fatalf("want exactly one gate_change_unapproved event, got %d: %+v", len(evs), evs)
-	}
-	for _, f := range gateEditFiles {
-		if !strings.Contains(out, f) {
-			t.Errorf("the merge output must name %s: %q", f, out)
-		}
-		if !strings.Contains(evs[0].Payload, f) {
-			t.Errorf("the event must name %s: %q", f, evs[0].Payload)
-		}
-	}
-	if evs[0].Actionable {
-		t.Error("the event is a record of a finished merge, not a request; it must not be actionable")
-	}
-	b, _ := os.ReadFile(m.P.AuditLog())
-	audit := string(b)
-	for _, want := range []string{"approver=auto", "gate-change=.ttorch/validate.sh", "gate-change-approval=off"} {
-		if !strings.Contains(audit, want) {
-			t.Errorf("the merge audit line must carry %q:\n%s", want, audit)
-		}
+	for _, tc := range []struct{ name, policy string }{
+		{"absent", ""},
+		{"off", "- gate-change-approval: off"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, repo := gateChangeApprovalRepo(t, "gcaoff"+tc.name, "trusted", tc.policy)
+			task, err := m.Spawn("go1", repo, false, "sleep 60")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _, _ = m.Teardown("go1", true) }()
+			head := commitGateDefinitionEdit(t, task.Worktree)
+			writeReviewReports(t, m.P.ReviewInputsDir("go1"), head, nil)
+			if _, err := m.TrustRecord("go1", "", time.Minute); err != nil {
+				t.Fatal(err)
+			}
+			if !approval.Valid(m.P.ApprovalFile("go1")) {
+				t.Fatal("with the gate-change approval off, a passing verdict must auto-approve a gate-definition change")
+			}
+			if reloaded, _, _ := m.Store.GetTask(context.Background(), "go1"); reloaded.ApprovedBy != "auto" {
+				t.Fatalf("the approval must be the gate's own (auto), got %q", reloaded.ApprovedBy)
+			}
+			out, err := m.MergeLocal("go1", false)
+			if err != nil {
+				t.Fatalf("with the gate-change approval off, the gate-definition change should merge with no ttorch approve: %v", err)
+			}
+			if gitIn(t, repo, "rev-parse", "HEAD") != head {
+				t.Fatal("the default branch should have fast-forwarded to the worker's commit")
+			}
+			if !strings.Contains(out, "gate-change-approval is off") {
+				t.Fatalf("the merge output must say no human approved the gate change, got: %q", out)
+			}
+			evs := gateChangeUnapprovedEvents(t, m, "go1")
+			if len(evs) != 1 {
+				t.Fatalf("want exactly one gate_change_unapproved event, got %d: %+v", len(evs), evs)
+			}
+			for _, f := range gateEditFiles {
+				if !strings.Contains(out, f) {
+					t.Errorf("the merge output must name %s: %q", f, out)
+				}
+				if !strings.Contains(evs[0].Payload, f) {
+					t.Errorf("the event must name %s: %q", f, evs[0].Payload)
+				}
+			}
+			if evs[0].Actionable {
+				t.Error("the event is a record of a finished merge, not a request; it must not be actionable")
+			}
+			b, _ := os.ReadFile(m.P.AuditLog())
+			audit := string(b)
+			for _, want := range []string{"approver=auto", "gate-change=.ttorch/validate.sh", "gate-change-approval=off"} {
+				if !strings.Contains(audit, want) {
+					t.Errorf("the merge audit line must carry %q:\n%s", want, audit)
+				}
+			}
+		})
 	}
 }
 
 // TestLand_GateChangeApprovalOffPrintsTheUnapprovedLine: the land path, which the scheduler's
-// land pass drives, reaches the same outcome and its output carries the same line, so
-// `ttorch land` says when it merged a gate change no human approved.
+// land pass drives, reaches the same outcome under the default and its output carries the
+// same line, so `ttorch land` says when it merged a gate change no human approved.
 func TestLand_GateChangeApprovalOffPrintsTheUnapprovedLine(t *testing.T) {
-	m, repo := gateChangeApprovalRepo(t, "gcaland", "trusted", "- gate-change-approval: off")
+	m, repo := gateChangeApprovalRepo(t, "gcaland", "trusted", "")
 	task, err := m.Spawn("gl1", repo, false, "sleep 60")
 	if err != nil {
 		t.Fatal(err)
@@ -3001,7 +3024,7 @@ func TestLand_GateChangeApprovalOffPrintsTheUnapprovedLine(t *testing.T) {
 	}
 	out, err := m.Land("gl1", true)
 	if err != nil {
-		t.Fatalf("with gate-change-approval off, land should merge the gate-definition change: %v", err)
+		t.Fatalf("with the gate-change approval off by default, land should merge the gate-definition change: %v", err)
 	}
 	if gitIn(t, repo, "rev-parse", "HEAD") != head {
 		t.Fatal("the default branch should have fast-forwarded to the worker's commit")
@@ -3025,13 +3048,57 @@ func TestLand_GateChangeApprovalOffPrintsTheUnapprovedLine(t *testing.T) {
 	}
 }
 
-// TestMergeLocal_GateChangeApprovalOffNeedsTrustedMode: the switch only relaxes the TRUSTED
+// TestLand_GateChangeApprovalUnrecognizedValueIsNamed: a misspelled gate-change-approval value
+// keeps the approval and is named where the lead will see it. The refusal names it, and once
+// the lead approves with --allow-gate-change the land summary names it as well, as it will on
+// every trusted land until the line is fixed.
+func TestLand_GateChangeApprovalUnrecognizedValueIsNamed(t *testing.T) {
+	m, repo := gateChangeApprovalRepo(t, "gcatypo", "trusted", "- gate-change-approval: requird")
+	task, err := m.Spawn("gt1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = m.Teardown("gt1", true) }()
+	head := commitGateDefinitionEdit(t, task.Worktree)
+	writeReviewReports(t, m.P.ReviewInputsDir("gt1"), head, nil)
+	if _, err := m.TrustRecord("gt1", "", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if approval.Valid(m.P.ApprovalFile("gt1")) {
+		t.Fatal("an unrecognized value must keep the approval, so the gate change must not auto-approve")
+	}
+	if _, err := m.Approve("gt1", time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	_, err = m.Land("gt1", true)
+	if err == nil || !strings.Contains(err.Error(), `"requird"`) {
+		t.Fatalf("the land refusal must name the unrecognized value, got: %v", err)
+	}
+	if _, err := m.Approve("gt1", time.Minute, true); err != nil {
+		t.Fatal(err)
+	}
+	out, err := m.Land("gt1", true)
+	if err != nil {
+		t.Fatalf("the lead's --allow-gate-change should land it: %v", err)
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") != head {
+		t.Fatal("the default branch should have fast-forwarded to the worker's commit")
+	}
+	if !strings.Contains(out, `unrecognized value ("requird")`) {
+		t.Fatalf("the land summary must name the unrecognized value still on main, got:\n%s", out)
+	}
+	if strings.Contains(out, "gate-change-approval is off") {
+		t.Fatalf("a human approved this gate change, so the summary must not call it unapproved:\n%s", out)
+	}
+}
+
+// TestMergeLocal_GateChangeApprovalOffNeedsTrustedMode: the policy only relaxes the TRUSTED
 // gate. In pr or validated mode, a --require-verdict merge of a gate-definition change still
-// needs --allow-gate-change, whatever the default branch says.
+// needs --allow-gate-change, even though the default branch leaves the approval off.
 func TestMergeLocal_GateChangeApprovalOffNeedsTrustedMode(t *testing.T) {
 	for _, mode := range []string{"pr", "validated"} {
 		t.Run(mode, func(t *testing.T) {
-			m, repo := gateChangeApprovalRepo(t, "gcamode"+mode, mode, "- gate-change-approval: off")
+			m, repo := gateChangeApprovalRepo(t, "gcamode"+mode, mode, "")
 			task, err := m.Spawn("gm1", repo, false, "sleep 60")
 			if err != nil {
 				t.Fatal(err)
@@ -3051,7 +3118,7 @@ func TestMergeLocal_GateChangeApprovalOffNeedsTrustedMode(t *testing.T) {
 			defHead := gitIn(t, repo, "rev-parse", "HEAD")
 			_, err = m.MergeLocal("gm1", true)
 			if err == nil || !strings.Contains(err.Error(), "--allow-gate-change") {
-				t.Fatalf("in %s mode the switch must have no effect; want a --allow-gate-change refusal, got: %v", mode, err)
+				t.Fatalf("in %s mode the policy must have no effect; want a --allow-gate-change refusal, got: %v", mode, err)
 			}
 			if gitIn(t, repo, "rev-parse", "HEAD") != defHead {
 				t.Fatal("the gate-definition change must not have merged")
@@ -3063,82 +3130,135 @@ func TestMergeLocal_GateChangeApprovalOffNeedsTrustedMode(t *testing.T) {
 	}
 }
 
-// TestMergeLocal_GateChangeApprovalOffOnWorkerBranchNeedsAllowGateChange: the switch is read
-// from the DEFAULT BRANCH. A worker that writes `off` into its own AGENTS.md has made a gate
-// change like any other, and while main says required it needs --allow-gate-change. With the
-// flag it merges and records no unapproved gate change, because a human approved it; from then
-// on main says off.
-func TestMergeLocal_GateChangeApprovalOffOnWorkerBranchNeedsAllowGateChange(t *testing.T) {
-	m, repo := gateChangeApprovalRepo(t, "gcabranch", "trusted", "- gate-change-approval: required")
-	task, err := m.Spawn("gb1", repo, false, "sleep 60")
+// editWorkerAgents rewrites the worker's AGENTS.md with edit and commits it, returning the new
+// HEAD. It fails the test if edit changes nothing, so a fixture cannot silently stop testing.
+func editWorkerAgents(t *testing.T, wt string, edit func(string) string) string {
+	t.Helper()
+	p := filepath.Join(wt, "AGENTS.md")
+	b, err := os.ReadFile(p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _, _ = m.Teardown("gb1", true) }()
-	wt := task.Worktree
-	agents := filepath.Join(wt, "AGENTS.md")
-	b, err := os.ReadFile(agents)
-	if err != nil {
-		t.Fatal(err)
+	changed := edit(string(b))
+	if changed == string(b) {
+		t.Fatalf("setup: the edit left the worker's AGENTS.md unchanged:\n%s", b)
 	}
-	flipped := strings.Replace(string(b), "- gate-change-approval: required", "- gate-change-approval: off", 1)
-	if flipped == string(b) {
-		t.Fatalf("setup: the worker's AGENTS.md has no required line to flip:\n%s", b)
-	}
-	if err := os.WriteFile(agents, []byte(flipped), 0o644); err != nil {
+	if err := os.WriteFile(p, []byte(changed), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	gitIn(t, wt, "add", "-A")
-	gitIn(t, wt, "commit", "-q", "-m", "turn off the gate-change approval")
-	head := gitIn(t, wt, "rev-parse", "HEAD")
-	if gateChangeApprovalWaived(repo) {
+	gitIn(t, wt, "commit", "-q", "-m", "change the gate-change-approval line")
+	return gitIn(t, wt, "rev-parse", "HEAD")
+}
+
+// TestMergeLocal_GateChangeApprovalWorkerCannotUnbindItsOwnMerge: the policy is read from the
+// DEFAULT BRANCH. While main says `required`, a worker that deletes that line from its own
+// AGENTS.md has made a gate change like any other, and its merge still needs
+// --allow-gate-change. With the flag it merges and records no unapproved gate change, because
+// a human approved it; from then on main is back to the default.
+func TestMergeLocal_GateChangeApprovalWorkerCannotUnbindItsOwnMerge(t *testing.T) {
+	m, repo := gateChangeApprovalRepo(t, "gcaunbind", "trusted", "- gate-change-approval: required")
+	task, err := m.Spawn("gu1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = m.Teardown("gu1", true) }()
+	head := editWorkerAgents(t, task.Worktree, func(s string) string {
+		return strings.Replace(s, "- gate-change-approval: required\n", "", 1)
+	})
+	if readGateChangePolicy(repo).waived {
 		t.Fatal("setup: main says required, so the approval must not be waived before the merge")
 	}
 
-	writeReviewReports(t, m.P.ReviewInputsDir("gb1"), head, nil)
-	if _, err := m.TrustRecord("gb1", "", time.Minute); err != nil {
+	writeReviewReports(t, m.P.ReviewInputsDir("gu1"), head, nil)
+	if _, err := m.TrustRecord("gu1", "", time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if approval.Valid(m.P.ApprovalFile("gb1")) {
-		t.Fatal("a branch that turns the switch off in its own AGENTS.md must not auto-approve itself")
+	if approval.Valid(m.P.ApprovalFile("gu1")) {
+		t.Fatal("a branch that removes main's required line must not auto-approve itself")
 	}
-	if _, err := m.Approve("gb1", time.Minute, false); err != nil {
+	if _, err := m.Approve("gu1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 	defHead := gitIn(t, repo, "rev-parse", "HEAD")
-	_, err = m.MergeLocal("gb1", false)
+	_, err = m.MergeLocal("gu1", false)
 	if err == nil || !strings.Contains(err.Error(), "--allow-gate-change") || !strings.Contains(err.Error(), "AGENTS.md") {
-		t.Fatalf("the worker's own `off` must not waive the approval for its merge, got: %v", err)
+		t.Fatalf("removing required on the worker's branch must not unbind its own merge, got: %v", err)
 	}
 	if gitIn(t, repo, "rev-parse", "HEAD") != defHead {
-		t.Fatal("the switch flip must not have merged on a plain approval")
+		t.Fatal("the removal must not have merged on a plain approval")
 	}
 
-	granted, err := m.Approve("gb1", time.Minute, true)
+	granted, err := m.Approve("gu1", time.Minute, true)
 	if err != nil || !slices.Contains(granted, "AGENTS.md") {
 		t.Fatalf("--allow-gate-change must still work while main requires it: granted=%v err=%v", granted, err)
 	}
-	out, err := m.MergeLocal("gb1", false)
+	out, err := m.MergeLocal("gu1", false)
 	if err != nil {
-		t.Fatalf("the lead's --allow-gate-change should merge the switch flip: %v", err)
+		t.Fatalf("the lead's --allow-gate-change should merge the removal: %v", err)
 	}
 	if strings.Contains(out, "gate-change-approval is off") {
 		t.Fatalf("a human approved this gate change, so the output must not say otherwise: %q", out)
 	}
-	if evs := gateChangeUnapprovedEvents(t, m, "gb1"); len(evs) != 0 {
+	if evs := gateChangeUnapprovedEvents(t, m, "gu1"); len(evs) != 0 {
 		t.Fatalf("a human-approved gate change must not be recorded as unapproved: %+v", evs)
 	}
-	if !gateChangeApprovalWaived(repo) {
-		t.Fatal("once the flip is on main, the approval must be waived for later merges")
+	if !readGateChangePolicy(repo).waived {
+		t.Fatal("once the removal is on main, the default applies and the approval is waived for later merges")
 	}
 }
 
-// TestMergeLocal_GateChangeApprovalOffStillRefusesBlockingHit: the switch waives the human
+// TestMergeLocal_GateChangeApprovalWorkerCannotBindItsOwnMerge is the other direction. While
+// main leaves the approval off, a worker that adds `required` to its own AGENTS.md does not
+// thereby require an approval for its own merge: the passing verdict lands it with no
+// `ttorch approve`, and the event names AGENTS.md as a gate change no human approved. From
+// then on main says required.
+func TestMergeLocal_GateChangeApprovalWorkerCannotBindItsOwnMerge(t *testing.T) {
+	m, repo := gateChangeApprovalRepo(t, "gcabind", "trusted", "")
+	task, err := m.Spawn("gn1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = m.Teardown("gn1", true) }()
+	head := editWorkerAgents(t, task.Worktree, func(s string) string {
+		return strings.Replace(s, "- delivery-mode: trusted\n", "- delivery-mode: trusted\n- gate-change-approval: required\n", 1)
+	})
+	if !readGateChangePolicy(repo).waived {
+		t.Fatal("setup: main has no line, so the approval must be waived before the merge")
+	}
+
+	writeReviewReports(t, m.P.ReviewInputsDir("gn1"), head, nil)
+	if _, err := m.TrustRecord("gn1", "", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if !approval.Valid(m.P.ApprovalFile("gn1")) {
+		t.Fatal("the worker's own required line must not stop its merge from auto-approving: main decides")
+	}
+	out, err := m.MergeLocal("gn1", false)
+	if err != nil {
+		t.Fatalf("adding required on the worker's branch must not bind its own merge: %v", err)
+	}
+	if gitIn(t, repo, "rev-parse", "HEAD") != head {
+		t.Fatal("the default branch should have fast-forwarded to the worker's commit")
+	}
+	if !strings.Contains(out, "gate-change-approval is off") || !strings.Contains(out, "AGENTS.md") {
+		t.Fatalf("the merge output must name AGENTS.md as a gate change no human approved: %q", out)
+	}
+	evs := gateChangeUnapprovedEvents(t, m, "gn1")
+	if len(evs) != 1 || !strings.Contains(evs[0].Payload, "AGENTS.md") {
+		t.Fatalf("want one gate_change_unapproved event naming AGENTS.md, got %+v", evs)
+	}
+	if readGateChangePolicy(repo).waived {
+		t.Fatal("once the required line is on main, the approval must be required for later merges")
+	}
+}
+
+// TestMergeLocal_GateChangeApprovalOffStillRefusesBlockingHit: the default waives the human
 // approval for a gate CHANGE. It does not touch the blocking hits no approval clears. A
 // symlink standing at covered ground is refused on the gate's own auto token and on a human
 // token alike.
 func TestMergeLocal_GateChangeApprovalOffStillRefusesBlockingHit(t *testing.T) {
-	m, repo := gateChangeApprovalRepo(t, "gcablock", "trusted", "- gate-change-approval: off")
+	m, repo := gateChangeApprovalRepo(t, "gcablock", "trusted", "")
 	task, err := m.Spawn("gk1", repo, false, "sleep 60")
 	if err != nil {
 		t.Fatal(err)
@@ -3165,27 +3285,30 @@ func TestMergeLocal_GateChangeApprovalOffStillRefusesBlockingHit(t *testing.T) {
 	if ls := gitIn(t, wt, "ls-files", "-s", ".claude"); !strings.HasPrefix(ls, "120000") {
 		t.Fatalf("setup: .claude is not recorded as a symlink: %q", ls)
 	}
+	if !readGateChangePolicy(repo).waived {
+		t.Fatal("setup: main leaves the approval off, so the waiver is what this test pushes against")
+	}
 
 	writeReviewReports(t, m.P.ReviewInputsDir("gk1"), head, nil)
 	if _, err := m.TrustRecord("gk1", "", time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	if approval.Valid(m.P.ApprovalFile("gk1")) {
-		t.Fatal("a blocking diff must not auto-approve, gate-change-approval off or not")
+		t.Fatal("a blocking diff must not auto-approve, gate-change approval off or not")
 	}
 	defHead := gitIn(t, repo, "rev-parse", "HEAD")
-	// The token the switch would otherwise let through: the gate's own auto approval.
+	// The token the default would otherwise let through: the gate's own auto approval.
 	if err := approval.Grant(m.P.ApprovalFile("gk1"), time.Minute, approvalPayload("auto", head, nil)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.MergeLocal("gk1", false); err == nil || !strings.Contains(err.Error(), "refused outright") {
-		t.Fatalf("a blocking hit must stay refused on an auto token with the switch off, got: %v", err)
+		t.Fatalf("a blocking hit must stay refused on an auto token with the approval off, got: %v", err)
 	}
 	if _, err := m.Approve("gk1", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.MergeLocal("gk1", false); err == nil || !strings.Contains(err.Error(), "refused outright") {
-		t.Fatalf("a blocking hit must stay refused on a human token with the switch off, got: %v", err)
+		t.Fatalf("a blocking hit must stay refused on a human token with the approval off, got: %v", err)
 	}
 	if gitIn(t, repo, "rev-parse", "HEAD") != defHead {
 		t.Fatal("the blocking diff must not have merged")
@@ -3195,11 +3318,11 @@ func TestMergeLocal_GateChangeApprovalOffStillRefusesBlockingHit(t *testing.T) {
 	}
 }
 
-// TestMergeLocal_GateChangeApprovalOffAcceptsAllowGateChange: with the switch off, a lead who
+// TestMergeLocal_GateChangeApprovalOffAcceptsAllowGateChange: with the approval off, a lead who
 // approves with --allow-gate-change anyway is not refused. The grant is recorded and the merge
 // goes through as a human-approved gate change, so it is not logged as unapproved.
 func TestMergeLocal_GateChangeApprovalOffAcceptsAllowGateChange(t *testing.T) {
-	m, repo := gateChangeApprovalRepo(t, "gcaflag", "trusted", "- gate-change-approval: off")
+	m, repo := gateChangeApprovalRepo(t, "gcaflag", "trusted", "")
 	task, err := m.Spawn("gf1", repo, false, "sleep 60")
 	if err != nil {
 		t.Fatal(err)
@@ -3212,7 +3335,7 @@ func TestMergeLocal_GateChangeApprovalOffAcceptsAllowGateChange(t *testing.T) {
 	}
 	granted, err := m.Approve("gf1", time.Minute, true)
 	if err != nil {
-		t.Fatalf("--allow-gate-change must stay accepted with the switch off: %v", err)
+		t.Fatalf("--allow-gate-change must stay accepted with the approval off: %v", err)
 	}
 	for _, f := range gateEditFiles {
 		if !slices.Contains(granted, f) {
@@ -3221,7 +3344,7 @@ func TestMergeLocal_GateChangeApprovalOffAcceptsAllowGateChange(t *testing.T) {
 	}
 	out, err := m.MergeLocal("gf1", false)
 	if err != nil {
-		t.Fatalf("a flagged approval should merge with the switch off: %v", err)
+		t.Fatalf("a flagged approval should merge with the approval off: %v", err)
 	}
 	if gitIn(t, repo, "rev-parse", "HEAD") != head {
 		t.Fatal("the default branch should have fast-forwarded to the worker's commit")
@@ -3238,65 +3361,110 @@ func TestMergeLocal_GateChangeApprovalOffAcceptsAllowGateChange(t *testing.T) {
 	}
 }
 
-// TestGateChangeApprovalWaived_ReadsTheDefaultBranch is the fast-lane half of the
-// worker-branch rule, with no worker spawned. The waiver follows the default branch's
-// COMMITTED AGENTS.md: a branch that says off, or an uncommitted edit, changes nothing, and
-// the delivery mode must be trusted as well.
-func TestGateChangeApprovalWaived_ReadsTheDefaultBranch(t *testing.T) {
+// TestReadGateChangePolicy_ReadsTheDefaultBranch is the fast-lane half of the worker-branch
+// rule, with no worker spawned. The policy follows the default branch's COMMITTED AGENTS.md: a
+// branch, or an uncommitted edit, changes nothing in either direction. The approval is waived
+// only in trusted mode, only when the committed block itself records trusted mode, and not when
+// the line says required or something unrecognized, which the warning names.
+func TestReadGateChangePolicy_ReadsTheDefaultBranch(t *testing.T) {
 	repo := t.TempDir()
 	gitIn(t, repo, "init", "-q", "-b", "main")
 	gitIn(t, repo, "config", "user.email", "t@example.com")
 	gitIn(t, repo, "config", "user.name", "t")
+	writeFixtureFile(t, repo, "README.md", "readme\n")
+	gitIn(t, repo, "add", "README.md")
+	gitIn(t, repo, "commit", "-q", "-m", "base")
 	if _, err := projectinit.Init(repo, "trusted"); err != nil {
 		t.Fatal(err)
 	}
-	setGateChangeApprovalLine(t, repo, "trusted", "- gate-change-approval: required")
-	gitIn(t, repo, "add", "-A")
-	gitIn(t, repo, "commit", "-q", "-m", "required on main")
 	agents := filepath.Join(repo, "AGENTS.md")
-	required, err := os.ReadFile(agents)
-	if err != nil {
-		t.Fatal(err)
-	}
-	off := strings.Replace(string(required), "- gate-change-approval: required", "- gate-change-approval: off", 1)
-	if gateChangeApprovalWaived(repo) {
-		t.Fatal("main says required: the approval must not be waived")
-	}
-
-	// A branch that says off, the shape of a worker's own commit.
-	gitIn(t, repo, "checkout", "-q", "-b", "worker")
-	if err := os.WriteFile(agents, []byte(off), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	gitIn(t, repo, "commit", "-q", "-am", "off on the branch")
-	gitIn(t, repo, "checkout", "-q", "main")
-	if gateChangeApprovalWaived(repo) {
-		t.Fatal("off on a non-default branch must not waive the approval")
-	}
-
-	// An uncommitted edit on main.
-	if err := os.WriteFile(agents, []byte(off), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if gateChangeApprovalWaived(repo) {
-		t.Fatal("an uncommitted off must not waive the approval: the gate reads committed bytes")
-	}
-
-	// Committed on main: waived.
-	gitIn(t, repo, "commit", "-q", "-am", "off on main")
-	if !gateChangeApprovalWaived(repo) {
-		t.Fatal("main says off in a trusted repo: the approval must be waived")
-	}
-
-	// The same committed line in any other mode waives nothing.
-	for _, mode := range []string{"pr", "local", "validated"} {
-		body := strings.Replace(off, "- delivery-mode: trusted", "- delivery-mode: "+mode, 1)
+	write := func(body string) {
+		t.Helper()
 		if err := os.WriteFile(agents, []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		gitIn(t, repo, "commit", "-q", "-am", "mode "+mode)
-		if gateChangeApprovalWaived(repo) {
-			t.Fatalf("delivery-mode %s: the switch must have no effect outside trusted mode", mode)
+	}
+	commit := func(msg string) {
+		t.Helper()
+		gitIn(t, repo, "add", "-A")
+		gitIn(t, repo, "commit", "-q", "-m", msg)
+	}
+	check := func(step string, wantWaived bool, wantInReason, wantInWarning string) {
+		t.Helper()
+		p := readGateChangePolicy(repo)
+		if p.waived != wantWaived {
+			t.Fatalf("%s: waived = %v, want %v (%+v)", step, p.waived, wantWaived, p)
 		}
+		if !strings.Contains(p.reason, wantInReason) {
+			t.Fatalf("%s: reason %q does not contain %q", step, p.reason, wantInReason)
+		}
+		if wantInWarning == "" && p.warning != "" || !strings.Contains(p.warning, wantInWarning) {
+			t.Fatalf("%s: warning %q, want it to contain %q", step, p.warning, wantInWarning)
+		}
+	}
+
+	// The trusted block exists only in the working tree: main has no policy to waive anything.
+	check("block not committed", false, "does not record delivery-mode: trusted", "")
+
+	commit("commit the ttorch block")
+	plain, err := os.ReadFile(agents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	required := strings.Replace(string(plain), "- delivery-mode: trusted\n", "- delivery-mode: trusted\n- gate-change-approval: required\n", 1)
+	check("no line on main", true, "", "")
+
+	// A branch that says required, the shape of a worker's own commit.
+	gitIn(t, repo, "checkout", "-q", "-b", "worker")
+	write(required)
+	commit("required on the branch")
+	gitIn(t, repo, "checkout", "-q", "main")
+	check("required on a non-default branch", true, "", "")
+
+	// An uncommitted edit on main.
+	write(required)
+	check("required uncommitted on main", true, "", "")
+
+	commit("required on main")
+	check("required on main", false, "sets gate-change-approval: required", "")
+
+	// Removing it on a branch does not unbind main.
+	gitIn(t, repo, "checkout", "-q", "-b", "unbind")
+	write(string(plain))
+	commit("remove required on a branch")
+	gitIn(t, repo, "checkout", "-q", "main")
+	check("required removed on a non-default branch", false, "sets gate-change-approval: required", "")
+
+	write(strings.Replace(required, ": required", ": requird", 1))
+	commit("typo on main")
+	check("unrecognized on main", false, `unrecognized value ("requird")`, `unrecognized value ("requird")`)
+
+	write(string(plain))
+	commit("back to the default")
+	check("line removed on main", true, "", "")
+
+	// AGENTS.md as a symlink: the working tree reads trusted through it, but the committed blob
+	// is only the link's target path, which records no mode.
+	writeFixtureFile(t, repo, "docs/agents.md", string(required))
+	if err := os.Remove(agents); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("docs/agents.md", agents); err != nil {
+		t.Fatal(err)
+	}
+	commit("AGENTS.md is a symlink")
+	if projectinit.ReadMode(repo) != "trusted" {
+		t.Fatal("setup: the working tree must read trusted through the symlink")
+	}
+	check("AGENTS.md is a symlink", false, "does not record delivery-mode: trusted", "")
+	if err := os.Remove(agents); err != nil {
+		t.Fatal(err)
+	}
+
+	// The same committed block in any other mode waives nothing and names nothing.
+	for _, mode := range []string{"pr", "local", "validated"} {
+		write(strings.Replace(string(plain), "- delivery-mode: trusted", "- delivery-mode: "+mode, 1))
+		commit("mode " + mode)
+		check("delivery-mode "+mode, false, "", "")
 	}
 }
