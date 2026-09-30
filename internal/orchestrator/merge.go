@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -700,13 +699,9 @@ func readGateChangePolicy(repo string, base worktree.GateBase) gateChangePolicy 
 	if !ok || projectinit.ParseMode(text) != "trusted" {
 		return gateChangePolicy{reason: fmt.Sprintf("the AGENTS.md committed on %s does not record delivery-mode: trusted, so the gate-change approval stays required until the ttorch block is committed there", def)}
 	}
-	policy, unrecognized := projectinit.ParseGateChangeApproval(text)
-	if len(unrecognized) > 0 {
-		quoted := make([]string, len(unrecognized))
-		for i, v := range unrecognized {
-			quoted[i] = strconv.Quote(v)
-		}
-		w := fmt.Sprintf("gate-change-approval on %s has an unrecognized value (%s), so the gate-change approval is required; set it to off or required", def, strings.Join(quoted, ", "))
+	policy, unrecognized, malformed := projectinit.ParseGateChangeApproval(text)
+	if p := projectinit.GateChangeApprovalProblems(unrecognized, malformed); p != "" {
+		w := fmt.Sprintf("AGENTS.md on %s has %s, so the gate-change approval is required; write it as `- gate-change-approval: off` or `required` inside the ttorch block", def, p)
 		return gateChangePolicy{reason: w, warning: w}
 	}
 	if policy == projectinit.GateChangeApprovalRequired {

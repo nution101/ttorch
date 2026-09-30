@@ -134,8 +134,8 @@ func TestInit_KeepsGateChangeApprovalLine(t *testing.T) {
 	if !strings.Contains(string(got), "gate-change-approval: required") {
 		t.Fatalf("the trusted block must tell the lead how to turn the gate-change approval on:\n%s", got)
 	}
-	if p, u := ParseGateChangeApproval(string(got)); p != GateChangeApprovalOff || u != nil {
-		t.Fatalf("fresh Init: ParseGateChangeApproval = %q, %q; want off with nothing unrecognized (the prose must not parse as a line)", p, u)
+	if p, u, bad := ParseGateChangeApproval(string(got)); p != GateChangeApprovalOff || u != nil || bad != nil {
+		t.Fatalf("fresh Init: ParseGateChangeApproval = %q, %q, %q; want off with nothing named (the prose must not parse as a line)", p, u, bad)
 	}
 
 	withLine := strings.Replace(string(got), "- delivery-mode: trusted\n", "- delivery-mode: trusted\n- gate-change-approval: required\n", 1)
@@ -150,7 +150,7 @@ func TestInit_KeepsGateChangeApprovalLine(t *testing.T) {
 		if n := strings.Count(string(got), gateChangeApprovalKey); n != 1 {
 			t.Fatalf("re-Init(%s) left %d gate-change-approval lines, want 1:\n%s", mode, n, got)
 		}
-		if p, _ := ParseGateChangeApproval(string(got)); p != GateChangeApprovalRequired {
+		if p, _, _ := ParseGateChangeApproval(string(got)); p != GateChangeApprovalRequired {
 			t.Fatalf("re-Init(%s) dropped the lead's required line: ParseGateChangeApproval = %q\n%s", mode, p, got)
 		}
 		if ReadMode(dir) != mode {
@@ -168,8 +168,22 @@ func TestInit_KeepsGateChangeApprovalLine(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, _ = os.ReadFile(agents)
-	if p, u := ParseGateChangeApproval(string(got)); p != GateChangeApprovalRequired || !slices.Equal(u, []string{"requird"}) {
+	if p, u, _ := ParseGateChangeApproval(string(got)); p != GateChangeApprovalRequired || !slices.Equal(u, []string{"requird"}) {
 		t.Fatalf("re-Init lost a misspelled line: ParseGateChangeApproval = %q, %q\n%s", p, u, got)
+	}
+
+	// So is a line the parser reads as a malformed attempt at the key: dropping it would turn
+	// the approval off.
+	star := strings.Replace(string(got), "- gate-change-approval: requird\n", "* gate-change-approval: required\n", 1)
+	if err := os.WriteFile(agents, []byte(star), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Init(dir, "trusted"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = os.ReadFile(agents)
+	if p, _, bad := ParseGateChangeApproval(string(got)); p != GateChangeApprovalRequired || !slices.Equal(bad, []string{"* gate-change-approval: required"}) {
+		t.Fatalf("re-Init lost a malformed line: ParseGateChangeApproval = %q, malformed %q\n%s", p, bad, got)
 	}
 }
 
@@ -199,6 +213,7 @@ func TestInit_ReportsTheGateChangeApproval(t *testing.T) {
 	for _, tc := range []struct{ line, want string }{
 		{"- gate-change-approval: required", "required (kept from the existing block)"},
 		{"- gate-change-approval: requird", `unrecognized value ("requird")`},
+		{"* gate-change-approval: required", `a line not in the recognized form ("* gate-change-approval: required")`},
 	} {
 		body := strings.Replace(string(b), "- delivery-mode: trusted\n", "- delivery-mode: trusted\n"+tc.line+"\n", 1)
 		if err := os.WriteFile(agents, []byte(body), 0o644); err != nil {
@@ -316,9 +331,9 @@ func TestReadMode(t *testing.T) {
 }
 
 // TestParseGateChangeApproval pins the reading of the gate-change-approval line. The approval
-// is off unless the managed block asks for it: an exact `required` turns it on, and so does
-// any value the reader does not recognize, which it also returns so the gate can name it. A
-// typo in a line someone added to require the approval must not leave it off.
+// is off unless AGENTS.md asks for it: an exact `required` in the managed block turns it on,
+// and so does any value the reader does not recognize, which it also returns so the gate can
+// name it. A typo in a line someone added to require the approval must not leave it off.
 func TestParseGateChangeApproval(t *testing.T) {
 	block := func(lines ...string) string {
 		return "# notes\n\n" + markerBegin + "\n- delivery-mode: trusted\n" + strings.Join(lines, "\n") + "\n" + markerEnd + "\n"
@@ -328,7 +343,6 @@ func TestParseGateChangeApproval(t *testing.T) {
 		unrecognized     []string
 	}{
 		{"empty text", "", GateChangeApprovalOff, nil},
-		{"no managed block", "- gate-change-approval: required\n", GateChangeApprovalOff, nil},
 		{"block without the line", block(), GateChangeApprovalOff, nil},
 		{"off", block("- gate-change-approval: off"), GateChangeApprovalOff, nil},
 		{"off twice", block("- gate-change-approval: off", "- gate-change-approval: off"), GateChangeApprovalOff, nil},
@@ -345,15 +359,64 @@ func TestParseGateChangeApproval(t *testing.T) {
 		{"synonym", block("- gate-change-approval: yes"), GateChangeApprovalRequired, []string{"yes"}},
 		{"garbage then off", block("- gate-change-approval: maybe", "- gate-change-approval: off"), GateChangeApprovalRequired, []string{"maybe"}},
 		{"two unrecognized", block("- gate-change-approval: a", "- gate-change-approval: b"), GateChangeApprovalRequired, []string{"a", "b"}},
-		{"required only outside the block", block() + "- gate-change-approval: required\n", GateChangeApprovalOff, nil},
-		{"end marker before begin", markerEnd + "\n- gate-change-approval: required\n" + markerBegin + "\n", GateChangeApprovalOff, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, unrecognized := ParseGateChangeApproval(tc.text)
-			if got != tc.want || !slices.Equal(unrecognized, tc.unrecognized) {
-				t.Fatalf("ParseGateChangeApproval = %q, %q; want %q, %q\ntext:\n%s", got, unrecognized, tc.want, tc.unrecognized, tc.text)
+			got, unrecognized, malformed := ParseGateChangeApproval(tc.text)
+			if got != tc.want || !slices.Equal(unrecognized, tc.unrecognized) || malformed != nil {
+				t.Fatalf("ParseGateChangeApproval = %q, %q, %q; want %q, %q, none malformed\ntext:\n%s", got, unrecognized, malformed, tc.want, tc.unrecognized, tc.text)
 			}
 		})
+	}
+}
+
+// TestParseGateChangeApproval_MalformedLines: a line anywhere in AGENTS.md that is an attempt
+// at the key but not its exact form (`- gate-change-approval: <value>` inside the managed
+// block) turns the approval on and is returned, trimmed, so the gate can name it. Otherwise a
+// `required` written with a `*` bullet, outside the block, or with the key misspelled would be
+// ignored and leave the approval silently off. Prose that mentions the key is not an attempt.
+func TestParseGateChangeApproval_MalformedLines(t *testing.T) {
+	block := func(lines ...string) string {
+		return markerBegin + "\n- delivery-mode: trusted\n" + strings.Join(lines, "\n") + "\n" + markerEnd + "\n"
+	}
+	for _, tc := range []struct{ name, text, line string }{
+		{"required outside the block", block() + "\n- gate-change-approval: required\n", "- gate-change-approval: required"},
+		{"off outside the block", "- gate-change-approval: off\n" + block(), "- gate-change-approval: off"},
+		{"no managed block at all", "- gate-change-approval: required\n", "- gate-change-approval: required"},
+		{"markers out of order", markerEnd + "\n- gate-change-approval: required\n" + markerBegin + "\n", "- gate-change-approval: required"},
+		{"star bullet", block("* gate-change-approval: required"), "* gate-change-approval: required"},
+		{"plus bullet", block("+ gate-change-approval: required"), "+ gate-change-approval: required"},
+		{"numbered", block("1. gate-change-approval: required"), "1. gate-change-approval: required"},
+		{"no bullet", block("gate-change-approval: required"), "gate-change-approval: required"},
+		{"two spaces after the dash", block("-  gate-change-approval: required"), "-  gate-change-approval: required"},
+		{"space before the colon", block("- gate-change-approval : required"), "- gate-change-approval : required"},
+		{"equals instead of colon", block("- gate-change-approval = required"), "- gate-change-approval = required"},
+		{"capitalized key", block("- Gate-Change-Approval: required"), "- Gate-Change-Approval: required"},
+		{"underscores", block("- gate_change_approval: required"), "- gate_change_approval: required"},
+		{"misspelled key", block("- gate-change-aproval: required"), "- gate-change-aproval: required"},
+		{"transposed letters", block("- gate-chnage-approval: required"), "- gate-chnage-approval: required"},
+		{"bold key", block("**gate-change-approval**: required"), "**gate-change-approval**: required"},
+		{"backticked", block("`- gate-change-approval: required`"), "`- gate-change-approval: required`"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _, malformed := ParseGateChangeApproval(tc.text)
+			if got != GateChangeApprovalRequired || !slices.Equal(malformed, []string{tc.line}) {
+				t.Fatalf("ParseGateChangeApproval = %q, malformed %q; want required with %q named\ntext:\n%s", got, malformed, tc.line, tc.text)
+			}
+		})
+	}
+
+	// Prose that mentions the key, and neighbouring keys, are not attempts.
+	for _, text := range []string{
+		block() + "\nchanges, set gate-change-approval: required in this block on the default branch.\n",
+		block() + "\nAdd `- gate-change-approval: required` under the delivery mode to require it.\n",
+		block() + "\nThe gate-change approval is off by default.\n",
+		block() + "\nNote: gate-change-approval lines are read from the default branch.\n",
+		block("- auto-mint-max-age: 72h", "- gate-approval: required", "- change-approval: required"),
+		"x\n" + managedBlock("trusted"),
+	} {
+		if got, u, malformed := ParseGateChangeApproval(text); got != GateChangeApprovalOff || u != nil || malformed != nil {
+			t.Errorf("ParseGateChangeApproval = %q, %q, %q; want off with nothing named\ntext:\n%s", got, u, malformed, text)
+		}
 	}
 }
 

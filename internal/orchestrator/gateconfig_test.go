@@ -2916,6 +2916,8 @@ func TestMergeLocal_GateChangeApprovalRequiredOnMainNeedsAllowGateChange(t *test
 		{"required", "- gate-change-approval: required", "sets gate-change-approval: required"},
 		{"misspelled", "- gate-change-approval: requird", `unrecognized value ("requird")`},
 		{"capitalized", "- gate-change-approval: Off", `unrecognized value ("Off")`},
+		{"star bullet", "* gate-change-approval: required", `a line not in the recognized form ("* gate-change-approval: required")`},
+		{"misspelled key", "- gate-change-aproval: required", `a line not in the recognized form ("- gate-change-aproval: required")`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m, repo := gateChangeApprovalRepo(t, "gcareq"+tc.name, "trusted", tc.policy)
@@ -3453,6 +3455,16 @@ func TestReadGateChangePolicy_ReadsTheDefaultBranch(t *testing.T) {
 	write(string(plain))
 	commit("back to the default")
 	check("line removed on main", true, "", "")
+
+	// A required line outside the managed block is not the recognized form, and it keeps the
+	// approval and is named rather than being ignored.
+	write(string(plain) + "\n- gate-change-approval: required\n")
+	commit("required outside the block")
+	check("required outside the block on main", false, `a line not in the recognized form ("- gate-change-approval: required")`, `a line not in the recognized form ("- gate-change-approval: required")`)
+
+	write(string(plain))
+	commit("back to the default again")
+	check("line removed on main again", true, "", "")
 
 	// AGENTS.md as a symlink: the working tree reads trusted through it, but the committed blob
 	// is only the link's target path, which records no mode.

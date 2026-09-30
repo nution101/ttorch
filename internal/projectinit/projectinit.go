@@ -89,25 +89,48 @@ const (
 	GateChangeApprovalRequired = "required"
 )
 
-// ParseGateChangeApproval returns the gate-change-approval policy recorded in the
-// ttorch-managed block of agentsMD, the text of an AGENTS.md, and every value in the block it
-// did not recognize, in order.
+// ParseGateChangeApproval returns the gate-change-approval policy recorded in agentsMD, the
+// text of an AGENTS.md, with every value it did not recognize and every line it could not
+// read, in file order.
 //
-// No block, no line, and lines that all say `off` read as GateChangeApprovalOff. A `required`
-// line reads as GateChangeApprovalRequired, and so does any other value: a typo in a line
-// someone added to switch the approval ON must not leave it off. Those values are returned so
-// the caller can name them. A block with both `off` and `required` is required, for the same
-// reason. Values are compared exactly, case included, so "Required" is unrecognized (and
-// therefore required) rather than folded. A line outside the managed block is ignored.
+// The recognized form is a `- gate-change-approval: <value>` line inside the ttorch-managed
+// block. No such line, and lines that all say `off`, read as GateChangeApprovalOff. A
+// `required` line reads as GateChangeApprovalRequired, and so does any other value, which is
+// returned in unrecognized: a typo in a line someone added to switch the approval ON must not
+// leave it off. A block with both `off` and `required` is required, for the same reason. Values
+// are compared exactly, case included, so "Required" is unrecognized rather than folded.
+//
+// A line ANYWHERE in the file that is an attempt at the key but not the recognized form (a `*`
+// bullet, a misspelled or re-cased key, a space before the colon, the line outside the managed
+// block) also reads as required and is returned, trimmed, in malformed. Ignoring it would
+// leave the approval off with nothing said. looksLikeGateChangeApprovalKey decides what counts
+// as an attempt.
 //
 // It takes the file's text rather than a directory, unlike ReadMode, because the gate that
 // consumes it must read the DEFAULT BRANCH's committed AGENTS.md, never a checkout a worker
 // can edit. A directory-reading variant would make the wrong read the easy one.
-func ParseGateChangeApproval(agentsMD string) (policy string, unrecognized []string) {
+func ParseGateChangeApproval(agentsMD string) (policy string, unrecognized, malformed []string) {
 	policy = GateChangeApprovalOff
-	for _, line := range managedBlockLines(agentsMD) {
+	before, block, after := agentsMD, "", ""
+	if bi, ei := strings.Index(agentsMD, markerBegin), strings.Index(agentsMD, markerEnd); bi >= 0 && ei > bi {
+		before, block, after = agentsMD[:bi], agentsMD[bi:ei], agentsMD[ei:]
+	}
+	outside := func(text string) {
+		for _, line := range strings.Split(text, "\n") {
+			if looksLikeGateChangeApprovalKey(line) {
+				policy = GateChangeApprovalRequired
+				malformed = append(malformed, strings.TrimSpace(line))
+			}
+		}
+	}
+	outside(before)
+	for _, line := range strings.Split(block, "\n") {
 		rest, ok := strings.CutPrefix(strings.TrimSpace(line), gateChangeApprovalKey)
 		if !ok {
+			if looksLikeGateChangeApprovalKey(line) {
+				policy = GateChangeApprovalRequired
+				malformed = append(malformed, strings.TrimSpace(line))
+			}
 			continue
 		}
 		switch v := strings.TrimSpace(rest); v {
@@ -119,7 +142,78 @@ func ParseGateChangeApproval(agentsMD string) (policy string, unrecognized []str
 			unrecognized = append(unrecognized, v)
 		}
 	}
-	return policy, unrecognized
+	outside(after)
+	return policy, unrecognized, malformed
+}
+
+// gateChangeApprovalLetters is the key's letters, lower-cased, which is what a line has to
+// resemble to count as an attempt at it.
+const gateChangeApprovalLetters = "gatechangeapproval"
+
+// looksLikeGateChangeApprovalKey reports whether line is an attempt at a gate-change-approval
+// line: it has a `:` or `=`, and the letters before the first one, lower-cased with everything
+// else dropped (bullets, numbering, markup, spaces, hyphens, underscores), are within two edits
+// of "gatechangeapproval". That covers any bullet style, re-casing, `_` for `-`, stray spaces
+// and a letter dropped, added or swapped. Prose that mentions the key does not match, because
+// its words before the colon ("set gate-change-approval: ...", "Add `- gate-change-approval: ")
+// add more than two letters; neither does a neighbouring key such as `gate-approval`.
+func looksLikeGateChangeApprovalKey(line string) bool {
+	i := strings.IndexAny(line, ":=")
+	if i < 0 {
+		return false
+	}
+	var b strings.Builder
+	for _, r := range strings.ToLower(line[:i]) {
+		if r >= 'a' && r <= 'z' {
+			b.WriteRune(r)
+		}
+	}
+	k := b.String()
+	if len(k) > len(gateChangeApprovalLetters)+2 || len(k) < len(gateChangeApprovalLetters)-2 {
+		return false
+	}
+	return editDistance(k, gateChangeApprovalLetters) <= 2
+}
+
+// editDistance is the Levenshtein distance between two ASCII strings.
+func editDistance(a, b string) int {
+	prev := make([]int, len(b)+1)
+	cur := make([]int, len(b)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		cur[0] = i
+		for j := 1; j <= len(b); j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			cur[j] = min(prev[j]+1, cur[j-1]+1, prev[j-1]+cost)
+		}
+		prev, cur = cur, prev
+	}
+	return prev[len(b)]
+}
+
+// GateChangeApprovalProblems describes, for a warning or a refusal, the unrecognized values and
+// malformed lines ParseGateChangeApproval returned, each quoted. It is "" when there are none.
+func GateChangeApprovalProblems(unrecognized, malformed []string) string {
+	quote := func(vs []string) string {
+		q := make([]string, len(vs))
+		for i, v := range vs {
+			q[i] = strconv.Quote(v)
+		}
+		return strings.Join(q, ", ")
+	}
+	var parts []string
+	if len(unrecognized) > 0 {
+		parts = append(parts, "an unrecognized value ("+quote(unrecognized)+")")
+	}
+	if len(malformed) > 0 {
+		parts = append(parts, "a line not in the recognized form ("+quote(malformed)+")")
+	}
+	return strings.Join(parts, " and ")
 }
 
 // autoMintMaxAgeKey is the per-repo policy line that bounds how stale a trusted,
@@ -226,15 +320,11 @@ func Init(dir, mode string) ([]string, error) {
 // any value ParseGateChangeApproval does not recognize, quoted, so a typo is visible at init
 // rather than only at the first refused merge.
 func gateChangeApprovalNote(agentsMD string) string {
-	policy, unrecognized := ParseGateChangeApproval(agentsMD)
+	policy, unrecognized, malformed := ParseGateChangeApproval(agentsMD)
 	switch {
-	case len(unrecognized) > 0:
-		quoted := make([]string, len(unrecognized))
-		for i, v := range unrecognized {
-			quoted[i] = strconv.Quote(v)
-		}
-		return "gate-change approval: required, because gate-change-approval has an unrecognized value (" +
-			strings.Join(quoted, ", ") + "); set it to off or required"
+	case len(unrecognized) > 0 || len(malformed) > 0:
+		return "gate-change approval: required, because AGENTS.md has " + GateChangeApprovalProblems(unrecognized, malformed) +
+			"; write it as `- gate-change-approval: off` or `required` inside the ttorch block"
 	case policy == GateChangeApprovalRequired:
 		return "gate-change approval: required (kept from the existing block); a change to the gate itself needs `ttorch approve --allow-gate-change`"
 	default:
@@ -268,15 +358,16 @@ func managedBlock(mode string, kept ...string) string {
 }
 
 // keptBlockLines returns the lines of an existing managed block that Init carries into the
-// block it regenerates: every `- gate-change-approval:` line, trimmed, in order. That line is
-// the lead's decision rather than ttorch's text, so re-running `ttorch init` must not erase it:
-// dropping a `required` line would silently remove the approval the lead asked for. All of
-// them are kept, so a pair that disagrees, or a misspelled value, still reads as required
-// afterwards.
+// block it regenerates: every `- gate-change-approval:` line, and every line that is an attempt
+// at one (looksLikeGateChangeApprovalKey), trimmed, in order. That line is the lead's decision
+// rather than ttorch's text, so re-running `ttorch init` must not erase it: dropping a
+// `required` line, or a `* gate-change-approval: required` the parser reads as required, would
+// silently remove the approval the lead asked for. All of them are kept, so a pair that
+// disagrees, a misspelled value or a malformed line still reads as required afterwards.
 func keptBlockLines(block string) []string {
 	var kept []string
 	for _, line := range strings.Split(block, "\n") {
-		if l := strings.TrimSpace(line); strings.HasPrefix(l, gateChangeApprovalKey) {
+		if l := strings.TrimSpace(line); strings.HasPrefix(l, gateChangeApprovalKey) || looksLikeGateChangeApprovalKey(l) {
 			kept = append(kept, l)
 		}
 	}
