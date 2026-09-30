@@ -3639,3 +3639,50 @@ func TestTrustRecord_RepointedOriginHeadCannotSupplyThePolicy(t *testing.T) {
 		t.Fatal("a repointed origin/HEAD must not move the gate onto the worker's branch: main says required")
 	}
 }
+
+// TestTrustPrep_GateBaseTagCannotEmptyTheReviewDiff: the reviewers read the three-dot diff
+// against the branch's base. Resolved by name, a worker's tag at its own HEAD would make that
+// diff empty and the stale-base guard vacuous, so the reviewers would pass a change they were
+// never shown. The tag is named after the local branch with and without an origin, and after
+// the remote-tracking one.
+func TestTrustPrep_GateBaseTagCannotEmptyTheReviewDiff(t *testing.T) {
+	for _, tc := range []struct {
+		name, tag  string
+		withOrigin bool
+	}{
+		{"no origin, tag main", "main", false},
+		{"origin, tag main", "main", true},
+		{"origin, tag origin/main", "origin/main", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, repo := deliveryHarness(t, "gbreview"+strings.NewReplacer(" ", "", ",", "", "/", "").Replace(tc.name))
+			commitGateScript(t, repo, "exit 0")
+			if tc.withOrigin {
+				bare := t.TempDir()
+				gitIn(t, bare, "init", "--bare", "-q", "-b", "main")
+				gitIn(t, repo, "remote", "add", "origin", bare)
+				gitIn(t, repo, "push", "-q", "origin", "main")
+				gitIn(t, repo, "fetch", "-q", "origin")
+			}
+			task, err := m.Spawn("gv1", repo, false, "sleep 60")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _, _ = m.Teardown("gv1", true) }()
+			head := commitFeature(t, task.Worktree, "feature.txt", "worker change\n")
+			gitIn(t, task.Worktree, "tag", tc.tag, head)
+
+			dir, err := m.TrustPrep("gv1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			patch, err := os.ReadFile(filepath.Join(dir, "diff.patch"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(patch), "feature.txt") {
+				t.Fatalf("a tag named %s must not empty the reviewers' diff; diff.patch:\n%s", tc.tag, patch)
+			}
+		})
+	}
+}

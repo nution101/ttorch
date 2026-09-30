@@ -889,12 +889,20 @@ func (m *Manager) resolveLandSpec(t db.Task, requireVerdict bool) (landSpec, err
 	if mode == "pr" && !hasOrigin {
 		return zero, fmt.Errorf("land: repo %s is in pr delivery mode but has no 'origin' remote to push to", repo)
 	}
+	// The default branch as the gate resolves it (worktree.ResolveGateBase), so a repointed
+	// origin/HEAD cannot move the land onto another branch. A repo it cannot resolve falls
+	// back to DefaultBranch for the rebase base only; every gated read resolves again and
+	// refuses on its own.
+	def := worktree.DefaultBranch(repo)
+	if gb, err := worktree.ResolveGateBase(repo); err == nil {
+		def = gb.Name
+	}
 	return landSpec{
 		taskID:         t.ID,
 		repo:           repo,
 		wt:             wt,
 		mode:           mode,
-		def:            worktree.DefaultBranch(repo),
+		def:            def,
 		gated:          requireVerdict || mode == "trusted",
 		requireVerdict: requireVerdict,
 		hasOrigin:      hasOrigin,
@@ -911,14 +919,20 @@ func (m *Manager) resolveLandSpec(t db.Task, requireVerdict bool) (landSpec, err
 // local default is the correct base. This is what lets a concurrent batch of local landings
 // converge — each re-prep rebases onto the default the prior landing just advanced. Falls back
 // to the local default when there is no origin/<def>.
+//
+// Both refs are resolved and returned FULLY QUALIFIED (refs/heads/<def>,
+// refs/remotes/origin/<def>). Refs are shared with every worker's worktree, and git resolves a
+// bare name to refs/tags/<name> before refs/heads/<name>, so a worker's tag named "main" would
+// otherwise become the base of the reviewers' diff and of the rebase: at the worker's own HEAD
+// it empties the diff the reviewers are shown.
 func landBase(repo, def string, hasOrigin bool) (ref, sha string, err error) {
-	localSha, err := worktree.ResolveRef(repo, def)
+	localRef := "refs/heads/" + def
+	localSha, err := worktree.ResolveRef(repo, localRef)
 	if err != nil {
-		return "", "", fmt.Errorf("could not resolve the local default %s: %w", def, err)
+		return "", "", fmt.Errorf("could not resolve the local default %s: %w", localRef, err)
 	}
-	ref, sha = def, localSha
-	if hasOrigin && worktree.RefExists(repo, "origin/"+def) {
-		originRef := "origin/" + def
+	ref, sha = localRef, localSha
+	if originRef := "refs/remotes/origin/" + def; hasOrigin && worktree.RefExists(repo, originRef) {
 		originSha, err := worktree.ResolveRef(repo, originRef)
 		if err != nil {
 			return "", "", fmt.Errorf("could not resolve %s: %w", originRef, err)
@@ -1318,7 +1332,7 @@ func (m *Manager) integratePR(t db.Task, def, rebasedHead string) (string, error
 	if changed, _ := worktree.HasTrackedChanges(repo); changed {
 		return "", fmt.Errorf("land: repo has uncommitted tracked changes; cannot fast-forward the local default after the PR merge")
 	}
-	if err := worktree.MergeFastForward(repo, "origin/"+def); err != nil {
+	if err := worktree.MergeFastForward(repo, "refs/remotes/origin/"+def); err != nil {
 		return "", fmt.Errorf("land: fast-forwarding local %s to origin/%s after the PR merge failed: %w", def, def, err)
 	}
 	// The PR merged and the local default fast-forwarded: record the delivery as a
@@ -1338,7 +1352,7 @@ func (m *Manager) integratePR(t db.Task, def, rebasedHead string) (string, error
 // files are allowed. Either failure is a loud, file-naming alarm (a post-merge tripwire; it
 // cannot un-merge, only refuse to bless).
 func verifyLanded(repo, def, baseSha, rebasedHead string, strict bool) (string, error) {
-	defAfter, err := worktree.ResolveRef(repo, def)
+	defAfter, err := worktree.ResolveRef(repo, "refs/heads/"+def)
 	if err != nil {
 		return "", fmt.Errorf("post-merge verify could not resolve %s: %w", def, err)
 	}

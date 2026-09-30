@@ -171,11 +171,18 @@ func (m *Manager) derivedFloor(t db.Task, sha string) []string {
 // they disagree, one of them has been moved, and taking the union means the move cannot hide a
 // changed file. Only refs that resolve are returned; duplicates are dropped so a diff is not
 // computed twice for the same sha.
+//
+// The refs are fully qualified and the name comes from worktree.ResolveGateBase, so a worker's
+// tag named after the branch, or a repointed origin/HEAD, cannot supply a base. When the name
+// cannot be resolved there are no candidates and derivedFloor falls back to the full set.
 func candidateReviewBases(repo string) []string {
-	def := worktree.DefaultBranch(repo)
+	gb, err := worktree.ResolveGateBase(repo)
+	if err != nil {
+		return nil
+	}
 	var out []string
 	seen := map[string]bool{}
-	for _, ref := range []string{"", def, "origin/" + def} {
+	for _, ref := range []string{"", "refs/heads/" + gb.Name, "refs/remotes/origin/" + gb.Name} {
 		if ref == "" {
 			// The base the land path will actually use. Resolved without a fetch: prep has
 			// already fetched for this episode, and a fetch here would be a network round trip
@@ -352,8 +359,13 @@ func (m *Manager) ReviewDiff(taskID string, stat bool) (string, error) {
 	if err != nil || !ok {
 		return "", fmt.Errorf("unknown task %q", taskID)
 	}
-	base := worktree.DefaultBranch(t.Project)
-	return worktree.Diff(t.Worktree, base, stat)
+	// Diffed against refs/heads/<default>, fully qualified, so a worker's tag named after the
+	// branch cannot change what the lead is shown (see worktree.ResolveGateBase).
+	gb, err := worktree.ResolveGateBase(t.Project)
+	if err != nil {
+		return "", err
+	}
+	return worktree.Diff(t.Worktree, "refs/heads/"+gb.Name, stat)
 }
 
 // gitOut runs `git -C dir <args...>` and returns its raw stdout, enriching the error with
@@ -401,8 +413,16 @@ func mergeBaseDiff(dir, base, rev string) (string, error) {
 // to the local default when origin is absent or behind (an unpushed local fast-forward), so
 // this never bases a diff on a ref the merge would not actually target; the merge gate's own
 // authoritative fetch+rebase catches a base that is still behind here.
+//
+// The default branch's name comes from worktree.ResolveGateBase and landBase resolves it fully
+// qualified, so neither a tag a worker names after the branch nor a repointed origin/HEAD can
+// become the base of the diff the reviewers are shown.
 func reviewBase(repo string, fetch bool) (string, error) {
-	def := worktree.DefaultBranch(repo)
+	gb, err := worktree.ResolveGateBase(repo)
+	if err != nil {
+		return "", err
+	}
+	def := gb.Name
 	hasOrigin := worktree.RemoteExists(repo, "origin")
 	if fetch && hasOrigin {
 		// Best-effort: a stale origin/<default> still beats the local default, and a branch

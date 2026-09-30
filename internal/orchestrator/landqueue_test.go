@@ -235,7 +235,7 @@ func TestLandBase_PrefersFastForwardTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 	localSha := gitIn(t, repo, "rev-parse", "main")
-	if ref != "main" || sha != localSha {
+	if ref != "refs/heads/main" || sha != localSha {
 		t.Fatalf("no-origin base should be the local default %s/%s, got %s/%s", "main", short(localSha), ref, short(sha))
 	}
 
@@ -256,7 +256,7 @@ func TestLandBase_PrefersFastForwardTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ref != "main" || sha != localAhead {
+	if ref != "refs/heads/main" || sha != localAhead {
 		t.Fatalf("with the local default ahead of origin, base must be the local default %s, got %s/%s", short(localAhead), ref, short(sha))
 	}
 
@@ -268,7 +268,7 @@ func TestLandBase_PrefersFastForwardTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 	originSha := gitIn(t, repo, "rev-parse", "origin/main")
-	if ref != "origin/main" || sha != originSha {
+	if ref != "refs/remotes/origin/main" || sha != originSha {
 		t.Fatalf("with origin equal-or-ahead, base must be origin/main %s, got %s/%s", short(originSha), ref, short(sha))
 	}
 }
