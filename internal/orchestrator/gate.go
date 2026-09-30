@@ -152,7 +152,7 @@ func (m *Manager) requiredDimensions(t db.Task, sha string) (required, dropped [
 func (m *Manager) derivedFloor(t db.Task, sha string) []string {
 	var floor []string
 	derived := false
-	for _, base := range candidateReviewBases(t.Project) {
+	for _, base := range candidateReviewBases(t.Project, m.recordedDefaultBranch(t.Project)) {
 		files, filesOK := diffFiles(t.Worktree, base, sha)
 		lines, binary, statOK := diffLineStat(t.Worktree, base, sha)
 		_, dims := review.Classify(files, lines, binary, filesOK && statOK)
@@ -172,11 +172,12 @@ func (m *Manager) derivedFloor(t db.Task, sha string) []string {
 // changed file. Only refs that resolve are returned; duplicates are dropped so a diff is not
 // computed twice for the same sha.
 //
-// The refs are fully qualified and the name comes from worktree.ResolveGateBase, so a worker's
-// tag named after the branch, or a repointed origin/HEAD, cannot supply a base. When the name
-// cannot be resolved there are no candidates and derivedFloor falls back to the full set.
-func candidateReviewBases(repo string) []string {
-	gb, err := worktree.ResolveGateBase(repo)
+// def is the default branch recorded for the project (see Manager.gateBase). The refs are fully
+// qualified, so a worker's tag named after the branch cannot supply a base, and no ref a worker
+// can write chooses the branch. With no recorded branch there are no candidates and
+// derivedFloor falls back to the full set.
+func candidateReviewBases(repo, def string) []string {
+	gb, err := worktree.ResolveGateBase(repo, def)
 	if err != nil {
 		return nil
 	}
@@ -187,7 +188,7 @@ func candidateReviewBases(repo string) []string {
 			// The base the land path will actually use. Resolved without a fetch: prep has
 			// already fetched for this episode, and a fetch here would be a network round trip
 			// on a per-tick path for no added integrity.
-			b, err := reviewBase(repo, false)
+			b, err := reviewBase(repo, gb.Name, false)
 			if err != nil {
 				continue
 			}
@@ -359,9 +360,9 @@ func (m *Manager) ReviewDiff(taskID string, stat bool) (string, error) {
 	if err != nil || !ok {
 		return "", fmt.Errorf("unknown task %q", taskID)
 	}
-	// Diffed against refs/heads/<default>, fully qualified, so a worker's tag named after the
-	// branch cannot change what the lead is shown (see worktree.ResolveGateBase).
-	gb, err := worktree.ResolveGateBase(t.Project)
+	// Diffed against refs/heads/<default>, fully qualified, with the recorded branch, so no ref a
+	// worker can write changes what the lead is shown (see Manager.gateBase).
+	gb, err := m.gateBase(t.Project)
 	if err != nil {
 		return "", err
 	}
@@ -414,15 +415,10 @@ func mergeBaseDiff(dir, base, rev string) (string, error) {
 // this never bases a diff on a ref the merge would not actually target; the merge gate's own
 // authoritative fetch+rebase catches a base that is still behind here.
 //
-// The default branch's name comes from worktree.ResolveGateBase and landBase resolves it fully
-// qualified, so neither a tag a worker names after the branch nor a repointed origin/HEAD can
-// become the base of the diff the reviewers are shown.
-func reviewBase(repo string, fetch bool) (string, error) {
-	gb, err := worktree.ResolveGateBase(repo)
-	if err != nil {
-		return "", err
-	}
-	def := gb.Name
+// def is the default branch recorded for the project (see Manager.gateBase), and landBase
+// resolves it fully qualified, so no ref a worker can write chooses the branch or stands in for
+// it in the diff the reviewers are shown.
+func reviewBase(repo, def string, fetch bool) (string, error) {
 	hasOrigin := worktree.RemoteExists(repo, "origin")
 	if fetch && hasOrigin {
 		// Best-effort: a stale origin/<default> still beats the local default, and a branch
@@ -546,12 +542,18 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	def := worktree.DefaultBranch(t.Project)
+	// The default branch the gate reads for this project, recorded at registration (see
+	// Manager.gateBase). One resolution serves the diff base and the staged validate below.
+	gb, err := m.gateBase(t.Project)
+	if err != nil {
+		return "", fmt.Errorf("trust prep %q: %w", taskID, err)
+	}
+	def := gb.Name
 	// Resolve the branch's TRUE base — the up-to-date default tip the merge targets, not the
 	// raw local <default> which may be behind origin (see reviewBase). A best-effort fetch
 	// refreshes origin/<default> first so a release that landed after the worker spawned is
 	// caught here too.
-	base, err := reviewBase(t.Project, true)
+	base, err := reviewBase(t.Project, def, true)
 	if err != nil {
 		return "", fmt.Errorf("trust prep %q: could not resolve the branch's base against %s: %w", taskID, def, err)
 	}
@@ -646,10 +648,6 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 	}
 	// validate.json reflects the gate's own check of the committed sha (default-branch
 	// definition, immutable checkout) — the same notion of "green" the gate enforces.
-	gb, err := worktree.ResolveGateBase(t.Project)
-	if err != nil {
-		return "", fmt.Errorf("trust prep %q: %w", taskID, err)
-	}
 	_, results, _ := validateCommitted(t.Project, gb, head) // nil when no checks are detected
 	vb, err := json.MarshalIndent(results, "", "  ")
 	if err != nil {
@@ -915,7 +913,11 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 	// No fetch here: prep just refreshed origin/<default>, and the three-dot diff against it
 	// is stable as origin advances (the merge-base stays the branch's fork point). Computed
 	// from committed objects, so it is independent of the worktree state.
-	reviewedBase, berr := reviewBase(t.Project, false)
+	recorded, berr := m.gateBase(t.Project)
+	if berr != nil {
+		return zero, fmt.Errorf("trust record %q: %w", taskID, berr)
+	}
+	reviewedBase, berr := reviewBase(t.Project, recorded.Name, false)
 	if berr != nil {
 		return zero, fmt.Errorf("trust record %q: could not resolve the reviewed diff base: %w", taskID, berr)
 	}
@@ -938,16 +940,11 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 	// are re-checked at the merge in MergeLocal — minting here is an optimization, not the
 	// authority. Any non-trusted mode leaves the verdict advisory.
 	if verdict.Overall == review.Pass && projectinit.ReadMode(t.Project) == "trusted" {
-		// One resolution of the default branch for this decision (see worktree.ResolveGateBase):
-		// the gate-definition diff, the policy and the validate all read base.SHA. If it cannot
-		// be resolved, nothing is minted and a human approves.
-		base, berr := worktree.ResolveGateBase(t.Project)
+		// The one resolution of the default branch this record took above (see Manager.gateBase):
+		// the gate-definition diff, the policy and the validate all read base.SHA.
+		base := recorded
 		clean, cerr := worktree.IsClean(t.Worktree)
-		var hit *gateConfigHit
-		var terr error
-		if berr == nil {
-			hit, terr = diffTouchesGateConfig(t.Project, base.SHA, sha)
-		}
+		hit, terr := diffTouchesGateConfig(t.Project, base.SHA, sha)
 		touched := hit != nil && (hit.Blocking || !readGateChangePolicy(t.Project, base).waived)
 		green := false
 		// A trusted auto-mint's green authority MUST be the default-branch gate script,
@@ -956,7 +953,7 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 		// approve — and skip validation entirely so no worker-defined checks run. The green
 		// comes from validateForAuthority, so it is one this process ran: the on-disk
 		// validate cache is a file the worker can write and cannot mint an approval.
-		if berr == nil && cerr == nil && terr == nil && clean && !touched && hasDefaultBranchGateScript(t.Project, base) {
+		if cerr == nil && terr == nil && clean && !touched && hasDefaultBranchGateScript(t.Project, base) {
 			green, _, _, _ = validateForAuthority(t.Project, base, sha)
 		}
 		if green {

@@ -2846,13 +2846,17 @@ func setGateChangeApprovalLine(t *testing.T, dir, mode, policy string) {
 	}
 }
 
-// gateBaseFor resolves repo's default branch the way the gate does, failing the test if it
-// cannot be resolved.
+// gateBaseFor resolves repo's default branch the way the gate does, with the branch its
+// registration would record (the checkout's), failing the test if it cannot be resolved.
 func gateBaseFor(t *testing.T, repo string) worktree.GateBase {
 	t.Helper()
-	b, err := worktree.ResolveGateBase(repo)
+	branch, err := worktree.DetectDefaultBranch(repo)
 	if err != nil {
-		t.Fatalf("ResolveGateBase(%s): %v", repo, err)
+		t.Fatalf("DetectDefaultBranch(%s): %v", repo, err)
+	}
+	b, err := worktree.ResolveGateBase(repo, branch)
+	if err != nil {
+		t.Fatalf("ResolveGateBase(%s, %s): %v", repo, branch, err)
 	}
 	return b
 }
@@ -3696,5 +3700,102 @@ func TestTrustPrep_GateBaseTagCannotEmptyTheReviewDiff(t *testing.T) {
 				t.Fatalf("a tag named %s must not empty the reviewers' diff; diff.patch:\n%s", tc.tag, patch)
 			}
 		})
+	}
+}
+
+// TestTrustPrep_PlantedMainCannotBeTheGateBase is the reviewers' half of a sequence reported
+// against the name-based gate. In a repository whose default branch is develop, with no
+// refs/remotes/origin/HEAD, a worker creates a local main at its own tip from its worktree.
+// A gate that fell back to main would stage the reviewers' diff against the worker's tip, so
+// they would review nothing. The gate reads the branch recorded at registration, develop.
+func TestTrustPrep_PlantedMainCannotBeTheGateBase(t *testing.T) {
+	m, repo := gateChangeApprovalRepo(t, "plantmain", "trusted", "")
+	gitIn(t, repo, "branch", "-m", "main", "develop")
+	task, err := m.Spawn("pm1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = m.Teardown("pm1", true) }()
+	head := commitFeature(t, task.Worktree, "feature.txt", "worker change\n")
+	gitIn(t, task.Worktree, "branch", "main", head)
+
+	dir, err := m.TrustPrep("pm1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	patch, err := os.ReadFile(filepath.Join(dir, "diff.patch"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(patch), "feature.txt") {
+		t.Fatalf("a main the worker planted at its own tip must not be the base of the reviewers' diff; diff.patch:\n%s", patch)
+	}
+}
+
+// TestTrustRecord_StaleMainCannotSupplyThePolicy: a repository whose default branch is neither
+// main nor master can still carry an old main. Here main has the trusted block with no
+// gate-change-approval line (off), and develop, the branch the checkout is on and the one
+// recorded at registration, says required. A gate that fell back to main would read the stale
+// off and auto-approve a gate-definition change. It must read develop and leave the approval
+// to a human.
+func TestTrustRecord_StaleMainCannotSupplyThePolicy(t *testing.T) {
+	m, repo := gateChangeApprovalRepo(t, "stalemain", "trusted", "")
+	gitIn(t, repo, "checkout", "-q", "-b", "develop")
+	requireGateChangeApproval(t, repo)
+	gitIn(t, repo, "commit", "-q", "-am", "develop requires the gate-change approval")
+	task, err := m.Spawn("sm1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = m.Teardown("sm1", true) }()
+	head := commitGateDefinitionEdit(t, task.Worktree)
+
+	writeReviewReports(t, m.P.ReviewInputsDir("sm1"), head, nil)
+	if _, err := m.TrustRecord("sm1", "", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if approval.Valid(m.P.ApprovalFile("sm1")) {
+		t.Fatal("a stale main must not supply the gate-change policy: develop, the recorded default branch, says required")
+	}
+}
+
+// TestGate_RefusesWithoutARecordedDefaultBranch: the gate reads only the recorded branch, so a
+// project with none (a seed that found nothing, or a row a worker's checkout predates) is
+// refused at prep and at the merge, with the command that fixes it. So is a recorded branch
+// with no local ref.
+func TestGate_RefusesWithoutARecordedDefaultBranch(t *testing.T) {
+	m, repo := gateChangeApprovalRepo(t, "nobranch", "trusted", "")
+	task, err := m.Spawn("nb1", repo, false, "sleep 60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = m.Teardown("nb1", true) }()
+	head := commitFeature(t, task.Worktree, "feature.txt", "worker change\n")
+	p := projectByRepo(t, m.Store, task.Project)
+	if p.DefaultBranch != "main" {
+		t.Fatalf("setup: spawn must have recorded main, got %+v", p)
+	}
+	if err := m.Store.SetProjectDefaultBranch(context.Background(), p.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.TrustPrep("nb1"); err == nil || !strings.Contains(err.Error(), "no default branch is recorded") || !strings.Contains(err.Error(), SetBranchCommand) {
+		t.Fatalf("prep without a recorded branch: %v, want a refusal naming %q", err, SetBranchCommand)
+	}
+	writeReviewReports(t, m.P.ReviewInputsDir("nb1"), head, nil)
+	if err := approval.Grant(m.P.ApprovalFile("nb1"), time.Minute, approvalPayload("auto", head, nil)); err != nil {
+		t.Fatal(err)
+	}
+	defHead := gitIn(t, repo, "rev-parse", "refs/heads/main")
+	if _, err := m.MergeLocal("nb1", false); err == nil || !strings.Contains(err.Error(), SetBranchCommand) {
+		t.Fatalf("merge without a recorded branch: %v, want a refusal naming %q", err, SetBranchCommand)
+	}
+	if gitIn(t, repo, "rev-parse", "refs/heads/main") != defHead {
+		t.Fatal("nothing may merge without a recorded default branch")
+	}
+	if err := m.Store.SetProjectDefaultBranch(context.Background(), p.ID, "gone"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.TrustPrep("nb1"); err == nil || !strings.Contains(err.Error(), "refs/heads/gone") {
+		t.Fatalf("prep with a recorded branch that has no ref: %v, want a refusal naming refs/heads/gone", err)
 	}
 }

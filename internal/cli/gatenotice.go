@@ -47,7 +47,7 @@ func printGateNotices(w io.Writer, p paths.Paths) {
 			fmt.Fprintf(w, "no default branch is recorded for %s, so the trust gate refuses it; run '%s %d <branch>'\n",
 				proj.RepoPath, orchestrator.SetBranchCommand, proj.ID)
 		}
-		if gateChangeApprovalDefaulted(proj.RepoPath) {
+		if gateChangeApprovalDefaulted(proj.RepoPath, proj.DefaultBranch) {
 			fmt.Fprintf(w, "gate-change approval is now off by default for %s; add '- gate-change-approval: required' to its AGENTS.md to keep it\n", proj.RepoPath)
 		}
 	}
@@ -69,15 +69,15 @@ func isRepoRoot(dir string) bool {
 }
 
 // gateChangeApprovalDefaulted reports whether repo is trusted and its gate-change approval is
-// off only because the default says so: the AGENTS.md committed on its default branch (what
-// the gate reads, see worktree.ResolveGateBase) records trusted mode and has no
-// gate-change-approval line. A default branch the gate cannot read, or one without a trusted
-// block, keeps the approval, so it is not reported.
-func gateChangeApprovalDefaulted(repo string) bool {
+// off only because the default says so: the AGENTS.md committed on branch, the default branch
+// recorded for the project (what the gate reads, see worktree.ResolveGateBase), records trusted
+// mode and has no gate-change-approval line. A default branch the gate cannot read, or one
+// without a trusted block, keeps the approval, so it is not reported.
+func gateChangeApprovalDefaulted(repo, branch string) bool {
 	if mode, ok := projectinit.LiveMode(repo); !ok || mode != "trusted" {
 		return false
 	}
-	base, err := worktree.ResolveGateBase(repo)
+	base, err := worktree.ResolveGateBase(repo, branch)
 	if err != nil {
 		return false
 	}

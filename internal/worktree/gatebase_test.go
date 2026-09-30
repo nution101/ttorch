@@ -30,9 +30,9 @@ func gateBaseRepo(t *testing.T) (repo, wt, mainTip, workerTip string) {
 	return repo, wt, mainTip, workerTip
 }
 
-func mustGateBase(t *testing.T, repo string) GateBase {
+func mustGateBase(t *testing.T, repo, branch string) GateBase {
 	t.Helper()
-	b, err := ResolveGateBase(repo)
+	b, err := ResolveGateBase(repo, branch)
 	if err != nil {
 		t.Fatalf("ResolveGateBase: %v", err)
 	}
@@ -53,7 +53,7 @@ func TestResolveGateBase_TagCannotShadowTheBranch(t *testing.T) {
 	if s, ok := ShowFile(repo, "main", "f.txt"); !ok || s != "worker\n" {
 		t.Fatalf("setup: expected a bare-name read to see the worker's bytes, got %q", s)
 	}
-	b := mustGateBase(t, repo)
+	b := mustGateBase(t, repo, "main")
 	if b.Name != "main" || b.SHA != mainTip {
 		t.Fatalf("ResolveGateBase = %+v, want main at %s (the branch, not the tag at %s)", b, mainTip, workerTip)
 	}
@@ -62,79 +62,39 @@ func TestResolveGateBase_TagCannotShadowTheBranch(t *testing.T) {
 	}
 }
 
-// TestResolveGateBase_RepointedOriginHeadDoesNotMoveIt: refs/remotes/origin/HEAD is shared and
-// can be repointed from any worktree. Pointing it at the worker's branch must not make the gate
-// read that branch while the repository's own checkout is on main.
-func TestResolveGateBase_RepointedOriginHeadDoesNotMoveIt(t *testing.T) {
+// TestResolveGateBase_WorkerRefsDoNotChooseTheBranch: the branch is the recorded one, so
+// nothing a worker can write from its worktree picks another. Here the recorded default is
+// develop, and a worker repoints refs/remotes/origin/HEAD at its own branch and creates a local
+// main and master at its tip, which is every ref the old derivation read.
+func TestResolveGateBase_WorkerRefsDoNotChooseTheBranch(t *testing.T) {
 	repo, wt, mainTip, workerTip := gateBaseRepo(t)
+	gitT(t, repo, "branch", "-m", "main", "develop")
+	gitT(t, wt, "branch", "main", workerTip)
+	gitT(t, wt, "branch", "master", workerTip)
 	gitT(t, wt, "update-ref", "refs/remotes/origin/worker", workerTip)
 	gitT(t, wt, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/worker")
 	if got := DefaultBranch(repo); got != "worker" {
 		t.Fatalf("setup: expected DefaultBranch to follow the repointed origin/HEAD, got %q", got)
 	}
-	b := mustGateBase(t, repo)
-	if b.Name != "main" || b.SHA != mainTip {
-		t.Fatalf("ResolveGateBase = %+v, want main at %s; a repointed origin/HEAD must not move the gate onto %s", b, mainTip, workerTip)
+	b := mustGateBase(t, repo, "develop")
+	if b.Name != "develop" || b.SHA != mainTip {
+		t.Fatalf("ResolveGateBase = %+v, want develop at %s, not the worker's %s", b, mainTip, workerTip)
 	}
 }
 
-// TestResolveGateBase_Names covers how the name is chosen when nothing is being attacked.
-func TestResolveGateBase_Names(t *testing.T) {
-	t.Run("develop default with the checkout on it", func(t *testing.T) {
-		repo := t.TempDir()
-		gitT(t, repo, "init", "-q", "-b", "develop")
-		if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("x\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		gitT(t, repo, "add", "-A")
-		gitT(t, repo, "commit", "-q", "-m", "x")
-		tip := gitT(t, repo, "rev-parse", "HEAD")
-		gitT(t, repo, "update-ref", "refs/remotes/origin/develop", tip)
-		gitT(t, repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/develop")
-		if b := mustGateBase(t, repo); b.Name != "develop" || b.SHA != tip {
-			t.Fatalf("ResolveGateBase = %+v, want develop at %s", b, tip)
-		}
-		// The same repo with the checkout moved to a feature branch: origin/HEAD alone does not
-		// decide, and there is no main or master to fall back to, so it fails closed.
-		gitT(t, repo, "checkout", "-q", "-b", "feature")
-		if b, err := ResolveGateBase(repo); err == nil {
-			t.Fatalf("with the checkout off the default and only origin/HEAD naming develop, want an error, got %+v", b)
-		}
-	})
-	t.Run("checkout on a feature branch falls back to main", func(t *testing.T) {
-		repo, _, mainTip, _ := gateBaseRepo(t)
-		gitT(t, repo, "checkout", "-q", "-b", "feature")
-		if b := mustGateBase(t, repo); b.Name != "main" || b.SHA != mainTip {
-			t.Fatalf("ResolveGateBase = %+v, want main at %s", b, mainTip)
-		}
-	})
-	t.Run("master", func(t *testing.T) {
-		repo := t.TempDir()
-		gitT(t, repo, "init", "-q", "-b", "master")
-		if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("x\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		gitT(t, repo, "add", "-A")
-		gitT(t, repo, "commit", "-q", "-m", "x")
-		if b := mustGateBase(t, repo); b.Name != "master" {
-			t.Fatalf("ResolveGateBase = %+v, want master", b)
-		}
-	})
-	t.Run("no default branch at all", func(t *testing.T) {
-		repo := t.TempDir()
-		gitT(t, repo, "init", "-q", "-b", "trunk")
-		if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("x\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		gitT(t, repo, "add", "-A")
-		gitT(t, repo, "commit", "-q", "-m", "x")
-		gitT(t, repo, "checkout", "-q", "--detach")
-		b, err := ResolveGateBase(repo)
-		if err == nil {
-			t.Fatalf("a detached checkout with no main, master or origin/HEAD must fail closed, got %+v", b)
-		}
-		if !strings.Contains(err.Error(), "default branch") {
-			t.Fatalf("the error must say what could not be resolved: %v", err)
-		}
-	})
+// TestResolveGateBase_FailsClosed: without a recorded branch, or with one that has no local
+// ref, the gate has nothing to read and must refuse rather than guess.
+func TestResolveGateBase_FailsClosed(t *testing.T) {
+	repo, _, _, workerTip := gateBaseRepo(t)
+	if b, err := ResolveGateBase(repo, ""); err == nil || !strings.Contains(err.Error(), "no default branch is recorded") {
+		t.Fatalf("no recorded branch: got %+v, %v; want a refusal saying none is recorded", b, err)
+	}
+	if b, err := ResolveGateBase(repo, "develop"); err == nil || !strings.Contains(err.Error(), "refs/heads/develop") {
+		t.Fatalf("a recorded branch with no local ref: got %+v, %v; want a refusal naming refs/heads/develop", b, err)
+	}
+	// A tag of the recorded name is not the branch.
+	gitT(t, repo, "tag", "develop", workerTip)
+	if b, err := ResolveGateBase(repo, "develop"); err == nil {
+		t.Fatalf("a tag named after the recorded branch must not resolve as it, got %+v", b)
+	}
 }

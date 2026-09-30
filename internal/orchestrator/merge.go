@@ -100,7 +100,7 @@ func (m *Manager) Approve(taskID string, ttl time.Duration, allowGateChange bool
 		return nil, err
 	}
 	if allowGateChange {
-		base, err := worktree.ResolveGateBase(t.Project)
+		base, err := m.gateBase(t.Project)
 		if err != nil {
 			return nil, fmt.Errorf("could not resolve the default branch to check which gate-definition files %q changes: %w", taskID, err)
 		}
@@ -226,16 +226,16 @@ func (m *Manager) mergeLocal(taskID string, requireVerdict bool, unapproved *[]s
 	if !gated && tokBy == "auto" {
 		return "", fmt.Errorf("%q carries an auto-approval that is only valid through the trust gate, but the gate is not active (repo not in trusted mode and no --require-verdict); refusing to merge ungated", taskID)
 	}
-	def := worktree.DefaultBranch(repo)
+	def := m.defaultBranch(repo)
 	// The default branch as the gate reads it, resolved ONCE for this merge: every read the
 	// gate takes from the default branch (the validate script, the gate-change-approval
 	// policy, the base of the gate-definition diff) is made at base.SHA, and the fast-forward
-	// below is refused unless the default branch still sits there. worktree.ResolveGateBase
-	// reads refs/heads/<name> fully qualified, so a worker's tag named after the branch, or a
-	// repointed origin/HEAD, cannot change what the gate reads.
+	// below is refused unless the default branch still sits there. Manager.gateBase takes the
+	// branch recorded for the project and reads refs/heads/<name> fully qualified, so no ref a
+	// worker can write chooses the branch or stands in for it.
 	var base worktree.GateBase
 	if gated {
-		b, err := worktree.ResolveGateBase(repo)
+		b, err := m.gateBase(repo)
 		if err != nil {
 			return "", fmt.Errorf("trust gate: %w; refusing to merge %q without a default branch to read the gate from", err, taskID)
 		}
@@ -494,7 +494,7 @@ func (m *Manager) mergeLocal(taskID string, requireVerdict bool, unapproved *[]s
 			*unapproved = unapprovedGateChange
 		}
 	}
-	if w := gateChangePolicyWarning(repo); w != "" {
+	if w := m.gateChangePolicyWarning(repo); w != "" {
 		out += "\n  " + w
 	}
 	return out, nil
@@ -503,8 +503,8 @@ func (m *Manager) mergeLocal(taskID string, requireVerdict bool, unapproved *[]s
 // gateChangePolicyWarning is readGateChangePolicy's warning for the default branch as it
 // stands now, for the line a trusted merge or land prints after it lands. It reads nothing
 // when the default branch cannot be resolved; the refusals already cover that case.
-func gateChangePolicyWarning(repo string) string {
-	base, err := worktree.ResolveGateBase(repo)
+func (m *Manager) gateChangePolicyWarning(repo string) string {
+	base, err := m.gateBase(repo)
 	if err != nil {
 		return ""
 	}
@@ -884,12 +884,17 @@ func (m *Manager) resolveLandSpec(t db.Task, requireVerdict bool) (landSpec, err
 	if mode == "pr" && !hasOrigin {
 		return zero, fmt.Errorf("land: repo %s is in pr delivery mode but has no 'origin' remote to push to", repo)
 	}
-	// The default branch as the gate resolves it (worktree.ResolveGateBase), so a repointed
-	// origin/HEAD cannot move the land onto another branch. A repo it cannot resolve falls
-	// back to DefaultBranch for the rebase base only; every gated read resolves again and
-	// refuses on its own.
-	def := worktree.DefaultBranch(repo)
-	if gb, err := worktree.ResolveGateBase(repo); err == nil {
+	// The default branch recorded for the project, so no ref a worker can write moves the land
+	// onto another branch. A gated land refuses here without one, before the rebase below
+	// rewrites the worker's branch onto a base the gate would not read; an ungated land falls
+	// back to worktree.DefaultBranch's guess.
+	gated := requireVerdict || mode == "trusted"
+	def := m.defaultBranch(repo)
+	if gated {
+		gb, err := m.gateBase(repo)
+		if err != nil {
+			return zero, fmt.Errorf("land: %w; refusing a gated land of %q without a default branch to read the gate from", err, t.ID)
+		}
 		def = gb.Name
 	}
 	return landSpec{
@@ -898,7 +903,7 @@ func (m *Manager) resolveLandSpec(t db.Task, requireVerdict bool) (landSpec, err
 		wt:             wt,
 		mode:           mode,
 		def:            def,
-		gated:          requireVerdict || mode == "trusted",
+		gated:          gated,
 		requireVerdict: requireVerdict,
 		hasOrigin:      hasOrigin,
 	}, nil
@@ -1015,7 +1020,7 @@ func (m *Manager) landPrep(t db.Task, spec landSpec, fetchMu *sync.Mutex) (landP
 	// (3) Validate the REBASED tree. Must be green; no checks detected is a hard block. This
 	// green gates the land, so it goes through validateForAuthority — a result this process
 	// produced, never one read back from the on-disk cache.
-	gb, err := worktree.ResolveGateBase(spec.repo)
+	gb, err := m.gateBase(spec.repo)
 	if err != nil {
 		return zero, fmt.Errorf("land: %w; refusing to validate %q without a default branch to read the gate from", err, spec.taskID)
 	}
@@ -1126,7 +1131,7 @@ func (m *Manager) landCommit(t db.Task, spec landSpec, prep landPrepResult) (str
 	if len(unapprovedGateChange) > 0 {
 		out += "\n  " + unapprovedGateChangeNote(unapprovedGateChange)
 	}
-	if w := gateChangePolicyWarning(spec.repo); w != "" {
+	if w := m.gateChangePolicyWarning(spec.repo); w != "" {
 		out += "\n  " + w
 	}
 	// Surface the security-everywhere audit status. This is purely ADVISORY and never

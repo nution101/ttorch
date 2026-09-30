@@ -89,3 +89,33 @@ func (m *Manager) recordedDefaultBranch(repo string) string {
 	}
 	return p.DefaultBranch
 }
+
+// gateBase resolves the default branch the trust gate reads for repo: the branch recorded on
+// its project row, resolved fully qualified to the commit it points at (worktree.ResolveGateBase).
+// It never derives the branch from refs, so no ref a worker can write decides it. A repo with no
+// recorded branch, or one whose recorded branch has no local ref, is an error that names the
+// command that fixes it, and every gate read refuses on it.
+func (m *Manager) gateBase(repo string) (worktree.GateBase, error) {
+	p, ok, err := m.Store.GetProjectByRepo(context.Background(), repo)
+	if err != nil {
+		return worktree.GateBase{}, fmt.Errorf("could not read the project for %s: %w", repo, err)
+	}
+	branch := ""
+	if ok {
+		branch = p.DefaultBranch
+	}
+	b, err := worktree.ResolveGateBase(repo, branch)
+	if err != nil {
+		return worktree.GateBase{}, fmt.Errorf("%w; set it with '%s %s <branch>'", err, SetBranchCommand, repo)
+	}
+	return b, nil
+}
+
+// defaultBranch is the default branch for the paths that are not gate reads: the recorded one
+// when there is one, else worktree.DefaultBranch's guess.
+func (m *Manager) defaultBranch(repo string) string {
+	if b := m.recordedDefaultBranch(repo); b != "" {
+		return b
+	}
+	return worktree.DefaultBranch(repo)
+}
