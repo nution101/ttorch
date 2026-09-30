@@ -173,6 +173,57 @@ func TestInit_KeepsGateChangeApprovalLine(t *testing.T) {
 	}
 }
 
+// TestInit_ReportsTheGateChangeApproval: `ttorch init --mode trusted` says what the gate-change
+// approval is set to and how to change it, names an unrecognized value, and says nothing about
+// it in any other mode, where it has no effect.
+func TestInit_ReportsTheGateChangeApproval(t *testing.T) {
+	note := func(notes []string) string {
+		for _, n := range notes {
+			if strings.HasPrefix(n, "gate-change approval:") {
+				return n
+			}
+		}
+		return ""
+	}
+	dir := t.TempDir()
+	notes, err := Init(dir, "trusted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := note(notes); !strings.Contains(n, "off (the default)") || !strings.Contains(n, "- gate-change-approval: required") {
+		t.Fatalf("a fresh trusted init must say the approval is off and how to require it, got %q (notes %q)", n, notes)
+	}
+
+	agents := filepath.Join(dir, "AGENTS.md")
+	b, _ := os.ReadFile(agents)
+	for _, tc := range []struct{ line, want string }{
+		{"- gate-change-approval: required", "required (kept from the existing block)"},
+		{"- gate-change-approval: requird", `unrecognized value ("requird")`},
+	} {
+		body := strings.Replace(string(b), "- delivery-mode: trusted\n", "- delivery-mode: trusted\n"+tc.line+"\n", 1)
+		if err := os.WriteFile(agents, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		notes, err := Init(dir, "trusted")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n := note(notes); !strings.Contains(n, tc.want) {
+			t.Fatalf("%s: want the init note to contain %q, got %q", tc.line, tc.want, n)
+		}
+	}
+
+	for _, mode := range []string{"pr", "local", "validated"} {
+		notes, err := Init(t.TempDir(), mode)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n := note(notes); n != "" {
+			t.Fatalf("%s mode: the approval has no effect, so init must not report it, got %q", mode, n)
+		}
+	}
+}
+
 func TestInit_DoesNotClobberRealClaudeMD(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "CLAUDE.md"), []byte("hand-written"), 0o644); err != nil {

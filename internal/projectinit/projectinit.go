@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -211,8 +212,35 @@ func Init(dir, mode string) ([]string, error) {
 		notes = append(notes, note)
 	}
 
+	if mode == "trusted" {
+		if b, err := os.ReadFile(agents); err == nil {
+			notes = append(notes, gateChangeApprovalNote(string(b)))
+		}
+	}
 	notes = append(notes, ensureSymlink(claude, "AGENTS.md"))
 	return notes, nil
+}
+
+// gateChangeApprovalNote is the line `ttorch init` prints for a trusted repo, saying what the
+// gate-change approval is set to in the AGENTS.md it just wrote and how to change it. It names
+// any value ParseGateChangeApproval does not recognize, quoted, so a typo is visible at init
+// rather than only at the first refused merge.
+func gateChangeApprovalNote(agentsMD string) string {
+	policy, unrecognized := ParseGateChangeApproval(agentsMD)
+	switch {
+	case len(unrecognized) > 0:
+		quoted := make([]string, len(unrecognized))
+		for i, v := range unrecognized {
+			quoted[i] = strconv.Quote(v)
+		}
+		return "gate-change approval: required, because gate-change-approval has an unrecognized value (" +
+			strings.Join(quoted, ", ") + "); set it to off or required"
+	case policy == GateChangeApprovalRequired:
+		return "gate-change approval: required (kept from the existing block); a change to the gate itself needs `ttorch approve --allow-gate-change`"
+	default:
+		return "gate-change approval: off (the default); a change to the reviewers or the validate step is authorized by the gate that change modifies. " +
+			"Add `- gate-change-approval: required` under the delivery mode to require `ttorch approve --allow-gate-change` for it"
+	}
 }
 
 // managedBlock renders the ttorch-managed block for mode. kept are policy lines carried over
