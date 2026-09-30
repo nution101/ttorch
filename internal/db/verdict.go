@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-const verdictColumns = `task_id, overall, reviewed_sha, diff_id, findings, approved_by, approval_sha, created_at, updated_at`
+const verdictColumns = `task_id, overall, reviewed_sha, diff_id, findings, approved_by, approval_sha, base_sha, created_at, updated_at`
 
 func scanVerdict(sc rowScanner) (Verdict, error) {
 	var (
@@ -14,7 +14,7 @@ func scanVerdict(sc rowScanner) (Verdict, error) {
 		createdAt, updAt string
 	)
 	if err := sc.Scan(&v.TaskID, &v.Overall, &v.ReviewedSHA, &v.DiffID, &v.Findings,
-		&v.ApprovedBy, &v.ApprovalSHA, &createdAt, &updAt); err != nil {
+		&v.ApprovedBy, &v.ApprovalSHA, &v.BaseSHA, &createdAt, &updAt); err != nil {
 		return Verdict{}, err
 	}
 	var err error
@@ -40,7 +40,7 @@ func upsertVerdictTx(ctx context.Context, q queryer, now time.Time, v Verdict) e
 	ts := formatTime(now)
 	_, err := q.ExecContext(ctx, `
 		INSERT INTO verdicts (`+verdictColumns+`)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(task_id) DO UPDATE SET
 			overall      = excluded.overall,
 			reviewed_sha = excluded.reviewed_sha,
@@ -48,9 +48,10 @@ func upsertVerdictTx(ctx context.Context, q queryer, now time.Time, v Verdict) e
 			findings     = excluded.findings,
 			approved_by  = excluded.approved_by,
 			approval_sha = excluded.approval_sha,
+			base_sha     = excluded.base_sha,
 			updated_at   = excluded.updated_at`,
 		v.TaskID, v.Overall, v.ReviewedSHA, v.DiffID, v.Findings,
-		v.ApprovedBy, v.ApprovalSHA, ts, ts)
+		v.ApprovedBy, v.ApprovalSHA, v.BaseSHA, ts, ts)
 	return err
 }
 

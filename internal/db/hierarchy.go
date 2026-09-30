@@ -7,12 +7,13 @@ import (
 	"strconv"
 )
 
-const projectColumns = `id, repo_path, name, delivery_mode, status, owner, created_at, updated_at`
+const projectColumns = `id, repo_path, name, delivery_mode, status, owner, default_branch, default_branch_seed, last_landed_sha, created_at, updated_at`
 
 func scanProject(sc rowScanner) (Project, error) {
 	var p Project
 	var createdAt, updatedAt string
-	if err := sc.Scan(&p.ID, &p.RepoPath, &p.Name, &p.DeliveryMode, &p.Status, &p.Owner, &createdAt, &updatedAt); err != nil {
+	if err := sc.Scan(&p.ID, &p.RepoPath, &p.Name, &p.DeliveryMode, &p.Status, &p.Owner,
+		&p.DefaultBranch, &p.DefaultBranchSeed, &p.LastLandedSHA, &createdAt, &updatedAt); err != nil {
 		return Project{}, err
 	}
 	var err error
@@ -107,6 +108,71 @@ func (s *Store) SetProjectModeByRepo(ctx context.Context, repoPath, mode string)
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE projects SET delivery_mode = ?, updated_at = ? WHERE repo_path = ?`,
 		mode, formatTime(s.now()), repoPath)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// SetProjectDefaultBranch records branch as the default branch the trust gate reads for
+// project id, replacing any branch already recorded and clearing a pending seed or notice. It
+// is the write behind `ttorch project set-branch`, which is the lead's to run.
+func (s *Store) SetProjectDefaultBranch(ctx context.Context, id int64, branch string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE projects SET default_branch = ?, default_branch_seed = '', updated_at = ? WHERE id = ?`,
+		branch, formatTime(s.now()), id)
+	if err != nil {
+		return err
+	}
+	return requireRows(res, fmt.Sprintf("project %d", id))
+}
+
+// FillProjectDefaultBranch records branch for project id only while none is recorded, and
+// reports whether it wrote. A recorded branch is never replaced here, so registering a project
+// again, or seeding one twice, cannot move the branch the gate reads. notice marks the branch
+// for the one-time line `ttorch update` and `ttorch doctor` print (see
+// DefaultBranchSeedNotice); a caller that shows the branch itself passes false.
+func (s *Store) FillProjectDefaultBranch(ctx context.Context, id int64, branch string, notice bool) (bool, error) {
+	seed := ""
+	if notice {
+		seed = DefaultBranchSeedNotice
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE projects SET default_branch = ?, default_branch_seed = ?, updated_at = ? WHERE id = ? AND default_branch = ''`,
+		branch, seed, formatTime(s.now()), id)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// SetProjectDefaultBranchSeed sets project id's seed state. Callers clear it (to the empty
+// string) once a pending seed has been tried or a notice has been shown.
+func (s *Store) SetProjectDefaultBranchSeed(ctx context.Context, id int64, state string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE projects SET default_branch_seed = ?, updated_at = ? WHERE id = ?`,
+		state, formatTime(s.now()), id)
+	if err != nil {
+		return err
+	}
+	return requireRows(res, fmt.Sprintf("project %d", id))
+}
+
+// SetProjectLastLanded records sha as the commit the latest successful land left the project
+// at repoPath's default branch at. Like SetProjectModeByRepo it reports whether a row matched
+// rather than failing on an unregistered repo.
+func (s *Store) SetProjectLastLanded(ctx context.Context, repoPath, sha string) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE projects SET last_landed_sha = ?, updated_at = ? WHERE repo_path = ?`,
+		sha, formatTime(s.now()), repoPath)
 	if err != nil {
 		return false, err
 	}

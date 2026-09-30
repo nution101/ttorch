@@ -100,9 +100,24 @@ type Project struct {
 	DeliveryMode string // DISPLAY CACHE ONLY — gates read AGENTS.md (§0.3)
 	Status       string
 	Owner        string
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	// DefaultBranch is the branch the trust gate reads for this project, set at registration
+	// or by the lead. '' means none is recorded, and the gate refuses until one is.
+	DefaultBranch string
+	// DefaultBranchSeed is '' for a branch recorded at registration or by the lead, "pending"
+	// for a row that predates the column and has not been seeded, and "notice" for a seeded
+	// branch the lead has not been shown yet (see migration 0010).
+	DefaultBranchSeed string
+	// LastLandedSHA is the commit the last successful land left the default branch at.
+	LastLandedSHA string
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
+
+// The DefaultBranchSeed states.
+const (
+	DefaultBranchSeedPending = "pending"
+	DefaultBranchSeedNotice  = "notice"
+)
 
 // Epic mirrors an epics row (a unit of work within a project).
 type Epic struct {
@@ -310,8 +325,20 @@ type Verdict struct {
 	Findings    string // JSON array of review.Finding (opaque to db)
 	ApprovedBy  string // "" | human | auto
 	ApprovalSHA string
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	// BaseSHA is the commit the reviewers' diff was staged against ('' on a verdict recorded
+	// before migration 0010).
+	BaseSHA   string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// ReviewPrep is the base one trust prep staged a task's review diff against.
+type ReviewPrep struct {
+	TaskID    string
+	Head      string
+	BaseSHA   string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // SchedulerStatus mirrors the singleton scheduler_status row: the durable observability record
