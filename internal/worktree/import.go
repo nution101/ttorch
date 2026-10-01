@@ -98,11 +98,11 @@ func ImportCommit(ctx context.Context, repo, clone, task, sha string) (string, e
 
 	ctx, cancel := context.WithTimeout(ctx, importTimeout)
 	defer cancel()
-	hooks, err := os.MkdirTemp("", "ttorch-import-hooks-")
+	hooks, done, err := emptyHooksDir()
 	if err != nil {
 		return "", err
 	}
-	defer os.RemoveAll(hooks)
+	defer done()
 	run := func(args ...string) (string, string, error) {
 		return importGit(ctx, hooks, nil, append([]string{"-C", repo}, args...)...)
 	}
@@ -257,4 +257,55 @@ func importGit(ctx context.Context, hooks string, stdin io.Reader, args ...strin
 		return out, stderr.String(), fmt.Errorf("git %s: %w: %s", escapeForTerminal(strings.Join(args, " ")), err, escapeForTerminal(strings.TrimSpace(stderr.String())))
 	}
 	return out, stderr.String(), nil
+}
+
+// DropImports deletes every ref under CloneRefs/<task>/ in repo: the task's imported commits
+// and anything else its clone keeps there. Once a task is done with, this leaves the objects
+// to repo's ordinary gc. One update-ref transaction deletes them all or none, under the
+// import's settings, so none of repo's hooks run. task is checked with ValidTaskID before any
+// git command runs; a "*" would otherwise match every task's refs.
+func DropImports(ctx context.Context, repo, task string) error {
+	if repo == "" {
+		return errors.New("drop imports: no repository")
+	}
+	if !ValidTaskID(task) {
+		return fmt.Errorf("drop imports: invalid task id %q", task)
+	}
+	ctx, cancel := context.WithTimeout(ctx, importTimeout)
+	defer cancel()
+	hooks, done, err := emptyHooksDir()
+	if err != nil {
+		return err
+	}
+	defer done()
+
+	dir := CloneRefs + task + "/"
+	out, _, err := importGit(ctx, hooks, nil, "-C", repo, "for-each-ref", "--format=%(refname)", dir)
+	if err != nil {
+		return fmt.Errorf("drop imports for %s: %w", task, err)
+	}
+	if out == "" {
+		return nil
+	}
+	var in strings.Builder
+	for _, ref := range strings.Split(out, "\n") {
+		if !strings.HasPrefix(ref, dir) {
+			return fmt.Errorf("drop imports for %s: listing %s returned %q", task, dir, escapeForTerminal(ref))
+		}
+		in.WriteString("delete " + ref + "\n")
+	}
+	if _, _, err := importGit(ctx, hooks, strings.NewReader(in.String()), "-C", repo, "update-ref", "--stdin"); err != nil {
+		return fmt.Errorf("drop imports for %s: %w", task, err)
+	}
+	return nil
+}
+
+// emptyHooksDir makes the empty directory the import points core.hooksPath at, and returns
+// it with a func that removes it.
+func emptyHooksDir() (string, func(), error) {
+	dir, err := os.MkdirTemp("", "ttorch-import-hooks-")
+	if err != nil {
+		return "", nil, err
+	}
+	return dir, func() { _ = os.RemoveAll(dir) }, nil
 }

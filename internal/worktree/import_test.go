@@ -763,3 +763,70 @@ func TestParseGitVersion(t *testing.T) {
 		}
 	}
 }
+
+// TestDropImports_DeletesOnlyThatTasksRefs: dropping a task's imports deletes every ref under
+// its directory in CloneRefs, imports and the other refs kept there alike, and nothing of a
+// task whose id merely starts the same way, nor any ref outside the namespace. main's hooks do
+// not run, a second drop is a no-op, and the commit can be imported again afterwards.
+func TestDropImports_DeletesOnlyThatTasksRefs(t *testing.T) {
+	f := newCloneFixture(t)
+	ctx := context.Background()
+	for _, c := range []struct{ task, sha string }{{"t1", f.tip}, {"t1", f.parent}, {"t10", f.tip}, {"t1x", f.tip}} {
+		if _, err := ImportCommit(ctx, f.main, f.clone, c.task, c.sha); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fgit(t, f.main, "", "update-ref", CloneRefs+"t1/base", f.base)
+	fgit(t, f.main, "", "update-ref", "refs/ttorch/discarded/t1-"+f.base[:12], f.base)
+	keep := []string{}
+	for _, r := range refsOf(t, f.main) {
+		if !strings.HasPrefix(r, CloneRefs+"t1/") {
+			keep = append(keep, r)
+		}
+	}
+	if len(keep) == len(refsOf(t, f.main)) {
+		t.Fatal("the fixture has no refs under t1/ to drop")
+	}
+	hooks, ran := runsNoProgram(t)
+	hookFile := filepath.Join(f.main, ".git", "hooks", "reference-transaction")
+	if err := os.WriteFile(hookFile, []byte("#!/bin/sh\n'"+hooks+"'\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := DropImports(ctx, f.main, "t1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := refsOf(t, f.main); !slices.Equal(got, keep) {
+		t.Fatalf("main's refs after dropping t1:\n  %s\nwant:\n  %s", strings.Join(got, "\n  "), strings.Join(keep, "\n  "))
+	}
+	if ran() {
+		t.Error("dropping the imports ran main's reference-transaction hook")
+	}
+	if err := DropImports(ctx, f.main, "t1"); err != nil {
+		t.Fatalf("a second drop: %v", err)
+	}
+	if err := os.Remove(hookFile); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ImportCommit(ctx, f.main, f.clone, "t1", f.tip); err != nil {
+		t.Fatalf("importing again after the drop: %v", err)
+	}
+}
+
+// TestDropImports_RefusesMalformedTaskIDBeforeGit: a task id that is not one ref component
+// never reaches git. "*" in particular would match every task's refs.
+func TestDropImports_RefusesMalformedTaskIDBeforeGit(t *testing.T) {
+	f := newCloneFixture(t)
+	log := installGitShim(t, "")
+	for _, task := range []string{"", "*", "t*", "a..b", "-x", "t1/..", "a/b", "t1/"} {
+		if err := DropImports(context.Background(), f.main, task); err == nil {
+			t.Errorf("DropImports(%q) succeeded", task)
+		}
+	}
+	if err := DropImports(context.Background(), "", "t1"); err == nil {
+		t.Error("DropImports with no repository succeeded")
+	}
+	if calls := readCalls(t, log); len(calls) != 0 {
+		t.Fatalf("a malformed task id reached git:\n%q", calls)
+	}
+}
