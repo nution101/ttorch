@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nution101/ttorch/internal/clonepool"
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/harness"
 	"github.com/nution101/ttorch/internal/termtab"
@@ -126,6 +127,13 @@ func (m *Manager) spawnWorker(taskID, projectPath string, scout bool, rawCmd str
 		}
 	}
 
+	// Resolve the kind of worker directory before any side effect, so a bad --workdir is
+	// refused with nothing left behind.
+	workdir, err := clonepool.ResolveKind(m.Workdir)
+	if err != nil {
+		return zero, fmt.Errorf("spawn %q: %w", taskID, err)
+	}
+
 	// Zero-config first-use setup so a worker always has AGENTS.md to read. autoInit is
 	// safe by construction: it writes the managed block / CLAUDE.md symlink / profile only
 	// when that introduces no tracked-file change, and otherwise nudges toward `ttorch
@@ -145,24 +153,16 @@ func (m *Manager) spawnWorker(taskID, projectPath string, scout bool, rawCmd str
 	if err != nil {
 		return zero, fmt.Errorf("spawn %q: cannot read in-use worktrees: %w", taskID, err)
 	}
-	wt, err := m.Pool.Acquire(repo, inUse)
+	wt, err := m.acquireWorkdir(workdir, repo, taskID, inUse)
 	if err != nil {
 		return zero, err
 	}
-	// A pooled worktree may be handed back still on a prior task's (often already
-	// merged) branch; start every worker on a FRESH branch cut from the up-to-date
-	// default branch with a clean tree so it never inherits a previous task's branch
-	// or state. Release the slot on failure so a bad start does not leak it.
-	if err := worktree.StartBranch(repo, wt, taskBranch(taskID)); err != nil {
-		_ = m.Pool.Release(repo, wt)
-		return zero, fmt.Errorf("spawn %q: preparing a fresh task branch: %w", taskID, err)
-	}
 	if err := m.backend().EnsureSession(m.Session); err != nil {
-		_ = m.Pool.Release(repo, wt)
+		_ = m.releaseWorkdir(repo, wt)
 		return zero, err
 	}
 	if err := m.newWindow(window, wt, windowLabel(kind, taskID)); err != nil {
-		_ = m.Pool.Release(repo, wt)
+		_ = m.releaseWorkdir(repo, wt)
 		return zero, err
 	}
 
@@ -298,6 +298,26 @@ func (m *Manager) spawnWorker(taskID, projectPath string, scout bool, rawCmd str
 	return t, nil
 }
 
+// acquireWorkdir hands out the worker directory for a new task, on a fresh task branch cut
+// from the up-to-date default branch with a clean tree. The clone pool provisions a clone
+// that way. A pooled worktree may be handed back still on a prior task's (often already
+// merged) branch, so it is started on a FRESH branch and never inherits a previous task's
+// branch or state; the slot is released on failure so a bad start does not leak it.
+func (m *Manager) acquireWorkdir(kind, repo, taskID string, inUse []string) (string, error) {
+	if kind == clonepool.KindClone {
+		return m.Clones.Acquire(repo, taskID, inUse)
+	}
+	wt, err := m.Pool.Acquire(repo, inUse)
+	if err != nil {
+		return "", err
+	}
+	if err := worktree.StartBranch(repo, wt, taskBranch(taskID)); err != nil {
+		_ = m.Pool.Release(repo, wt)
+		return "", fmt.Errorf("spawn %q: preparing a fresh task branch: %w", taskID, err)
+	}
+	return wt, nil
+}
+
 // taskBranch is the local branch a freshly spawned worker starts on: a stable,
 // per-task name so a reused pooled worktree never leaves the worker on a prior task's
 // branch. It matches the branch the PR delivery path publishes (see integratePR), so
@@ -368,7 +388,7 @@ func (m *Manager) abortSpawn(window, repo, wt string) {
 	m.killPaneProcesses(window)
 	_ = m.backend().KillWindow(m.Session, window)
 	if repo != "" && wt != "" {
-		_ = m.Pool.Release(repo, wt)
+		_ = m.releaseWorkdir(repo, wt)
 	}
 }
 

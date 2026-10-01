@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/nution101/ttorch/internal/backend"
+	"github.com/nution101/ttorch/internal/clonepool"
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/harness"
 	"github.com/nution101/ttorch/internal/livestate"
@@ -32,6 +33,12 @@ type Manager struct {
 	Session string
 	Store   *db.Store
 	Pool    worktree.Pool
+	// Clones is the pool of private per-worker clones a spawn draws from instead of Pool
+	// when TTORCH_WORKER_CLONES is on or Workdir asks for one.
+	Clones clonepool.ClonePool
+	// Workdir is the kind of worker directory this Manager's spawns use: clonepool.KindClone,
+	// clonepool.KindWorktree, or "" to follow TTORCH_WORKER_CLONES (`ttorch spawn --workdir`).
+	Workdir string
 	// Backend hosts the session every window lives in. New selects it from
 	// TTORCH_BACKEND; a Manager built without New leaves it nil, which means tmux.
 	Backend backend.Backend
@@ -70,6 +77,7 @@ func New(p paths.Paths) (*Manager, error) {
 		Session: be.SessionName(),
 		Store:   store,
 		Pool:    worktree.Pool{Root: p.Worktrees(), Max: worktree.MaxFromEnv()},
+		Clones:  clonepool.ClonePool{Root: p.Clones(), Max: worktree.MaxFromEnv()},
 		Backend: be,
 	}
 	// Migrate any pre-SQLite JSON state into the DB (one-shot, idempotent — §2.5).
@@ -146,6 +154,18 @@ func (m *Manager) inUseWorktrees(repo string) ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// releaseWorkdir returns a task's worker directory to the pool it came from. A path under
+// the clone pool goes to Clones, which deletes it without running git there; anything else
+// goes to the worktree pool as before. The route is chosen by location rather than by the
+// shape of the directory's .git, so a clone is never handed to the worktree pool, whose
+// release runs checkout and reset inside it.
+func (m *Manager) releaseWorkdir(repo, wt string) error {
+	if m.Clones.Owns(wt) {
+		return m.Clones.Release(repo, wt)
+	}
+	return m.Pool.Release(repo, wt)
 }
 
 // killPaneProcesses reaps a window's pane process group so a returned worktree is
@@ -313,7 +333,7 @@ func (m *Manager) Teardown(taskID string, force bool) ([]string, error) {
 	_ = m.backend().KillWindow(m.Session, t.Window)
 	closeTermTab(t.Window)
 	if t.Project != "" && t.Worktree != "" {
-		if err := m.Pool.Release(t.Project, t.Worktree); err != nil {
+		if err := m.releaseWorkdir(t.Project, t.Worktree); err != nil {
 			notes = append(notes, "worktree: "+err.Error())
 		} else {
 			notes = append(notes, "worktree returned to pool for reuse")
