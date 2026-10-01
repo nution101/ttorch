@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/nution101/ttorch/internal/db"
+	"github.com/nution101/ttorch/internal/paths"
 )
 
 func openTestStore(t *testing.T) *db.Store {
@@ -161,5 +162,50 @@ func TestSeedDefaultBranches_KeepsTheNoticeWhenRegistrationWins(t *testing.T) {
 	}
 	if got := projectByRepo(t, s, repo); got.DefaultBranch != "main" || got.DefaultBranchSeed != db.DefaultBranchSeedNotice {
 		t.Fatalf("after losing the race the seed must leave the registration's notice: %+v", got)
+	}
+}
+
+// TestNew_DoesNotSeedFromAWorkerContext: every ttorch command a worker runs (report, status)
+// opens a Manager, and New ran the seed, which records whatever branch the refs a worker can
+// write point at. From a worker context New now leaves a pending row pending for the lead's
+// next run. The pending row's checkout is on develop so a seed, had it run, would be visible.
+func TestNew_DoesNotSeedFromAWorkerContext(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("TTORCH_HOME", t.TempDir())
+	repo := newRepoMain(t)
+	gitIn(t, repo, "checkout", "-q", "-b", "develop")
+	s, err := db.Open(paths.Default().StateDB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := s.UpsertProject(ctx, repo, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetProjectDefaultBranchSeed(ctx, p.ID, db.DefaultBranchSeedPending); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Close()
+
+	t.Setenv("TTORCH_TASK_ID", "w1")
+	m, err := New(paths.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := projectByRepo(t, m.Store, repo)
+	_ = m.Close()
+	if got.DefaultBranch != "" || got.DefaultBranchSeed != db.DefaultBranchSeedPending {
+		t.Fatalf("New from a worker context seeded the row: %+v, want it still pending with no branch", got)
+	}
+
+	t.Setenv("TTORCH_TASK_ID", "")
+	t.Chdir(t.TempDir())
+	m, err = New(paths.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if got := projectByRepo(t, m.Store, repo); got.DefaultBranch != "develop" || got.DefaultBranchSeed != db.DefaultBranchSeedNotice {
+		t.Fatalf("New from the lead's context must seed: %+v", got)
 	}
 }

@@ -553,6 +553,39 @@ func ReadWorkerTaskFile(dir string) (taskID, dbPath string, ok bool) {
 	return taskID, dbPath, taskID != ""
 }
 
+// FindWorkerTaskFile walks up from dir to the first .ttorch/task file and returns what
+// ReadWorkerTaskFile reads from it, or empty strings when no directory at or above dir has one.
+func FindWorkerTaskFile(dir string) (taskID, dbPath string) {
+	for {
+		if id, dbp, ok := ReadWorkerTaskFile(dir); ok {
+			return id, dbp
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", ""
+		}
+		dir = parent
+	}
+}
+
+// WorkerContextSignal names the signal that marks this process as running inside a worker's
+// context: $TTORCH_TASK_ID, then a .ttorch/task file at or above the current directory, the two
+// things the manager writes at spawn. It returns "" when neither is present. The `ttorch
+// approve` guard refuses on it, and the steps that record or announce the default branch the
+// trust gate reads skip their writes on it. A worker can unset or avoid both, so it narrows
+// accidental and injected calls and is not a boundary.
+func WorkerContextSignal() string {
+	if env := strings.TrimSpace(os.Getenv("TTORCH_TASK_ID")); env != "" {
+		return fmt.Sprintf("$TTORCH_TASK_ID is set (%s)", env)
+	}
+	if dir, err := os.Getwd(); err == nil {
+		if id, _ := FindWorkerTaskFile(dir); id != "" {
+			return fmt.Sprintf("a .ttorch/task file at or above the current directory names task %s", id)
+		}
+	}
+	return ""
+}
+
 // TrustWorktree pre-accepts Claude Code's one-time folder-trust prompt for a
 // worker's repo and worktree, so a spawned worker runs without an interactive
 // prompt blocking it. It sets hasTrustDialogAccepted in Claude's config

@@ -18,8 +18,9 @@ const SetBranchCommand = "ttorch project set-branch"
 // print so a wrong guess is seen. The branch comes from worktree.DetectDefaultBranch. A
 // project whose branch cannot be detected (not a git repository, or a detached checkout with
 // no usable origin/HEAD) is left without one, and the gate refuses it until the lead records
-// one with `ttorch project set-branch`. Each row is tried once. It runs on every Manager open,
-// and after the first run it only reads the project list.
+// one with `ttorch project set-branch`. Each row is tried once. It runs, outside a worker's
+// context (harness.WorkerContextSignal), on every Manager open and in `ttorch update` and
+// `ttorch doctor`; after the first run it only reads the project list.
 func SeedDefaultBranches(ctx context.Context, store *db.Store) error {
 	projects, err := store.ListProjects(ctx)
 	if err != nil {

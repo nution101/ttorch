@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"github.com/nution101/ttorch/internal/db"
+	"github.com/nution101/ttorch/internal/harness"
 	"github.com/nution101/ttorch/internal/orchestrator"
 	"github.com/nution101/ttorch/internal/paths"
 	"github.com/nution101/ttorch/internal/projectinit"
@@ -22,6 +23,11 @@ import (
 // line, since the human gate-change approval became off by default and installing a binary
 // with that default silently drops the approval for exactly those. It is best-effort and silent
 // on any read failure, and it never creates the state database.
+//
+// From a worker's context (harness.WorkerContextSignal) it prints the same lines and writes
+// nothing: the seed does not run and a notice is not cleared, so a worker that runs doctor in
+// its own pane neither records a branch from refs it can write nor uses up the notice meant for
+// the lead.
 func printGateNotices(w io.Writer, p paths.Paths) {
 	if _, err := os.Stat(p.StateDB()); err != nil {
 		return
@@ -32,7 +38,10 @@ func printGateNotices(w io.Writer, p paths.Paths) {
 	}
 	defer store.Close()
 	ctx := context.Background()
-	_ = orchestrator.SeedDefaultBranches(ctx, store)
+	lead := harness.WorkerContextSignal() == ""
+	if lead {
+		_ = orchestrator.SeedDefaultBranches(ctx, store)
+	}
 	projects, err := store.ListProjects(ctx)
 	if err != nil {
 		return
@@ -42,7 +51,9 @@ func printGateNotices(w io.Writer, p paths.Paths) {
 		case proj.DefaultBranchSeed == db.DefaultBranchSeedNotice && proj.DefaultBranch != "":
 			fmt.Fprintf(w, "recorded %s as the default branch the trust gate reads for %s; if that is wrong, run '%s %d <branch>'\n",
 				proj.DefaultBranch, proj.RepoPath, orchestrator.SetBranchCommand, proj.ID)
-			_ = store.SetProjectDefaultBranchSeed(ctx, proj.ID, "")
+			if lead {
+				_ = store.SetProjectDefaultBranchSeed(ctx, proj.ID, "")
+			}
 		case proj.DefaultBranch == "" && isRepoRoot(proj.RepoPath):
 			fmt.Fprintf(w, "no default branch is recorded for %s, so the trust gate refuses it; run '%s %d <branch>'\n",
 				proj.RepoPath, orchestrator.SetBranchCommand, proj.ID)

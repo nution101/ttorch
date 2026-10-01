@@ -3,7 +3,8 @@ package cli
 import (
 	"fmt"
 	"os"
-	"strings"
+
+	"github.com/nution101/ttorch/internal/harness"
 )
 
 // The `ttorch approve` caller guard.
@@ -51,16 +52,11 @@ func stdinIsInteractiveDevice(f *os.File, nullDevice string) bool {
 
 // workerContextSignal names the signal that marks this process as running inside a worker's
 // context — $TTORCH_TASK_ID, then a .ttorch/task file at or above cwd, the two things the
-// manager writes at spawn — or "" when neither is present. Both are checked, and the message
-// says which one tripped, so a lead who hits this in a worktree shell can see why.
+// manager writes at spawn — or "" when neither is present (harness.WorkerContextSignal). Both
+// are checked, and the message says which one tripped, so a lead who hits this in a worktree
+// shell can see why.
 func workerContextSignal() string {
-	if env := strings.TrimSpace(os.Getenv("TTORCH_TASK_ID")); env != "" {
-		return fmt.Sprintf("$TTORCH_TASK_ID is set (%s)", env)
-	}
-	if id, _ := findTaskFile(); id != "" {
-		return fmt.Sprintf("a .ttorch/task file at or above the current directory names task %s", id)
-	}
-	return ""
+	return harness.WorkerContextSignal()
 }
 
 // checkApproveCaller returns the refusal for an approve that does not look like the lead

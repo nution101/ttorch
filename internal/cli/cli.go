@@ -971,16 +971,7 @@ func findTaskFile() (taskID, dbPath string) {
 
 // findTaskFileFrom is findTaskFile starting at dir instead of the cwd.
 func findTaskFileFrom(dir string) (taskID, dbPath string) {
-	for {
-		if id, dbp, ok := harness.ReadWorkerTaskFile(dir); ok {
-			return id, dbp
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return "", ""
-		}
-		dir = parent
-	}
+	return harness.FindWorkerTaskFile(dir)
 }
 
 func cmdStatus() error {

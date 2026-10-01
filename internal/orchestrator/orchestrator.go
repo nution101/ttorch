@@ -82,9 +82,13 @@ func New(p paths.Paths) (*Manager, error) {
 		fmt.Fprintf(os.Stderr, "ttorch: legacy state import skipped: %v\n", err)
 	}
 	// Record a default branch for any project migration 0010 left awaiting one. Best-effort
-	// like the import: a project it cannot seed has no branch, and the gate refuses it.
-	if err := SeedDefaultBranches(context.Background(), store); err != nil {
-		fmt.Fprintf(os.Stderr, "ttorch: could not record default branches: %v\n", err)
+	// like the import: a project it cannot seed has no branch, and the gate refuses it. A
+	// worker's own commands (report, status) open a Manager too, and the seed reads refs a
+	// worker can write, so it waits for a process outside any worker's context.
+	if harness.WorkerContextSignal() == "" {
+		if err := SeedDefaultBranches(context.Background(), store); err != nil {
+			fmt.Fprintf(os.Stderr, "ttorch: could not record default branches: %v\n", err)
+		}
 	}
 	return m, nil
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -146,10 +147,11 @@ func TestCmdInitRecordsDefaultBranch(t *testing.T) {
 	}
 }
 
-// TestDefaultBranchNotices: `ttorch update` and `ttorch doctor` show a seeded branch once, so a
-// wrong guess is seen, and name every git project with no recorded branch each time, since the
-// gate refuses those. A directory that is not a repository root is not named.
+// TestDefaultBranchNotices: `ttorch update` and `ttorch doctor`, run by the lead, show a seeded
+// branch once, so a wrong guess is seen, and name every git project with no recorded branch each
+// time, since the gate refuses those. A directory that is not a repository root is not named.
 func TestDefaultBranchNotices(t *testing.T) {
+	clearWorkerContext(t)
 	seeded := branchedRepo(t, "develop")
 	missing := branchedRepo(t, "main")
 	gitInRepo(t, missing, "checkout", "-q", "--detach")
@@ -254,6 +256,65 @@ func TestRecordingTheBranchNeedsTheLead(t *testing.T) {
 			}
 			if p, _, _ := reopen(t, dbPath).GetProjectByRepo(context.Background(), repo); p.DefaultBranch != "" || p.DeliveryMode != "trusted" {
 				t.Fatalf("init must refresh the mode and leave the branch unrecorded: %+v", p)
+			}
+		})
+	}
+}
+
+// TestGateNotices_ChangeNothingFromAWorkerContext: `ttorch doctor` and `ttorch update` ran the
+// seed and cleared the one-time notice whoever called them, so a worker that ran doctor in its
+// own pane recorded a branch from refs it can write, and the notice the lead was meant to see
+// was printed there and cleared. From a worker context they still print, and change nothing.
+func TestGateNotices_ChangeNothingFromAWorkerContext(t *testing.T) {
+	underTaskFile := func(t *testing.T) {
+		wt := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(wt, ".ttorch"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(wt, ".ttorch", "task"), []byte("task_id=w1\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Chdir(wt)
+	}
+	for _, c := range []struct {
+		name  string
+		setup func(t *testing.T)
+	}{
+		{"TTORCH_TASK_ID", func(t *testing.T) { t.Setenv("TTORCH_TASK_ID", "w1") }},
+		{"task file", underTaskFile},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			pending := branchedRepo(t, "develop")
+			noticed := branchedRepo(t, "trunk")
+			dbPath := withSeedDB(t, func(ctx context.Context, s *db.Store) {
+				p, err := s.UpsertProject(ctx, pending, "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := s.SetProjectDefaultBranchSeed(ctx, p.ID, db.DefaultBranchSeedPending); err != nil {
+					t.Fatal(err)
+				}
+				n, err := s.UpsertProject(ctx, noticed, "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := s.FillProjectDefaultBranch(ctx, n.ID, "trunk", true); err != nil {
+					t.Fatal(err)
+				}
+			})
+			clearWorkerContext(t)
+			c.setup(t)
+			var out bytes.Buffer
+			printGateNotices(&out, paths.Default())
+			if !strings.Contains(out.String(), "recorded trunk as the default branch the trust gate reads for "+noticed) {
+				t.Fatalf("the notice must still be printed:\n%s", out.String())
+			}
+			s := reopen(t, dbPath)
+			if p, _, _ := s.GetProjectByRepo(context.Background(), pending); p.DefaultBranch != "" || p.DefaultBranchSeed != db.DefaultBranchSeedPending {
+				t.Fatalf("the seed ran: %+v, want the row still pending with no branch", p)
+			}
+			if p, _, _ := s.GetProjectByRepo(context.Background(), noticed); p.DefaultBranchSeed != db.DefaultBranchSeedNotice {
+				t.Fatalf("the notice was cleared: %+v", p)
 			}
 		})
 	}
