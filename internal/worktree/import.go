@@ -171,12 +171,21 @@ func importConfig(hooks string) []string {
 }
 
 // importEnv is the environment every git command of the import runs with, the clone's
-// upload-pack included. No global or system config: the import needs neither, the worker
+// upload-pack included. None of the caller's GIT_* variables, so the import means the same
+// whoever runs it: a GIT_DIR would point it at another repository, and a
+// GIT_OBJECT_DIRECTORY would write the commit where repo does not read it, with the import
+// still reporting success. No global or system config: the import needs neither, the worker
 // could have edited the lead's global file, and upload-pack reads it, where a global
 // uploadpack.packObjectsHook would run. No prompt, so an import can never wait on a
 // terminal.
 func importEnv() []string {
-	return append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0")
+	var env []string
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "GIT_") {
+			env = append(env, kv)
+		}
+	}
+	return append(env, "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0")
 }
 
 // importGit runs one git command of the import under ctx with importConfig and importEnv,

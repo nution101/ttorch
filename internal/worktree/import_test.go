@@ -665,3 +665,39 @@ func TestImportCommit_StartsNoRepackInMain(t *testing.T) {
 		}
 	}
 }
+
+// TestImportCommit_IgnoresTheCallersGitEnvironment: the import means the same thing whoever
+// runs it. A GIT_DIR in the caller's environment would point it at another repository, and a
+// GIT_OBJECT_DIRECTORY would write the commit somewhere main does not read, while the import
+// still reported success.
+func TestImportCommit_IgnoresTheCallersGitEnvironment(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		env  func(t *testing.T, f cloneFixture) (key, value string)
+	}{
+		{"GIT_DIR", func(t *testing.T, f cloneFixture) (string, string) {
+			other := filepath.Join(t.TempDir(), "other")
+			fgit(t, filepath.Dir(other), "", "init", "-q", other)
+			return "GIT_DIR", filepath.Join(other, ".git")
+		}},
+		{"GIT_OBJECT_DIRECTORY", func(t *testing.T, f cloneFixture) (string, string) {
+			return "GIT_OBJECT_DIRECTORY", t.TempDir()
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newCloneFixture(t)
+			key, value := c.env(t, f)
+			t.Setenv(key, value)
+			ref, err := ImportCommit(context.Background(), f.main, f.clone, "t1", f.tip)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := fgit(t, f.main, "", "rev-parse", "--verify", "--quiet", ref+"^{commit}"); got != f.tip {
+				t.Fatalf("%s in main = %q, want %q", ref, got, f.tip)
+			}
+			if !fgitOK(t, f.main, "cat-file", "-e", f.tip) {
+				t.Fatalf("main does not hold %s after the import", f.tip)
+			}
+		})
+	}
+}
