@@ -367,29 +367,45 @@ recorded default branch, the pinned review base and the origin checks above cove
 worker can move from its own worktree, but a worker running ordinary git commands there can
 still mislead the gate in three ways:
 
-- It can rewrite `remote.origin.url` in the shared `.git/config`, or add a `url.*.insteadOf`
-  rule, so the origin checks in `landPrep` and `ttorch fleet-sync` consult a repository the
-  worker controls. If that repository's default branch is at the worker's own commit, the review
-  base is that commit, the reviewers' diff is empty, and the land brings in a commit no reviewer
-  saw. While gate-change approval is off, which is the default, that commit can change the
-  gate's own files too.
-- It can repoint `refs/remotes/origin/HEAD` or plant branches before the first run of an
-  upgraded binary, and the one-time default-branch seed trusts what it finds. The seed does not
-  run from a worker's context, so it runs on the lead's next command, but it reads whatever
-  the worker left.
-- It can leave refs behind that a later spawn records as the default branch when a project has
-  none recorded.
+1. It can send origin somewhere else through the shared `.git/config`, so the fetch and
+   `ls-remote` behind trust prep's review base, the land's origin check and `ttorch fleet-sync`
+   reach a repository the worker controls. Rewriting `remote.origin.url` or adding a
+   `url.*.insteadOf` rule does this, and so do transport settings that leave the URL as it was:
+   `core.sshCommand` for an ssh origin, `remote.origin.vcs` with a remote-helper alias and
+   `protocol.ext.allow` for an https one, and likely `remote.origin.uploadpack`, `http.proxy`
+   and `http.curloptResolve`. If that repository's default branch is at the worker's own commit,
+   the review base is that commit, the reviewers' diff is empty, and the land brings in a commit
+   no reviewer saw. While gate-change approval is off, which is the default, that commit can
+   change the gate's own files too.
+2. It can repoint `refs/remotes/origin/HEAD` or plant branches before the first run of an
+   upgraded binary, and the one-time default-branch seed trusts what it finds. The seed does not
+   run from a worker's context, so it runs on the lead's next command, but it reads whatever the
+   worker left. The origin URL recorded beside the branch by the seed or by a spawn is read from
+   the repository's config at that moment, so it can already be the worker's. `ttorch project
+   set-branch`, run from the lead's shell, records it again.
+3. It can leave refs behind that a later spawn records as the default branch when a project has
+   none recorded.
 
-The planned fix gives each worker its own clone instead of a worktree that shares the main
-checkout's `.git`. Until then, the lead checks what the gate reads with `ttorch doctor`. On every
-run it prints, for each trusted project, the recorded default branch and the commit it is at,
-the commit the last land left it at, and the URL origin resolves to (after any `insteadOf`
-rule). It warns when the branch no longer contains the last landed commit, and when origin
-differs from the URL recorded with the branch. `ttorch project ls` shows the recorded branch in
-its BRANCH column. `ttorch project set-branch` corrects a wrong branch and records the current
-origin URL, which is also how the lead accepts an origin they changed themselves. These are
-warnings for the lead to act on. The gate does not refuse a land because of them, so a land that
-runs before the lead looks is not stopped.
+Per-worker clones, which give each worker its own `.git` instead of a worktree sharing the main
+checkout's, are the planned fix for all three.
+
+`ttorch doctor` prints, on every run and for each trusted project, the recorded default branch
+and the commit it is at, the commit the last land left it at, and the URL `git remote get-url
+origin` reports. It warns when the branch no longer contains the last landed commit, and when
+that URL differs from the one recorded with the branch. `ttorch project ls` shows the recorded
+branch in its BRANCH column. Doctor is not the check for the first limit. Its origin line only
+catches a `remote.origin.url` or `insteadOf` rewrite that is still in place when doctor runs. It
+cannot see the transport settings above, which leave that URL unchanged, or a rewrite made for
+one land and undone afterwards. Nothing refuses a land on its warnings.
+
+To check against the real origin, run `git ls-remote <url> refs/heads/<branch>` from a directory
+outside any repository, with the URL typed out, so no repository config applies. Compare the sha
+it prints with the local branch: every commit the local branch has beyond it (`git log
+<sha>..refs/heads/<branch>` in the checkout) should be one a review covered. A `trust-record`
+line in `~/.ttorch/audit.log` whose `commit=` is an ancestor of its `base=` (`git merge-base
+--is-ancestor <commit> <base>` succeeds) records a review of an empty diff. Global git config
+still applies outside a repository, and a worker can write it too, so check it for the keys above
+first.
 
 ### Why the gate-config set stops where it does
 

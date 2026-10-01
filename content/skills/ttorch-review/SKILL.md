@@ -236,19 +236,26 @@ invalidates the verdict — re-prep, re-review, re-record.
 
   **Known limit: shared git state.** Workers run as the lead's user in worktrees that share one
   `.git` with the main checkout, so a worker running ordinary git commands in its own worktree
-  can still mislead the gate: by pointing `remote.origin.url` in the shared `.git/config` at a
-  repository it controls, which the land's and fleet-sync's origin checks then consult; by
-  repointing `origin/HEAD` or planting branches before the first run after an upgrade, which the
-  one-time default-branch seed trusts; and by leaving refs that a later spawn records as the
-  default branch for a project that has none. The first of these can empty the reviewers' diff:
-  when the default branch in the worker's repository is at the worker's own commit, the review
-  covers nothing and the commit lands unreviewed, including changes to the gate's own files
-  while gate-change approval is off (the default). Per-worker clones are the planned fix. Until
-  then the lead checks `ttorch doctor`. On every run it prints, for each trusted project, the
-  recorded default branch and its commit, the last landed commit and origin's URL, and it warns
-  when the branch has lost the last landed commit or origin differs from the URL recorded with
-  the branch. `ttorch project ls` shows the recorded branch in its BRANCH column. Nothing
-  refuses a land on these warnings, so they only help once the lead looks.
+  can still mislead the gate in three ways. (1) It can send origin's fetch and `ls-remote`, which
+  the review base, the land's origin check and fleet-sync rely on, to a repository it controls:
+  through `remote.origin.url` or a `url.*.insteadOf` rule, or through transport settings that
+  leave the URL unchanged (`core.sshCommand`; `remote.origin.vcs` with a remote-helper alias and
+  `protocol.ext.allow`; likely `remote.origin.uploadpack`, `http.proxy`, `http.curloptResolve`).
+  When that repository's default branch is at the worker's own commit, the review covers nothing
+  and the commit lands unreviewed, including changes to the gate's own files while gate-change
+  approval is off (the default). (2) It can repoint `origin/HEAD` or plant branches before the
+  first run after an upgrade, which the one-time default-branch seed trusts; the origin URL the
+  seed or a spawn records beside the branch comes from the same config and can already be the
+  worker's, and `ttorch project set-branch` from the lead's shell records it again. (3) It can
+  leave refs that a later spawn records as the default branch for a project that has none.
+  Per-worker clones are the planned fix for all three. `ttorch doctor` prints each trusted
+  project's recorded branch and its commit, the last landed commit and the URL `git remote
+  get-url origin` reports, and `ttorch project ls` shows the branch, but doctor is not the check
+  for (1): it only sees a `remote.origin.url` or `insteadOf` rewrite still in place when it runs,
+  not the transport settings or a rewrite undone after the land. The check that works is `git
+  ls-remote <url> refs/heads/<branch>` run outside any repository with the URL typed out, then
+  confirming that every commit the local branch has beyond that sha was covered by a review (see
+  "Known limit: shared git state" in `docs/ARCHITECTURE.md`).
 
   **Matching on the name alone is not enough, so the guard does not rely on it.** Paths are
   compared under `fsIdentityKey` — NFD, Unicode FULL case folding, then SimpleFold

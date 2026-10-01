@@ -82,11 +82,12 @@ func projectIsTrusted(proj db.Project) bool {
 
 // printGateStatus prints what the trust gate reads for proj: the recorded default branch and
 // the commit it is at now, the commit the last land left it at, and the URL origin resolves to.
-// A worker can move the branch and rewrite origin from its own worktree, since refs and git
+// A worker can move the branch and redirect origin from its own worktree, since refs and git
 // config are shared by every linked worktree, and nothing in ttorch prevents that (see "Known
-// limit: shared git state" in docs/ARCHITECTURE.md). This is where the lead checks them. It
-// warns when the branch no longer contains the last landed commit, and when origin differs from
-// the URL recorded with the branch. It reads only.
+// limit: shared git state" in docs/ARCHITECTURE.md). It warns when the branch no longer contains
+// the last landed commit, and when origin's URL differs from the one recorded with the branch.
+// That only shows a URL rewrite still in place when it runs, not a transport setting that
+// redirects origin without changing the URL, or a rewrite already undone. It reads only.
 func printGateStatus(w io.Writer, proj db.Project) {
 	fmt.Fprintf(w, "trust gate for %s (project %d):\n", proj.RepoPath, proj.ID)
 	var warnings []string

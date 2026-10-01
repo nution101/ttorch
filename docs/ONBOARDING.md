@@ -212,10 +212,11 @@ it; run that yourself, since it refuses a worker's context. A project registered
 branch was recorded is seeded once, and `ttorch update` and `ttorch doctor` print the seeded
 branch once so you can correct it. `ttorch doctor` also prints, on every run and for each
 trusted project, the recorded branch and the commit it is at, the commit the last land left it
-at, and the URL origin resolves to, with a warning when the branch has lost the last landed
-commit or origin no longer matches the URL recorded with the branch. A worker can move the
-branch or rewrite origin from its own worktree, and the gate does not stop a land when that
-happens, so check this output (see "Known limit: shared git state" in `docs/ARCHITECTURE.md`).
+at, and the URL `git remote get-url origin` reports, with a warning when the branch has lost the
+last landed commit or that URL no longer matches the one recorded with the branch. A worker can
+move the branch or redirect origin from its own worktree, and doctor only sees a redirect of the
+URL that is still in place, so a clean doctor does not rule one out. "Known limit: shared git
+state" in `docs/ARCHITECTURE.md` gives a check against the real origin.
 
 `ttorch init` also derives a **project profile** (stack, exact build/test/lint commands,
 layout, and a few exemplar files) into `AGENTS.md` so workers match the repo's style; refresh
