@@ -493,6 +493,68 @@ func TestHook_RefusedWriteLeavesNoTrace(t *testing.T) {
 	}
 }
 
+// TestHook_RefusedHookNeverOpensADisagreeingTaskFilesDB: a .ttorch/task that disagrees with
+// the other identity sources may have been planted, so the db= path it names is never
+// opened. Opening it would chmod the file to 0600 and migrate ttorch tables into it. The
+// victim is left byte-for-byte and mode-for-mode as it was, for every hook event, whether
+// it is a plain file or an existing SQLite database, and whether the disagreeing file is
+// found from the cwd or from CLAUDE_PROJECT_DIR.
+func TestHook_RefusedHookNeverOpensADisagreeingTaskFilesDB(t *testing.T) {
+	for _, victimKind := range []string{"plain file", "sqlite db"} {
+		for _, where := range []string{"cwd", "project dir"} {
+			t.Run(victimKind+" via "+where, func(t *testing.T) {
+				hookWorker(t, "wt1") // TTORCH_TASK_ID=wt1, no TTORCH_DB
+				victim := filepath.Join(t.TempDir(), "victim")
+				if victimKind == "sqlite db" {
+					seedHookDB(t, victim, "wt1", "wt2")
+				} else if err := os.WriteFile(victim, []byte("not a database\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(victim, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				before, err := os.ReadFile(victim)
+				if err != nil {
+					t.Fatal(err)
+				}
+				planted := workerWorktree(t, "wt2")
+				if err := os.WriteFile(filepath.Join(planted, ".ttorch", "task"), []byte("task_id=wt2\ndb="+victim+"\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if where == "cwd" {
+					t.Chdir(planted)
+				} else {
+					t.Setenv("CLAUDE_PROJECT_DIR", planted)
+				}
+				for _, ev := range livestate.Events {
+					if err := cmdHook([]string{string(ev)}, strings.NewReader("")); err != nil {
+						t.Fatalf("hook %s: %v", ev, err)
+					}
+				}
+				fi, err := os.Stat(victim)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if fi.Mode().Perm() != 0o644 {
+					t.Errorf("victim mode = %v, want 0644: the hook opened the disagreeing task file's db", fi.Mode().Perm())
+				}
+				after, err := os.ReadFile(victim)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(after) != string(before) {
+					t.Errorf("victim contents changed (%d bytes to %d): the hook wrote to the disagreeing task file's db", len(before), len(after))
+				}
+				for _, side := range []string{"-wal", "-shm"} {
+					if _, err := os.Stat(victim + side); !os.IsNotExist(err) {
+						t.Errorf("victim%s exists (stat err = %v): the hook opened the disagreeing task file's db", side, err)
+					}
+				}
+			})
+		}
+	}
+}
+
 // TestHook_TraceNeverCreatesADB: a worker whose state DB does not exist still records its
 // turn, and the hook does not create a DB to hold the trace.
 func TestHook_TraceNeverCreatesADB(t *testing.T) {
