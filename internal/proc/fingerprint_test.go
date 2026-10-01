@@ -102,7 +102,11 @@ func TestVerify_Table(t *testing.T) {
 		{"unchanged", map[int]Process{200: agent}, AgentAlive, ""},
 		{"gone", map[int]Process{}, AgentExited, "has exited"},
 		{"pid reused", map[int]Process{200: {PID: 200, PPID: pane, Start: "t1", Cmdline: agent.Cmdline}}, AgentExited, "started later"},
-		{"exec'd into another command", map[int]Process{200: {PID: 200, PPID: pane, Start: "t0", Cmdline: "-zsh"}}, AgentExited, "different command"},
+		// An in-place exec keeps the pid and the start time and changes only the command
+		// line. That is still the process ttorch launched, so it is alive.
+		{"exec'd in place", map[int]Process{200: {PID: 200, PPID: pane, Start: "t0", Cmdline: "claude --resume x"}}, AgentAlive, ""},
+		{"no start time now, same command", map[int]Process{200: {PID: 200, PPID: pane, Cmdline: agent.Cmdline}}, AgentAlive, ""},
+		{"no start time now, different command", map[int]Process{200: {PID: 200, PPID: pane, Cmdline: "-zsh"}}, AgentExited, "different command"},
 		{"no longer under the pane", map[int]Process{200: {PID: 200, PPID: 1, Start: "t0", Cmdline: agent.Cmdline}}, AgentExited, "no longer in the window's pane"},
 	}
 	for _, tc := range tests {
@@ -113,6 +117,23 @@ func TestVerify_Table(t *testing.T) {
 				t.Fatalf("Verify = %v (%q), want %v containing %q", st, why, tc.want, tc.match)
 			}
 		})
+	}
+}
+
+// A recorded fingerprint without a start time falls back to the command hash, and one with
+// neither cannot be decided either way.
+func TestVerify_NoRecordedStartUsesCommandHash(t *testing.T) {
+	const pane = 100
+	agent := Process{PID: 200, PPID: pane, Start: "t0", Cmdline: "claude"}
+	fakeProcesses(t, map[int]Process{200: agent}, nil)
+	if st, why := Verify(Fingerprint{PID: 200, CmdHash: hashCmdline("claude")}, pane); st != AgentAlive {
+		t.Fatalf("Verify(no start, same command) = %v (%s), want alive", st, why)
+	}
+	if st, why := Verify(Fingerprint{PID: 200, CmdHash: hashCmdline("-zsh")}, pane); st != AgentExited {
+		t.Fatalf("Verify(no start, other command) = %v (%s), want exited", st, why)
+	}
+	if st, why := Verify(Fingerprint{PID: 200}, pane); st != AgentUnknown {
+		t.Fatalf("Verify(no start, no command) = %v (%s), want unknown", st, why)
 	}
 }
 

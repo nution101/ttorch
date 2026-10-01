@@ -1023,8 +1023,9 @@ row is there, is on `Reconcile`.
   start time and a hash of its command line in `data/<id>/agent.fingerprint`. The agent is
   the pane shell's child that leads the terminal's foreground process group; it is read
   with `ps` on macOS and from `/proc` on Linux. `ttorch status` and the watcher's liveness
-  sweep compare it with what is running now: the same pid, start time and command, still a
-  child of the pane, is alive. Anything else is `agent-exited` in `ttorch status` and an
+  sweep compare it with what is running now: the same pid and start time, still a child of
+  the pane, is alive, even under a new command line, because an exec in place keeps both.
+  The command hash only decides when a start time is missing. Anything else is `agent-exited` in `ttorch status` and an
   actionable `agent_exited` watch update, and a pid with a different start time counts as a
   different process. A read that fails is `unknown`, never exited or alive. A task with no
   fingerprint (spawned before fingerprints, or rebuilt by `ttorch resume`, which does not

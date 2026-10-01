@@ -8,13 +8,14 @@ package proc
 // is still "present". A fingerprint pins the identity of the agent process at spawn so a
 // later read can tell those cases from a live agent.
 //
-// Identity is three things read together: the pid, the process start time, and a hash of
-// the command line. The pid alone is not an identity, because the OS reuses pids; a reused
-// pid belongs to a process that started later, so the start time differs. The command hash
-// catches a pid that exec'd into something else. A read also checks that the process is
-// still a child of the window's pane process, which is how panes are started: tmux runs a
-// shell in the pane and the launch command is typed into it, so the agent is the shell's
-// child and leads the terminal's foreground process group.
+// Identity is the pid and the process start time read together. The pid alone is not an
+// identity, because the OS reuses pids; a reused pid belongs to a process that started
+// later, so the start time differs. A hash of the command line is recorded too, but it only
+// decides when a start time is unavailable: a process that exec's in place keeps its pid and
+// start time under a new command line and is still the same agent. A read also checks that
+// the process is still a child of the window's pane process, which is how panes are started:
+// tmux runs a shell in the pane and the launch command is typed into it, so the agent is the
+// shell's child and leads the terminal's foreground process group.
 //
 // Reading is done with ps on macOS and from /proc on Linux, with no cgo. A read that fails
 // (ps missing, erroring, or printing something unparseable) is reported as AgentUnknown,
@@ -156,10 +157,17 @@ func Verify(want Fingerprint, panePID int) (AgentState, string) {
 	if !ok {
 		return AgentExited, fmt.Sprintf("agent process %d has exited", want.PID)
 	}
-	if got.Start != want.Start {
-		return AgentExited, fmt.Sprintf("pid %d now belongs to a process started later", want.PID)
-	}
-	if got.Fingerprint().CmdHash != want.CmdHash {
+	// The start time decides identity. A process that exec's in place keeps its pid and start
+	// time and changes only its command line, and it is still the agent ttorch launched. The
+	// command hash only decides when a start time is missing from either side.
+	switch {
+	case want.Start != "" && got.Start != "":
+		if got.Start != want.Start {
+			return AgentExited, fmt.Sprintf("pid %d now belongs to a process started later", want.PID)
+		}
+	case want.CmdHash == "":
+		return AgentUnknown, fmt.Sprintf("no start time or command recorded to compare for pid %d", want.PID)
+	case got.Fingerprint().CmdHash != want.CmdHash:
 		return AgentExited, fmt.Sprintf("pid %d now runs a different command", want.PID)
 	}
 	if got.PPID != panePID {
