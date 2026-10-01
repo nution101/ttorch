@@ -99,3 +99,26 @@ func TestServerErrorLogCannotBeInjected(t *testing.T) {
 		t.Fatalf("redactor wrote %q, want one redacted line", got)
 	}
 }
+
+// TestRefusalLogCapsThePath: refusals run before the token check, so anyone who can reach the
+// port chooses the path's length too. A long path is cut to a fixed prefix, marked with an
+// ellipsis and the length it had, rather than copied whole into the lead's terminal.
+func TestRefusalLogCapsThePath(t *testing.T) {
+	h := newHarness(t)
+	long := "/" + strings.Repeat("a", 64<<10)
+	rawGET(t, h.srv.host, long, h.srv.host)
+	logged := h.log.String()
+	if strings.Count(logged, "refused") != 1 {
+		t.Fatalf("want 1 refusal in the log, got %d bytes:\n%.300s", len(logged), logged)
+	}
+	checkLogLines(t, logged)
+	if len(logged) > 512 {
+		t.Errorf("a %d-byte path wrote %d bytes to the log", len(long), len(logged))
+	}
+	if want := fmt.Sprintf("…(%d bytes)", len(long)); !strings.Contains(logged, want) {
+		t.Errorf("the capped path does not say it was cut (want %q):\n%.600s", want, logged)
+	}
+	if want := `"/aaaa`; !strings.Contains(logged, want) {
+		t.Errorf("the capped path lost its quoted prefix:\n%.600s", logged)
+	}
+}

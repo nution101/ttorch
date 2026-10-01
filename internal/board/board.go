@@ -36,6 +36,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/orchestrator"
@@ -311,10 +312,30 @@ func setSecurityHeaders(w http.ResponseWriter) {
 // never the query string (which is where the page's token travels). Refusals run before the
 // token check, so the path is anyone's text: net/http has already percent-decoded it, and
 // %0A or %1B arrive as real bytes. It is logged quoted, so a newline or a terminal escape
-// shows as \n or \x1b inside the quotes and cannot start a line of its own.
+// shows as \n or \x1b inside the quotes and cannot start a line of its own. The path's length
+// is the sender's choice too, so the quoted form is cut to maxLoggedPath bytes.
 func (s *Server) refuse(w http.ResponseWriter, r *http.Request, code int, why string) {
-	s.logf("refused %s %s: %s", safeText(r.Method), review.SafeQuote(r.URL.Path), why)
+	s.logf("refused %s %s: %s", safeText(r.Method), loggedPath(r.URL.Path), why)
 	http.Error(w, http.StatusText(code), code)
+}
+
+// maxLoggedPath caps a refused path in the log. A request line can run to net/http's 1MB
+// header limit, and without a cap each refusal would copy all of it to the lead's terminal.
+const maxLoggedPath = 256
+
+// loggedPath quotes a request path for the log and, past maxLoggedPath bytes, cuts the quoted
+// form there (backing up to a character boundary, so the cut leaves valid UTF-8) and ends it
+// with an ellipsis and the path's original length.
+func loggedPath(path string) string {
+	q := review.SafeQuote(path)
+	if len(q) <= maxLoggedPath {
+		return q
+	}
+	cut := maxLoggedPath
+	for cut > 0 && !utf8.RuneStart(q[cut]) {
+		cut--
+	}
+	return fmt.Sprintf("%s…(%d bytes)", q[:cut], len(path))
 }
 
 // logf writes one board log line. It is the only way this package writes to the log, and it
