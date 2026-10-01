@@ -21,6 +21,11 @@ const EventHookTurnStarted = "hook_turn_started"
 // a chatty session cannot flood the events table.
 const HookEventInterval = time.Minute
 
+// hookEventBeforeInsert, when set, runs after AppendHookTurnStarted has passed its checks and
+// before it inserts, inside the same transaction. Tests set it to force a second writer into
+// that gap; it is nil in production.
+var hookEventBeforeInsert func()
+
 // AppendHookTurnStarted records an EventHookTurnStarted row for taskID unless the task is
 // unknown or already has one within HookEventInterval of now. It reports whether a row was
 // written. The check and the insert share one immediate transaction, so two hooks racing for
@@ -55,6 +60,9 @@ func (s *Store) AppendHookTurnStarted(ctx context.Context, taskID, payload strin
 		case sql.ErrNoRows:
 		default:
 			return err
+		}
+		if hookEventBeforeInsert != nil {
+			hookEventBeforeInsert()
 		}
 		if _, err := appendEvent(ctx, tx, now, Event{
 			EntityType: EntityTypeTask, EntityID: taskID, Type: EventHookTurnStarted,

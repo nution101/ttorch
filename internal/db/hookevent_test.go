@@ -3,7 +3,7 @@ package db
 import (
 	"context"
 	"path/filepath"
-	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -100,53 +100,63 @@ func TestAppendHookTurnStarted_NotASignOfLife(t *testing.T) {
 	}
 }
 
-// TestAppendHookTurnStarted_RacingHooksWriteOne: hooks in separate processes (separate
-// connections to one file) racing for the same task write a single row.
-func TestAppendHookTurnStarted_RacingHooksWriteOne(t *testing.T) {
+// TestAppendHookTurnStarted_InterleavedWritersWriteOne: a second writer (another process,
+// so another connection) that tries to append while the first sits between its interval
+// check and its insert cannot finish until the first commits, and then finds its row. The
+// test-only hookEventBeforeInsert holds the first writer in that gap and starts the second.
+func TestAppendHookTurnStarted_InterleavedWritersWriteOne(t *testing.T) {
+	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "state.db")
-	seed, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	mkSpawnedWorker(t, seed, "h1")
-	seed.Close()
-
-	const n = 16
-	var wg sync.WaitGroup
-	start := make(chan struct{})
-	wrote := make(chan bool, n)
-	for i := 0; i < n; i++ {
+	open := func() *Store {
 		s, err := Open(path)
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { s.Close() })
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			got, err := s.AppendHookTurnStarted(context.Background(), "h1", "via=env")
-			if err != nil {
-				t.Error(err)
-			}
-			wrote <- got
-		}()
+		return s
 	}
-	close(start)
-	wg.Wait()
-	close(wrote)
-	count := 0
-	for w := range wrote {
-		if w {
-			count++
+	first, second := open(), open()
+	mkSpawnedWorker(t, first, "h1")
+
+	type result struct {
+		wrote bool
+		err   error
+	}
+	secondDone := make(chan result, 1)
+	finishedInGap := false
+	var held atomic.Bool
+	hookEventBeforeInsert = func() {
+		if !held.CompareAndSwap(false, true) {
+			return // the second writer passing through, if it ever gets this far
+		}
+		go func() {
+			got, err := second.AppendHookTurnStarted(ctx, "h1", "second")
+			secondDone <- result{got, err}
+		}()
+		// The second writer should be stuck waiting for the write lock. If it finishes here,
+		// its check and insert ran while the first writer's were apart.
+		select {
+		case r := <-secondDone:
+			finishedInGap = true
+			secondDone <- r
+		case <-time.After(time.Second):
 		}
 	}
-	check, err := Open(path)
+	t.Cleanup(func() { hookEventBeforeInsert = nil })
+
+	wroteFirst, err := first.AppendHookTurnStarted(ctx, "h1", "first")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer check.Close()
-	if rows := len(hookEvents(t, check, "h1")); count != 1 || rows != 1 {
-		t.Fatalf("%d racing hooks reported %d writes and left %d rows, want 1 and 1", n, count, rows)
+	r := <-secondDone
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	if finishedInGap {
+		t.Error("the second writer finished while the first sat between its check and its insert")
+	}
+	rows := hookEvents(t, first, "h1")
+	if !wroteFirst || r.wrote || len(rows) != 1 {
+		t.Fatalf("first wrote=%v, second wrote=%v, %d rows; want true, false, 1", wroteFirst, r.wrote, len(rows))
 	}
 }
