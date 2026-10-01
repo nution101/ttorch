@@ -1027,7 +1027,9 @@ row is there, is on `Reconcile`.
   the pane, is alive, even under a new command line, because an exec in place keeps both.
   The command hash only decides when a start time is missing. Anything else is `agent-exited` in `ttorch status` and an
   actionable `agent_exited` watch update, and a pid with a different start time counts as a
-  different process. A read that fails is `unknown`, never exited or alive. A task with no
+  different process. A read that fails, or a fingerprint file that cannot be loaded, is
+  `unknown`, never exited or alive; the watcher raises nothing for it and goes on to the usual
+  pane and idle checks, so a corrupt file cannot hide an idle worker. A task with no
   fingerprint (spawned before fingerprints, or rebuilt by `ttorch resume`, which does not
   wait for its agent) keeps window-presence liveness. The scheduler does not reclaim on
   `agent_exited`; the manager decides. The fingerprint file carries no integrity check, so

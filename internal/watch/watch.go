@@ -523,8 +523,10 @@ func (w *Watcher) pollLiveness(ctx context.Context) error {
 		}
 		// A present window can still have lost its agent: it died and left the pane's shell,
 		// or the pid now belongs to another process. That is as definitive as a gone window
-		// when the fingerprint says so; a check that could not complete is skipped like an
-		// unreadable pane, never read as alive or as exited. A task with no fingerprint
+		// when the fingerprint says so. A check that could not complete (AgentUnknown) is
+		// never read as alive or as exited and raises nothing of its own, but it does not
+		// stop the sweep: the pane path below only reads the pane, and skipping it would let
+		// a corrupt fingerprint file hide an idle worker. A task with no fingerprint
 		// (spawned before fingerprints, or resumed) keeps the window-presence behaviour.
 		// Once agent_exited has been raised the sweep goes on to the pane path, so the
 		// idle net still reaches a worker whose fingerprint keeps reading as exited.
@@ -539,8 +541,6 @@ func (w *Watcher) pollLiveness(ctx context.Context) error {
 			}); err != nil {
 				return err
 			}
-			continue
-		case proc.AgentUnknown:
 			continue
 		}
 		if !obs.captured {

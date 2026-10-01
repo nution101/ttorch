@@ -3,6 +3,8 @@ package watch
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -52,35 +54,58 @@ func TestPollLiveness_AgentExited(t *testing.T) {
 	}
 }
 
-// A check that could not complete (a ps failure) is neither exited nor alive: no event, and
-// the idle bookkeeping is left alone rather than advanced on a pane it could not vouch for.
-func TestPollLiveness_AgentUnknownIsSkipped(t *testing.T) {
+// A check that could not complete (a ps failure) is neither exited nor alive. It raises no
+// event of its own, and it does not stop the sweep: the pane path still runs, so an idle
+// worker is flagged idle_unreported as if it had no fingerprint.
+func TestPollLiveness_AgentUnknownTakesPanePath(t *testing.T) {
 	w, s, _, _ := newWatcher(t)
 	ctx := context.Background()
 	w.Dwell = -1
 	seedActiveTask(t, s, "fp", "wk-fp")
 	w.agent = func(db.Task) (proc.AgentState, string) { return proc.AgentUnknown, "ps: exit status 2" }
 
-	for i := 0; i < 2*idleStaleSweeps+1; i++ {
+	for i := 0; i < idleStaleSweeps+1; i++ {
 		if err := w.pollLiveness(ctx); err != nil {
 			t.Fatalf("pollLiveness: %v", err)
 		}
 	}
-	rows, err := s.EventsSince(ctx, 0, true)
-	if err != nil {
+	if idle, _ := s.HasEventType(ctx, "fp", db.EventIdleUnreported); !idle {
+		t.Fatal("an unknown agent state skipped the idle check")
+	}
+	if exited, _ := s.HasEventType(ctx, "fp", db.EventAgentExited); exited {
+		t.Fatal("an unknown agent state produced an agent_exited event")
+	}
+}
+
+// A corrupt fingerprint file (here only a pid) cannot be loaded, which reads as unknown. It
+// must not hide an idle worker: the production seam still lets idle_unreported fire.
+func TestPollLiveness_CorruptFingerprintStillFlagsIdle(t *testing.T) {
+	w, s, _, _ := newWatcher(t)
+	ctx := context.Background()
+	w.Dwell = -1
+	seedActiveTask(t, s, "fp", "wk-fp")
+	path := w.P.AgentFingerprintPath("fp")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for _, e := range rows {
-		if e.EntityID == "fp" && e.Type != db.EventCreated {
-			t.Fatalf("unknown agent state produced a %s event", e.Type)
+	if err := os.WriteFile(path, []byte("pid=1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task, _, _ := s.GetTask(ctx, "fp")
+	if st, _ := w.agent(task); st != proc.AgentUnknown {
+		t.Fatalf("production seam with a corrupt fingerprint = %v, want unknown", st)
+	}
+
+	for i := 0; i < idleStaleSweeps+1; i++ {
+		if err := w.pollLiveness(ctx); err != nil {
+			t.Fatalf("pollLiveness: %v", err)
 		}
 	}
-	task, _, err := s.GetTask(ctx, "fp")
-	if err != nil {
-		t.Fatal(err)
+	if idle, _ := s.HasEventType(ctx, "fp", db.EventIdleUnreported); !idle {
+		t.Fatal("a corrupt fingerprint file hid an idle worker from idle_unreported")
 	}
-	if task.IdleSweeps != 0 || task.LastPaneHash != "" {
-		t.Fatalf("idle bookkeeping advanced on an unknown agent: sweeps=%d hash=%q", task.IdleSweeps, task.LastPaneHash)
+	if exited, _ := s.HasEventType(ctx, "fp", db.EventAgentExited); exited {
+		t.Fatal("a corrupt fingerprint file produced an agent_exited event")
 	}
 }
 
