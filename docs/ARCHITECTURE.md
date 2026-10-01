@@ -996,8 +996,10 @@ row is there, is on `Reconcile`.
   from the worktree's files, never by running git there, because the worker controls that
   repository's config. Each read has a 2s deadline and at most one read per task runs at a
   time, and the git dir it follows must be inside the worktree or be that worktree's entry
-  under the project's common git dir; anything else reads as unknown. HEAD-identity
-  progress is not available in a repository whose refs are stored in reftable
+  under the project's common git dir. Every file is opened by walking down from the worktree
+  or that common dir one component at a time without following symlinks, so a symlinked
+  directory partway down a ref's path cannot lead out. Anything else reads as unknown.
+  HEAD-identity progress is not available in a repository whose refs are stored in reftable
   (`extensions.refStorage = reftable`): ttorch does not parse reftable, so HEAD there always
   reads as unknown and pane progress and the other signals still apply. The clock and the ladder are events in the store, so they carry
   across watcher re-arms. The ladder only reports: lease expiry and recovery are unchanged.

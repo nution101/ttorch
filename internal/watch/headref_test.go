@@ -247,6 +247,25 @@ func TestHeadIdentity_ConfinesGitDir(t *testing.T) {
 			t.Fatalf("headIdentity = %q, want unknown", id)
 		}
 	})
+	t.Run("commondir planted in the project's .git directory", func(t *testing.T) {
+		// The project's .git is shared with every worker. A commondir planted there must
+		// not move the common dir to a tree the worker built, admin entry and all.
+		wt, main := layout(t, map[string]string{".git": "gitdir: ../evil/worktrees/wt\n"})
+		root := filepath.Dir(wt)
+		real, err := filepath.EvalSymlinks(wt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeTree(t, root, map[string]string{
+			"main/.git/commondir":         "../../evil\n",
+			"evil/worktrees/wt/HEAD":      idA + "\n",
+			"evil/worktrees/wt/commondir": "../..\n",
+			"evil/worktrees/wt/gitdir":    real + "/.git\n",
+		})
+		if id, ok := headIdentity(wt, main); ok {
+			t.Fatalf("headIdentity = %q, want unknown", id)
+		}
+	})
 	t.Run("the worktree's own admin entry still reads", func(t *testing.T) {
 		wt, main := layout(t, map[string]string{".git": "gitdir: ../main/.git/worktrees/wt\n"})
 		if id, ok := headIdentity(wt, main); !ok || id != idA {
@@ -409,21 +428,6 @@ func TestValidRefName(t *testing.T) {
 	}
 }
 
-func TestJoinWithin(t *testing.T) {
-	base := filepath.Join(t.TempDir(), "git")
-	for ref, want := range map[string]bool{
-		"refs/heads/main":    true,
-		"refs/../../outside": false,
-		"../sibling":         false,
-		"..":                 false,
-		"refs/../HEAD":       true, // cleans to base/HEAD, still inside
-	} {
-		if _, got := joinWithin(base, ref); got != want {
-			t.Errorf("joinWithin(%q) = %v, want %v", ref, got, want)
-		}
-	}
-}
-
 // TestBoundedHead_SlowOpenTimesOutWithoutPileUp: a HEAD open that never returns (an
 // automount or FUSE path behind gitdir:) must read as unknown once the deadline passes,
 // and must not start a second read for the task while the first is still hanging.
@@ -435,12 +439,12 @@ func TestBoundedHead_SlowOpenTimesOutWithoutPileUp(t *testing.T) {
 	orig := openGitFile
 	t.Cleanup(func() { openGitFile = orig })
 	t.Cleanup(unblock) // runs first: let any hung read finish
-	openGitFile = func(path string) (*os.File, error) {
-		if filepath.Base(path) == "HEAD" {
+	openGitFile = func(anchor, rel string) (*os.File, error) {
+		if filepath.Base(rel) == "HEAD" {
 			opens.Add(1)
 			<-release
 		}
-		return orig(path)
+		return orig(anchor, rel)
 	}
 
 	wt := t.TempDir()
@@ -562,6 +566,63 @@ func TestHeadIdentity_ReftableReadsAsUnknown(t *testing.T) {
 		writeTree(t, repo, map[string]string{".git/HEAD": idA + "\n"}) // a stub git ignores
 		if id, ok := headIdentity(repo, repo); ok {
 			t.Fatalf("headIdentity = %q in a reftable repository, want unknown", id)
+		}
+	})
+}
+
+// TestHeadIdentity_RefusesSymlinkedDirectories: a symlinked directory partway down any
+// path the walk opens must read as unknown, not lead out of the confined git dir. The
+// first case is the reproduction from review: .git/refs is a symlink to / and HEAD names
+// a ref whose path spells out any file on the machine that holds an object id.
+func TestHeadIdentity_RefusesSymlinkedDirectories(t *testing.T) {
+	outside, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTree(t, outside, map[string]string{"leak": idA + "\n", "heads/main": idA + "\n"})
+
+	t.Run(".git/refs symlinked to /", func(t *testing.T) {
+		wt := t.TempDir()
+		writeTree(t, wt, map[string]string{".git/HEAD": "ref: refs" + filepath.Join(outside, "leak") + "\n"})
+		if err := os.Symlink("/", filepath.Join(wt, ".git", "refs")); err != nil {
+			t.Fatal(err)
+		}
+		if id, ok := headIdentity(wt, ""); ok {
+			t.Fatalf("headIdentity = %q read through .git/refs -> /, want unknown", id)
+		}
+	})
+	t.Run(".git/refs/heads symlinked out of the worktree", func(t *testing.T) {
+		wt := t.TempDir()
+		writeTree(t, wt, map[string]string{".git/HEAD": "ref: refs/heads/main\n", ".git/refs/.keep": ""})
+		if err := os.Symlink(filepath.Join(outside, "heads"), filepath.Join(wt, ".git", "refs", "heads")); err != nil {
+			t.Fatal(err)
+		}
+		if id, ok := headIdentity(wt, ""); ok {
+			t.Fatalf("headIdentity = %q read through a symlinked refs/heads, want unknown", id)
+		}
+	})
+	t.Run("admin entry's refs symlinked out", func(t *testing.T) {
+		root := t.TempDir()
+		wt, main := filepath.Join(root, "wt"), filepath.Join(root, "main")
+		if err := os.MkdirAll(wt, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		real, err := filepath.EvalSymlinks(wt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeTree(t, main, map[string]string{
+			".git/HEAD":                   idB + "\n",
+			".git/worktrees/wt/HEAD":      "ref: refs/heads/main\n",
+			".git/worktrees/wt/commondir": "../..\n",
+			".git/worktrees/wt/gitdir":    real + "/.git\n",
+		})
+		writeTree(t, wt, map[string]string{".git": "gitdir: ../main/.git/worktrees/wt\n"})
+		if err := os.Symlink(outside, filepath.Join(main, ".git", "worktrees", "wt", "refs")); err != nil {
+			t.Fatal(err)
+		}
+		if id, ok := headIdentity(wt, main); ok {
+			t.Fatalf("headIdentity = %q read through a symlinked admin-entry refs, want unknown", id)
 		}
 	})
 }

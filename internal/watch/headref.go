@@ -11,19 +11,23 @@ package watch
 // asks whether HEAD changed since the clock last restarted, which a committer date forged
 // into the future cannot fake. Anything unexpected reads as unknown, and an unknown HEAD
 // neither restarts the clock nor counts against the worker. The read runs under a short
-// deadline (boundedHead), so a path that never answers cannot hold up the sweep. Only the
+// deadline (boundedHead), so a path that never answers cannot hold up the sweep, and every
+// file is opened through openUnder, which follows no symlink on the way. Only the
 // files ref backend is read: a reftable repository's HEAD is always unknown.
 
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/nution101/ttorch/internal/db"
 )
@@ -98,30 +102,24 @@ const (
 // follows the worktree's .git (a directory, or a file carrying "gitdir: <path>"), the
 // gitdir's commondir for a linked worktree, at most one symref level from HEAD to a ref,
 // and packed-refs when the ref is not loose. The git dir and commondir must stay where
-// ttorch put them (see confineGitDir). ok is false for anything else.
+// ttorch put them (see confineGitDir), and every file is opened through openUnder, which
+// follows no symlink. ok is false for anything else.
 func headIdentity(dir, project string) (string, bool) {
-	if dir == "" {
-		return "", false
-	}
-	// The recorded path must be the worktree itself, not a symlink the worker swapped in.
-	if fi, err := os.Lstat(dir); err != nil || !fi.IsDir() {
-		return "", false
-	}
-	root, err := filepath.EvalSymlinks(dir)
-	if err != nil {
-		return "", false
-	}
-	gitdir, ok := resolveGitDir(root)
+	root, ok := resolveWorktree(dir)
 	if !ok {
 		return "", false
 	}
-	gitdir, commondir, ok := confineGitDir(root, project, gitdir)
+	dotgit, _, ok := resolveGitDir(root)
+	if !ok {
+		return "", false
+	}
+	gitdir, commondir, ok := confineGitDir(root, project, dotgit)
 	if !ok || !refsInFiles(commondir) {
 		return "", false
 	}
 
-	b, found := readGitFile(filepath.Join(gitdir, "HEAD"), maxSmallGitFile)
-	if !found {
+	b, st := readGitFile(gitdir.join("HEAD"), maxSmallGitFile)
+	if st != fileRead {
 		return "", false
 	}
 	head := strings.TrimSpace(string(b))
@@ -133,99 +131,144 @@ func headIdentity(dir, project string) (string, bool) {
 		return "", false
 	}
 	// A per-worktree ref lives under the gitdir, a branch under the commondir.
-	for _, base := range []string{gitdir, commondir} {
-		p, inside := joinWithin(base, ref)
-		if !inside {
+	for _, base := range []gitPath{gitdir, commondir} {
+		b, st := readGitFile(base.join(ref), maxSmallGitFile)
+		switch st {
+		case fileMissing:
+			continue
+		case fileRefused:
 			return "", false
 		}
-		if b, found := readGitFile(p, maxSmallGitFile); found {
-			id := strings.TrimSpace(string(b))
-			if isObjectID(id) {
-				return id, true
-			}
-			return "", false // a second symref level, or garbage
+		id := strings.TrimSpace(string(b))
+		if isObjectID(id) {
+			return id, true
 		}
+		return "", false // a second symref level, or garbage
 	}
-	return packedRef(filepath.Join(commondir, "packed-refs"), ref)
+	return packedRef(commondir.join("packed-refs"), ref)
 }
 
-// resolveGitDir returns the git directory for the worktree at dir: dir/.git when it is a
-// directory, or the path a regular .git file names. A symlinked .git reads as unknown.
-func resolveGitDir(dir string) (string, bool) {
-	dotgit := filepath.Join(dir, ".git")
-	fi, err := os.Lstat(dotgit)
+// gitPath names a file or directory the walk may open: rel, relative and clean, under
+// anchor, a directory ttorch recorded (the worktree root or the project's common git dir).
+type gitPath struct {
+	anchor, rel string
+}
+
+func (g gitPath) join(name string) gitPath { return gitPath{g.anchor, filepath.Join(g.rel, name)} }
+func (g gitPath) path() string             { return filepath.Join(g.anchor, g.rel) }
+
+// under returns p as a gitPath below anchor when, by name, p is anchor or lies inside it.
+func under(anchor, p string) (gitPath, bool) {
+	if !within(anchor, p) {
+		return gitPath{}, false
+	}
+	rel, _ := filepath.Rel(anchor, p)
+	return gitPath{anchor, rel}, true
+}
+
+// resolveWorktree returns the worktree path ttorch recorded with the symlinks in its
+// parent resolved, once, so it can be compared with the resolved paths git writes. The
+// last component is left as recorded: openUnder opens it with O_NOFOLLOW, so a symlink
+// swapped in at the worktree's own path fails every read rather than being followed.
+func resolveWorktree(dir string) (string, bool) {
+	if dir == "" {
+		return "", false
+	}
+	dir = filepath.Clean(dir)
+	base := filepath.Base(dir)
+	if base == "." || base == ".." || base == string(filepath.Separator) {
+		return "", false
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(dir))
 	if err != nil {
 		return "", false
 	}
-	if fi.IsDir() {
-		return dotgit, true
+	return filepath.Join(parent, base), true
+}
+
+// resolveGitDir returns the git directory for the worktree at root, by name: root/.git
+// when it is a directory (isDir), or the path a regular .git file names. A symlinked .git
+// reads as unknown.
+func resolveGitDir(root string) (gitdir string, isDir, ok bool) {
+	f, err := openGitFile(root, ".git")
+	if err != nil {
+		return "", false, false
 	}
-	b, found := readGitFile(dotgit, maxSmallGitFile)
-	if !found {
-		return "", false
+	defer f.Close()
+	if fi, err := f.Stat(); err == nil && fi.IsDir() {
+		return filepath.Join(root, ".git"), true, true
 	}
-	p, ok := strings.CutPrefix(strings.TrimSpace(string(b)), "gitdir: ")
-	if !ok || p == "" || strings.ContainsRune(p, 0) {
-		return "", false
+	b, st := readOpened(f, maxSmallGitFile)
+	if st != fileRead {
+		return "", false, false
+	}
+	p, found := strings.CutPrefix(strings.TrimSpace(string(b)), "gitdir: ")
+	if !found || p == "" || strings.ContainsRune(p, 0) {
+		return "", false, false
 	}
 	if !filepath.IsAbs(p) {
-		p = filepath.Join(dir, p)
+		p = filepath.Join(root, p)
 	}
-	return filepath.Clean(p), true
+	return filepath.Clean(p), false, true
 }
 
 // confineGitDir accepts the git dir a worktree's .git names only where ttorch put it:
-// inside the worktree (root, already free of symlinks), or the project's admin entry for
-// this worktree, <common>/worktrees/<name>, whose gitdir file points back at root/.git.
-// The commondir it names must be inside the worktree or be the project's common git dir.
-// Both are returned with symlinks resolved. Each candidate is checked by name before any
-// symlink in it is followed, so an outside path is refused without touching it.
-func confineGitDir(root, project, gitdir string) (string, string, bool) {
+// inside the worktree, or the project's admin entry for this worktree,
+// <common>/worktrees/<name>, whose gitdir file points back at root/.git. The commondir
+// it names must be inside the worktree or be the project's common git dir. Both checks
+// are on the path as written, and nothing is opened for a path that fails them. What
+// passes is returned anchored at the worktree root or the project's common git dir, and
+// every later read walks down from that anchor through openUnder, so a symlink anywhere
+// below it is refused rather than followed. The only files opened here are the admin
+// entry's gitdir and the git dir's commondir, both through openUnder, plus the project's
+// own .git and commondir in commonGitDir.
+func confineGitDir(root, project, dotgit string) (gitPath, gitPath, bool) {
 	pc := commonGitDir(project)
-	adminDir := filepath.Join(pc, "worktrees")
-	admin := !within(root, gitdir)
-	if admin && (pc == "" || filepath.Dir(gitdir) != adminDir) {
-		return "", "", false
-	}
-	real, err := filepath.EvalSymlinks(gitdir)
-	if err != nil {
-		return "", "", false
-	}
+	gitdir, admin := under(root, dotgit)
+	admin = !admin
 	if admin {
-		if filepath.Dir(real) != adminDir || !linksBack(real, filepath.Join(root, ".git")) {
-			return "", "", false
+		if pc == "" || filepath.Dir(dotgit) != filepath.Join(pc, "worktrees") {
+			return gitPath{}, gitPath{}, false
 		}
-	} else if !within(root, real) {
-		return "", "", false
+		gitdir, _ = under(pc, dotgit)
+		if !linksBack(gitdir, filepath.Join(root, ".git")) {
+			return gitPath{}, gitPath{}, false
+		}
 	}
 
-	b, found := readGitFile(filepath.Join(real, "commondir"), maxSmallGitFile)
-	if !found {
+	b, st := readGitFile(gitdir.join("commondir"), maxSmallGitFile)
+	switch st {
+	case fileMissing:
 		if admin {
-			return "", "", false // git always writes commondir for a linked worktree
+			return gitPath{}, gitPath{}, false // git always writes commondir for a linked worktree
 		}
-		return real, real, true
+		return gitdir, gitdir, true
+	case fileRefused:
+		return gitPath{}, gitPath{}, false
 	}
 	c := strings.TrimSpace(string(b))
 	if c == "" || strings.ContainsRune(c, 0) {
-		return "", "", false
+		return gitPath{}, gitPath{}, false
 	}
 	if !filepath.IsAbs(c) {
-		c = filepath.Join(real, c)
+		c = filepath.Join(gitdir.path(), c)
 	}
-	allowed := func(p string) bool { return within(root, p) || (pc != "" && p == pc) }
-	if c = filepath.Clean(c); !allowed(c) {
-		return "", "", false
+	c = filepath.Clean(c)
+	if common, ok := under(root, c); ok {
+		return gitdir, common, true
 	}
-	realCommon, err := filepath.EvalSymlinks(c)
-	if err != nil || !allowed(realCommon) {
-		return "", "", false
+	if pc != "" && c == pc {
+		return gitdir, gitPath{pc, "."}, true
 	}
-	return real, realCommon, true
+	return gitPath{}, gitPath{}, false
 }
 
 // commonGitDir returns the project's common git dir with symlinks resolved, the directory
 // `git rev-parse --git-common-dir` names there, read from files; "" when it cannot be read.
+// The project is the lead's checkout as ttorch recorded it, so its path is resolved
+// freely. A .git directory is taken as the common dir as it stands: it is shared with
+// every worker, so a commondir file planted in it is not followed. A .git file (the
+// project is itself a linked worktree) is followed to its git dir and that dir's commondir.
 func commonGitDir(project string) string {
 	if project == "" {
 		return ""
@@ -234,21 +277,32 @@ func commonGitDir(project string) string {
 	if err != nil {
 		return ""
 	}
-	gd, ok := resolveGitDir(pr)
+	dotgit, isDir, ok := resolveGitDir(pr)
 	if !ok {
 		return ""
 	}
-	if b, found := readGitFile(filepath.Join(gd, "commondir"), maxSmallGitFile); found {
-		c := strings.TrimSpace(string(b))
-		if c == "" || strings.ContainsRune(c, 0) {
-			return ""
-		}
-		if !filepath.IsAbs(c) {
-			c = filepath.Join(gd, c)
-		}
-		gd = c
+	gd, err := filepath.EvalSymlinks(dotgit)
+	if err != nil {
+		return ""
 	}
-	real, err := filepath.EvalSymlinks(gd)
+	if isDir {
+		return gd
+	}
+	b, st := readGitFile(gitPath{gd, "commondir"}, maxSmallGitFile)
+	switch st {
+	case fileMissing:
+		return gd
+	case fileRefused:
+		return ""
+	}
+	c := strings.TrimSpace(string(b))
+	if c == "" || strings.ContainsRune(c, 0) {
+		return ""
+	}
+	if !filepath.IsAbs(c) {
+		c = filepath.Join(gd, c)
+	}
+	real, err := filepath.EvalSymlinks(c)
 	if err != nil {
 		return ""
 	}
@@ -256,10 +310,11 @@ func commonGitDir(project string) string {
 }
 
 // linksBack reports whether the admin entry's gitdir file names dotgit, the worktree's .git
-// file. git writes it absolute, or relative to the entry with worktree.useRelativePaths.
-func linksBack(entry, dotgit string) bool {
-	b, found := readGitFile(filepath.Join(entry, "gitdir"), maxSmallGitFile)
-	if !found {
+// file, by name. git writes it resolved and absolute, or relative to the entry with
+// worktree.useRelativePaths.
+func linksBack(entry gitPath, dotgit string) bool {
+	b, st := readGitFile(entry.join("gitdir"), maxSmallGitFile)
+	if st != fileRead {
 		return false
 	}
 	p := strings.TrimSpace(string(b))
@@ -267,13 +322,9 @@ func linksBack(entry, dotgit string) bool {
 		return false
 	}
 	if !filepath.IsAbs(p) {
-		p = filepath.Join(entry, p)
+		p = filepath.Join(entry.path(), p)
 	}
-	if p = filepath.Clean(p); p == dotgit {
-		return true
-	}
-	real, err := filepath.EvalSymlinks(p)
-	return err == nil && real == dotgit
+	return filepath.Clean(p) == dotgit
 }
 
 // refsInFiles reports whether the repository at commondir keeps its refs as files. A
@@ -281,12 +332,13 @@ func linksBack(entry, dotgit string) bool {
 // and leaves stub HEAD and refs files that git ignores, so it reads as unknown rather
 // than trusting them; there is no reftable parser here. A config that exists but cannot
 // be read is unknown too. A missing config is the files backend, git's default.
-func refsInFiles(commondir string) bool {
-	path := filepath.Join(commondir, "config")
-	b, found := readGitFile(path, maxGitConfig)
-	if !found {
-		_, err := os.Lstat(path)
-		return os.IsNotExist(err)
+func refsInFiles(commondir gitPath) bool {
+	b, st := readGitFile(commondir.join("config"), maxGitConfig)
+	switch st {
+	case fileMissing:
+		return true
+	case fileRefused:
+		return false
 	}
 	return !configSetsReftable(b)
 }
@@ -326,9 +378,9 @@ func configSetsReftable(b []byte) bool {
 }
 
 // packedRef looks ref up in a packed-refs file.
-func packedRef(path, ref string) (string, bool) {
-	b, found := readGitFile(path, maxPackedRefFile)
-	if !found {
+func packedRef(path gitPath, ref string) (string, bool) {
+	b, st := readGitFile(path, maxPackedRefFile)
+	if st != fileRead {
 		return "", false
 	}
 	sc := bufio.NewScanner(bytes.NewReader(b))
@@ -346,41 +398,97 @@ func packedRef(path, ref string) (string, bool) {
 	return "", false
 }
 
-// readGitFile reads at most max bytes of a regular file. found is false when the path is
-// missing, is not a regular file (a symlink, FIFO or device is refused without blocking),
-// or is larger than max.
-func readGitFile(path string, max int64) ([]byte, bool) {
-	// O_NOFOLLOW refuses a symlink in the last component; O_NONBLOCK keeps a FIFO planted
-	// in place of the file from blocking the open, and the regular-file check then refuses it.
-	f, err := openGitFile(path)
+// fileState is the outcome of reading one git file.
+type fileState int
+
+const (
+	fileRead    fileState = iota
+	fileMissing           // the file, or a directory on the way to it, does not exist
+	fileRefused           // a symlink on the way, not a regular file, over the cap, or unreadable
+)
+
+// readGitFile reads at most max bytes of the regular file p names, opened through
+// openGitFile.
+func readGitFile(p gitPath, max int64) ([]byte, fileState) {
+	f, err := openGitFile(p.anchor, p.rel)
 	if err != nil {
-		return nil, false
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, fileMissing
+		}
+		return nil, fileRefused
 	}
 	defer f.Close()
+	return readOpened(f, max)
+}
+
+// readOpened reads at most max bytes of f, refusing anything that is not a regular file
+// (a FIFO, device or directory) or is larger than max.
+func readOpened(f *os.File, max int64) ([]byte, fileState) {
 	fi, err := f.Stat()
 	if err != nil || !fi.Mode().IsRegular() {
-		return nil, false
+		return nil, fileRefused
 	}
 	b, err := io.ReadAll(io.LimitReader(f, max+1))
 	if err != nil || int64(len(b)) > max {
-		return nil, false
+		return nil, fileRefused
 	}
-	return b, true
+	return b, fileRead
 }
 
 // openGitFile opens one git file for readGitFile. Tests swap it for a slow opener.
-var openGitFile = func(path string) (*os.File, error) {
-	return os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+var openGitFile = openUnder
+
+// errBadGitPath is returned for a rel that is absolute or has an empty, "." or ".."
+// component; gitPath values built by under and join never do.
+var errBadGitPath = errors.New("git path is not a clean relative path")
+
+// openUnder opens rel under the directory anchor one component at a time, each with
+// O_NOFOLLOW, so a symlink anywhere on the way (anchor's own last component, a directory
+// partway down, or the file itself) fails the open instead of being followed, and the
+// check cannot be raced by swapping a directory for a symlink between check and open.
+// O_NONBLOCK keeps a FIFO planted as the file from blocking the open; readOpened then
+// refuses it. A missing component reports fs.ErrNotExist.
+func openUnder(anchor, rel string) (*os.File, error) {
+	if filepath.IsAbs(rel) {
+		return nil, errBadGitPath
+	}
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return nil, errBadGitPath
+		}
+	}
+	const dirFlags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
+	fd, err := retryEINTR(func() (int, error) { return unix.Open(anchor, dirFlags, 0) })
+	if err != nil {
+		return nil, &fs.PathError{Op: "open", Path: anchor, Err: err}
+	}
+	for _, part := range parts[:len(parts)-1] {
+		next, err := retryEINTR(func() (int, error) { return unix.Openat(fd, part, dirFlags, 0) })
+		_ = unix.Close(fd)
+		if err != nil {
+			return nil, &fs.PathError{Op: "openat", Path: filepath.Join(anchor, rel), Err: err}
+		}
+		fd = next
+	}
+	last := parts[len(parts)-1]
+	ffd, err := retryEINTR(func() (int, error) {
+		return unix.Openat(fd, last, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	})
+	_ = unix.Close(fd)
+	if err != nil {
+		return nil, &fs.PathError{Op: "openat", Path: filepath.Join(anchor, rel), Err: err}
+	}
+	return os.NewFile(uintptr(ffd), filepath.Join(anchor, rel)), nil
 }
 
-// joinWithin joins a ref name onto base and reports whether the result, once cleaned,
-// is still inside base.
-func joinWithin(base, ref string) (string, bool) {
-	p := filepath.Join(base, ref)
-	if !within(base, p) {
-		return "", false
+func retryEINTR(open func() (int, error)) (int, error) {
+	for {
+		fd, err := open()
+		if err != unix.EINTR {
+			return fd, err
+		}
 	}
-	return p, true
 }
 
 // within reports whether the clean path p is base or lies under it, by name alone.
