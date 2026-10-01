@@ -979,8 +979,10 @@ inherited one worker's env inside another task's worktree cannot write either re
 turn-started record also appends a non-actionable `hook_turn_started` event, at most one per
 task a minute, so the timeline of a ladder held quiet by a record names the first writer in
 that minute as the writer describes itself: how it resolved the task, its own
-`CLAUDE_PROJECT_DIR`, and the harness's pid. Later writers in the same minute leave no row,
-and nothing in the payload is verified. Both stop accidents; a process running as the worker's user can still write `hook.json` directly.
+`CLAUDE_PROJECT_DIR`, and the hook process's parent pid (usually the shell the harness ran
+the hook through, which has exited by the time anyone reads the row). Later writers in the
+same minute leave no row, and nothing in the payload is verified. Both stop accidents; a
+process running as the worker's user can still write `hook.json` directly.
 `livestate.Reconcile` combines the pane and the record in a fixed order. Busy text on the
 pane always reads as busy, and stall text always leaves the decision to the pane. Otherwise
 a turn-started record less than 30 minutes old reads as busy whatever the pane shows, so a

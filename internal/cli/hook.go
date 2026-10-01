@@ -67,8 +67,10 @@ func cmdHook(args []string, in io.Reader) error {
 // which is non-actionable and written at most once a minute per task, so a chatty session
 // cannot flood the events table. A later writer inside the same minute leaves nothing. The
 // payload is this writer's own account, unverified: how the hook resolved its task (via),
-// its CLAUDE_PROJECT_DIR (the cwd when that is unset), and the hook's parent pid, which is
-// the harness process that ran it.
+// its CLAUDE_PROJECT_DIR (the cwd when that is unset), and the hook process's parent pid.
+// Claude Code runs a command hook through a shell, so that pid is usually the short-lived
+// shell's, and the harness's own only when the shell exec'd ttorch in its place. Reading
+// further up the process tree would not settle which, so the field records only this.
 //
 // It is best-effort like the rest of the hook. The DB is resolved as `ttorch report`
 // resolves it, a DB that does not exist yet is never created, and any error is dropped.

@@ -11,9 +11,10 @@ import (
 // holds the stall ladder quiet while it reads busy. The trace is rate-limited
 // (HookEventInterval), so it records only the first writer in each interval, and its payload
 // is that writer's description of itself: how the hook resolved its task, the project dir
-// from the writer's own CLAUDE_PROJECT_DIR, and the hook's parent pid. Nothing in it is
-// verified. actor=system, non-actionable, and deliberately not a worker: actor, so it never
-// reads as a sign of life to the stall clock (StallInfo).
+// from the writer's own CLAUDE_PROJECT_DIR, and the hook process's parent pid (the shell
+// the harness ran the hook through, or the harness itself when that shell exec'd ttorch).
+// Nothing in it is verified. actor=system, non-actionable, and deliberately not a worker:
+// actor, so it never reads as a sign of life to the stall clock (StallInfo).
 const EventHookTurnStarted = "hook_turn_started"
 
 // HookEventInterval is the least time between two EventHookTurnStarted rows for one task, so
