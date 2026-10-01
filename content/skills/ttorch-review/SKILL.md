@@ -248,14 +248,23 @@ invalidates the verdict — re-prep, re-review, re-record.
   seed or a spawn records beside the branch comes from the same config and can already be the
   worker's, and `ttorch project set-branch` from the lead's shell records it again. (3) It can
   leave refs that a later spawn records as the default branch for a project that has none.
-  Per-worker clones are the planned fix for all three. `ttorch doctor` prints each trusted
+  Per-worker clones are the planned fix for all three. Until then, no check run from the lead's
+  account can be relied on, because a worker runs as the lead's user and can change what git,
+  `git ls-remote`, `ttorch doctor` and the audit log show there. Examples, not a complete list:
+  a fake `git` earlier on `PATH` (`~/.ttorch/bin`, mise shims), `~/.config/git/config` or
+  `include.path`, `GIT_SSH_COMMAND` / `GIT_CONFIG_*` / `HTTPS_PROXY` / `GIT_SSL_NO_VERIFY` from a
+  shell rc file, `Host` entries in `~/.ssh/config`, `http.sslVerify` / `http.sslCAInfo`, and
+  `~/.ttorch/audit.log` being a plain writable file. `ttorch doctor` prints each trusted
   project's recorded branch and its commit, the last landed commit and the URL `git remote
   get-url origin` reports, and `ttorch project ls` shows the branch, but doctor is not the check
-  for (1): it only sees a `remote.origin.url` or `insteadOf` rewrite still in place when it runs,
-  not the transport settings or a rewrite undone after the land. The check that works is `git
-  ls-remote <url> refs/heads/<branch>` run outside any repository with the URL typed out, then
-  confirming that every commit the local branch has beyond that sha was covered by a review (see
-  "Known limit: shared git state" in `docs/ARCHITECTURE.md`).
+  for (1): it only sees a `remote.origin.url` or `insteadOf` rewrite still in place when it runs.
+  The check that works reads main from GitHub's own view, in a browser or from another machine or
+  account, and compares it with what the `trust-record` audit lines cover: a commit `c` counts as
+  reviewed only if some line has `c` as an ancestor of its `commit=` and not of its `base=` (for a
+  rebased land, use the rebased head from its `fast-land` line and the commit main was at before
+  that land). The audit log is writable too, so this finds uncovered commits but cannot prove a
+  line genuine. A local `git ls-remote` against the typed-out URL is a convenience that all of the
+  above can fool (see "Known limit: shared git state" in `docs/ARCHITECTURE.md`).
 
   **Matching on the name alone is not enough, so the guard does not rely on it.** Paths are
   compared under `fsIdentityKey` — NFD, Unicode FULL case folding, then SimpleFold

@@ -389,6 +389,14 @@ still mislead the gate in three ways:
 Per-worker clones, which give each worker its own `.git` instead of a worktree sharing the main
 checkout's, are the planned fix for all three.
 
+Until then, no check run from the lead's account can be relied on. A worker runs as the lead's
+user, so it can change what git, `git ls-remote`, `ttorch doctor` and the audit log show to
+anything else running as that user. Some ways, as examples rather than a complete list: a fake
+`git` earlier on `PATH` (`~/.ttorch/bin`, mise shims); `~/.config/git/config` or an
+`include.path`; `GIT_SSH_COMMAND`, `GIT_CONFIG_*`, `HTTPS_PROXY` or `GIT_SSL_NO_VERIFY` set from a
+shell rc file; `Host` entries in `~/.ssh/config`; `http.sslVerify` and `http.sslCAInfo`; and
+`~/.ttorch/audit.log` itself, which is a plain file the same user can write.
+
 `ttorch doctor` prints, on every run and for each trusted project, the recorded default branch
 and the commit it is at, the commit the last land left it at, and the URL `git remote get-url
 origin` reports. It warns when the branch no longer contains the last landed commit, and when
@@ -398,14 +406,17 @@ catches a `remote.origin.url` or `insteadOf` rewrite that is still in place when
 cannot see the transport settings above, which leave that URL unchanged, or a rewrite made for
 one land and undone afterwards. Nothing refuses a land on its warnings.
 
-To check against the real origin, run `git ls-remote <url> refs/heads/<branch>` from a directory
-outside any repository, with the URL typed out, so no repository config applies. Compare the sha
-it prints with the local branch: every commit the local branch has beyond it (`git log
-<sha>..refs/heads/<branch>` in the checkout) should be one a review covered. A `trust-record`
-line in `~/.ttorch/audit.log` whose `commit=` is an ancestor of its `base=` (`git merge-base
---is-ancestor <commit> <base>` succeeds) records a review of an empty diff. Global git config
-still applies outside a repository, and a worker can write it too, so check it for the keys above
-first.
+The check that works reads main from somewhere the worker cannot fake from the lead's machine:
+GitHub's own view of the branch, in a browser or from another machine or account. A trusted land
+only fast-forwards the local branch, so landed work shows there once it has been pushed. Compare
+the commits on it with the ones `trust-record` lines in the audit log cover. A commit `c` counts as
+reviewed only if some line has `c` as an ancestor of its `commit=` and not of its `base=`. Where a
+land rebased the work, main holds rebased copies, and that task's `fast-land` line (`carried
+verdict <reviewed>-><rebased>`) gives the head to use in place of `commit=`, with the commit main
+was at before that land in place of `base=`. A commit merged some other way, such as a pull
+request, has no line. Since the audit log is writable too, this finds commits no line covers but
+cannot prove a line is genuine. Running `git ls-remote` against the typed-out URL from outside
+any repository is a quicker look at GitHub's main, and everything listed above can fool it.
 
 ### Why the gate-config set stops where it does
 
