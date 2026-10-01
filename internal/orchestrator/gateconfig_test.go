@@ -87,6 +87,8 @@ var decidingFunctions = []string{
 	"archivePriorReports", "carryReportsPastStamp", "gateOnceAt",
 	// the audit record a trusted merge refuses to proceed without
 	"writeAudit", "sanitizeAuditLine",
+	// which commit a task's gate pins to, and where its diffs of that commit run
+	"openWork", "workHead", "observedHead",
 	// the path-spelling and collision controls the guard rests on
 	"fsIdentityKey", "orbitMin", "hostilePath", "collidesInTree", "entriesWithDirs",
 	"sanitizePathForMessage", "isAuditControl",

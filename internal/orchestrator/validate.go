@@ -155,6 +155,10 @@ var ttorchSourceFiles = []string{
 	// Records the default branch every gate read starts from, at registration and for a
 	// project registered before the branch was recorded.
 	"internal/orchestrator/defaultbranch.go",
+	// workdir.go decides which commit the gate reviews, validates and merges for a task, and
+	// where its diffs of that commit run, so a change there moves what every other entry
+	// here is checking.
+	"internal/orchestrator/workdir.go",
 	// The gate's own proofs. Without these, the backstop can be deleted in the same merge
 	// as the attack it would catch: TestTtorchRepoIsScopedIn goes red on a .gitattributes
 	// that un-scopes the repo, but a diff that adds the attribute AND deletes the test
