@@ -152,7 +152,11 @@ func TestCarryVerdictForward_CarriesHumanApprovalAndVerdict(t *testing.T) {
 
 	reloaded, _, _ := m.Store.GetTask(context.Background(), "cu1")
 	defSha := gitIn(t, repo, "rev-parse", "refs/heads/"+def)
-	carried, err := m.carryVerdictForward(reloaded, def, defSha, rebased)
+	w, err := openWork(reloaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	carried, err := m.carryVerdictForward(reloaded, w, def, defSha, rebased)
 	if err != nil {
 		t.Fatalf("carryVerdictForward should carry a clean human-approved rebase: %v", err)
 	}

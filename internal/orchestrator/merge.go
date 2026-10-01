@@ -903,8 +903,13 @@ func (m *Manager) Land(taskID string, requireVerdict bool) (string, error) {
 // its derived gate/origin facts, and the local default branch name. resolveLandSpec computes
 // it once (validating the preconditions that do not depend on the rebase) so both the single
 // Land and the concurrent LandSet share one definition of what landing this task means.
+//
+// w is the task's working directory as resolveLandSpec resolved it. Every later step of the
+// land reads the workdir through it, so a worker that rewrites its .git during the land cannot
+// send the rebase, the carry-forward and the merge down different paths.
 type landSpec struct {
 	taskID, repo, wt string
+	w                work
 	mode, def        string
 	gated            bool
 	requireVerdict   bool
@@ -969,6 +974,7 @@ func (m *Manager) resolveLandSpec(t db.Task, requireVerdict bool) (landSpec, err
 		taskID:         t.ID,
 		repo:           repo,
 		wt:             wt,
+		w:              w,
 		mode:           mode,
 		def:            def,
 		gated:          gated,
@@ -1092,7 +1098,7 @@ func (m *Manager) landPrep(t db.Task, spec landSpec, fetchMu *sync.Mutex) (landP
 	if err := verifyRemoteBase(spec.repo, spec.def, base, baseSha); err != nil {
 		return zero, fmt.Errorf("land: %w", err)
 	}
-	preRebase, err := workHead(t)
+	preRebase, err := spec.w.head()
 	if err != nil {
 		return zero, err
 	}
@@ -1162,7 +1168,7 @@ func (m *Manager) landPrep(t db.Task, spec landSpec, fetchMu *sync.Mutex) (landP
 	// MergeLocal remains the consuming authority.
 	if spec.mode != "pr" {
 		if spec.gated && rebasedHead != preRebase {
-			if _, err := m.carryVerdictForward(t, base, baseSha, rebasedHead); err != nil {
+			if _, err := m.carryVerdictForward(t, spec.w, base, baseSha, rebasedHead); err != nil {
 				return zero, err
 			}
 		}
@@ -1300,7 +1306,10 @@ func (m *Manager) securityAuditNote(taskID, landedSHA string, gated bool) string
 // the usual re-gate/re-approve demand. MergeLocal re-validates and re-consumes the re-pinned
 // verdict against the commit it fast-forwards, so carry-forward is an optimization, never the
 // authority.
-func (m *Manager) carryVerdictForward(t db.Task, base, baseSha, rebasedHead string) (bool, error) {
+//
+// w is the task's working directory as the land resolved it, which decides where the rebased
+// diff is computed.
+func (m *Manager) carryVerdictForward(t db.Task, w work, base, baseSha, rebasedHead string) (bool, error) {
 	v, ok, err := m.Store.GetVerdict(context.Background(), t.ID)
 	if err != nil {
 		return false, fmt.Errorf("land: could not read the verdict for %q to carry it forward: %w", t.ID, err)
@@ -1316,10 +1325,6 @@ func (m *Manager) carryVerdictForward(t db.Task, base, baseSha, rebasedHead stri
 	}
 	// The same command TrustRecord took the recorded identity over (work.patch), so an
 	// unchanged diff hashes the same for a clone as for a worktree.
-	w, err := openWork(t)
-	if err != nil {
-		return false, fmt.Errorf("land: %w", err)
-	}
 	patch, err := w.patch(baseSha, rebasedHead)
 	if err != nil {
 		return false, fmt.Errorf("land: could not compute the rebased diff for %q to carry its verdict forward: %w", t.ID, err)
