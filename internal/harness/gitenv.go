@@ -267,7 +267,8 @@ func writePrivateConfig(path, level string, includes []string) (err error) {
 
 // prepareWorkerGitEnv sets up a clone worker's git environment for a new task: it rewrites the
 // slot's private global and system config files and returns the variables. For anything that
-// is not a clone slot it returns nil and touches nothing.
+// is not a clone slot it returns nil and touches nothing. It runs for every harness, because
+// the files outlive the task and the next worker in the slot reads them whatever it runs.
 func prepareWorkerGitEnv(workdir string) (map[string]string, error) {
 	e := GitEnvFor(workdir)
 	if e.IsZero() {

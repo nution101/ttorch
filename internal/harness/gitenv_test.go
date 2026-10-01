@@ -529,3 +529,36 @@ func TestSystemConfigPathAsksGit(t *testing.T) {
 		t.Errorf("asking git for the system config path changed %s", p)
 	}
 }
+
+// TestNonClaudeHarnessRewritesPrivateConfig: the private files sit in the pool directory and
+// outlive a task, so they are rewritten at spawn whatever harness the new worker runs; a
+// harness with no settings file must not inherit the previous worker's keys.
+func TestNonClaudeHarnessRewritesPrivateConfig(t *testing.T) {
+	root := realTempDir(t)
+	t.Setenv("HOME", root)
+	t.Setenv("GIT_CONFIG_GLOBAL", "")
+	t.Setenv("TTORCH_HOME", filepath.Join(root, ".ttorch"))
+	stubSystemConfig(t, filepath.Join(root, "etc-gitconfig"))
+	slot := cloneSlot(t, "repo-0123abcd", "4")
+	e := GitEnvFor(slot)
+	for _, f := range []string{e.ConfigGlobal, e.ConfigSystem} {
+		if err := os.WriteFile(f, []byte("[core]\n\tfsmonitor = echo previous-task\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := WriteWorkerSettings("codex", slot); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{e.ConfigGlobal, e.ConfigSystem} {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("%s: %v", f, err)
+		}
+		if strings.Contains(string(b), "previous-task") {
+			t.Errorf("%s kept the previous task's key for a non-claude worker:\n%s", filepath.Base(f), b)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(slot, ".claude", "settings.local.json")); !os.IsNotExist(err) {
+		t.Errorf("a non-claude harness still gets no settings file (stat err = %v)", err)
+	}
+}
