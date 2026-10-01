@@ -332,7 +332,7 @@ func readLooseOrPacked(t *testing.T, slot, ref string) string {
 // TestSyncCloneRefusesTransportRewrite: a url.*.insteadOf in the clone's config rewrites the
 // lead's path to an ssh URL whose core.sshCommand is the worker's program, and a plain fetch
 // runs it. sync refuses every transport but a local path, so the fetch fails without running
-// it.
+// it, and the error does not name the lead's repository.
 func TestSyncCloneRefusesTransportRewrite(t *testing.T) {
 	repo, slot, _ := syncFixture(t)
 	marks := realDir(t)
@@ -347,6 +347,9 @@ func TestSyncCloneRefusesTransportRewrite(t *testing.T) {
 	err := syncClone(repo, slot, io.Discard)
 	if err == nil {
 		t.Fatalf("sync through an ssh rewrite succeeded; want it refused")
+	}
+	if strings.Contains(err.Error(), repo) {
+		t.Errorf("the error names the lead's repository: %v", err)
 	}
 	assertNoSentinels(t, marks)
 	assertSameSnapshot(t, before, snapshot(t, repo))
@@ -370,5 +373,21 @@ func TestSyncCloneIgnoresCallerGitEnv(t *testing.T) {
 	}
 	if out, err := exec.Command("git", "-C", other, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/main").CombinedOutput(); err == nil {
 		t.Errorf("sync wrote the repository GIT_DIR named: %s", out)
+	}
+}
+
+// TestSyncCloneOutputOmitsLeadPath: the worker needs the ref and the sha, not where the lead's
+// repository lives.
+func TestSyncCloneOutputOmitsLeadPath(t *testing.T) {
+	repo, slot, _ := syncFixture(t)
+	var out strings.Builder
+	if err := syncClone(repo, slot, &out); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), repo) {
+		t.Errorf("sync output names the lead's repository: %q", out.String())
+	}
+	if !strings.Contains(out.String(), fixtureGit(t, repo, "rev-parse", "refs/heads/main")) {
+		t.Errorf("sync output should give the sha: %q", out.String())
 	}
 }

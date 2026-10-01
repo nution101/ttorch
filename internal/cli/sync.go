@@ -112,6 +112,8 @@ var syncFetchFlags = []string{
 // It does not fetch origin in the lead's repository first: that would write the lead's refs
 // from a worker's process. The base is as fresh as the manager's last fetch, which is the
 // same base the land gate rebases onto after its own fetch, or older.
+//
+// Nothing it prints names the lead's repository path; the worker needs only the ref and sha.
 func syncClone(repo, workdir string, out io.Writer) error {
 	if !harness.IsCloneWorkdir(workdir) {
 		return fmt.Errorf("sync: %s is not a clone working directory. In a linked worktree origin/<default> is already the lead's ref; rebase onto it directly", workdir)
@@ -130,9 +132,9 @@ func syncClone(repo, workdir string, out io.Writer) error {
 		"--no-auto-gc", "--no-auto-maintenance", "--upload-pack=git-upload-pack",
 		"--", repo, "+"+sha+":"+dst)
 	if msg, err := syncGit(args...); err != nil {
-		return fmt.Errorf("sync: fetching %s from %s: %v: %s", sha, repo, err, msg)
+		return fmt.Errorf("sync: fetching %s from the lead's repository: %v: %s", sha, err, strings.ReplaceAll(msg, repo, "<lead repository>"))
 	}
-	fmt.Fprintf(out, "origin/%s -> %s (%s in %s). Rebase with: git rebase origin/%s\n", def, sha, baseRef, repo, def)
+	fmt.Fprintf(out, "origin/%s -> %s (the lead's %s). Rebase with: git rebase origin/%s\n", def, sha, baseRef, def)
 	return nil
 }
 
@@ -165,7 +167,7 @@ func syncRefExists(repo, ref string) bool {
 func syncBase(repo, def string) (ref, sha string, err error) {
 	local := "refs/heads/" + def
 	if !syncRefExists(repo, local) {
-		return "", "", fmt.Errorf("the lead's repository %s has no branch %s", repo, def)
+		return "", "", fmt.Errorf("the lead's repository has no branch %s", def)
 	}
 	localSha, err := syncGit("-C", repo, "rev-parse", "--verify", local+"^{commit}")
 	if err != nil {
