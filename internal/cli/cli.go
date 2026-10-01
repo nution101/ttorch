@@ -116,6 +116,8 @@ func Main(args []string) int {
 		return run(cmdNote(rest))
 	case "follow-on":
 		return run(cmdFollowOn(rest))
+	case "sync":
+		return run(cmdSync(rest))
 	case "status":
 		return run(cmdStatus())
 	case "tasks":
@@ -2427,6 +2429,8 @@ Worker reporting (run by a worker about its own task; resolves the task from
                           record freeform activity (does not wake the manager)
   follow-on <new-id> --title "…" [--touches "a,b"]
                           file a child task into the backlog (does not spawn)
+  sync                    in a clone (TTORCH_WORKER_CLONES): move origin/<default> to
+                          the base the gate lands on, then 'git rebase origin/<default>'
 
 Backlog & planning (read the DB; includes pending backlog tasks):
   tasks                   list tasks (DB-backed), with filters and views
