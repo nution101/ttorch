@@ -71,7 +71,7 @@ type stallTracker struct {
 	policy stallPolicy
 	// headIdentity reports the commit id HEAD resolves to in a task's worktree (ok=false
 	// when it cannot be read in time). It reads files only; see headref.go. Tests swap it out.
-	headIdentity func(t db.Task) (string, bool)
+	headIdentity func(ctx context.Context, t db.Task) (string, bool)
 }
 
 func newStallTracker() stallTracker {
@@ -161,7 +161,7 @@ func (w *Watcher) trackStall(ctx context.Context, now time.Time, t db.Task, obs 
 	}
 	// HEAD is only read once an update is due. A HEAD that cannot be read now, or was
 	// never recorded, is not progress: unknown neither restarts the clock nor raises.
-	if head, ok := w.stall.headIdentity(t); ok && clock.Head != "" && head != clock.Head {
+	if head, ok := w.stall.headIdentity(ctx, t); ok && clock.Head != "" && head != clock.Head {
 		return w.restartStallClock(ctx, now, t, st, clock, pane)
 	}
 
@@ -213,7 +213,7 @@ func (w *Watcher) restartStallClock(ctx context.Context, now time.Time, t db.Tas
 		}
 	}
 	next := stallClock{Pane: pane, Head: prev.Head}
-	if head, ok := w.stall.headIdentity(t); ok {
+	if head, ok := w.stall.headIdentity(ctx, t); ok {
 		next.Head = head
 	}
 	payload, err := json.Marshal(next)

@@ -987,23 +987,25 @@ row is there, is on `Reconcile`.
   where the manager's own LLM turn died with actionable work waiting. It re-pokes the
   manager **through the same DB-event channel** `watch` uses — never a keystroke — and is
   idle-aware, so it no-ops when nothing is waiting.
-- **The stall ladder** keeps reporting a worker that has gone quiet. While a worker's task is
-  `active` and its pane sits at an unchanging, non-busy prompt, `watch` raises an actionable
-  `stalled` update after `TTORCH_STALL_AFTER` (default 10m), repeats it every
+- **The stall ladder** keeps reporting a worker that has gone quiet. While a worker's task
+  is `active` and its pane sits at an unchanging, non-busy prompt, `watch` raises an
+  actionable `stalled` update after `TTORCH_STALL_AFTER` (default 10m), repeats it every
   `TTORCH_STALL_REPEAT` (default 15m), and after `TTORCH_STALL_RERAISES` re-raises (default
-  3) marks each further update `needs-inspection`. A pane change, a report or stage, a status
-  change or re-dispatch, or HEAD moving in the worktree restarts the clock. HEAD is read
-  from the worktree's files, never by running git there, because the worker controls that
-  repository's config. Each read has a 2s deadline and at most one read per task runs at a
-  time, and the git dir it follows must be inside the worktree or be that worktree's entry
-  under the project's common git dir. Every file is opened by walking down from the worktree
-  or that common dir one component at a time without following symlinks, so a symlinked
-  directory partway down a ref's path cannot lead out. Anything else reads as unknown.
-  HEAD-identity progress is not available in a repository whose refs are stored in reftable
-  (`extensions.refStorage = reftable`): ttorch does not parse reftable, so HEAD there always
-  reads as unknown and pane progress and the other signals still apply. The clock and the ladder are events in the store, so they carry
-  across watcher re-arms. The ladder only reports: lease expiry and recovery are unchanged.
-  `TTORCH_STALL_AFTER=0` turns it off.
+  3) marks each further update `needs-inspection`. A pane change, a report or stage, a
+  status change or re-dispatch, or HEAD moving in the worktree restarts the clock. HEAD is
+  read from the worktree's files, never by running git there, because the worker controls
+  that repository's config. Each read has a 2s deadline and at most one read per task runs
+  at a time; a read that takes 500ms or more, or times out, skips that task's HEAD reads for
+  the next 5 minutes. The git dir a read follows must be inside the worktree or be that
+  worktree's entry under the project's common git dir. Every file is opened by walking down
+  from the worktree or that common dir one component at a time without following symlinks,
+  so a symlinked directory partway down a ref's path cannot lead out. Anything else reads as
+  unknown. HEAD-identity progress is not available in a repository whose refs are stored in
+  reftable (`extensions.refStorage = reftable`): ttorch does not parse reftable, so HEAD
+  there always reads as unknown and pane progress and the other signals still apply. The
+  clock and the ladder are events in the store, so they carry across watcher re-arms. The
+  ladder only reports: lease expiry and recovery are unchanged. `TTORCH_STALL_AFTER=0` turns
+  it off.
 - **Agent fingerprints.** A present window does not prove a live worker: the agent can exit
   and leave the pane's shell behind, or the window can end up running something else. At
   spawn, once the launch has taken over the pane, ttorch records the agent process's pid,

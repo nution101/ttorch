@@ -134,7 +134,7 @@ func ladderCase(t *testing.T, started bool, end time.Duration) ([]raised, time.T
 	w, s, _, clk := newWatcher(t)
 	task := seedHarnessTask(t, s, "ld", "claude")
 	w.stall.policy = testStallPolicy
-	w.stall.headIdentity = func(db.Task) (string, bool) { return "", false }
+	w.stall.headIdentity = func(context.Context, db.Task) (string, bool) { return "", false }
 	w.capture = func(string) paneObservation {
 		return paneObservation{present: true, captured: true, pane: paneBrewing}
 	}
