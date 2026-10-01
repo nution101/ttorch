@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/nution101/ttorch/internal/clonepool"
 	"github.com/nution101/ttorch/internal/termtab"
 	"github.com/nution101/ttorch/internal/tmux"
 )
@@ -103,7 +104,7 @@ func Run(out io.Writer, in io.Reader, autoYes bool) error {
 	// Per-worker clones need a git new enough to honour GIT_CONFIG_GLOBAL; checked only when
 	// the flag is on.
 	if _, ok := d.Found["git"]; ok {
-		reportGitCloneFloor(out, workerClonesEnabled(), gitVersion())
+		reportGitCloneFloor(out, clonepool.Enabled(), gitVersion())
 	}
 
 	// iTerm2 is an optional macOS convenience: with it present, 'ttorch' opens the

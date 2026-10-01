@@ -3,15 +3,12 @@ package doctor
 import (
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"strconv"
 	"strings"
-)
 
-// WorkerClonesEnvVar selects per-worker clones instead of linked worktrees for new spawns.
-// Doctor reads it only to decide whether to check git's version against the clone floor.
-const WorkerClonesEnvVar = "TTORCH_WORKER_CLONES"
+	"github.com/nution101/ttorch/internal/clonepool"
+)
 
 // GitCloneFloor is the oldest git per-worker clones run on, as major, minor, patch. 2.45.1
 // carries the fixes for CVE-2024-32002, -32004, -32020, -32021 and -32465; before it, a
@@ -84,14 +81,11 @@ func reportGitCloneFloor(out io.Writer, enabled bool, banner string) {
 	shown := strings.TrimPrefix(strings.TrimSpace(banner), "git version ")
 	switch {
 	case !ok:
-		fmt.Fprintf(out, "  git version: could not be read from %q; %s=1 needs git %s or newer\n", banner, WorkerClonesEnvVar, gitCloneFloor())
+		fmt.Fprintf(out, "  git version: could not be read from %q; %s=1 needs git %s or newer\n", banner, clonepool.EnvVar, gitCloneFloor())
 	case atLeast(got, GitCloneFloor):
-		fmt.Fprintf(out, "  git version: %s (at or above the %s that %s needs)\n", shown, gitCloneFloor(), WorkerClonesEnvVar)
+		fmt.Fprintf(out, "  git version: %s (at or above the %s that %s needs)\n", shown, gitCloneFloor(), clonepool.EnvVar)
 	default:
 		fmt.Fprintf(out, "  git version: %s — below %s, which %s needs: an older git can run a program a worker's clone names while ttorch fetches from it (CVE-2024-32004), and before 2.32 it ignores the private GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM a clone worker gets. Upgrade git, or unset %s\n",
-			shown, gitCloneFloor(), WorkerClonesEnvVar, WorkerClonesEnvVar)
+			shown, gitCloneFloor(), clonepool.EnvVar, clonepool.EnvVar)
 	}
 }
-
-// workerClonesEnabled reports whether WorkerClonesEnvVar reads as on.
-func workerClonesEnabled() bool { return truthyEnv(os.Getenv(WorkerClonesEnvVar)) }

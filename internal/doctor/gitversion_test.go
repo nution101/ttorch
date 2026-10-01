@@ -5,6 +5,8 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/nution101/ttorch/internal/clonepool"
 )
 
 func TestParseGitVersion(t *testing.T) {
@@ -82,7 +84,7 @@ func TestRunReportsGitFloorOnlyWithFlag(t *testing.T) {
 	gitVersion = func() string { return "git version 2.30.1" }
 
 	run := func(flag string) string {
-		t.Setenv(WorkerClonesEnvVar, flag)
+		t.Setenv(clonepool.EnvVar, flag)
 		var out bytes.Buffer
 		if err := Run(&out, strings.NewReader("n\n"), false); err != nil {
 			t.Fatal(err)
@@ -91,10 +93,10 @@ func TestRunReportsGitFloorOnlyWithFlag(t *testing.T) {
 	}
 	for _, off := range []string{"", "0", "false"} {
 		if got := run(off); strings.Contains(got, "git version") {
-			t.Errorf("%s=%q: report mentions the git version:\n%s", WorkerClonesEnvVar, off, got)
+			t.Errorf("%s=%q: report mentions the git version:\n%s", clonepool.EnvVar, off, got)
 		}
 	}
 	if got := run("1"); !strings.Contains(got, "git version: 2.30.1 — below 2.45.1") {
-		t.Errorf("%s=1: report lacks the floor warning:\n%s", WorkerClonesEnvVar, got)
+		t.Errorf("%s=1: report lacks the floor warning:\n%s", clonepool.EnvVar, got)
 	}
 }
