@@ -316,16 +316,22 @@ func splitFindings(s string) []string {
 	return out
 }
 
-// shellQuote renders s as one POSIX shell word, because the lead pastes the approval command
-// into a shell and a task id is text the board did not choose. An id made only of characters
-// no shell treats specially is left bare, so the common case reads as typed; anything else is
-// single-quoted, where nothing expands, and a quote inside the id is closed, escaped with a
-// backslash and reopened.
+// shellQuote renders s as one shell word, because the lead pastes the approval command into
+// a shell and a task id is text the board did not choose. An id made only of letters, digits
+// and ._:/@+- that starts with a letter or digit is left bare, so the common case reads as
+// typed: no POSIX shell, bash or zsh expands those characters, and the first-character rule
+// keeps out a leading - (read as a flag). Anything else, = included because zsh expands a
+// leading =cmd to that command's path, is single-quoted, where nothing expands in any of
+// them; a quote inside the id is closed, escaped with a backslash and reopened.
 func shellQuote(s string) string {
-	if s != "" && strings.Trim(s, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@%+=:,./_-") == "" {
+	if s != "" && isAlnum(s[0]) && strings.Trim(s, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:/@+-") == "" {
 		return s
 	}
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+func isAlnum(c byte) bool {
+	return 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9'
 }
 
 // approvalFor decides whether a done task waits on the lead's approval, and why. Approving
