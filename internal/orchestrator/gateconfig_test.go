@@ -81,7 +81,7 @@ var decidingFunctions = []string{
 	// the per-repo policy that waives the human approval for a trusted gate change
 	"readGateChangePolicy",
 	// the merge and review decisions themselves
-	"MergeLocal", "mergeLocal", "TrustPrep", "TrustRecord", "carryVerdictForward", "gateCoversRebased",
+	"MergeLocal", "mergeLocal", "mergeLocalAt", "mergeHead", "TrustPrep", "TrustRecord", "carryVerdictForward", "gateCoversRebased",
 	// what a verdict must cover and fold, what a re-prep keeps, and the daemon that records
 	"requiredDimensions", "derivedFloor", "foldDimensions",
 	"archivePriorReports", "carryReportsPastStamp", "gateOnceAt",

@@ -168,10 +168,10 @@ func (m *Manager) recordDelivered(taskID, eventType, payload string) {
 	}
 }
 
-// MergeLocal fast-forwards the repo's local default branch to the worker's HEAD —
-// the sole sanctioned state-changing write to a real checkout. It always requires a
-// valid approval token, the default branch checked out and clean, and a clean
-// fast-forward.
+// MergeLocal fast-forwards the repo's local default branch to the worker's HEAD (for a
+// clone task, that commit imported into the repo) — the sole sanctioned state-changing write
+// to a real checkout. It always requires a valid approval token, the default branch checked
+// out and clean, and a clean fast-forward.
 //
 // The trust gate is layered on top: when requireVerdict is set, or the repo is in
 // trusted delivery mode, the merge ADDITIONALLY requires a passing, commit-pinned
@@ -193,6 +193,29 @@ func (m *Manager) MergeLocal(taskID string, requireVerdict bool) (string, error)
 // "" for a direct merge. The verdict's review may start from it as well as from the default
 // branch (see verdictBaseCovers).
 func (m *Manager) mergeLocal(taskID string, requireVerdict bool, landBase string, unapproved *[]string) (string, error) {
+	return m.mergeLocalAt(taskID, requireVerdict, landBase, nil, unapproved)
+}
+
+// landedHead is what a land of a clone task hands its merge: the commit to fast-forward to and
+// the clone head that commit was made from.
+type landedHead struct {
+	// w is the task's working directory as the land resolved it.
+	w work
+	// sha is the commit the land validated and carried the gate to: the clone's head, or the
+	// commit rebaseInScratch made from it. Either way it is an object in the project.
+	sha string
+	// from is the clone head the land imported. The clone must still be at it.
+	from string
+}
+
+// mergeLocalAt is mergeLocal pinned to at. A clone task's land rebases in a scratch worktree of
+// the project and leaves the clone where the worker put it, so the head a merge reads from the
+// clone is the commit from before the rebase, which the verdict and the approval no longer
+// cover once the land has carried them to the rebased one. The land therefore passes the commit
+// it prepared, and the merge refuses when the clone has moved off the head that commit came
+// from. With at nil the merge reads the head through the workdir, as MergeLocal does for both
+// kinds and a worktree's land always has.
+func (m *Manager) mergeLocalAt(taskID string, requireVerdict bool, landBase string, at *landedHead, unapproved *[]string) (string, error) {
 	t, ok, err := m.Store.GetTask(context.Background(), taskID)
 	if err != nil || !ok {
 		return "", fmt.Errorf("unknown task %q", taskID)
@@ -201,11 +224,7 @@ func (m *Manager) mergeLocal(taskID string, requireVerdict bool, landBase string
 	gated := requireVerdict || projectinit.ReadMode(repo) == "trusted"
 	// The committed object that will fast-forward. Everything the gate validates and pins
 	// is THIS sha — never the mutable worktree, which a running worker could change.
-	w, err := openWork(t)
-	if err != nil {
-		return "", err
-	}
-	workerHead, err := w.head()
+	w, workerHead, from, err := mergeHead(t, at)
 	if err != nil {
 		return "", err
 	}
@@ -388,7 +407,7 @@ func (m *Manager) mergeLocal(taskID string, requireVerdict bool, landBase string
 		}
 		// HEAD-unchanged bracket: the worker must not have advanced HEAD during the gate,
 		// so the sha we validated and pinned is still the sha that merges.
-		if cur, err := w.observe(); err != nil || cur != workerHead {
+		if cur, err := w.observe(); err != nil || cur != from {
 			return "", fmt.Errorf("trust gate: the worker for %q advanced during review; re-prep, re-review, and re-record", taskID)
 		}
 	}
@@ -528,6 +547,25 @@ func (m *Manager) mergeLocal(taskID string, requireVerdict bool, landBase string
 		out += "\n  " + lastLanded
 	}
 	return out, nil
+}
+
+// mergeHead resolves the workdir a merge of t reads, the commit it fast-forwards to, and the
+// head the workdir must still be at when the gate's HEAD-unchanged bracket checks it. With at
+// nil the commit is the workdir's head and the bracket compares against it. With at set it is
+// at.sha, and the clone is first checked to still be at at.from, from its files, so a worker who
+// commits after the land prepared is refused here whether or not the merge is gated.
+func mergeHead(t db.Task, at *landedHead) (w work, head, from string, err error) {
+	if at != nil {
+		if cur, err := at.w.observe(); err != nil || cur != at.from {
+			return work{}, "", "", fmt.Errorf("the worker for %q advanced past %s after the land prepared it; re-run land", t.ID, short(at.from))
+		}
+		return at.w, at.sha, at.from, nil
+	}
+	if w, err = openWork(t); err != nil {
+		return work{}, "", "", err
+	}
+	head, err = w.head()
+	return w, head, head, err
 }
 
 // verdictBaseCovers refuses a verdict whose review did not start from the branch this merge
@@ -1423,14 +1461,21 @@ func (m *Manager) gateCoversRebased(t db.Task, rebasedHead string, gated bool) e
 func (m *Manager) integrate(t db.Task, spec landSpec, prep landPrepResult) (string, []string, error) {
 	repo := t.Project
 	if spec.mode == "pr" {
-		head, err := m.integratePR(t, spec.def, prep.rebasedHead)
+		head, err := m.integratePR(t, spec, prep)
 		return head, nil, err
 	}
 	// local / validated / trusted: an approval-gated local fast-forward. MergeLocal
 	// enforces the approval token and (in trusted mode or with --require-verdict) the
 	// adversarial-review verdict + a fresh green validate; Land never bypasses those.
+	//
+	// A worktree's merge reads the worktree, which this land's rebase moved to the rebased
+	// commit. A clone's never moves, so its merge is pinned to the commit landPrep made.
 	var unapproved []string
-	if _, err := m.mergeLocal(t.ID, spec.requireVerdict, prep.baseSha, &unapproved); err != nil {
+	var at *landedHead
+	if spec.w.clone {
+		at = &landedHead{w: spec.w, sha: prep.rebasedHead, from: prep.preRebase}
+	}
+	if _, err := m.mergeLocalAt(t.ID, spec.requireVerdict, prep.baseSha, at, &unapproved); err != nil {
 		return "", nil, fmt.Errorf("land: local merge gate refused %q: %w", t.ID, err)
 	}
 	head, err := worktree.Head(repo)
@@ -1441,13 +1486,21 @@ func (m *Manager) integrate(t db.Task, spec landSpec, prep landPrepResult) (stri
 // opens (or reuses) a PR, merges it, then fast-forwards the local default branch to the
 // merged tip. GitHub's required reviews / branch protection / status checks are the gate
 // here, and a merge they block fails loudly.
-func (m *Manager) integratePR(t db.Task, def, rebasedHead string) (string, error) {
+func (m *Manager) integratePR(t db.Task, spec landSpec, prep landPrepResult) (string, error) {
 	repo, wt := t.Project, t.Worktree
+	def, rebasedHead := spec.def, prep.rebasedHead
 	// HEAD-unchanged bracket (mirrors MergeLocal): the worker must not have advanced past
 	// the validated commit between validation and publish, so an unvalidated commit can
-	// never reach the remote.
-	if cur, err := worktree.Head(wt); err != nil || cur != rebasedHead {
-		return "", fmt.Errorf("land: the worker for %q advanced past the validated commit %s before publish; re-run land", t.ID, short(rebasedHead))
+	// never reach the remote. A worktree's land rebased the worktree, so it must be at the
+	// rebased commit. A clone's land rebased in a scratch worktree, so the clone must still be
+	// at the head that was imported, and that is read from its files.
+	advanced := fmt.Errorf("land: the worker for %q advanced past the validated commit %s before publish; re-run land", t.ID, short(rebasedHead))
+	if spec.w.clone {
+		if cur, err := spec.w.observe(); err != nil || cur != prep.preRebase {
+			return "", advanced
+		}
+	} else if cur, err := worktree.Head(wt); err != nil || cur != rebasedHead {
+		return "", advanced
 	}
 	branch := "ttorch/" + t.ID
 	if err := worktree.Push(repo, "origin", rebasedHead+":refs/heads/"+branch); err != nil {

@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -8,10 +9,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/nution101/ttorch/internal/approval"
+	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/review"
 )
 
@@ -160,6 +163,146 @@ func TestCloneLand_RebaseConflictLeavesTheCloneByteIdentical(t *testing.T) {
 	}
 }
 
+// TestCloneLand_CleanRebaseLandsTheRebasedCommitWithTheCarriedVerdict lands a reviewed clone
+// task after main gained a disjoint commit. The land must rebase in the project, carry the
+// verdict to the rebased commit because the reviewed diff is unchanged, and fast-forward main to
+// that commit, not to the clone's head and not to a commit made in the clone. The clone is left
+// as it was and no git runs there apart from prep's import.
+func TestCloneLand_CleanRebaseLandsTheRebasedCommitWithTheCarriedVerdict(t *testing.T) {
+	m, repo, _ := trustHarness(t, "wt1", "trusted", "exit 0")
+	clone := cloneTask(t, m, repo, "cl1")
+	head := commitInClone(t, clone, "feature.txt", "from the clone\n")
+	sentinel := armClone(t, clone)
+	calls := recordGitCalls(t)
+	gateClone(t, m, "cl1", head)
+	base := advanceMain(t, repo, "other.txt", "from main\n")
+	before := snapshotTree(t, clone)
+
+	out, err := m.Land("cl1", false)
+	if err != nil {
+		t.Fatalf("Land: %v", err)
+	}
+	landed := gitIn(t, repo, "rev-parse", "HEAD")
+	if landed == head || landed == base {
+		t.Fatalf("main is at %s; want a rebase of the clone's %s onto %s", short(landed), short(head), short(base))
+	}
+	if parent := gitIn(t, repo, "rev-parse", landed+"^"); parent != base {
+		t.Fatalf("the landed commit's parent is %s, want the base %s", short(parent), short(base))
+	}
+	if got := gitIn(t, repo, "rev-parse", cloneRebasedRef("cl1")); got != landed {
+		t.Errorf("%s names %s, want the landed commit %s", cloneRebasedRef("cl1"), short(got), short(landed))
+	}
+	for _, f := range []string{"feature.txt", "other.txt"} {
+		gitIn(t, repo, "cat-file", "-e", landed+":"+f)
+	}
+	if !strings.Contains(out, "rebased "+short(head)+"→"+short(landed)) {
+		t.Errorf("the land summary does not report the rebase: %q", out)
+	}
+
+	auditLog, err := os.ReadFile(m.P.AuditLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"fast-land task=cl1 carried verdict " + short(head) + "->" + short(landed),
+		"main -> " + short(landed) + " gate=verdict approver=auto",
+	} {
+		if !strings.Contains(string(auditLog), want) {
+			t.Errorf("the audit log lacks %q:\n%s", want, auditLog)
+		}
+	}
+	if n := strings.Count(string(auditLog), "trust-record task=cl1"); n != 1 {
+		t.Errorf("the land must carry the verdict, not re-record it; trust-record count = %d", n)
+	}
+	if _, ok := m.TrustShow("cl1"); ok {
+		t.Error("the carried verdict must be consumed by the merge")
+	}
+
+	assertSameTree(t, before, snapshotTree(t, clone))
+	assertNoGitInClone(t, calls(), clone)
+	if _, err := os.Stat(sentinel); err == nil {
+		t.Error("a program from the clone's config ran during the land")
+	}
+	assertNoScratchLeft(t, repo)
+}
+
+// TestCloneLand_MergeRefusedWhenTheCloneAdvanced prepares a land of a clone task, then has
+// the worker commit again before the merge. The merge must refuse, because the clone is no
+// longer at the head the land rebased and validated, and refuse without moving main or
+// spending the verdict and approval a re-run of the land needs.
+func TestCloneLand_MergeRefusedWhenTheCloneAdvanced(t *testing.T) {
+	m, repo, _ := trustHarness(t, "wt1", "trusted", "exit 0")
+	clone := cloneTask(t, m, repo, "cl1")
+	head := commitInClone(t, clone, "feature.txt", "first\n")
+	gateClone(t, m, "cl1", head)
+	base := advanceMain(t, repo, "other.txt", "from main\n")
+
+	task, _, err := m.Store.GetTask(context.Background(), "cl1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := m.resolveLandSpec(task, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prep, err := m.landPrep(task, spec, &sync.Mutex{})
+	if err != nil {
+		t.Fatalf("landPrep: %v", err)
+	}
+	if prep.rebasedHead == head {
+		t.Fatal("main advanced, so the land must have rebased; the merge below would prove nothing")
+	}
+	commitInClone(t, clone, "feature.txt", "second\n")
+
+	if _, err := m.landCommit(task, spec, prep); err == nil || !strings.Contains(err.Error(), "advanced") {
+		t.Fatalf("landCommit = %v, want a refusal because the clone advanced", err)
+	}
+	if got := gitIn(t, repo, "rev-parse", "HEAD"); got != base {
+		t.Errorf("main moved to %s, want it left at %s", short(got), short(base))
+	}
+	if v, ok := m.TrustShow("cl1"); !ok || v.ReviewedSHA != prep.rebasedHead {
+		t.Errorf("the refusal must leave the carried verdict in place, got %+v ok=%v", v, ok)
+	}
+	if !approval.Valid(m.P.ApprovalFile("cl1")) {
+		t.Error("the refusal must leave the approval in place")
+	}
+}
+
+// TestCloneLand_PublishRefusedWhenTheCloneAdvanced is the pr-mode half: integratePR must not
+// push a commit once the clone has moved past the head the land validated, and it must find
+// that out from the clone's files, not by running git there.
+func TestCloneLand_PublishRefusedWhenTheCloneAdvanced(t *testing.T) {
+	m, repo, _ := trustHarness(t, "wt1", "trusted", "exit 0")
+	clone := cloneTask(t, m, repo, "cl1")
+	head := commitInClone(t, clone, "feature.txt", "first\n")
+	calls := recordGitCalls(t)
+	if _, err := workHead(db.Task{ID: "cl1", Project: repo, Worktree: clone}); err != nil {
+		t.Fatalf("importing the clone's head: %v", err)
+	}
+	imported := calls()
+	task, _, err := m.Store.GetTask(context.Background(), "cl1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := m.resolveLandSpec(task, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec.mode = "pr"
+	base := gitIn(t, repo, "rev-parse", "HEAD")
+	prep := landPrepResult{base: "refs/heads/main", baseSha: base, preRebase: head, rebasedHead: head}
+	commitInClone(t, clone, "feature.txt", "second\n")
+	fixture := len(calls()) // the commit above is the worker's own git, not the land's
+
+	if _, err := m.landCommit(task, spec, prep); err == nil || !strings.Contains(err.Error(), "advanced") {
+		t.Fatalf("landCommit = %v, want a refusal because the clone advanced", err)
+	}
+	if out := gitIn(t, repo, "ls-remote", "origin", "refs/heads/ttorch/cl1"); out != "" {
+		t.Errorf("the refusal still pushed the branch: %s", out)
+	}
+	assertNoGitInClone(t, append(imported, calls()[fixture:]...), clone)
+}
+
 // TestCloneLand_UngatedLandBehindTheDefaultAsksTheWorkerToRebase lands a clone task in local
 // mode with no verdict after main moved on. Its approval pins the clone's head, which a rebase
 // in the project cannot move, so no approval could cover a rebased commit. The land must say so
@@ -204,6 +347,38 @@ func TestCloneLand_UngatedLandBehindTheDefaultAsksTheWorkerToRebase(t *testing.T
 	if got := gitIn(t, repo, "rev-parse", "HEAD"); got != rebased {
 		t.Errorf("main is at %s, want the worker's rebased commit %s", short(got), short(rebased))
 	}
+}
+
+// TestCloneLand_LandSetLandsTwoClonesThatTouchDifferentFiles lands two reviewed clone tasks in
+// one LandSet after main moved on. Each preps its own scratch at once and the fast-forwards
+// serialize, so the second re-preps over the first; both must land, each clone left as it was.
+func TestCloneLand_LandSetLandsTwoClonesThatTouchDifferentFiles(t *testing.T) {
+	m, repo, _ := trustHarness(t, "wt1", "trusted", "exit 0")
+	ids := []string{"cl1", "cl2"}
+	clones := map[string]string{}
+	for _, id := range ids {
+		clones[id] = cloneTask(t, m, repo, id)
+		gateClone(t, m, id, commitInClone(t, clones[id], id+".txt", id+"\n"))
+	}
+	advanceMain(t, repo, "other.txt", "from main\n")
+	before := map[string]map[string]string{}
+	for _, id := range ids {
+		before[id] = snapshotTree(t, clones[id])
+	}
+
+	for _, r := range m.LandSet(context.Background(), ids, false) {
+		if r.Err != nil {
+			t.Errorf("%s did not land: %v", r.TaskID, r.Err)
+		}
+	}
+	tip := gitIn(t, repo, "rev-parse", "HEAD")
+	for _, f := range []string{"cl1.txt", "cl2.txt", "other.txt"} {
+		gitIn(t, repo, "cat-file", "-e", tip+":"+f)
+	}
+	for _, id := range ids {
+		assertSameTree(t, before[id], snapshotTree(t, clones[id]))
+	}
+	assertNoScratchLeft(t, repo)
 }
 
 // TestRebaseInScratch_RunsNoRebaseHookAndLeavesNoScratch drives the primitive directly. The
