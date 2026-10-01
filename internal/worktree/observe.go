@@ -67,7 +67,7 @@ func ObserveHead(dir, project string) (string, bool) {
 		return "", false
 	}
 	head := strings.TrimSpace(string(b))
-	if isObjectID(head) {
+	if ValidObjectID(head) {
 		return head, true // detached
 	}
 	ref, isSym := strings.CutPrefix(head, "ref: ")
@@ -84,7 +84,7 @@ func ObserveHead(dir, project string) (string, bool) {
 			return "", false
 		}
 		id := strings.TrimSpace(string(b))
-		if isObjectID(id) {
+		if ValidObjectID(id) {
 			return id, true
 		}
 		return "", false // a second symref level, or garbage
@@ -335,7 +335,7 @@ func packedRef(path gitPath, ref string) (string, bool) {
 			continue // header, or the peeled id of the tag above
 		}
 		id, name, ok := strings.Cut(line, " ")
-		if ok && name == ref && isObjectID(id) {
+		if ok && name == ref && ValidObjectID(id) {
 			return id, true
 		}
 	}
