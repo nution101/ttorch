@@ -8,12 +8,13 @@ import (
 )
 
 func TestParseGitVersion(t *testing.T) {
-	for banner, want := range map[string][2]int{
-		"git version 2.50.1 (Apple Git-155)": {2, 50},
-		"git version 2.45.1.windows.1":       {2, 45},
-		"git version 2.32.0":                 {2, 32},
-		"git version 2.31.8\n":               {2, 31},
-		"git version 3.0":                    {3, 0},
+	for banner, want := range map[string][3]int{
+		"git version 2.50.1 (Apple Git-155)": {2, 50, 1},
+		"git version 2.45.1.windows.1":       {2, 45, 1},
+		"git version 2.45.0.rc1":             {2, 45, 0},
+		"git version 2.32.0":                 {2, 32, 0},
+		"git version 2.31.8\n":               {2, 31, 8},
+		"git version 3.0":                    {3, 0, 0},
 	} {
 		got, ok := parseGitVersion(banner)
 		if !ok || got != want {
@@ -27,9 +28,9 @@ func TestParseGitVersion(t *testing.T) {
 	}
 }
 
-// TestReportGitCloneFloor: with the flag on, a git below 2.32 is called out (it ignores
-// GIT_CONFIG_GLOBAL), 2.32 and newer pass, and an unreadable banner says so. With the flag off
-// nothing is printed.
+// TestReportGitCloneFloor: with the flag on, a git below 2.45.1 is called out, including the
+// 2.45.0 just before the security fixes and the 2.32 that met the old floor; 2.45.1 and newer
+// pass, and an unreadable banner says so. With the flag off nothing is printed.
 func TestReportGitCloneFloor(t *testing.T) {
 	cases := []struct {
 		banner  string
@@ -37,11 +38,16 @@ func TestReportGitCloneFloor(t *testing.T) {
 		want    []string
 		absent  []string
 	}{
-		{"git version 2.31.8", true, []string{"below 2.32", "GIT_CONFIG_GLOBAL", "TTORCH_WORKER_CLONES"}, []string{"at or above"}},
-		{"git version 2.28.0", true, []string{"below 2.32"}, nil},
-		{"git version 2.32.0", true, []string{"at or above the 2.32"}, []string{"below"}},
+		{"git version 2.31.8", true, []string{"below 2.45.1", "GIT_CONFIG_GLOBAL", "CVE-2024-32004", "TTORCH_WORKER_CLONES"}, []string{"at or above"}},
+		{"git version 2.32.0", true, []string{"below 2.45.1"}, []string{"at or above"}},
+		{"git version 2.45.0", true, []string{"below 2.45.1"}, []string{"at or above"}},
+		{"git version 2.45.0.rc1", true, []string{"below 2.45.1"}, []string{"at or above"}},
+		{"git version 2.44.9", true, []string{"below 2.45.1"}, []string{"at or above"}},
+		{"git version 2.45.1", true, []string{"at or above the 2.45.1"}, []string{"below"}},
+		{"git version 2.46.0", true, []string{"at or above"}, []string{"below"}},
+		{"git version 3.0", true, []string{"at or above"}, []string{"below"}},
 		{"git version 2.50.1 (Apple Git-155)", true, []string{"2.50.1", "at or above"}, []string{"below"}},
-		{"weird", true, []string{"could not be read", "2.32"}, nil},
+		{"weird", true, []string{"could not be read", "2.45.1"}, nil},
 	}
 	for _, c := range cases {
 		var b bytes.Buffer
@@ -88,7 +94,7 @@ func TestRunReportsGitFloorOnlyWithFlag(t *testing.T) {
 			t.Errorf("%s=%q: report mentions the git version:\n%s", WorkerClonesEnvVar, off, got)
 		}
 	}
-	if got := run("1"); !strings.Contains(got, "git version: 2.30.1 — below 2.32") {
+	if got := run("1"); !strings.Contains(got, "git version: 2.30.1 — below 2.45.1") {
 		t.Errorf("%s=1: report lacks the floor warning:\n%s", WorkerClonesEnvVar, got)
 	}
 }

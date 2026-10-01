@@ -13,19 +13,19 @@ import (
 // Doctor reads it only to decide whether to check git's version against the clone floor.
 const WorkerClonesEnvVar = "TTORCH_WORKER_CLONES"
 
-// The oldest git a clone worker can run on. The binding feature is GIT_CONFIG_GLOBAL, which
-// git 2.32 introduced: an older git ignores the variable, so a clone worker's private global
-// config is never read and `git config --global` writes the lead's own file. The other
-// features clones use are older (`git init --initial-branch` is 2.28, `git fetch
-// --no-write-fetch-head` and `--no-auto-maintenance` are 2.29). These two constants are the
-// only spelling of the floor.
-const (
-	gitCloneFloorMajor = 2
-	gitCloneFloorMinor = 32
-)
+// GitCloneFloor is the oldest git per-worker clones run on, as major, minor, patch. 2.45.1
+// carries the fixes for CVE-2024-32002, -32004, -32020, -32021 and -32465; before it, a
+// fetch from a clone could lazy-fetch through a promisor remote the clone's own config names
+// and run a program the worker chose. The clone import and ttorch sync also set
+// GIT_NO_LAZY_FETCH, which 2.45 documents. Older floors are inside it: GIT_CONFIG_GLOBAL and
+// GIT_CONFIG_SYSTEM, which a clone worker's private config files rely on, arrived in 2.32,
+// `git init --initial-branch` in 2.28 and `git fetch --no-write-fetch-head` in 2.29. The fix
+// was also released as 2.39.4, 2.40.2, 2.41.1, 2.42.2, 2.43.4 and 2.44.1; those are refused
+// anyway, since one floor is simpler to state and to check than seven.
+var GitCloneFloor = [3]int{2, 45, 1}
 
 func gitCloneFloor() string {
-	return strconv.Itoa(gitCloneFloorMajor) + "." + strconv.Itoa(gitCloneFloorMinor)
+	return fmt.Sprintf("%d.%d.%d", GitCloneFloor[0], GitCloneFloor[1], GitCloneFloor[2])
 }
 
 // gitVersion returns git's version banner ("git version 2.50.1"), or "" when git cannot be
@@ -38,23 +38,40 @@ var gitVersion = func() string {
 	return strings.TrimSpace(string(out))
 }
 
-// parseGitVersion pulls major and minor out of a banner such as "git version 2.50.1 (Apple
-// Git-155)" or "git version 2.45.1.windows.1".
-func parseGitVersion(banner string) ([2]int, bool) {
+// parseGitVersion pulls major, minor and patch out of a banner such as "git version 2.50.1
+// (Apple Git-155)", "git version 2.45.1.windows.1" or "git version 2.45.0.rc1". A missing or
+// non-numeric patch reads as 0, so a release candidate never passes for the release.
+func parseGitVersion(banner string) ([3]int, bool) {
 	v, ok := strings.CutPrefix(strings.TrimSpace(banner), "git version ")
 	if !ok {
-		return [2]int{}, false
+		return [3]int{}, false
 	}
-	parts := strings.SplitN(strings.Fields(v + " ")[0], ".", 3)
+	parts := strings.SplitN(strings.Fields(v + " ")[0], ".", 4)
 	if len(parts) < 2 {
-		return [2]int{}, false
+		return [3]int{}, false
 	}
 	major, err1 := strconv.Atoi(parts[0])
 	minor, err2 := strconv.Atoi(parts[1])
-	if err1 != nil || err2 != nil {
-		return [2]int{}, false
+	if err1 != nil || err2 != nil || major < 0 || minor < 0 {
+		return [3]int{}, false
 	}
-	return [2]int{major, minor}, true
+	patch := 0
+	if len(parts) > 2 {
+		if n, err := strconv.Atoi(parts[2]); err == nil && n >= 0 {
+			patch = n
+		}
+	}
+	return [3]int{major, minor, patch}, true
+}
+
+// atLeast reports whether version v is at or above floor.
+func atLeast(v, floor [3]int) bool {
+	for i := range v {
+		if v[i] != floor[i] {
+			return v[i] > floor[i]
+		}
+	}
+	return true
 }
 
 // reportGitCloneFloor prints the git version line when per-worker clones are switched on. With
@@ -68,10 +85,10 @@ func reportGitCloneFloor(out io.Writer, enabled bool, banner string) {
 	switch {
 	case !ok:
 		fmt.Fprintf(out, "  git version: could not be read from %q; %s=1 needs git %s or newer\n", banner, WorkerClonesEnvVar, gitCloneFloor())
-	case got[0] > gitCloneFloorMajor || (got[0] == gitCloneFloorMajor && got[1] >= gitCloneFloorMinor):
+	case atLeast(got, GitCloneFloor):
 		fmt.Fprintf(out, "  git version: %s (at or above the %s that %s needs)\n", shown, gitCloneFloor(), WorkerClonesEnvVar)
 	default:
-		fmt.Fprintf(out, "  git version: %s — below %s, which %s needs: an older git ignores GIT_CONFIG_GLOBAL, so a clone worker's `git config --global` would write your own global config. Upgrade git, or unset %s\n",
+		fmt.Fprintf(out, "  git version: %s — below %s, which %s needs: an older git can run a program a worker's clone names while ttorch fetches from it (CVE-2024-32004), and before 2.32 it ignores the private GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM a clone worker gets. Upgrade git, or unset %s\n",
 			shown, gitCloneFloor(), WorkerClonesEnvVar, WorkerClonesEnvVar)
 	}
 }
