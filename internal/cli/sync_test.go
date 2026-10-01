@@ -16,8 +16,8 @@ import (
 	"github.com/nution101/ttorch/internal/paths"
 )
 
-// syncGit runs git in dir with a fixture identity and fails the test on error.
-func syncGit(t *testing.T, dir string, args ...string) string {
+// fixtureGit runs git in dir with a fixture identity and fails the test on error.
+func fixtureGit(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	full := append([]string{"-c", "user.name=sync fixture", "-c", "user.email=fixture@example.invalid",
 		"-c", "commit.gpgsign=false"}, args...)
@@ -58,30 +58,30 @@ func syncFixture(t *testing.T) (repo, slot, base string) {
 	t.Helper()
 	isolateGit(t)
 	repo = filepath.Join(realDir(t), "lead")
-	syncGit(t, filepath.Dir(repo), "init", "-q", "-b", "main", repo)
+	fixtureGit(t, filepath.Dir(repo), "init", "-q", "-b", "main", repo)
 	if err := os.WriteFile(filepath.Join(repo, "f"), []byte("one\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	syncGit(t, repo, "add", "f")
-	syncGit(t, repo, "commit", "-q", "-m", "one")
-	base = syncGit(t, repo, "rev-parse", "HEAD")
+	fixtureGit(t, repo, "add", "f")
+	fixtureGit(t, repo, "commit", "-q", "-m", "one")
+	base = fixtureGit(t, repo, "rev-parse", "HEAD")
 
 	slot = filepath.Join(paths.Default().Home, "clones", "lead-0123abcd", "1")
 	if err := os.MkdirAll(filepath.Dir(slot), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	syncGit(t, filepath.Dir(slot), "init", "-q", "-b", "main", slot)
-	common := syncGit(t, repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	fixtureGit(t, filepath.Dir(slot), "init", "-q", "-b", "main", slot)
+	common := fixtureGit(t, repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
 	if err := os.WriteFile(filepath.Join(slot, ".git", "objects", "info", "alternates"), []byte(filepath.Join(common, "objects")+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	syncGit(t, slot, "update-ref", "refs/remotes/origin/main", base)
-	syncGit(t, slot, "checkout", "-q", "-B", "ttorch/t1", base)
+	fixtureGit(t, slot, "update-ref", "refs/remotes/origin/main", base)
+	fixtureGit(t, slot, "checkout", "-q", "-B", "ttorch/t1", base)
 
 	if err := os.WriteFile(filepath.Join(repo, "f"), []byte("two\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	syncGit(t, repo, "commit", "-q", "-am", "two")
+	fixtureGit(t, repo, "commit", "-q", "-am", "two")
 	return repo, slot, base
 }
 
@@ -140,16 +140,16 @@ func assertSameSnapshot(t *testing.T, before, after map[string]string) {
 // current default and leaves every byte of the lead's repository as it was.
 func TestSyncCloneFetchesBaseWithoutWritingLead(t *testing.T) {
 	repo, slot, base := syncFixture(t)
-	tip := syncGit(t, repo, "rev-parse", "refs/heads/main")
+	tip := fixtureGit(t, repo, "rev-parse", "refs/heads/main")
 	before := snapshot(t, repo)
 
 	if err := syncClone(repo, slot, io.Discard); err != nil {
 		t.Fatal(err)
 	}
-	if got := syncGit(t, slot, "rev-parse", "refs/remotes/origin/main"); got != tip {
+	if got := fixtureGit(t, slot, "rev-parse", "refs/remotes/origin/main"); got != tip {
 		t.Errorf("clone origin/main = %s, want the lead's main %s", got, tip)
 	}
-	if got := syncGit(t, slot, "rev-parse", "HEAD"); got != base {
+	if got := fixtureGit(t, slot, "rev-parse", "HEAD"); got != base {
 		t.Errorf("sync must not move the worker's branch: HEAD = %s, want %s", got, base)
 	}
 	if _, err := os.Stat(filepath.Join(slot, ".git", "FETCH_HEAD")); !os.IsNotExist(err) {
@@ -163,32 +163,32 @@ func TestSyncCloneFetchesBaseWithoutWritingLead(t *testing.T) {
 func TestSyncClonePicksLandBase(t *testing.T) {
 	repo, slot, _ := syncFixture(t)
 	remote := filepath.Join(realDir(t), "remote.git")
-	syncGit(t, repo, "init", "-q", "--bare", "-b", "main", remote)
-	syncGit(t, repo, "remote", "add", "origin", remote)
-	syncGit(t, repo, "push", "-q", "origin", "main")
-	syncGit(t, repo, "fetch", "-q", "origin")
+	fixtureGit(t, repo, "init", "-q", "--bare", "-b", "main", remote)
+	fixtureGit(t, repo, "remote", "add", "origin", remote)
+	fixtureGit(t, repo, "push", "-q", "origin", "main")
+	fixtureGit(t, repo, "fetch", "-q", "origin")
 
 	// origin ahead of the local default: a commit pushed from elsewhere, then fetched.
 	other := filepath.Join(realDir(t), "other")
-	syncGit(t, repo, "clone", "-q", remote, other)
-	syncGit(t, other, "commit", "-q", "--allow-empty", "-m", "three")
-	syncGit(t, other, "push", "-q", "origin", "main")
-	syncGit(t, repo, "fetch", "-q", "origin")
-	originTip := syncGit(t, repo, "rev-parse", "refs/remotes/origin/main")
+	fixtureGit(t, repo, "clone", "-q", remote, other)
+	fixtureGit(t, other, "commit", "-q", "--allow-empty", "-m", "three")
+	fixtureGit(t, other, "push", "-q", "origin", "main")
+	fixtureGit(t, repo, "fetch", "-q", "origin")
+	originTip := fixtureGit(t, repo, "rev-parse", "refs/remotes/origin/main")
 	if err := syncClone(repo, slot, io.Discard); err != nil {
 		t.Fatal(err)
 	}
-	if got := syncGit(t, slot, "rev-parse", "refs/remotes/origin/main"); got != originTip {
+	if got := fixtureGit(t, slot, "rev-parse", "refs/remotes/origin/main"); got != originTip {
 		t.Errorf("origin ahead: clone origin/main = %s, want origin's %s", got, originTip)
 	}
 
 	// The local default diverged from origin: the land gate bases on the local default.
-	syncGit(t, repo, "commit", "-q", "--allow-empty", "-m", "local only")
-	localTip := syncGit(t, repo, "rev-parse", "refs/heads/main")
+	fixtureGit(t, repo, "commit", "-q", "--allow-empty", "-m", "local only")
+	localTip := fixtureGit(t, repo, "rev-parse", "refs/heads/main")
 	if err := syncClone(repo, slot, io.Discard); err != nil {
 		t.Fatal(err)
 	}
-	if got := syncGit(t, slot, "rev-parse", "refs/remotes/origin/main"); got != localTip {
+	if got := fixtureGit(t, slot, "rev-parse", "refs/remotes/origin/main"); got != localTip {
 		t.Errorf("local diverged: clone origin/main = %s, want the local default %s", got, localTip)
 	}
 }
@@ -197,12 +197,12 @@ func TestSyncClonePicksLandBase(t *testing.T) {
 // it, because sync reads refs/heads/<default> and refs/remotes/origin/<default> by full name.
 func TestSyncCloneIgnoresShadowingTag(t *testing.T) {
 	repo, slot, base := syncFixture(t)
-	syncGit(t, repo, "tag", "main", base)
-	tip := syncGit(t, repo, "rev-parse", "refs/heads/main")
+	fixtureGit(t, repo, "tag", "main", base)
+	tip := fixtureGit(t, repo, "rev-parse", "refs/heads/main")
 	if err := syncClone(repo, slot, io.Discard); err != nil {
 		t.Fatal(err)
 	}
-	if got := syncGit(t, slot, "rev-parse", "refs/remotes/origin/main"); got != tip {
+	if got := fixtureGit(t, slot, "rev-parse", "refs/remotes/origin/main"); got != tip {
 		t.Errorf("clone origin/main = %s, want the branch %s, not the tag %s", got, tip, base)
 	}
 }
@@ -212,7 +212,7 @@ func TestSyncCloneIgnoresShadowingTag(t *testing.T) {
 func TestSyncCloneRefusesWorktree(t *testing.T) {
 	repo, _, base := syncFixture(t)
 	wt := filepath.Join(paths.Default().Home, "clones", "lead-0123abcd", "2")
-	syncGit(t, repo, "worktree", "add", "-q", "--detach", wt, base)
+	fixtureGit(t, repo, "worktree", "add", "-q", "--detach", wt, base)
 	before := snapshot(t, repo)
 	err := syncClone(repo, wt, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "not a clone") {
@@ -246,7 +246,7 @@ func TestCmdSyncFromDB(t *testing.T) {
 	if err := cmdSync(nil); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := syncGit(t, slot, "rev-parse", "refs/remotes/origin/main"), syncGit(t, repo, "rev-parse", "refs/heads/main"); got != want {
+	if got, want := fixtureGit(t, slot, "rev-parse", "refs/remotes/origin/main"), fixtureGit(t, repo, "rev-parse", "refs/heads/main"); got != want {
 		t.Errorf("clone origin/main = %s, want %s", got, want)
 	}
 }
@@ -261,5 +261,114 @@ func TestCmdSyncRefusesManager(t *testing.T) {
 	}
 	if err := cmdSync([]string{"extra"}); err == nil {
 		t.Fatalf("cmdSync with an argument must fail")
+	}
+}
+
+// sentinelProgram returns a shell command that records name in dir when git runs it.
+func sentinelProgram(dir, name string) string {
+	return "touch '" + filepath.Join(dir, "ran-"+name) + "'; true"
+}
+
+func assertNoSentinels(t *testing.T, dir string) {
+	t.Helper()
+	ran, _ := filepath.Glob(filepath.Join(dir, "ran-*"))
+	if len(ran) > 0 {
+		var names []string
+		for _, r := range ran {
+			names = append(names, strings.TrimPrefix(filepath.Base(r), "ran-"))
+		}
+		t.Errorf("sync ran programs the clone's config named: %s", strings.Join(names, ", "))
+	}
+}
+
+// TestSyncCloneRunsNoCloneConfiguredProgram: a plain `git fetch` in a clone runs the clone's
+// reference-transaction hook, its core.alternateRefsCommand and its core.fsmonitor. sync's
+// fetch runs none of them and still moves the ref, so a lead who runs sync from inside a
+// clone does not run the worker's programs.
+func TestSyncCloneRunsNoCloneConfiguredProgram(t *testing.T) {
+	repo, slot, _ := syncFixture(t)
+	marks := realDir(t)
+	hook := filepath.Join(slot, ".git", "hooks", "reference-transaction")
+	if err := os.MkdirAll(filepath.Dir(hook), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\n"+sentinelProgram(marks, "hook")+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fixtureGit(t, slot, "config", "core.alternateRefsCommand", sentinelProgram(marks, "alternateRefsCommand"))
+	fixtureGit(t, slot, "config", "core.fsmonitor", sentinelProgram(marks, "fsmonitor"))
+	if err := os.RemoveAll(marks); err != nil { // the fixture's own git calls above may have run the fsmonitor
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(marks, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := syncClone(repo, slot, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	assertNoSentinels(t, marks)
+	if got, want := fixtureGit(t, repo, "rev-parse", "refs/heads/main"), readLooseOrPacked(t, slot, "refs/remotes/origin/main"); got != want {
+		t.Errorf("clone origin/main = %s, want %s", want, got)
+	}
+}
+
+// readLooseOrPacked reads a ref of the clone without running git there (which would run its
+// fsmonitor and leave a sentinel behind).
+func readLooseOrPacked(t *testing.T, slot, ref string) string {
+	t.Helper()
+	if b, err := os.ReadFile(filepath.Join(slot, ".git", ref)); err == nil {
+		return strings.TrimSpace(string(b))
+	}
+	b, _ := os.ReadFile(filepath.Join(slot, ".git", "packed-refs"))
+	for _, line := range strings.Split(string(b), "\n") {
+		if sha, name, ok := strings.Cut(line, " "); ok && name == ref {
+			return sha
+		}
+	}
+	return ""
+}
+
+// TestSyncCloneRefusesTransportRewrite: a url.*.insteadOf in the clone's config rewrites the
+// lead's path to an ssh URL whose core.sshCommand is the worker's program, and a plain fetch
+// runs it. sync refuses every transport but a local path, so the fetch fails without running
+// it.
+func TestSyncCloneRefusesTransportRewrite(t *testing.T) {
+	repo, slot, _ := syncFixture(t)
+	marks := realDir(t)
+	fixtureGit(t, slot, "config", "core.sshCommand", sentinelProgram(marks, "sshCommand"))
+	fixtureGit(t, slot, "config", "url.ssh://rewritten.invalid/x.insteadOf", repo)
+	// Without the alternates file the clone lacks the commit, so the fetch has to open a
+	// transport; with it, git finds the object locally and never consults the URL.
+	if err := os.Remove(filepath.Join(slot, ".git", "objects", "info", "alternates")); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshot(t, repo)
+	err := syncClone(repo, slot, io.Discard)
+	if err == nil {
+		t.Fatalf("sync through an ssh rewrite succeeded; want it refused")
+	}
+	assertNoSentinels(t, marks)
+	assertSameSnapshot(t, before, snapshot(t, repo))
+}
+
+// TestSyncCloneIgnoresCallerGitEnv: a GIT_DIR in the caller's environment would point the
+// clone-side fetch at another repository. sync drops every GIT_ variable, so the clone moves
+// and the other repository is untouched.
+func TestSyncCloneIgnoresCallerGitEnv(t *testing.T) {
+	repo, slot, _ := syncFixture(t)
+	other := filepath.Join(realDir(t), "other")
+	fixtureGit(t, filepath.Dir(other), "init", "-q", other)
+	t.Setenv("GIT_DIR", filepath.Join(other, ".git"))
+	err := syncClone(repo, slot, io.Discard)
+	os.Unsetenv("GIT_DIR")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := fixtureGit(t, slot, "rev-parse", "refs/remotes/origin/main"), fixtureGit(t, repo, "rev-parse", "refs/heads/main"); got != want {
+		t.Errorf("clone origin/main = %s, want %s", got, want)
+	}
+	if out, err := exec.Command("git", "-C", other, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/main").CombinedOutput(); err == nil {
+		t.Errorf("sync wrote the repository GIT_DIR named: %s", out)
 	}
 }
