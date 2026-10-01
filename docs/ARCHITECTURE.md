@@ -972,6 +972,14 @@ on an API error; it fires `StopFailure`, and without that hook such a worker's r
 stay at turn-started and read as busy for up to 30 minutes. The gate's reviewer sessions get
 the same settings, so `ttorch hook` records nothing for a session that started in a review
 workspace, and a reviewer's hooks never write the record of the worker it reviews.
+The hook also writes nothing when its identity sources disagree: `TTORCH_TASK_ID`, the
+`.ttorch/task` found walking up from the cwd, and the one found walking up from
+`CLAUDE_PROJECT_DIR` must all name the same task where they resolve, so a subprocess that
+inherited one worker's env inside another task's worktree cannot write either record. A
+turn-started record also appends a non-actionable `hook_turn_started` event (at most one per
+task a minute) naming how the task was resolved, the session's project dir and the
+harness's pid, so a ladder held quiet by a record shows in the timeline who wrote it. Both
+stop accidents; a process running as the worker's user can still write `hook.json` directly.
 `livestate.Reconcile` combines the pane and the record in a fixed order. Busy text on the
 pane always reads as busy, and stall text always leaves the decision to the pane. Otherwise
 a turn-started record less than 30 minutes old reads as busy whatever the pane shows, so a
