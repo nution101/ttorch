@@ -406,15 +406,17 @@ catches a `remote.origin.url` or `insteadOf` rewrite that is still in place when
 cannot see the transport settings above, which leave that URL unchanged, or a rewrite made for
 one land and undone afterwards. Nothing refuses a land on its warnings.
 
-The check that works reads main from somewhere the worker cannot fake from the lead's machine:
-GitHub's own view of the branch, in a browser or from another machine or account. A trusted land
-only fast-forwards the local branch, so landed work shows there once it has been pushed. Compare
-the commits on it with the ones `trust-record` lines in the audit log cover. A commit `c` counts as
-reviewed only if some line has `c` as an ancestor of its `commit=` and not of its `base=`. Where a
-land rebased the work, main holds rebased copies, and that task's `fast-land` line (`carried
-verdict <reviewed>-><rebased>`) gives the head to use in place of `commit=`, with the commit main
-was at before that land in place of `base=`. A commit merged some other way, such as a pull
-request, has no line. Since the audit log is writable too, this finds commits no line covers but
+The check reads GitHub's view of main from another machine or another OS account, which are the
+only places out of the worker's reach. A browser on the lead's own machine and account runs as
+the lead's user too, with a profile whose proxy settings and certificate store a worker can
+change. A trusted land only fast-forwards the local branch, so landed work shows on GitHub once
+it has been pushed. Compare the commits on it with the ones `trust-record` lines in the audit log
+cover. A commit `c` counts as reviewed only if some line has `c` as an ancestor of its `commit=`
+and not of its `base=`. Where a land rebased the work, main holds rebased copies, and that task's
+`fast-land` line (`carried verdict <reviewed>-><rebased>`) gives the head to use in place of
+`commit=`. Its `base=` is the name of the ref the land rebased onto, not a sha, so take the commit
+the rebased work sits on from GitHub's history, read from that other machine or account, and use
+it in place of `base=`. A commit merged some other way, such as a pull request, has no line. Since the audit log is writable too, this finds commits no line covers but
 cannot prove a line is genuine. Running `git ls-remote` against the typed-out URL from outside
 any repository is a quicker look at GitHub's main, and everything listed above can fool it.
 

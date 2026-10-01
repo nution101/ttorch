@@ -258,11 +258,13 @@ invalidates the verdict — re-prep, re-review, re-record.
   project's recorded branch and its commit, the last landed commit and the URL `git remote
   get-url origin` reports, and `ttorch project ls` shows the branch, but doctor is not the check
   for (1): it only sees a `remote.origin.url` or `insteadOf` rewrite still in place when it runs.
-  The check that works reads main from GitHub's own view, in a browser or from another machine or
-  account, and compares it with what the `trust-record` audit lines cover: a commit `c` counts as
-  reviewed only if some line has `c` as an ancestor of its `commit=` and not of its `base=` (for a
-  rebased land, use the rebased head from its `fast-land` line and the commit main was at before
-  that land). The audit log is writable too, so this finds uncovered commits but cannot prove a
+  The check reads GitHub's view of main from another machine or another OS account, the only
+  places out of the worker's reach (a browser on the lead's own account is not: its proxy settings
+  and certificate store are the worker's to change), and compares it with what the `trust-record`
+  audit lines cover: a commit `c` counts as reviewed only if some line has `c` as an ancestor of
+  its `commit=` and not of its `base=`. For a rebased land, use the rebased head from its
+  `fast-land` line; that line's `base=` is a ref name, not a sha, so take the commit the rebased
+  work sits on from GitHub's history, read from that other machine or account. The audit log is writable too, so this finds uncovered commits but cannot prove a
   line genuine. A local `git ls-remote` against the typed-out URL is a convenience that all of the
   above can fool (see "Known limit: shared git state" in `docs/ARCHITECTURE.md`).
 
