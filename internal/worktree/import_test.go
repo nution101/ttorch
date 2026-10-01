@@ -701,3 +701,65 @@ func TestImportCommit_IgnoresTheCallersGitEnvironment(t *testing.T) {
 		})
 	}
 }
+
+// TestImportCommit_RefusesAnOlderGit: GIT_CONFIG_GLOBAL arrived in git 2.32 and an older git
+// ignores it silently, so the clone's upload-pack would read the lead's global config. The
+// import refuses before it fetches on a git that reports an older version, or a version it
+// cannot read, and runs on 2.32.
+func TestImportCommit_RefusesAnOlderGit(t *testing.T) {
+	for _, c := range []struct {
+		version string
+		ok      bool
+	}{
+		{"git version 2.31.8", false},
+		{"git version 1.99.0", false},
+		{"git version garbage", false},
+		{"git version 2.32.0", true},
+		{"git version 3.0.0", true},
+	} {
+		t.Run(c.version, func(t *testing.T) {
+			f := newCloneFixture(t)
+			log := installGitShim(t, `for a in "$@"; do if [ "$a" = version ]; then echo '`+c.version+`'; exit 0; fi; done`)
+			_, err := ImportCommit(context.Background(), f.main, f.clone, "t1", f.tip)
+			if c.ok {
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("imported on a git older than 2.32")
+			}
+			t.Logf("refused: %v", err)
+			for _, call := range readCalls(t, log) {
+				if slices.Contains(call, "fetch") {
+					t.Fatalf("fetched before refusing the version: %q", call)
+				}
+			}
+			assertNoRef(t, f.main, CloneRefs+"t1/"+f.tip)
+		})
+	}
+}
+
+func TestParseGitVersion(t *testing.T) {
+	for _, c := range []struct {
+		out          string
+		major, minor int
+		ok           bool
+	}{
+		{"git version 2.50.1 (vendor build 155)", 2, 50, true},
+		{"git version 2.45.0.rc1.17.gabcdef0", 2, 45, true},
+		{"git version 2.32.0\n", 2, 32, true},
+		{"git version 2.43", 2, 43, true},
+		{"git version 2", 0, 0, false},
+		{"git version x.y.z", 0, 0, false},
+		{"git version -1.40.0", 0, 0, false},
+		{"version 2.50.1", 0, 0, false},
+		{"", 0, 0, false},
+	} {
+		major, minor, ok := parseGitVersion(c.out)
+		if major != c.major || minor != c.minor || ok != c.ok {
+			t.Errorf("parseGitVersion(%q) = %d, %d, %v; want %d, %d, %v", c.out, major, minor, ok, c.major, c.minor, c.ok)
+		}
+	}
+}

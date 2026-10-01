@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -78,7 +79,8 @@ const importTimeout = 2 * time.Minute
 //
 // When the ref already names the commit, nothing is fetched. task and sha are checked with
 // ValidTaskID and ValidObjectID, and clone must be an absolute clean path, before any git
-// command runs. The whole call runs under importTimeout as well as ctx.
+// command runs. Before it fetches, it refuses a git older than minImportGit. The whole call
+// runs under importTimeout as well as ctx.
 func ImportCommit(ctx context.Context, repo, clone, task, sha string) (string, error) {
 	if repo == "" {
 		return "", errors.New("import: no repository to import into")
@@ -112,6 +114,9 @@ func ImportCommit(ctx context.Context, repo, clone, task, sha string) (string, e
 	if id, ok := resolve(ref + "^{commit}"); ok && id == sha {
 		return ref, nil
 	}
+	if err := checkImportGit(ctx, hooks); err != nil {
+		return "", err
+	}
 	_, stderr, err := run(
 		"fetch", "--quiet",
 		"--no-tags",               // a tag the worker made on a fetched object would follow it in
@@ -141,6 +146,51 @@ func ImportCommit(ctx context.Context, repo, clone, task, sha string) (string, e
 		return "", fmt.Errorf("import %s from %s: it is a %s, not a commit", sha, from, typ)
 	}
 	return ref, nil
+}
+
+// minImportGit is the oldest git the import's command means what it says on.
+// GIT_CONFIG_GLOBAL arrived in 2.32, and an older git ignores it without a word, so the
+// clone's upload-pack would read the lead's global config. The newest flags the fetch uses,
+// --no-write-fetch-head and --no-auto-maintenance, arrived in 2.29 and fail loudly on an
+// older git, so they need no check of their own.
+var minImportGit = [2]int{2, 32}
+
+// checkImportGit refuses when git is older than minImportGit or its version cannot be read.
+func checkImportGit(ctx context.Context, hooks string) error {
+	out, _, err := importGit(ctx, hooks, nil, "version")
+	if err != nil {
+		return fmt.Errorf("import: %w", err)
+	}
+	major, minor, ok := parseGitVersion(out)
+	if !ok {
+		return fmt.Errorf("import: cannot read the git version from %q", escapeForTerminal(out))
+	}
+	if major < minImportGit[0] || major == minImportGit[0] && minor < minImportGit[1] {
+		return fmt.Errorf("import: git %d.%d is older than %d.%d, which the import needs for GIT_CONFIG_GLOBAL",
+			major, minor, minImportGit[0], minImportGit[1])
+	}
+	return nil
+}
+
+// parseGitVersion reads the major and minor numbers from `git version` output, such as
+// "git version 2.50.1", "git version 2.50.1 (vendor build 155)" or
+// "git version 2.45.0.rc1.17.gabcdef0".
+func parseGitVersion(out string) (major, minor int, ok bool) {
+	v, found := strings.CutPrefix(strings.TrimSpace(out), "git version ")
+	if !found {
+		return 0, 0, false
+	}
+	v, _, _ = strings.Cut(v, " ")
+	parts := strings.SplitN(v, ".", 3)
+	if len(parts) < 2 {
+		return 0, 0, false
+	}
+	major, err1 := strconv.Atoi(parts[0])
+	minor, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil || major < 0 || minor < 0 {
+		return 0, 0, false
+	}
+	return major, minor, true
 }
 
 // importConfig is the configuration every git command of the import runs with, on top of
