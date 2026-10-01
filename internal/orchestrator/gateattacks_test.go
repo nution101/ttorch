@@ -1813,3 +1813,41 @@ func TestEmbedsContentRoot_GlobsAndQuotes(t *testing.T) {
 		})
 	}
 }
+
+// TestGateGuard_TagNamedLikeTheDefaultBranchShadowsNothing runs the tag-shadowing attack (E10
+// in the per-worker-clones design) against a clone task. A clone's worker cannot write the
+// project's refs, but something else can: a worktree worker in the same repository, or any
+// process running as the lead. git resolves a bare "main" to a tag before the branch, so a tag
+// main at the worker's own commit made the gate read that commit's weakened
+// .ttorch/validate.sh as the default branch's, and diff the commit against itself, which left
+// the guard no changed file to see.
+//
+// The gate reads the default branch as refs/heads/<recorded branch>, so neither read moves:
+// the staged validate runs the default branch's red script, and the guard still sees the
+// change to .ttorch/validate.sh.
+func TestGateGuard_TagNamedLikeTheDefaultBranchShadowsNothing(t *testing.T) {
+	m, repo, _ := trustHarness(t, "wt1", "trusted", "exit 1")
+	clone := cloneTask(t, m, repo, "cl1")
+	head := commitFeature(t, clone, ".ttorch/validate.sh", "true\n")
+	if _, err := workHead(mustTask(t, m, "cl1")); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "tag", "main", head)
+	if got, err := gitOut(repo, "rev-parse", "main"); err != nil || strings.TrimSpace(got) != head {
+		t.Fatalf("the attack is not in place: a bare main resolves to %q (%v), want the worker's commit %s", strings.TrimSpace(got), err, head)
+	}
+
+	if _, err := m.TrustPrep("cl1"); err != nil {
+		t.Fatalf("TrustPrep: %v", err)
+	}
+	if got := review.ValidateState(m.P.ReviewInputsDir("cl1"), head); !strings.HasPrefix(got, "failed:") {
+		t.Errorf("the staged validate is %q, want the default branch's failing gate: the gate ran the worker's .ttorch/validate.sh", got)
+	}
+	granted, err := m.Approve("cl1", time.Minute, true)
+	if err != nil {
+		t.Fatalf("Approve --allow-gate-change: %v", err)
+	}
+	if len(granted) != 1 || granted[0] != ".ttorch/validate.sh" {
+		t.Errorf("the guard saw %q changed, want [.ttorch/validate.sh]", granted)
+	}
+}
