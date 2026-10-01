@@ -729,7 +729,7 @@ func TestFetchAndBase_WarnsOnFetchFailureButFallsBack(t *testing.T) {
 		t.Fatal("a failed origin fetch must surface a warning")
 	}
 	// No origin/<default> ref was ever fetched, so the fallback is the local default.
-	if base != def {
+	if base != "refs/heads/"+def {
 		t.Fatalf("offline fallback should use the local default %q, got %q", def, base)
 	}
 }
@@ -753,7 +753,7 @@ func TestFetchAndBase_NoOriginSkipsWarn(t *testing.T) {
 	if warned != 0 {
 		t.Fatalf("a repo with no origin must not warn, warned %d time(s)", warned)
 	}
-	if base != def {
+	if base != "refs/heads/"+def {
 		t.Fatalf("with no origin the base should be the local default %q, got %q", def, base)
 	}
 }

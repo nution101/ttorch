@@ -317,10 +317,12 @@ func IsClean(path string) (bool, error) {
 // It fails safe — if merge status cannot be determined (no base resolves, or git errors) it
 // reports true, so an indeterminate slot is left alone rather than reset. The slot is a
 // linked worktree sharing the repo's refs/objects, so each base resolves from it directly
-// (repo HEAD is passed as a resolved SHA, reachable via the shared object store).
+// (repo HEAD is passed as a resolved SHA, reachable via the shared object store). The
+// branch bases are fully qualified: a bare name resolves a tag first, and a tag named
+// origin/<default> at the slot's own commit would make that commit read as landed.
 func hasUnlandedWork(repo, slot string) bool {
 	def := DefaultBranch(slot)
-	bases := []string{def, "origin/" + def}
+	bases := []string{"refs/heads/" + def, "refs/remotes/origin/" + def}
 	if head, err := headCommit(repo); err == nil {
 		bases = append(bases, head)
 	}
@@ -408,14 +410,16 @@ func fetchAndBase(repo string) string {
 
 // defaultBase returns the ref a fresh task branch should be cut from: the remote
 // default branch origin/<default> when it resolves (the authoritative, just-fetched
-// tip), else the local <default> branch, else HEAD.
+// tip), else the local <default> branch, else HEAD. Both branch refs are fully
+// qualified, so a tag named origin/<default> or <default>, which any worker can create
+// in the shared refs, cannot choose the base of later tasks.
 func defaultBase(repo string) string {
 	def := DefaultBranch(repo)
-	if RefExists(repo, "origin/"+def) {
-		return "origin/" + def
+	if ref := "refs/remotes/origin/" + def; RefExists(repo, ref) {
+		return ref
 	}
-	if RefExists(repo, def) {
-		return def
+	if ref := "refs/heads/" + def; RefExists(repo, ref) {
+		return ref
 	}
 	return "HEAD"
 }
