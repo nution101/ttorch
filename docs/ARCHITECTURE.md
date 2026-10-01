@@ -1211,28 +1211,41 @@ string). `ttorch doctor` reports the same when the flag is on.
 ### Per-worker clones (`TTORCH_WORKER_CLONES`, in progress)
 
 A linked worktree shares its main repository's refs, tags, config, hooks and `info/exclude`,
-so a git command a worker runs in its worktree can change the lead's repository. Per-worker
-clones replace the worktree with a private repository whose object store borrows the main
-repository's through an alternates file, with no remote that points at main. The flag is
-**off by default** and is being built in several independent changes; it is not safe to turn
-on until all of them have landed. With it off, nothing below applies and workers get exactly
-what they got before. A task keeps the kind it was spawned with: a clone's `.git` is a
-directory and a linked worktree's is a file, so the kind is read from the working directory
-and the flag only decides what a new spawn gets.
+so an ordinary git command a worker runs in its worktree (`git tag main`, `git config ...`)
+changes the lead's repository. Per-worker clones replace the worktree with a private
+repository whose object store borrows the main repository's through an alternates file, with
+no remote that points at main. The flag is **off by default** and is being built in several
+independent changes; it is not safe to turn on until all of them have landed. With it off,
+nothing below applies and workers get exactly what they got before. A task keeps the kind it
+was spawned with: a clone's `.git` is a directory and a linked worktree's is a file, so the
+kind is read from the working directory and the flag only decides what a new spawn gets.
 
-A clone worker runs with two git variables that a worktree worker does not get:
+A clone worker runs with three git variables that a worktree worker does not get:
 
 | Variable | Value | Effect |
 | --- | --- | --- |
-| `GIT_CEILING_DIRECTORIES` | `~/.ttorch/clones` | git run from a pool directory, or from any non-repository directory inside a pool, does not discover a repository in an ancestor (a dotfiles repo in `$HOME`, say). Inside the clone, discovery is unchanged. git applies a ceiling only to directories strictly below it, which is why the value is the clones root and not the pool directory |
-| `GIT_CONFIG_GLOBAL` | `~/.ttorch/clones/<pool>/.global-<N>` | a private file per slot that `[include]`s the lead's global config (the XDG file then `~/.gitconfig`, or the lead's own `GIT_CONFIG_GLOBAL`), so identity and `includeIf` rules still resolve while `git config --global` writes the private file. It is rewritten at every spawn, so a key one task wrote never reaches the next task in the slot |
+| `GIT_CEILING_DIRECTORIES` | `~/.ttorch/clones` | git run from a pool directory, or from any non-repository directory inside a pool, does not discover a repository in an ancestor (a dotfiles repo in `$HOME`, say). Inside the clone, discovery is unchanged. git applies a ceiling only to directories strictly below it, which is why the value is the clones root and not the pool directory, and why it does nothing for git run from the clones root itself or anywhere above it |
+| `GIT_CONFIG_GLOBAL` | `~/.ttorch/clones/<pool>/.global-<N>` | a private file per slot that `[include]`s the lead's global config (the XDG file then `~/.gitconfig`, or the lead's own `GIT_CONFIG_GLOBAL`), so identity and `includeIf` rules still resolve while `git config --global` writes the private file |
+| `GIT_CONFIG_SYSTEM` | `~/.ttorch/clones/<pool>/.system-<N>` | a private file per slot that `[include]`s the system config the lead's git reads (the lead's `GIT_CONFIG_SYSTEM`, else the path compiled into git; nothing when the lead sets `GIT_CONFIG_NOSYSTEM`), so `git config --system` writes the private file. Without it, a worker whose git is installed under the lead's user (Homebrew, say) could write the system file every git process reads, the scheduler's gate and land included |
 
-They are set in three places, because each covers a case the others miss: the launch prefix
-of a fresh spawn, both halves of the resume command a restore sends (a resume has no launch
-prefix, and an assignment before `a || b` reaches only `a`), and the `env` block of the
-worker's `.claude/settings.local.json`, which the harness applies to the processes its tools
-start and which survives a resume. `GIT_DIR` and `GIT_WORK_TREE` are deliberately not set:
-exported, they break every test fixture that runs `git init` in a temp directory.
+Both private files are rewritten at every spawn, whatever harness the worker runs, so a key
+one task wrote never reaches the next task in the slot.
+
+The variables are set in three places, because each covers a case the others miss: the
+launch prefix of a fresh spawn, both halves of the resume command a restore sends (a resume
+has no launch prefix, and an assignment before `a || b` reaches only `a`), and the `env`
+block of the worker's `.claude/settings.local.json`, which the harness applies to the
+processes its tools start and which survives a resume. `GIT_DIR` and `GIT_WORK_TREE` are
+deliberately not set: exported, they break every test fixture that runs `git init` in a
+temp directory.
+
+What this closes and what it does not. Inside its clone a worker's git commands act on the
+clone: tags, branches, `origin/HEAD`, config and hooks are the clone's own, `git push origin`
+has no path back to main, and `git config --global` and `--system` write the slot's private
+files. Nothing stops a worker naming the lead's repository explicitly. `cd <main> && git
+...`, `git -C <main> ...` and `GIT_DIR=<main>/.git git ...` all still work, and so does
+writing a config file or a ref by path. Workers run as the lead's OS user, so a path is not a
+capability, and this is the same same-uid residual described for the review workspace.
 
 A clone's `origin/<default>` is a snapshot taken when the clone is provisioned, not the lead's
 remote-tracking ref. When the default branch moves, the worker runs **`ttorch sync`**, which
@@ -1240,12 +1253,23 @@ reads the base the land gate would use (`origin/<default>` when the local defaul
 ancestor of it, else the local default, both read by full ref name so a tag cannot stand in
 for either) from the lead's repository and fetches that commit into the clone's
 `refs/remotes/origin/<default>`. The lead's side of that fetch is an upload-pack, which
-writes nothing; sync does not fetch origin in the lead's repository first. It refuses in a
-linked worktree, where `origin/<default>` is already the lead's ref, and it refuses outside
-a worker, since the manager never runs git in a worker's clone.
+writes nothing; sync does not fetch origin in the lead's repository first, and it does not
+print where the lead's repository is. It refuses in a linked worktree, where
+`origin/<default>` is already the lead's ref.
 
-`GIT_CONFIG_GLOBAL` arrived in git 2.32. An older git ignores it, so `ttorch doctor` reports a
-git below 2.32 when the flag is on.
+sync takes its task from the caller's worker identity, which the lead can also have by
+running it from inside a clone, so every git command it runs is hardened instead of trusting
+the caller: every `GIT_` variable dropped, no system or global config,
+`GIT_ALLOW_PROTOCOL=file` (so a `url.*.insteadOf` in the clone cannot turn the fetch into an
+ssh or `ext::` command), `GIT_NO_LAZY_FETCH=1`, and on the fetch in the clone, command-line
+overrides for the hooks path, the fsmonitor, the alternate-refs command and auto gc and
+maintenance. Without them, a fetch in a clone runs the clone's `reference-transaction` hook,
+its `core.alternateRefsCommand` and its `core.fsmonitor`.
+
+`ttorch doctor` reports a git below 2.45.1 when the flag is on. 2.45.1 carries the fixes for
+CVE-2024-32002, -32004, -32020, -32021 and -32465, the second of which let a fetch from a
+clone run a program the clone's config named; the private config files also need 2.32, where
+`GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` arrived.
 
 ## 8. Sessions and reasoning effort
 
@@ -1402,7 +1426,7 @@ These properties are load-bearing:
   data/<id>/            a task's stored brief.md, review inputs and agent.fingerprint
   worktrees/            the per-repository worktree pool
   clones/<pool>/<N>/    per-worker clone slots (TTORCH_WORKER_CLONES), with each slot's
-                        private global git config beside them as .global-<N>
+                        private git config beside them as .global-<N> and .system-<N>
   audit.log             approvals + merges
   scheduler.log         the auto-started daemon's output
 ~/.claude/
