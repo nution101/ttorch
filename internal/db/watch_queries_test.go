@@ -64,3 +64,46 @@ func TestHasActionableEventForTask(t *testing.T) {
 		t.Fatal("an event at the cutoff must count (>=)")
 	}
 }
+
+// TestActionableEventTypesForTask: the types of a task's actionable events, bounded by the
+// same >= cutoff as HasActionableEventForTask, with non-actionable events and other tasks'
+// events left out.
+func TestActionableEventTypesForTask(t *testing.T) {
+	s, clk := newTestStoreClock(t)
+	ctx := context.Background()
+	proj, _ := s.UpsertProject(ctx, "/r", "r")
+	for _, id := range []string{"t1", "t2"} {
+		if _, err := s.CreateTask(ctx, Task{ID: id, ProjectID: proj.ID, Status: StatusActive}, ActorManager); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, err := s.ActionableEventTypesForTask(ctx, "t1", nil); err != nil || len(got) != 0 {
+		t.Fatalf("created (non-actionable) must not count: got=%v err=%v", got, err)
+	}
+	clk.advance(time.Hour)
+	early := clk.t
+	_, err := s.AppendEvent(ctx, Event{EntityType: EntityTypeTask, EntityID: "t1", Type: EventIdleUnreported, Actor: ActorSystem, Actionable: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clk.advance(time.Hour)
+	late := clk.t
+	if _, err := s.AppendEvent(ctx, Event{EntityType: EntityTypeTask, EntityID: "t1", Type: EventAgentExited, Actor: ActorSystem, Actionable: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendEvent(ctx, Event{EntityType: EntityTypeTask, EntityID: "t2", Type: EventWindowGone, Actor: ActorSystem, Actionable: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ActionableEventTypesForTask(ctx, "t1", nil)
+	if err != nil || len(got) != 2 || !got[EventIdleUnreported] || !got[EventAgentExited] {
+		t.Fatalf("all actionable types = %v (err %v), want idle_unreported and agent_exited", got, err)
+	}
+	cut := early.Add(time.Minute)
+	if got, _ := s.ActionableEventTypesForTask(ctx, "t1", &cut); len(got) != 1 || !got[EventAgentExited] {
+		t.Fatalf("types after the cutoff = %v, want only agent_exited", got)
+	}
+	at := late
+	if got, _ := s.ActionableEventTypesForTask(ctx, "t1", &at); !got[EventAgentExited] {
+		t.Fatalf("an event at the cutoff must count (>=): %v", got)
+	}
+}

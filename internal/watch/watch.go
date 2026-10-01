@@ -501,11 +501,14 @@ func (w *Watcher) pollLiveness(ctx context.Context) error {
 		// Already-surfaced gate: a task already in needs_input/blocked is out of scope
 		// (not 'active'); one carrying an unresolved actionable event (a prior
 		// window_gone/idle_unreported, or a pending pr_merged) must not be re-flagged.
-		surfaced, err := w.Store.HasActionableEventForTask(ctx, t.ID, t.LastProgressAt)
+		// agent_exited is the exception: it rests on a fingerprint file with no integrity
+		// check, so it must not mask the window_gone or idle_unreported that would follow.
+		// It only stops itself being raised twice (below).
+		surfacedTypes, err := w.Store.ActionableEventTypesForTask(ctx, t.ID, t.LastProgressAt)
 		if err != nil {
 			return err
 		}
-		if surfaced {
+		if surfacedBesides(surfacedTypes, db.EventAgentExited) {
 			continue
 		}
 
@@ -523,8 +526,13 @@ func (w *Watcher) pollLiveness(ctx context.Context) error {
 		// when the fingerprint says so; a check that could not complete is skipped like an
 		// unreadable pane, never read as alive or as exited. A task with no fingerprint
 		// (spawned before fingerprints, or resumed) keeps the window-presence behaviour.
+		// Once agent_exited has been raised the sweep goes on to the pane path, so the
+		// idle net still reaches a worker whose fingerprint keeps reading as exited.
 		switch state, reason := w.agent(t); state {
 		case proc.AgentExited:
+			if surfacedTypes[db.EventAgentExited] {
+				break
+			}
 			if _, err := w.Store.AppendEvent(ctx, db.Event{
 				EntityType: db.EntityTypeTask, EntityID: t.ID, Type: db.EventAgentExited,
 				Actor: db.ActorSystem, Actionable: true, Payload: t.Window + " (" + reason + ")",
@@ -610,6 +618,16 @@ func (w *Watcher) pollLiveness(ctx context.Context) error {
 	return nil
 }
 
+// surfacedBesides reports whether types holds any event type other than except.
+func surfacedBesides(types map[string]bool, except string) bool {
+	for typ := range types {
+		if typ != except {
+			return true
+		}
+	}
+	return false
+}
+
 // setLiveness persists the pane hash + idle sweep count, avoiding a needless write
 // when nothing changed (the hot path: a busy worker re-confirmed each sweep).
 func (w *Watcher) setLiveness(ctx context.Context, t db.Task, paneHash string, sweeps int) error {
@@ -622,12 +640,18 @@ func (w *Watcher) setLiveness(ctx context.Context, t db.Task, paneHash string, s
 // dedupeByEntity collapses the actionable rows to one per entity_id, keeping the row
 // with the maximum events.id (the latest transition wins, §4.3) so a task that went
 // blocked → active → done surfaces a single → done line, never a stale → blocked
-// alongside it. The result is ordered by id ascending for a stable batch.
+// alongside it. agent_exited is deduplicated on its own key, so it neither displaces nor
+// is displaced by the entity's other events: like the liveness gate, it must not mask
+// them. The result is ordered by id ascending for a stable batch.
 func dedupeByEntity(rows []db.Event) []db.Event {
 	best := make(map[string]db.Event, len(rows))
 	for _, e := range rows {
-		if cur, ok := best[e.EntityID]; !ok || e.ID > cur.ID {
-			best[e.EntityID] = e
+		key := e.EntityID
+		if e.Type == db.EventAgentExited {
+			key += "\x00" + db.EventAgentExited
+		}
+		if cur, ok := best[key]; !ok || e.ID > cur.ID {
+			best[key] = e
 		}
 	}
 	out := make([]db.Event, 0, len(best))

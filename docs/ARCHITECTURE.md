@@ -1030,7 +1030,10 @@ row is there, is on `Reconcile`.
   different process. A read that fails is `unknown`, never exited or alive. A task with no
   fingerprint (spawned before fingerprints, or rebuilt by `ttorch resume`, which does not
   wait for its agent) keeps window-presence liveness. The scheduler does not reclaim on
-  `agent_exited`; the manager decides.
+  `agent_exited`; the manager decides. The fingerprint file carries no integrity check, so
+  `agent_exited` never masks the task's other liveness events: it is raised once per quiet
+  spell, it does not count as already surfaced for `window_gone` or `idle_unreported`, and
+  the watch batch keeps it beside the task's latest other event instead of in its place.
 
 ## 7. Worktrees, footprints, and isolation
 

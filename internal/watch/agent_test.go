@@ -2,6 +2,7 @@ package watch
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -129,5 +130,107 @@ func TestPollLiveness_AgentAliveTakesPanePath(t *testing.T) {
 	}
 	if exited, _ := s.HasEventType(ctx, "fp", db.EventAgentExited); exited {
 		t.Fatal("a live agent got an agent_exited event")
+	}
+}
+
+// agent_exited does not mask the task's later liveness events. The fingerprint file has no
+// integrity check, so one that always reads as exited must not be able to hide a window that
+// then disappears: window_gone still fires after an agent_exited for the same task.
+func TestPollLiveness_AgentExitedDoesNotMaskWindowGone(t *testing.T) {
+	w, s, _, _ := newWatcher(t)
+	ctx := context.Background()
+	seedActiveTask(t, s, "fp", "wk-fp")
+	w.agent = func(db.Task) (proc.AgentState, string) { return proc.AgentExited, "forged" }
+
+	if err := w.pollLiveness(ctx); err != nil {
+		t.Fatalf("pollLiveness: %v", err)
+	}
+	if has, _ := s.HasEventType(ctx, "fp", db.EventAgentExited); !has {
+		t.Fatal("first sweep did not raise agent_exited")
+	}
+	w.capture = func(string) paneObservation { return paneObservation{} }
+	if err := w.pollLiveness(ctx); err != nil {
+		t.Fatalf("pollLiveness: %v", err)
+	}
+	if has, _ := s.HasEventType(ctx, "fp", db.EventWindowGone); !has {
+		t.Fatal("window_gone was suppressed by an earlier agent_exited")
+	}
+}
+
+// The same holds for idle_unreported: once agent_exited has been raised, the idle pane path
+// still runs and flags the worker, and agent_exited itself is raised only once.
+func TestPollLiveness_AgentExitedDoesNotMaskIdleUnreported(t *testing.T) {
+	w, s, _, _ := newWatcher(t)
+	ctx := context.Background()
+	w.Dwell = -1
+	seedActiveTask(t, s, "fp", "wk-fp")
+	w.agent = func(db.Task) (proc.AgentState, string) { return proc.AgentExited, "forged" }
+
+	for i := 0; i < idleStaleSweeps+2; i++ {
+		if err := w.pollLiveness(ctx); err != nil {
+			t.Fatalf("pollLiveness: %v", err)
+		}
+	}
+	if has, _ := s.HasEventType(ctx, "fp", db.EventIdleUnreported); !has {
+		t.Fatal("idle_unreported was suppressed by an earlier agent_exited")
+	}
+	rows, err := s.EventsSince(ctx, 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exited := 0
+	for _, e := range rows {
+		if e.EntityID == "fp" && e.Type == db.EventAgentExited {
+			exited++
+		}
+	}
+	if exited != 1 {
+		t.Fatalf("agent_exited events = %d, want exactly 1", exited)
+	}
+}
+
+// Another actionable event still suppresses the sweep as before: a task already flagged
+// idle_unreported is not re-flagged, and gets no agent_exited on top while it stays surfaced.
+func TestPollLiveness_OtherSurfacedEventStillSuppresses(t *testing.T) {
+	w, s, _, _ := newWatcher(t)
+	ctx := context.Background()
+	seedActiveTask(t, s, "fp", "wk-fp")
+	if _, err := s.AppendEvent(ctx, db.Event{
+		EntityType: db.EntityTypeTask, EntityID: "fp", Type: db.EventIdleUnreported,
+		Actor: db.ActorSystem, Actionable: true, Payload: "wk-fp",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	w.agent = func(db.Task) (proc.AgentState, string) { return proc.AgentExited, "gone" }
+	w.capture = func(string) paneObservation { return paneObservation{} }
+	if err := w.pollLiveness(ctx); err != nil {
+		t.Fatalf("pollLiveness: %v", err)
+	}
+	for _, typ := range []string{db.EventAgentExited, db.EventWindowGone} {
+		if has, _ := s.HasEventType(ctx, "fp", typ); has {
+			t.Fatalf("an already-surfaced task got a %s event", typ)
+		}
+	}
+}
+
+// In the surfaced batch, agent_exited is deduplicated on its own: it never displaces another
+// event for the same task, and a later event never displaces it.
+func TestDedupeByEntity_AgentExitedKeptBesideOtherEvents(t *testing.T) {
+	rows := []db.Event{
+		{ID: 1, EntityID: "a", Type: db.EventIdleUnreported},
+		{ID: 2, EntityID: "a", Type: db.EventAgentExited},
+		{ID: 3, EntityID: "a", Type: db.EventAgentExited},
+		{ID: 4, EntityID: "b", Type: db.EventAgentExited},
+		{ID: 5, EntityID: "b", Type: db.EventWindowGone},
+		{ID: 6, EntityID: "c", Type: db.EventWindowGone},
+		{ID: 7, EntityID: "c", Type: db.EventIdleUnreported},
+	}
+	var got []int64
+	for _, e := range dedupeByEntity(rows) {
+		got = append(got, e.ID)
+	}
+	want := []int64{1, 3, 4, 5, 7}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("dedupeByEntity ids = %v, want %v", got, want)
 	}
 }

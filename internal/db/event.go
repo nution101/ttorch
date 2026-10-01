@@ -136,6 +136,34 @@ func (s *Store) HasActionableEventForTask(ctx context.Context, taskID string, cu
 	return exists != 0, nil
 }
 
+// ActionableEventTypesForTask returns the set of event types among a task's actionable
+// events at or after the cutoff (a nil cutoff means "ever"). It is HasActionableEventForTask
+// broken out by type, for a caller that weighs some event types differently from others: the
+// watcher's liveness net does not let an agent_exited event count as already surfaced.
+func (s *Store) ActionableEventTypesForTask(ctx context.Context, taskID string, cutoff *time.Time) (map[string]bool, error) {
+	query := `SELECT DISTINCT type FROM events
+		WHERE entity_type = 'task' AND entity_id = ? AND actionable = 1`
+	args := []any{taskID}
+	if cutoff != nil {
+		query += ` AND ts >= ?`
+		args = append(args, formatTime(*cutoff))
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	types := map[string]bool{}
+	for rows.Next() {
+		var typ string
+		if err := rows.Scan(&typ); err != nil {
+			return nil, err
+		}
+		types[typ] = true
+	}
+	return types, rows.Err()
+}
+
 // HasEventType reports whether a task already has an event of the given type. The
 // watcher uses it to record an external transition exactly once — e.g. a merged PR
 // is appended as pr_merged only if no pr_merged event exists yet (§4.4), the durable
