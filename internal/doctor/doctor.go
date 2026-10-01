@@ -100,6 +100,12 @@ func Run(out io.Writer, in io.Reader, autoYes bool) error {
 		reportTmuxVersion(out, tmux.Version())
 	}
 
+	// Per-worker clones need a git new enough to honour GIT_CONFIG_GLOBAL; checked only when
+	// the flag is on.
+	if _, ok := d.Found["git"]; ok {
+		reportGitCloneFloor(out, workerClonesEnabled(), gitVersion())
+	}
+
 	// iTerm2 is an optional macOS convenience: with it present, 'ttorch' opens the
 	// team in a single iTerm2 window with clean per-worker tabs. Never required.
 	wantITerm := false
