@@ -11,7 +11,8 @@ package watch
 // asks whether HEAD changed since the clock last restarted, which a committer date forged
 // into the future cannot fake. Anything unexpected reads as unknown, and an unknown HEAD
 // neither restarts the clock nor counts against the worker. The read runs under a short
-// deadline (boundedHead), so a path that never answers cannot hold up the sweep.
+// deadline (boundedHead), so a path that never answers cannot hold up the sweep. Only the
+// files ref backend is read: a reftable repository's HEAD is always unknown.
 
 import (
 	"bufio"
@@ -89,6 +90,7 @@ func (b *boundedHead) identity(t db.Task) (string, bool) {
 const (
 	maxSmallGitFile  = 4 << 10 // 4 KiB
 	maxPackedRefFile = 8 << 20 // 8 MiB
+	maxGitConfig     = 1 << 20 // 1 MiB
 )
 
 // headIdentity resolves HEAD in the worktree at dir to a commit id, using file reads only.
@@ -114,7 +116,7 @@ func headIdentity(dir, project string) (string, bool) {
 		return "", false
 	}
 	gitdir, commondir, ok := confineGitDir(root, project, gitdir)
-	if !ok {
+	if !ok || !refsInFiles(commondir) {
 		return "", false
 	}
 
@@ -272,6 +274,55 @@ func linksBack(entry, dotgit string) bool {
 	}
 	real, err := filepath.EvalSymlinks(p)
 	return err == nil && real == dotgit
+}
+
+// refsInFiles reports whether the repository at commondir keeps its refs as files. A
+// reftable repository (extensions.refStorage = reftable) keeps HEAD in the reftable stack
+// and leaves stub HEAD and refs files that git ignores, so it reads as unknown rather
+// than trusting them; there is no reftable parser here. A config that exists but cannot
+// be read is unknown too. A missing config is the files backend, git's default.
+func refsInFiles(commondir string) bool {
+	path := filepath.Join(commondir, "config")
+	b, found := readGitFile(path, maxGitConfig)
+	if !found {
+		_, err := os.Lstat(path)
+		return os.IsNotExist(err)
+	}
+	return !configSetsReftable(b)
+}
+
+// configSetsReftable reports whether a git config sets extensions.refStorage to reftable.
+// Section and key names are matched case-insensitively, a key may follow its section
+// header on the same line, and a value may be quoted or carry a trailing comment. git
+// reads repository extensions from this file alone, so includes are not followed.
+func configSetsReftable(b []byte) bool {
+	section := ""
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "[") {
+			end := strings.IndexByte(line, ']')
+			if end < 0 {
+				section = ""
+				continue
+			}
+			section = strings.ToLower(strings.TrimSpace(line[1:end]))
+			line = strings.TrimSpace(line[end+1:])
+		}
+		if section != "extensions" || line == "" || line[0] == '#' || line[0] == ';' {
+			continue
+		}
+		key, value, _ := strings.Cut(line, "=")
+		if !strings.EqualFold(strings.TrimSpace(key), "refstorage") {
+			continue
+		}
+		if i := strings.IndexAny(value, "#;"); i >= 0 {
+			value = value[:i]
+		}
+		if strings.EqualFold(strings.Trim(strings.TrimSpace(value), `"`), "reftable") {
+			return true
+		}
+	}
+	return false
 }
 
 // packedRef looks ref up in a packed-refs file.

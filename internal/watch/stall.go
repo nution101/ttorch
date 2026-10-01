@@ -15,6 +15,10 @@ package watch
 // and puts the worker back at the bottom of the ladder. What the ladder flags is a worker
 // sitting at an idle, unchanging prompt while its task is still active.
 //
+// HEAD-identity progress is not available in a repository that stores its refs in
+// reftable (extensions.refStorage = reftable): HEAD there always reads as unknown, so only
+// the other signals, the pane above all, can restart the clock.
+//
 // The clock lives on the event spine (db.EventStallClock / db.EventStalled), not in the
 // Watcher, because the watcher exits every time it surfaces a batch; an in-memory timer
 // would restart on every arm and a busy fleet would never let it reach the threshold.

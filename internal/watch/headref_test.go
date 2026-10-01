@@ -490,3 +490,78 @@ func TestBoundedHead_SlowOpenTimesOutWithoutPileUp(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// TestHeadIdentity_ReftableReadsAsUnknown: a repository whose config sets
+// extensions.refStorage to reftable keeps HEAD in the reftable stack, and the HEAD and
+// refs files there are stubs git ignores. The read must be unknown rather than trust a
+// planted HEAD file that disagrees with git.
+func TestHeadIdentity_ReftableReadsAsUnknown(t *testing.T) {
+	for name, c := range map[string]struct {
+		config string
+		wantOK bool
+	}{
+		"refStorage = reftable":           {"[extensions]\n\trefStorage = reftable\n", false},
+		"mixed case, quoted":              {"[Extensions]\n\tRefStorage = \"reftable\"\n", false},
+		"on the header line, commented":   {"[core]\n\tbare = false\n[extensions] refstorage=reftable ; set by init\n", false},
+		"refStorage = files":              {"[extensions]\n\trefStorage = files\n", true},
+		"reftable under a subsection":     {"[extensions \"x\"]\n\trefStorage = reftable\n", true},
+		"reftable as another key's value": {"[extensions]\n\tobjectFormat = sha1\n[core]\n\trefStorage = reftable\n", true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			wt := t.TempDir()
+			writeTree(t, wt, map[string]string{".git/config": c.config, ".git/HEAD": idA + "\n"})
+			if _, ok := headIdentity(wt, ""); ok != c.wantOK {
+				t.Fatalf("headIdentity ok = %v, want %v", ok, c.wantOK)
+			}
+		})
+	}
+	t.Run("linked worktree, reftable set in the common config", func(t *testing.T) {
+		root := t.TempDir()
+		wt, main := filepath.Join(root, "wt"), filepath.Join(root, "main")
+		if err := os.MkdirAll(wt, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		real, err := filepath.EvalSymlinks(wt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeTree(t, main, map[string]string{
+			".git/config":                 "[extensions]\n\trefstorage = reftable\n",
+			".git/worktrees/wt/HEAD":      idA + "\n",
+			".git/worktrees/wt/commondir": "../..\n",
+			".git/worktrees/wt/gitdir":    real + "/.git\n",
+		})
+		writeTree(t, wt, map[string]string{".git": "gitdir: ../main/.git/worktrees/wt\n"})
+		if id, ok := headIdentity(wt, main); ok {
+			t.Fatalf("headIdentity = %q, want unknown", id)
+		}
+	})
+	t.Run("config that cannot be read", func(t *testing.T) {
+		wt := t.TempDir()
+		writeTree(t, wt, map[string]string{".git/HEAD": idA + "\n"})
+		if err := syscall.Mkfifo(filepath.Join(wt, ".git", "config"), 0o644); err != nil {
+			t.Skipf("mkfifo: %v", err)
+		}
+		if id, ok := headIdentity(wt, ""); ok {
+			t.Fatalf("headIdentity = %q with an unreadable config, want unknown", id)
+		}
+	})
+	t.Run("repository made by git", func(t *testing.T) {
+		if _, err := exec.LookPath("git"); err != nil {
+			t.Skip("git not installed")
+		}
+		repo := filepath.Join(t.TempDir(), "r")
+		cmd := exec.Command("git", "init", "-q", "--ref-format=reftable", repo)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Skipf("git cannot create a reftable repository: %v\n%s", err, out)
+		}
+		gitIn(t, repo, "commit", "-q", "--allow-empty", "-m", "one")
+		if gitIn(t, repo, "rev-parse", "HEAD") == "" {
+			t.Fatal("git could not resolve HEAD")
+		}
+		writeTree(t, repo, map[string]string{".git/HEAD": idA + "\n"}) // a stub git ignores
+		if id, ok := headIdentity(repo, repo); ok {
+			t.Fatalf("headIdentity = %q in a reftable repository, want unknown", id)
+		}
+	})
+}
