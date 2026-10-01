@@ -24,6 +24,7 @@ import (
 
 	"github.com/nution101/ttorch/internal/backend"
 	"github.com/nution101/ttorch/internal/buildinfo"
+	"github.com/nution101/ttorch/internal/clonepool"
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/doctor"
 	"github.com/nution101/ttorch/internal/harness"
@@ -455,7 +456,7 @@ func cmdSpawn(args []string) error {
 	// Task id and repo are the first two positionals; flags follow (the stdlib
 	// flag parser stops at the first positional, so parse the remainder).
 	if len(args) < 2 {
-		return errors.New(`usage: ttorch spawn <task-id> <repo-path> [--scout] [--init] [--touches "a,b"] [--brief-file <path> | --brief "..."] [--effort <level>] [--model <m>] [--force-overlap] [--cmd "..."] [--no-brief-lint]`)
+		return errors.New(`usage: ttorch spawn <task-id> <repo-path> [--scout] [--init] [--touches "a,b"] [--brief-file <path> | --brief "..."] [--effort <level>] [--model <m>] [--workdir clone|worktree] [--force-overlap] [--cmd "..."] [--no-brief-lint]`)
 	}
 	id, repo := args[0], args[1]
 	fs := flag.NewFlagSet("spawn", flag.ContinueOnError)
@@ -471,8 +472,12 @@ func cmdSpawn(args []string) error {
 	citationsRef := fs.String("citations-ref", "", "ref the brief's file:line citations were read at (a worker HEAD or reviewed sha) - passed to the brief lint")
 	lintOffline := fs.Bool("brief-lint-offline", false, "lint the brief without reaching the network: the target-branch rule is skipped and the rest still run")
 	noLint := fs.Bool("no-brief-lint", false, "spawn without linting the brief (see 'ttorch brief-lint'); prefer disabling a specific rule in the project's AGENTS.md")
+	workdir := fs.String("workdir", "", "worker directory: clone (a private repository) or worktree (default: clone when $"+clonepool.EnvVar+" is on, else worktree). Clones are not safe to use until the rest of the per-worker clone work lands")
 	if err := fs.Parse(args[2:]); err != nil {
 		return err
+	}
+	if !clonepool.ValidKind(*workdir) {
+		return fmt.Errorf("spawn: invalid --workdir %q (want %s or %s)", *workdir, clonepool.KindClone, clonepool.KindWorktree)
 	}
 	// Reject an unknown --effort before any side effect, naming the accepted levels, so a
 	// typo fails loudly rather than silently launching the worker at the ultracode default.
@@ -507,6 +512,7 @@ func cmdSpawn(args []string) error {
 		return err
 	}
 	defer m.Close()
+	m.Workdir = *workdir
 	if *doInit {
 		notes, err := m.InitRepo(repo, "pr")
 		if err != nil {
@@ -2352,6 +2358,12 @@ Team:
     --model <m>             model: haiku|sonnet|opus|fable|opusplan or a full id
                             (default: $TTORCH_MODEL, else claude's own default);
                             persisted so a resume restores it
+    --workdir <kind>        clone: a private repository that shares no refs or config
+                            with the lead's; worktree: a linked worktree (default:
+                            clone when TTORCH_WORKER_CLONES is on, else worktree).
+                            Clones are NOT safe to use yet: the gate, land and
+                            teardown paths that read a clone's work back are still
+                            to land. LFS, partial-clone and submodule repos are refused
     --force-overlap         dispatch anyway when --touches overlaps a live worker
     --cmd "..."             run a raw command instead of the default harness
   status                  list active workers (live tmux state + DB status/stage/owner)
