@@ -95,7 +95,7 @@ func (m *Manager) Approve(taskID string, ttl time.Duration, allowGateChange bool
 	if ttl <= 0 {
 		return nil, fmt.Errorf("--ttl must be positive (got %s)", ttl)
 	}
-	head, err := worktree.Head(t.Worktree)
+	head, err := workHead(t)
 	if err != nil {
 		return nil, err
 	}
@@ -199,7 +199,11 @@ func (m *Manager) mergeLocal(taskID string, requireVerdict bool, landBase string
 	gated := requireVerdict || projectinit.ReadMode(repo) == "trusted"
 	// The committed object that will fast-forward. Everything the gate validates and pins
 	// is THIS sha — never the mutable worktree, which a running worker could change.
-	workerHead, err := worktree.Head(t.Worktree)
+	w, err := openWork(t)
+	if err != nil {
+		return "", err
+	}
+	workerHead, err := w.head()
 	if err != nil {
 		return "", err
 	}
@@ -267,7 +271,7 @@ func (m *Manager) mergeLocal(taskID string, requireVerdict bool, landBase string
 		// Defense in depth: the worktree must be clean (a clean signal that no worker is
 		// mid-edit), though correctness no longer depends on it — the gate validates the
 		// committed sha, not the worktree.
-		if clean, err := worktree.IsClean(t.Worktree); err != nil || !clean {
+		if clean, err := w.clean(); err != nil || !clean {
 			return "", fmt.Errorf("trust gate: the worktree for %q is not clean; commit or discard all changes before merging", taskID)
 		}
 		// A trusted AUTO-merge's green authority must be the default-branch gate script —
@@ -382,7 +386,7 @@ func (m *Manager) mergeLocal(taskID string, requireVerdict bool, landBase string
 		}
 		// HEAD-unchanged bracket: the worker must not have advanced HEAD during the gate,
 		// so the sha we validated and pinned is still the sha that merges.
-		if cur, err := worktree.Head(t.Worktree); err != nil || cur != workerHead {
+		if cur, err := w.observe(); err != nil || cur != workerHead {
 			return "", fmt.Errorf("trust gate: the worker for %q advanced during review; re-prep, re-review, and re-record", taskID)
 		}
 	}
@@ -935,7 +939,11 @@ func (m *Manager) resolveLandSpec(t db.Task, requireVerdict bool) (landSpec, err
 	}
 	// The rebased + validated commit must be exactly what merges: refuse a dirty worktree
 	// up front (a worker mid-edit), the same contract trust prep enforces.
-	if clean, err := worktree.IsClean(wt); err != nil || !clean {
+	w, err := openWork(t)
+	if err != nil {
+		return zero, fmt.Errorf("land: %w", err)
+	}
+	if clean, err := w.clean(); err != nil || !clean {
 		return zero, fmt.Errorf("land: the worktree for %q is not clean; commit or discard changes first so the rebased, validated commit is exactly what lands", t.ID)
 	}
 	// pr mode REQUIRES an origin to push to; other modes can land a purely local repo (no
@@ -1084,7 +1092,7 @@ func (m *Manager) landPrep(t db.Task, spec landSpec, fetchMu *sync.Mutex) (landP
 	if err := verifyRemoteBase(spec.repo, spec.def, base, baseSha); err != nil {
 		return zero, fmt.Errorf("land: %w", err)
 	}
-	preRebase, err := worktree.Head(spec.wt)
+	preRebase, err := workHead(t)
 	if err != nil {
 		return zero, err
 	}
@@ -1306,7 +1314,13 @@ func (m *Manager) carryVerdictForward(t db.Task, base, baseSha, rebasedHead stri
 	if v.DiffID == "" {
 		return false, nil // a verdict recorded before content identities — fail safe to re-gate
 	}
-	patch, err := mergeBaseDiff(t.Worktree, baseSha, rebasedHead)
+	// The same command TrustRecord took the recorded identity over (work.patch), so an
+	// unchanged diff hashes the same for a clone as for a worktree.
+	w, err := openWork(t)
+	if err != nil {
+		return false, fmt.Errorf("land: %w", err)
+	}
+	patch, err := w.patch(baseSha, rebasedHead)
 	if err != nil {
 		return false, fmt.Errorf("land: could not compute the rebased diff for %q to carry its verdict forward: %w", t.ID, err)
 	}

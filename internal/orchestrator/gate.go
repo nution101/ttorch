@@ -141,8 +141,8 @@ func (m *Manager) requiredDimensions(t db.Task, sha string) (required, dropped [
 // every base that resolves and unioning the results means an attacker has to poison all of
 // them; unpoisoned local <default> still sees the .go files and still demands security.
 //
-// Every failure path lands on the full three-dimension set: no base resolves, git fails, or
-// review.Classify's own ok flag goes false.
+// Every failure path lands on the full three-dimension set: the workdir resolves as neither a
+// worktree nor a clone, no base resolves, git fails, or review.Classify's own ok flag goes false.
 //
 // WHAT THIS DOES NOT CLOSE. Every candidate is a ref in a store the worker can write, so
 // poisoning all of them lowers the floor again. That is the process channel, and a session that
@@ -150,11 +150,15 @@ func (m *Manager) requiredDimensions(t db.Task, sha string) (required, dropped [
 // entirely. This makes the floor no longer the cheapest way through; it does not make it
 // unreachable.
 func (m *Manager) derivedFloor(t db.Task, sha string) []string {
+	w, err := openWork(t)
+	if err != nil {
+		return append([]string(nil), requiredReviewers...)
+	}
 	var floor []string
 	derived := false
 	for _, base := range candidateReviewBases(t.Project, m.recordedDefaultBranch(t.Project)) {
-		files, filesOK := diffFiles(t.Worktree, base, sha)
-		lines, binary, statOK := diffLineStat(t.Worktree, base, sha)
+		files, filesOK := diffFiles(w.gitDir(), base, sha)
+		lines, binary, statOK := diffLineStat(w.gitDir(), base, sha)
 		_, dims := review.Classify(files, lines, binary, filesOK && statOK)
 		floor = unionDimensions(floor, dims)
 		derived = true
@@ -354,7 +358,8 @@ func unlistedReportsFinding(err error) review.Finding {
 	}
 }
 
-// ReviewDiff returns a worker's changes against the repo's default branch.
+// ReviewDiff returns a worker's changes against the repo's default branch: a worktree's working
+// tree, or a clone's imported head (see work.reviewDiff).
 func (m *Manager) ReviewDiff(taskID string, stat bool) (string, error) {
 	t, ok, err := m.Store.GetTask(context.Background(), taskID)
 	if err != nil || !ok {
@@ -366,7 +371,11 @@ func (m *Manager) ReviewDiff(taskID string, stat bool) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return worktree.Diff(t.Worktree, "refs/heads/"+gb.Name, stat)
+	w, err := openWork(t)
+	if err != nil {
+		return "", err
+	}
+	return w.reviewDiff("refs/heads/"+gb.Name, stat)
 }
 
 // gitOut runs `git -C dir <args...>` and returns its raw stdout, enriching the error with
@@ -534,11 +543,15 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 	if err != nil || !ok {
 		return "", fmt.Errorf("unknown task %q", taskID)
 	}
+	w, err := openWork(t)
+	if err != nil {
+		return "", fmt.Errorf("trust prep %q: %w", taskID, err)
+	}
 	// Reviewed state must equal the committed state that will merge.
-	if clean, err := worktree.IsClean(t.Worktree); err != nil || !clean {
+	if clean, err := w.clean(); err != nil || !clean {
 		return "", fmt.Errorf("worktree for %q is not clean; commit or discard changes before review so the reviewers see exactly the committed diff that will merge", taskID)
 	}
-	head, err := worktree.Head(t.Worktree)
+	head, err := w.head()
 	if err != nil {
 		return "", err
 	}
@@ -573,7 +586,7 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 	// rev-list <head>..<base>` lists exactly the commits the base has that the worker lacks;
 	// any output means the base is stale. Fail loudly so the manager rebases the worker onto
 	// the current default first, and stage nothing.
-	behind, err := gitOut(t.Worktree, "rev-list", head+".."+base)
+	behind, err := gitOut(w.gitDir(), "rev-list", head+".."+base)
 	if err != nil {
 		return "", fmt.Errorf("trust prep %q: could not check whether the branch is based on the current %s: %w", taskID, def, err)
 	}
@@ -626,7 +639,7 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 	// correct, intent-revealing way to diff a branch against its base, and is defense in
 	// depth against a phantom-revert diff. Reads committed objects only, never the working
 	// tree.
-	diff, err := mergeBaseDiff(t.Worktree, base, head)
+	diff, err := w.patch(base, head)
 	if err != nil {
 		return "", err
 	}
@@ -644,8 +657,8 @@ func (m *Manager) TrustPrep(taskID string) (string, error) {
 	// malicious code file behind a quoted/non-ASCII name to misclassify a code diff as
 	// docs-only and skip the security reviewer. Any git failure fails closed to the full
 	// set via the ok flags.
-	files, filesOK := diffFiles(t.Worktree, base, head)
-	lines, binary, statOK := diffLineStat(t.Worktree, base, head)
+	files, filesOK := diffFiles(w.gitDir(), base, head)
+	lines, binary, statOK := diffLineStat(w.gitDir(), base, head)
 	size, dims := review.Classify(files, lines, binary, filesOK && statOK)
 	sb, err := json.MarshalIndent(scaledReviewers{Size: size, Dimensions: dims}, "", "  ")
 	if err != nil {
@@ -883,7 +896,11 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 	if ttl <= 0 {
 		return zero, fmt.Errorf("--ttl must be positive (got %s)", ttl)
 	}
-	head, err := worktree.Head(t.Worktree)
+	w, err := openWork(t)
+	if err != nil {
+		return zero, err
+	}
+	head, err := w.head()
 	if err != nil {
 		return zero, err
 	}
@@ -935,7 +952,7 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 	if berr != nil {
 		return zero, fmt.Errorf("trust record %q: could not resolve the reviewed diff base: %w", taskID, berr)
 	}
-	patch, derr := mergeBaseDiff(t.Worktree, reviewedBase, sha)
+	patch, derr := w.patch(reviewedBase, sha)
 	if derr != nil {
 		return zero, fmt.Errorf("trust record %q: could not compute the reviewed diff identity: %w", taskID, derr)
 	}
@@ -957,7 +974,7 @@ func (m *Manager) TrustRecord(taskID, sha string, ttl time.Duration) (review.Ver
 		// The one resolution of the default branch this record took above (see Manager.gateBase):
 		// the gate-definition diff, the policy and the validate all read base.SHA.
 		base := recorded
-		clean, cerr := worktree.IsClean(t.Worktree)
+		clean, cerr := w.clean()
 		hit, terr := diffTouchesGateConfig(t.Project, base.SHA, sha)
 		touched := hit != nil && (hit.Blocking || !readGateChangePolicy(t.Project, base).waived)
 		green := false
@@ -1133,7 +1150,7 @@ func (m *Manager) AdvisoryPrep(taskID string, dims []string) (inputsDir, advisor
 	if err != nil || !ok {
 		return "", "", fmt.Errorf("unknown task %q", taskID)
 	}
-	head, err := worktree.Head(t.Worktree)
+	head, err := observedHead(t)
 	if err != nil {
 		return "", "", err
 	}
@@ -1260,7 +1277,7 @@ func (m *Manager) SecurityReview(taskID, sha string, ttl time.Duration) (review.
 	if ttl <= 0 {
 		return zero, fmt.Errorf("--ttl must be positive (got %s)", ttl)
 	}
-	head, err := worktree.Head(t.Worktree)
+	head, err := observedHead(t)
 	if err != nil {
 		return zero, err
 	}
@@ -1329,7 +1346,7 @@ func (m *Manager) QAReview(taskID, sha string, ttl time.Duration) (review.Verdic
 	if ttl <= 0 {
 		return zero, fmt.Errorf("--ttl must be positive (got %s)", ttl)
 	}
-	head, err := worktree.Head(t.Worktree)
+	head, err := observedHead(t)
 	if err != nil {
 		return zero, err
 	}
@@ -1634,7 +1651,12 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 	}
 	// The committed object the reviewers must cover and the merge will fast-forward — never the
 	// mutable worktree. An unreadable head (e.g. a torn-down worktree) is not gateable this tick.
-	head, err := worktree.Head(t.Worktree)
+	// A clone's head is only observed here, from files; prep imports it when it opens an episode.
+	w, err := openWork(t)
+	if err != nil {
+		return GateSkipped, nil
+	}
+	head, err := w.observe()
 	if err != nil {
 		return GateSkipped, nil
 	}
