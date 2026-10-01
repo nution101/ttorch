@@ -31,8 +31,8 @@ const hookUsage = `usage: ttorch hook <turn-started|turn-ended|session-ended>   
 // It drains in, the hook payload, without parsing it, so the harness is never left writing
 // a large prompt into a pipe nobody reads.
 //
-// A turn-started record also leaves a trace on the event spine (recordTurnStarted), so a
-// stall ladder held quiet by a busy record shows in the task's timeline who wrote it.
+// A turn-started record also leaves a trace on the event spine (recordTurnStarted): the
+// first writer each minute, as that writer describes itself.
 //
 // Claude Code waits for each of these hooks before it moves on, so a worker's records land
 // in the order its events happened.
@@ -65,9 +65,10 @@ func cmdHook(args []string, in io.Reader) error {
 
 // recordTurnStarted appends the task's hook_turn_started event (db.AppendHookTurnStarted),
 // which is non-actionable and written at most once a minute per task, so a chatty session
-// cannot flood the events table. The payload says who wrote the record: how the hook
-// resolved its task (via), the session's project dir (the cwd when CLAUDE_PROJECT_DIR is
-// unset), and the hook's parent pid, which is the harness process that ran it.
+// cannot flood the events table. A later writer inside the same minute leaves nothing. The
+// payload is this writer's own account, unverified: how the hook resolved its task (via),
+// its CLAUDE_PROJECT_DIR (the cwd when that is unset), and the hook's parent pid, which is
+// the harness process that ran it.
 //
 // It is best-effort like the rest of the hook. The DB is resolved as `ttorch report`
 // resolves it, a DB that does not exist yet is never created, and any error is dropped.
@@ -103,8 +104,8 @@ func recordTurnStarted(taskID, fileDB, via string) {
 // inside a different task's worktree, and not when the cwd and the project dir lie in
 // different worktrees.
 //
-// This stops accidents, and the turn-started trace (recordTurnStarted) leaves a record of
-// who wrote; it is not a security boundary. Any process running as the worker's user can
+// This stops accidents, and the turn-started trace (recordTurnStarted) notes the first
+// writer each minute as it describes itself; it is not a security boundary. Any process running as the worker's user can
 // still write hook.json directly.
 func hookIdentity() (taskID, fileDB, via string, ok bool) {
 	env := strings.TrimSpace(os.Getenv("TTORCH_TASK_ID"))

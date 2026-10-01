@@ -976,10 +976,11 @@ The hook also writes nothing when its identity sources disagree: `TTORCH_TASK_ID
 `.ttorch/task` found walking up from the cwd, and the one found walking up from
 `CLAUDE_PROJECT_DIR` must all name the same task where they resolve, so a subprocess that
 inherited one worker's env inside another task's worktree cannot write either record. A
-turn-started record also appends a non-actionable `hook_turn_started` event (at most one per
-task a minute) naming how the task was resolved, the session's project dir and the
-harness's pid, so a ladder held quiet by a record shows in the timeline who wrote it. Both
-stop accidents; a process running as the worker's user can still write `hook.json` directly.
+turn-started record also appends a non-actionable `hook_turn_started` event, at most one per
+task a minute, so the timeline of a ladder held quiet by a record names the first writer in
+that minute as the writer describes itself: how it resolved the task, its own
+`CLAUDE_PROJECT_DIR`, and the harness's pid. Later writers in the same minute leave no row,
+and nothing in the payload is verified. Both stop accidents; a process running as the worker's user can still write `hook.json` directly.
 `livestate.Reconcile` combines the pane and the record in a fixed order. Busy text on the
 pane always reads as busy, and stall text always leaves the decision to the pane. Otherwise
 a turn-started record less than 30 minutes old reads as busy whatever the pane shows, so a
