@@ -319,7 +319,8 @@ passing commit-pinned verdict plus a fresh green validate auto-mints the approva
   whose default is another branch supplied an old policy. The branch is recorded when the
   project is registered, from the lead's checkout (the branch `origin/HEAD` names when that
   branch exists locally, else the branch the checkout is on): by `ttorch project add`, by
-  `ttorch init` for a registered project that has none, or by the first spawn, but only while no
+  `ttorch init` for a registered project that has none (both only when the lead runs them at a
+  terminal, behind the same guard as `set-branch`), or by the first spawn, but only while no
   worker has had a checkout of the repository. Only the lead changes it, with
   `ttorch project set-branch <project> <branch>`, which refuses a worker context and a
   non-interactive stdin. Projects registered before the branch was recorded are seeded once by
@@ -357,6 +358,24 @@ passing commit-pinned verdict plus a fresh green validate auto-mints the approva
   as the lead.
 - The audit record is written and flushed **before** the irreversible fast-forward; an
   unauditable merge aborts.
+
+#### Known limit: shared git state
+
+Workers run as the lead's user, in worktrees that share one `.git` with the main checkout. The
+recorded default branch, the pinned review base and the origin checks above cover the refs a
+worker can move from its own worktree, but a worker running ordinary git commands there can
+still mislead the gate in three ways:
+
+- It can rewrite `remote.origin.url` in the shared `.git/config`, so the origin checks in
+  `landPrep` and `ttorch fleet-sync` consult a repository the worker controls.
+- It can repoint `refs/remotes/origin/HEAD` or plant branches before the first run of an
+  upgraded binary, and the one-time default-branch seed trusts what it finds.
+- It can leave refs behind that a later spawn records as the default branch when a project has
+  none recorded.
+
+The planned fix gives each worker its own clone instead of a worktree that shares the main
+checkout's `.git`. Until then, the lead should check the recorded default branch that
+`ttorch update` and `ttorch doctor` print, and correct it with `ttorch project set-branch`.
 
 ### Why the gate-config set stops where it does
 

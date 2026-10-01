@@ -205,9 +205,9 @@ gate that change modifies; each such merge records a `gate_change_unapproved` ev
 one line saying so.
 
 The gate reads the **default branch recorded for the project**, never one it works out from the
-repository's refs, since a worker can move those. `ttorch project add`, `ttorch init` or the
-first spawn records it from your checkout: the branch `origin/HEAD` names, else the branch you
-are on. `ttorch project ls` shows it and `ttorch project set-branch <project> <branch>` changes
+repository's refs, since a worker can move those. `ttorch project add` or `ttorch init` (when
+you run them yourself at a terminal), or the first spawn, records it from your checkout: the
+branch `origin/HEAD` names, else the branch you are on. `ttorch project ls` shows it and `ttorch project set-branch <project> <branch>` changes
 it; run that yourself, since it refuses a worker's context. A project registered before the
 branch was recorded is seeded once, and `ttorch update` and `ttorch doctor` print the seeded
 branch once so you can correct it.

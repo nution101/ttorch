@@ -281,7 +281,7 @@ act, then re-check.
 | `ttorch land <id>… \| --all [--require-verdict]` | one atomic delivery per task (fetch, rebase, re-validate, integrate honoring the gates, verify, fast-forward); several ids or `--all` (the whole done set) land **concurrently** through the async queue — each lands as soon as it is individually ready, serializing only the per-repo fast-forward. Throughput is bounded by file overlap: disjoint tasks land in parallel, while overlapping tasks rebase onto the prior and serialize the fast-forward (a non-clean rebase is aborted and surfaced as a `land_rebase_conflict`, never force-merged). **The scheduler runs this for you on already-gated work** — use it by hand only when you want to land something immediately yourself |
 | `ttorch promote <id>` | turn a scout task into a ship task |
 | `ttorch pr-check <id> <url>` | watch a PR and be notified when it merges |
-| `ttorch project add <repo> [--name n]` · `project ls` | register / list projects (caches delivery mode for display; records the default branch the trust gate reads) |
+| `ttorch project add <repo> [--name n]` · `project ls` | register / list projects (caches delivery mode for display). Run by you, it records no default branch; the first spawn or the lead does |
 | `ttorch project set-branch <project> <branch>` | the lead's command, not yours: change the recorded default branch. When the gate refuses for want of one, surface it to the lead |
 | `ttorch epic add --project <id> --title "…"` · `epic ls` · `epic set-status <id> <s>` | manage epics |
 | `ttorch phase add --epic <id> --title "…"` · `phase ls` · `phase set-status <id> <s>` | manage phases |

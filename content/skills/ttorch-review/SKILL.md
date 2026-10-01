@@ -234,6 +234,16 @@ invalidates the verdict — re-prep, re-review, re-record.
   approval off, a change to the reviewers or the validate step is authorized by the gate that
   change modifies, and your verdict is the only review it gets.
 
+  **Known limit: shared git state.** Workers run as the lead's user in worktrees that share one
+  `.git` with the main checkout, so a worker running ordinary git commands in its own worktree
+  can still mislead the gate: by pointing `remote.origin.url` in the shared `.git/config` at a
+  repository it controls, which the land's and fleet-sync's origin checks then consult; by
+  repointing `origin/HEAD` or planting branches before the first run after an upgrade, which the
+  one-time default-branch seed trusts; and by leaving refs that a later spawn records as the
+  default branch for a project that has none. Per-worker clones are the planned fix. Until then
+  the lead should check the recorded default branch that `ttorch update` and `ttorch doctor`
+  print.
+
   **Matching on the name alone is not enough, so the guard does not rely on it.** Paths are
   compared under `fsIdentityKey` — NFD, Unicode FULL case folding, then SimpleFold
   orbit-minimum — which is the relation APFS implements, verified by creating the files and
