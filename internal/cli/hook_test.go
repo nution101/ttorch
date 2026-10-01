@@ -1,12 +1,15 @@
 package cli
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/livestate"
 	"github.com/nution101/ttorch/internal/paths"
 )
@@ -367,5 +370,140 @@ func TestHook_AgreeingIdentityRecords(t *testing.T) {
 				t.Fatalf("record = (%+v, %v), want turn-started for wt1", r, ok)
 			}
 		})
+	}
+}
+
+// seedHookDB creates a state DB at path holding a spawned task for each id.
+func seedHookDB(t *testing.T, path string, ids ...string) {
+	t.Helper()
+	s, err := db.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	p, err := s.UpsertProject(ctx, "/repo", "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids {
+		if _, err := s.CreateTask(ctx, db.Task{ID: id, ProjectID: p.ID, Status: db.StatusActive, Window: "wk-" + id, Owner: "worker:" + id}, db.ActorManager); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// hookTraces returns the hook_turn_started events recorded for id in the DB at path.
+func hookTraces(t *testing.T, path, id string) []db.Event {
+	t.Helper()
+	s, err := db.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	items, err := s.Timeline(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []db.Event
+	for _, it := range items {
+		if it.Event != nil && it.Event.Type == db.EventHookTurnStarted {
+			out = append(out, *it.Event)
+		}
+	}
+	return out
+}
+
+// TestHook_TurnStartedLeavesOneTracePerMinute: the first turn-started record of a task puts
+// a non-actionable hook_turn_started event in its timeline naming the writer, a second
+// turn-started inside the minute adds none, and the other events never add one.
+func TestHook_TurnStartedLeavesOneTracePerMinute(t *testing.T) {
+	hookWorker(t, "wt1")
+	// A spawned worker carries TTORCH_DB, which wins over the task file's db (here /nowhere).
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	t.Setenv("TTORCH_DB", dbPath)
+	seedHookDB(t, dbPath, "wt1")
+	project := workerWorktree(t, "wt1")
+	t.Setenv("CLAUDE_PROJECT_DIR", project)
+
+	hook := func(evs ...livestate.Event) {
+		t.Helper()
+		for _, ev := range evs {
+			if err := cmdHook([]string{string(ev)}, strings.NewReader("")); err != nil {
+				t.Fatalf("hook %s: %v", ev, err)
+			}
+		}
+	}
+	hook(livestate.TurnEnded, livestate.SessionEnded)
+	if n := len(hookTraces(t, dbPath, "wt1")); n != 0 {
+		t.Fatalf("turn-ended and session-ended left %d traces, want none", n)
+	}
+	hook(livestate.TurnStarted, livestate.TurnEnded, livestate.TurnStarted, livestate.SessionEnded)
+	traces := hookTraces(t, dbPath, "wt1")
+	if len(traces) != 1 {
+		t.Fatalf("got %d hook_turn_started events, want 1: %+v", len(traces), traces)
+	}
+	e := traces[0]
+	if e.Actionable || e.Actor != db.ActorSystem {
+		t.Errorf("trace %+v: want a non-actionable system event", e)
+	}
+	want := fmt.Sprintf("via=env dir=%q ppid=%d", project, os.Getppid())
+	if e.Payload != want {
+		t.Errorf("trace payload = %q, want %q", e.Payload, want)
+	}
+}
+
+// TestHook_TraceUsesTheTaskFileDB: with no TTORCH_DB, the trace lands in the DB the
+// worktree's .ttorch/task names, as `ttorch report` resolves it, and says the task came
+// from the task file.
+func TestHook_TraceUsesTheTaskFileDB(t *testing.T) {
+	hookWorker(t, "wt1")
+	t.Setenv("TTORCH_TASK_ID", "")
+	dbPath := filepath.Join(t.TempDir(), "elsewhere.db")
+	seedHookDB(t, dbPath, "wt1")
+	wt := workerWorktree(t, "wt1")
+	if err := os.WriteFile(filepath.Join(wt, ".ttorch", "task"), []byte("task_id=wt1\ndb="+dbPath+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(wt)
+	if err := cmdHook([]string{"turn-started"}, strings.NewReader("")); err != nil {
+		t.Fatal(err)
+	}
+	traces := hookTraces(t, dbPath, "wt1")
+	if len(traces) != 1 || !strings.HasPrefix(traces[0].Payload, "via=task-file ") {
+		t.Fatalf("traces in the task file's DB = %+v, want one via=task-file", traces)
+	}
+}
+
+// TestHook_RefusedWriteLeavesNoTrace: a hook whose identity sources disagree writes no
+// record, so it leaves no trace for either task.
+func TestHook_RefusedWriteLeavesNoTrace(t *testing.T) {
+	hookWorker(t, "wt1")
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	t.Setenv("TTORCH_DB", dbPath)
+	seedHookDB(t, dbPath, "wt1", "wt2")
+	t.Chdir(workerWorktree(t, "wt2"))
+	if err := cmdHook([]string{"turn-started"}, strings.NewReader("")); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"wt1", "wt2"} {
+		if n := len(hookTraces(t, dbPath, id)); n != 0 {
+			t.Errorf("refused hook left %d traces for %s", n, id)
+		}
+	}
+}
+
+// TestHook_TraceNeverCreatesADB: a worker whose state DB does not exist still records its
+// turn, and the hook does not create a DB to hold the trace.
+func TestHook_TraceNeverCreatesADB(t *testing.T) {
+	path := hookWorker(t, "wt1")
+	if err := cmdHook([]string{"turn-started"}, strings.NewReader("")); err != nil {
+		t.Fatal(err)
+	}
+	if r, ok := livestate.ReadRecord(path, "wt1"); !ok || r.Event != livestate.TurnStarted {
+		t.Fatalf("record = (%+v, %v), want turn-started", r, ok)
+	}
+	if _, err := os.Stat(paths.Default().StateDB()); !os.IsNotExist(err) {
+		t.Fatalf("the hook created a state DB (stat err = %v)", err)
 	}
 }

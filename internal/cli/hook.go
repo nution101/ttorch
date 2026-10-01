@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/livestate"
 	"github.com/nution101/ttorch/internal/paths"
 )
@@ -29,6 +31,9 @@ const hookUsage = `usage: ttorch hook <turn-started|turn-ended|session-ended>   
 // It drains in, the hook payload, without parsing it, so the harness is never left writing
 // a large prompt into a pipe nobody reads.
 //
+// A turn-started record also leaves a trace on the event spine (recordTurnStarted), so a
+// stall ladder held quiet by a busy record shows in the task's timeline who wrote it.
+//
 // Claude Code waits for each of these hooks before it moves on, so a worker's records land
 // in the order its events happened.
 func cmdHook(args []string, in io.Reader) error {
@@ -43,18 +48,50 @@ func cmdHook(args []string, in io.Reader) error {
 	if inReviewWorkspace() {
 		return nil
 	}
-	taskID, ok := hookIdentity()
+	taskID, fileDB, via, ok := hookIdentity()
 	if !ok || !plainTaskID(taskID) {
 		return nil
 	}
-	_ = livestate.WriteRecord(paths.Default().HookRecordFile(taskID), livestate.Record{
+	if err := livestate.WriteRecord(paths.Default().HookRecordFile(taskID), livestate.Record{
 		Event: ev, TaskID: taskID, At: time.Now().UTC(),
-	})
+	}); err != nil {
+		return nil
+	}
+	if ev == livestate.TurnStarted {
+		recordTurnStarted(taskID, fileDB, via)
+	}
 	return nil
 }
 
-// hookIdentity resolves the task a hook writes for. ok is false when there is none (not a
-// spawned worker) or when the sources disagree.
+// recordTurnStarted appends the task's hook_turn_started event (db.AppendHookTurnStarted),
+// which is non-actionable and written at most once a minute per task, so a chatty session
+// cannot flood the events table. The payload says who wrote the record: how the hook
+// resolved its task (via), the session's project dir (the cwd when CLAUDE_PROJECT_DIR is
+// unset), and the hook's parent pid, which is the harness process that ran it.
+//
+// It is best-effort like the rest of the hook. The DB is resolved as `ttorch report`
+// resolves it, a DB that does not exist yet is never created, and any error is dropped.
+func recordTurnStarted(taskID, fileDB, via string) {
+	path := resolveDBPath(fileDB)
+	if fi, err := os.Stat(path); err != nil || !fi.Mode().IsRegular() {
+		return
+	}
+	store, err := db.Open(path)
+	if err != nil {
+		return
+	}
+	defer store.Close()
+	dir := os.Getenv("CLAUDE_PROJECT_DIR")
+	if dir == "" {
+		dir, _ = os.Getwd()
+	}
+	payload := fmt.Sprintf("via=%s dir=%q ppid=%d", via, dir, os.Getppid())
+	_, _ = store.AppendHookTurnStarted(context.Background(), taskID, payload)
+}
+
+// hookIdentity resolves the task a hook writes for, the DB path recorded in its task file
+// ("" when no task file was found), and which source named it first: "env" or "task-file".
+// ok is false when there is none (not a spawned worker) or when the sources disagree.
 //
 // The sources are $TTORCH_TASK_ID, the .ttorch/task found walking up from the cwd, and the
 // one found walking up from CLAUDE_PROJECT_DIR (where the session started). Every source
@@ -66,14 +103,15 @@ func cmdHook(args []string, in io.Reader) error {
 // inside a different task's worktree, and not when the cwd and the project dir lie in
 // different worktrees.
 //
-// This stops accidents; it is not a security boundary. Any process running as the worker's
-// user can still write hook.json directly.
-func hookIdentity() (taskID string, ok bool) {
+// This stops accidents, and the turn-started trace (recordTurnStarted) leaves a record of
+// who wrote; it is not a security boundary. Any process running as the worker's user can
+// still write hook.json directly.
+func hookIdentity() (taskID, fileDB, via string, ok bool) {
 	env := strings.TrimSpace(os.Getenv("TTORCH_TASK_ID"))
-	cwdID, _ := findTaskFile()
-	var projectID string
+	cwdID, cwdDB := findTaskFile()
+	var projectID, projectDB string
 	if dir := os.Getenv("CLAUDE_PROJECT_DIR"); dir != "" {
-		projectID, _ = findTaskFileFrom(dir)
+		projectID, projectDB = findTaskFileFrom(dir)
 	}
 	for _, id := range []string{env, cwdID, projectID} {
 		switch {
@@ -81,10 +119,21 @@ func hookIdentity() (taskID string, ok bool) {
 		case taskID == "":
 			taskID = id
 		case id != taskID:
-			return "", false
+			return "", "", "", false
 		}
 	}
-	return taskID, taskID != ""
+	if taskID == "" {
+		return "", "", "", false
+	}
+	fileDB = cwdDB
+	if fileDB == "" {
+		fileDB = projectDB
+	}
+	via = "task-file"
+	if env != "" {
+		via = "env"
+	}
+	return taskID, fileDB, via, true
 }
 
 // inReviewWorkspace reports whether this hook's session started inside the review workspaces
