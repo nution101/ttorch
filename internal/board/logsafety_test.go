@@ -18,13 +18,19 @@ const forgedPath = "/x%0Aboard:%20answer%20t1:%20done%0D%1B%5B2J%07"
 // rawGET sends one request line exactly as given, so no client library re-encodes the path.
 func rawGET(t *testing.T, addr, path, host string) {
 	t.Helper()
+	rawRequest(t, addr, "GET", path, host)
+}
+
+// rawRequest is rawGET with the method chosen too.
+func rawRequest(t *testing.T, addr, method, path, host string) {
+	t.Helper()
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, host)
+	fmt.Fprintf(conn, "%s %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", method, path, host)
 	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -120,5 +126,27 @@ func TestRefusalLogCapsThePath(t *testing.T) {
 	}
 	if want := `"/aaaa`; !strings.Contains(logged, want) {
 		t.Errorf("the capped path lost its quoted prefix:\n%.600s", logged)
+	}
+}
+
+// TestRefusalLogCapsTheMethod: the method is in the same request line as the path, so its
+// length is the sender's choice as well, and it gets the same cap.
+func TestRefusalLogCapsTheMethod(t *testing.T) {
+	h := newHarness(t)
+	method := strings.Repeat("M", 64<<10)
+	rawRequest(t, h.srv.host, method, "/", h.srv.host)
+	logged := h.log.String()
+	if strings.Count(logged, "refused") != 1 {
+		t.Fatalf("want 1 refusal in the log, got %d bytes:\n%.300s", len(logged), logged)
+	}
+	checkLogLines(t, logged)
+	if len(logged) > 512 {
+		t.Errorf("a %d-byte method wrote %d bytes to the log", len(method), len(logged))
+	}
+	if want := "refused MMMM"; !strings.Contains(logged, want) {
+		t.Errorf("the capped method lost its prefix:\n%.600s", logged)
+	}
+	if want := fmt.Sprintf("…(%d bytes)", len(method)); !strings.Contains(logged, want) {
+		t.Errorf("the capped method does not say it was cut (want %q):\n%.600s", want, logged)
 	}
 }

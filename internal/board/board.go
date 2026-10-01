@@ -310,32 +310,32 @@ func setSecurityHeaders(w http.ResponseWriter) {
 
 // refuse answers a rejected request with a bare status and logs why, naming the path but
 // never the query string (which is where the page's token travels). Refusals run before the
-// token check, so the path is anyone's text: net/http has already percent-decoded it, and
-// %0A or %1B arrive as real bytes. It is logged quoted, so a newline or a terminal escape
-// shows as \n or \x1b inside the quotes and cannot start a line of its own. The path's length
-// is the sender's choice too, so the quoted form is cut to maxLoggedPath bytes.
+// token check, so the method and path are anyone's text: net/http has already percent-decoded
+// the path, and %0A or %1B arrive as real bytes. It is logged quoted, so a newline or a
+// terminal escape shows as \n or \x1b inside the quotes and cannot start a line of its own.
+// Their length is the sender's choice too, so each is cut to maxLogged bytes.
 func (s *Server) refuse(w http.ResponseWriter, r *http.Request, code int, why string) {
-	s.logf("refused %s %s: %s", safeText(r.Method), loggedPath(r.URL.Path), why)
+	s.logf("refused %s %s: %s", capLogged(safeText(r.Method), len(r.Method)), capLogged(review.SafeQuote(r.URL.Path), len(r.URL.Path)), why)
 	http.Error(w, http.StatusText(code), code)
 }
 
-// maxLoggedPath caps a refused path in the log. A request line can run to net/http's 1MB
-// header limit, and without a cap each refusal would copy all of it to the lead's terminal.
-const maxLoggedPath = 256
+// maxLogged caps each piece of request text a refusal logs. A request line can run to
+// net/http's 1MB header limit, and without a cap each refusal would copy all of it to the
+// lead's terminal.
+const maxLogged = 256
 
-// loggedPath quotes a request path for the log and, past maxLoggedPath bytes, cuts the quoted
-// form there (backing up to a character boundary, so the cut leaves valid UTF-8) and ends it
-// with an ellipsis and the path's original length.
-func loggedPath(path string) string {
-	q := review.SafeQuote(path)
-	if len(q) <= maxLoggedPath {
-		return q
+// capLogged takes request text already made safe for the log (quoted or SafeLine'd) and, past
+// maxLogged bytes, cuts it there (backing up to a character boundary, so the cut leaves valid
+// UTF-8) and ends it with an ellipsis and the original text's length, n.
+func capLogged(safe string, n int) string {
+	if len(safe) <= maxLogged {
+		return safe
 	}
-	cut := maxLoggedPath
-	for cut > 0 && !utf8.RuneStart(q[cut]) {
+	cut := maxLogged
+	for cut > 0 && !utf8.RuneStart(safe[cut]) {
 		cut--
 	}
-	return fmt.Sprintf("%s…(%d bytes)", q[:cut], len(path))
+	return fmt.Sprintf("%s…(%d bytes)", safe[:cut], n)
 }
 
 // logf writes one board log line. It is the only way this package writes to the log, and it
