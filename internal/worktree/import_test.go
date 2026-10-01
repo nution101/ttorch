@@ -702,20 +702,29 @@ func TestImportCommit_IgnoresTheCallersGitEnvironment(t *testing.T) {
 	}
 }
 
-// TestImportCommit_RefusesAnOlderGit: GIT_CONFIG_GLOBAL arrived in git 2.32 and an older git
-// ignores it silently, so the clone's upload-pack would read the lead's global config. The
-// import refuses before it fetches on a git that reports an older version, or a version it
-// cannot read, and runs on 2.32.
-func TestImportCommit_RefusesAnOlderGit(t *testing.T) {
+// TestImportCommit_RefusesGitWithoutTheCVEFix: on a git without the CVE-2024-32004 fix the
+// clone's upload-pack can lazy-fetch through a worker-named promisor and run its program, which
+// no flag of the fetch stops. The import refuses before it fetches on such a git, or one whose
+// version it cannot read, and runs on a fixed one. The boundary is per-series: a backport is
+// fixed, the release just below it is not.
+func TestImportCommit_RefusesGitWithoutTheCVEFix(t *testing.T) {
 	for _, c := range []struct {
 		version string
 		ok      bool
 	}{
-		{"git version 2.31.8", false},
-		{"git version 1.99.0", false},
-		{"git version garbage", false},
-		{"git version 2.32.0", true},
+		{"git version 2.45.1", true},
+		{"git version 2.45.0", false},
+		{"git version 2.44.1", true},
+		{"git version 2.44.0", false},
+		{"git version 2.43.4", true},
+		{"git version 2.43.3", false},
+		{"git version 2.39.4", true},
+		{"git version 2.39.3", false},
+		{"git version 2.38.5", false},
+		{"git version 2.50.1 (vendor build 155)", true},
 		{"git version 3.0.0", true},
+		{"git version 2.31.0", false},
+		{"git version garbage", false},
 	} {
 		t.Run(c.version, func(t *testing.T) {
 			f := newCloneFixture(t)
@@ -728,7 +737,7 @@ func TestImportCommit_RefusesAnOlderGit(t *testing.T) {
 				return
 			}
 			if err == nil {
-				t.Fatal("imported on a git older than 2.32")
+				t.Fatal("imported on a git without the CVE-2024-32004 fix")
 			}
 			t.Logf("refused: %v", err)
 			for _, call := range readCalls(t, log) {
@@ -743,24 +752,67 @@ func TestImportCommit_RefusesAnOlderGit(t *testing.T) {
 
 func TestParseGitVersion(t *testing.T) {
 	for _, c := range []struct {
-		out          string
-		major, minor int
-		ok           bool
+		out                 string
+		major, minor, patch int
+		ok                  bool
 	}{
-		{"git version 2.50.1 (vendor build 155)", 2, 50, true},
-		{"git version 2.45.0.rc1.17.gabcdef0", 2, 45, true},
-		{"git version 2.32.0\n", 2, 32, true},
-		{"git version 2.43", 2, 43, true},
-		{"git version 2", 0, 0, false},
-		{"git version x.y.z", 0, 0, false},
-		{"git version -1.40.0", 0, 0, false},
-		{"version 2.50.1", 0, 0, false},
-		{"", 0, 0, false},
+		{"git version 2.50.1 (vendor build 155)", 2, 50, 1, true},
+		{"git version 2.45.0.rc1.17.gabcdef0", 2, 45, 0, true},
+		{"git version 2.39.4", 2, 39, 4, true},
+		{"git version 2.32.0\n", 2, 32, 0, true},
+		{"git version 2.43", 2, 43, 0, true}, // missing patch reads as 0
+		{"git version 2", 0, 0, 0, false},
+		{"git version x.y.z", 0, 0, 0, false},
+		{"git version -1.40.0", 0, 0, 0, false},
+		{"version 2.50.1", 0, 0, 0, false},
+		{"", 0, 0, 0, false},
 	} {
-		major, minor, ok := parseGitVersion(c.out)
-		if major != c.major || minor != c.minor || ok != c.ok {
-			t.Errorf("parseGitVersion(%q) = %d, %d, %v; want %d, %d, %v", c.out, major, minor, ok, c.major, c.minor, c.ok)
+		major, minor, patch, ok := parseGitVersion(c.out)
+		if major != c.major || minor != c.minor || patch != c.patch || ok != c.ok {
+			t.Errorf("parseGitVersion(%q) = %d, %d, %d, %v; want %d, %d, %d, %v",
+				c.out, major, minor, patch, ok, c.major, c.minor, c.patch, c.ok)
 		}
+	}
+}
+
+func TestGitFixesCVE202432004(t *testing.T) {
+	for _, c := range []struct {
+		major, minor, patch int
+		want                bool
+	}{
+		{2, 45, 1, true}, {2, 45, 0, false}, {2, 45, 2, true},
+		{2, 44, 1, true}, {2, 44, 0, false},
+		{2, 43, 4, true}, {2, 43, 3, false},
+		{2, 42, 2, true}, {2, 42, 1, false},
+		{2, 41, 1, true}, {2, 41, 0, false},
+		{2, 40, 2, true}, {2, 40, 1, false},
+		{2, 39, 4, true}, {2, 39, 3, false},
+		{2, 38, 9, false}, {2, 46, 0, true}, {2, 50, 1, true},
+		{3, 0, 0, true}, {1, 99, 9, false},
+	} {
+		if got := gitFixesCVE202432004(c.major, c.minor, c.patch); got != c.want {
+			t.Errorf("gitFixesCVE202432004(%d,%d,%d) = %v, want %v", c.major, c.minor, c.patch, got, c.want)
+		}
+	}
+}
+
+// TestImportEnv_DisablesLazyFetch: importEnv sets GIT_NO_LAZY_FETCH=1, and because it strips
+// every GIT_* first, a hostile GIT_NO_LAZY_FETCH=0 in the caller's environment cannot override
+// it, with no duplicate entry for resolution to depend on.
+func TestImportEnv_DisablesLazyFetch(t *testing.T) {
+	t.Setenv("GIT_NO_LAZY_FETCH", "0")
+	t.Setenv("GIT_DIR", "/somewhere/else")
+	last, count := "", 0
+	for _, kv := range importEnv() {
+		if v, ok := strings.CutPrefix(kv, "GIT_NO_LAZY_FETCH="); ok {
+			last, count = v, count+1
+		}
+		if strings.HasPrefix(kv, "GIT_DIR=") {
+			t.Error("importEnv kept the caller's GIT_DIR")
+		}
+	}
+	if last != "1" || count != 1 {
+		t.Errorf("importEnv GIT_NO_LAZY_FETCH: value %q, count %d; want \"1\", 1", last, count)
 	}
 }
 
@@ -829,4 +881,94 @@ func TestDropImports_RefusesMalformedTaskIDBeforeGit(t *testing.T) {
 	if calls := readCalls(t, log); len(calls) != 0 {
 		t.Fatalf("a malformed task id reached git:\n%q", calls)
 	}
+}
+
+// promisorClone builds main, and a clone that (a) borrows main's objects by alternates so it
+// genuinely lacks an object that lives only in an upstream, (b) has that upstream configured
+// as a promisor remote whose upload-pack is a marker script, and (c) carries a commit whose
+// tree references the absent object. Importing that commit is what would make the clone's
+// upload-pack lazy-fetch through the marker. It returns main, the clone, the bad commit, and a
+// func reporting whether the marker ran.
+func promisorClone(t *testing.T) (main, clone, bad string, markerRan func() bool) {
+	t.Helper()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	up := filepath.Join(root, "up")
+	fgit(t, root, "", "init", "-q", "-b", "main", up)
+	commitFile(t, up, "secret", "secret\n")
+	blob := fgit(t, up, "", "rev-parse", "HEAD:secret")
+
+	marker := filepath.Join(root, "ran")
+	script := filepath.Join(root, "up.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\ntouch '"+marker+"'\nexec git upload-pack \"$@\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	main = filepath.Join(root, "main")
+	fgit(t, root, "", "init", "-q", "-b", "main", main)
+	base := commitFile(t, main, "a.txt", "a\n")
+
+	clone = filepath.Join(root, "clone")
+	fgit(t, root, "", "init", "-q", "-b", "main", clone)
+	common := fgit(t, main, "", "rev-parse", "--path-format=absolute", "--git-common-dir")
+	info := filepath.Join(clone, ".git", "objects", "info")
+	if err := os.MkdirAll(info, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(info, "alternates"), []byte(filepath.Join(common, "objects")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fgit(t, clone, "", "update-ref", "refs/remotes/origin/main", base)
+	fgit(t, clone, "", "checkout", "-q", "-B", "ttorch/t1", base)
+	tree := fgit(t, clone, "100644 blob "+blob+"\tsecret\n", "mktree", "--missing")
+	bad = fgit(t, clone, "", "commit-tree", tree, "-p", base, "-m", "references a promised blob the clone lacks")
+	fgit(t, clone, "", "update-ref", "refs/heads/ttorch/t1", bad)
+	fgit(t, clone, "", "config", "core.repositoryformatversion", "1")
+	fgit(t, clone, "", "config", "extensions.partialClone", "origin")
+	fgit(t, clone, "", "config", "remote.origin.promisor", "true")
+	fgit(t, clone, "", "config", "remote.origin.partialclonefilter", "blob:none")
+	fgit(t, clone, "", "config", "remote.origin.url", "file://"+up)
+	fgit(t, clone, "", "config", "remote.origin.uploadpack", script)
+
+	// Confirm the blob is absent WITHOUT triggering a lazy fetch (which would run the marker
+	// and cache the blob): GIT_NO_LAZY_FETCH=1 makes cat-file report absence instead of fetching.
+	probe := exec.Command(realGit(t), "-C", clone, "cat-file", "-e", blob)
+	probe.Env = append(fixtureEnv(), "GIT_NO_LAZY_FETCH=1")
+	if probe.Run() == nil {
+		t.Skip("the clone already has the promised blob; cannot stage a lazy fetch")
+	}
+	return main, clone, bad, func() bool { _, err := os.Stat(marker); return err == nil }
+}
+
+// TestImportCommit_RunsNoPromisorProgram: importing a commit that references an object the
+// clone lacks must not run the worker's promisor program, even when the ambient environment
+// re-enables lazy fetch (as GIT_NO_LAZY_FETCH=0 does on a fixed git). The control shows the
+// same clone does run the marker when the fetch is let to lazy-fetch, so the test is not
+// vacuous.
+func TestImportCommit_RunsNoPromisorProgram(t *testing.T) {
+	// Control: a fetch allowed to lazy-fetch runs the worker's program.
+	t.Run("control: the attack is real", func(t *testing.T) {
+		main, clone, bad, ran := promisorClone(t)
+		cmd := exec.Command(realGit(t), "-C", main, "-c", "protocol.version=2",
+			"fetch", "-q", "--no-tags", "--no-write-fetch-head", "--", clone, bad+":refs/ttorch/clones/t1/"+bad)
+		cmd.Env = append(fixtureEnv(), "GIT_NO_LAZY_FETCH=0")
+		_ = cmd.Run()
+		if !ran() {
+			t.Skip("git did not lazy-fetch even with GIT_NO_LAZY_FETCH=0; cannot demonstrate the attack on this git")
+		}
+	})
+
+	main, clone, bad, ran := promisorClone(t)
+	t.Setenv("GIT_NO_LAZY_FETCH", "0") // the hostile ambient value importEnv must override
+	_, err := ImportCommit(context.Background(), main, clone, "t1", bad)
+	if ran() {
+		t.Fatal("the import ran the clone's promisor program")
+	}
+	if err == nil {
+		t.Fatal("importing a commit referencing an object the clone lacks should fail closed")
+	}
+	t.Logf("refused: %v", err)
+	assertNoRef(t, main, CloneRefs+"t1/"+bad)
 }

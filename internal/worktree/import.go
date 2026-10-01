@@ -79,8 +79,8 @@ const importTimeout = 2 * time.Minute
 //
 // When the ref already names the commit, nothing is fetched. task and sha are checked with
 // ValidTaskID and ValidObjectID, and clone must be an absolute clean path, before any git
-// command runs. Before it fetches, it refuses a git older than minImportGit. The whole call
-// runs under importTimeout as well as ctx.
+// command runs. Before it fetches, it refuses a git without the CVE-2024-32004 fix
+// (checkImportGit). The whole call runs under importTimeout as well as ctx.
 func ImportCommit(ctx context.Context, repo, clone, task, sha string) (string, error) {
 	if repo == "" {
 		return "", errors.New("import: no repository to import into")
@@ -148,49 +148,103 @@ func ImportCommit(ctx context.Context, repo, clone, task, sha string) (string, e
 	return ref, nil
 }
 
-// minImportGit is the oldest git the import's command means what it says on.
-// GIT_CONFIG_GLOBAL arrived in 2.32, and an older git ignores it without a word, so the
-// clone's upload-pack would read the lead's global config. The newest flags the fetch uses,
-// --no-write-fetch-head and --no-auto-maintenance, arrived in 2.29 and fail loudly on an
-// older git, so they need no check of their own.
-var minImportGit = [2]int{2, 32}
+// cveFixedPatch is the lowest patch release in each 2.x series that carries the fix for
+// CVE-2024-32004, the arbitrary-code-execution bug where the clone's upload-pack lazy-fetches
+// a missing object through a promisor remote named in the clone's own config and runs the
+// program that config points at. git shipped the fix on 2024-05-14 across the maintained
+// series at once; each of these releases names CVE-2024-32004 in its release notes (verified
+// against Documentation/RelNotes/<v>.adoc):
+//
+//	2.39.4  2.40.2  2.41.1  2.42.2  2.43.4  2.44.1  2.45.1
+//
+// A 2.x.y git is fixed when y >= cveFixedPatch[x] for its series, or when the series is newer
+// than every entry (2.46 and up), or when a series sits between two entries and so was never
+// vulnerable in a release we would see. Below 2.39 there is no fixed release, so those are
+// refused outright. This floor also clears every earlier requirement the import had:
+// GIT_CONFIG_GLOBAL (2.32), --no-write-fetch-head and --no-auto-maintenance (2.29). And
+// GIT_NO_LAZY_FETCH, importEnv's belt-and-suspenders against the same bug, is honoured by
+// every git at or above this floor (it is in promisor-remote.c as of 2.39.4).
+var cveFixedPatch = map[int]int{39: 4, 40: 2, 41: 1, 42: 2, 43: 4, 44: 1, 45: 1}
 
-// checkImportGit refuses when git is older than minImportGit or its version cannot be read.
+// gitFixesCVE202432004 reports whether a 2.x.y git carries the CVE-2024-32004 fix.
+func gitFixesCVE202432004(major, minor, patch int) bool {
+	if major > 2 {
+		return true
+	}
+	if major < 2 || minor < 39 {
+		return false
+	}
+	if minor >= 46 {
+		return true
+	}
+	min, known := cveFixedPatch[minor]
+	if !known {
+		// A series with no entry (none exist between 39 and 45 today); treat as unfixed so a
+		// future gap fails closed rather than open.
+		return false
+	}
+	return patch >= min
+}
+
+// checkImportGit refuses a git that does not carry the CVE-2024-32004 fix, or whose version
+// cannot be read. On an unfixed git the clone's upload-pack would run a worker-chosen program
+// during the import, which no flag of the fetch can stop.
 func checkImportGit(ctx context.Context, hooks string) error {
 	out, _, err := importGit(ctx, hooks, nil, "version")
 	if err != nil {
 		return fmt.Errorf("import: %w", err)
 	}
-	major, minor, ok := parseGitVersion(out)
+	major, minor, patch, ok := parseGitVersion(out)
 	if !ok {
 		return fmt.Errorf("import: cannot read the git version from %q", escapeForTerminal(out))
 	}
-	if major < minImportGit[0] || major == minImportGit[0] && minor < minImportGit[1] {
-		return fmt.Errorf("import: git %d.%d is older than %d.%d, which the import needs for GIT_CONFIG_GLOBAL",
-			major, minor, minImportGit[0], minImportGit[1])
+	if !gitFixesCVE202432004(major, minor, patch) {
+		return fmt.Errorf("import: git %d.%d.%d does not carry the fix for CVE-2024-32004; "+
+			"the import needs 2.45.1, or the backport for its series (2.39.4, 2.40.2, 2.41.1, 2.42.2, 2.43.4, 2.44.1)",
+			major, minor, patch)
 	}
 	return nil
 }
 
-// parseGitVersion reads the major and minor numbers from `git version` output, such as
+// parseGitVersion reads the major, minor and patch numbers from `git version` output, such as
 // "git version 2.50.1", "git version 2.50.1 (vendor build 155)" or
-// "git version 2.45.0.rc1.17.gabcdef0".
-func parseGitVersion(out string) (major, minor int, ok bool) {
+// "git version 2.45.0.rc1.17.gabcdef0" (patch 0). A missing patch component reads as 0.
+func parseGitVersion(out string) (major, minor, patch int, ok bool) {
 	v, found := strings.CutPrefix(strings.TrimSpace(out), "git version ")
 	if !found {
-		return 0, 0, false
+		return 0, 0, 0, false
 	}
 	v, _, _ = strings.Cut(v, " ")
-	parts := strings.SplitN(v, ".", 3)
+	parts := strings.SplitN(v, ".", 4)
 	if len(parts) < 2 {
-		return 0, 0, false
+		return 0, 0, 0, false
 	}
 	major, err1 := strconv.Atoi(parts[0])
 	minor, err2 := strconv.Atoi(parts[1])
 	if err1 != nil || err2 != nil || major < 0 || minor < 0 {
-		return 0, 0, false
+		return 0, 0, 0, false
 	}
-	return major, minor, true
+	if len(parts) >= 3 {
+		// The patch component may carry an rc or build suffix ("0.rc1.17.gabcdef0"); take its
+		// leading digits, and treat no leading digit as 0 rather than failing the whole parse.
+		patch = leadingInt(parts[2])
+	}
+	return major, minor, patch, true
+}
+
+// leadingInt returns the integer the leading decimal digits of s spell, or 0 when s has none.
+func leadingInt(s string) int {
+	n := 0
+	for ; n < len(s) && s[n] >= '0' && s[n] <= '9'; n++ {
+	}
+	if n == 0 {
+		return 0
+	}
+	v, err := strconv.Atoi(s[:n])
+	if err != nil {
+		return 0
+	}
+	return v
 }
 
 // importConfig is the configuration every git command of the import runs with, on top of
@@ -224,10 +278,18 @@ func importConfig(hooks string) []string {
 // upload-pack included. None of the caller's GIT_* variables, so the import means the same
 // whoever runs it: a GIT_DIR would point it at another repository, and a
 // GIT_OBJECT_DIRECTORY would write the commit where repo does not read it, with the import
-// still reporting success. No global or system config: the import needs neither, the worker
-// could have edited the lead's global file, and upload-pack reads it, where a global
-// uploadpack.packObjectsHook would run. No prompt, so an import can never wait on a
-// terminal.
+// still reporting success. Stripping them all also means an ambient GIT_NO_LAZY_FETCH=0
+// cannot override the value this function then sets.
+//
+// GIT_NO_LAZY_FETCH=1 forces the clone's upload-pack not to lazy-fetch a missing object
+// through a promisor remote the worker named, which is the CVE-2024-32004 code path. The
+// version floor refuses a git that lacks the fix; this enforces it even on a fixed git, whose
+// default a worker's clone config could otherwise flip. Measured: with the value 0 the clone's
+// upload-pack ran the worker's promisor program; with 1 it did not.
+//
+// No global or system config: the import needs neither, the worker could have edited the
+// lead's global file, and upload-pack reads it, where a global uploadpack.packObjectsHook
+// would run. No prompt, so an import can never wait on a terminal.
 func importEnv() []string {
 	var env []string
 	for _, kv := range os.Environ() {
@@ -235,7 +297,12 @@ func importEnv() []string {
 			env = append(env, kv)
 		}
 	}
-	return append(env, "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0")
+	return append(env,
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_NO_LAZY_FETCH=1",
+	)
 }
 
 // importGit runs one git command of the import under ctx with importConfig and importEnv,
