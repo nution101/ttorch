@@ -10,13 +10,13 @@ import (
 	"testing"
 )
 
-// TestSessionCallersDoNotImportTmux keeps the seam whole. The orchestrator and the
-// watcher reach their session only through a Backend, so no non-test file in either
-// package may import package tmux: one direct call would be a call site a second backend
-// silently skips. Tests may still import it to drive a real tmux.
+// TestSessionCallersDoNotImportTmux keeps the seam whole. The orchestrator, the watcher
+// and the scheduler reach their session only through a Backend, so no non-test file in
+// those packages may import package tmux: one direct call would be a call site a second
+// backend silently skips. Tests may still import it to drive a real tmux.
 func TestSessionCallersDoNotImportTmux(t *testing.T) {
 	const tmuxPkg = "github.com/nution101/ttorch/internal/tmux"
-	for _, dir := range []string{"../orchestrator", "../watch"} {
+	for _, dir := range []string{"../orchestrator", "../watch", "../scheduler"} {
 		files, err := filepath.Glob(filepath.Join(dir, "*.go"))
 		if err != nil || len(files) == 0 {
 			t.Fatalf("no Go files under %s (err = %v)", dir, err)

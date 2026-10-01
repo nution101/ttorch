@@ -312,8 +312,8 @@ func TestManagerInjectionDetector(t *testing.T) {
 		// The ONE allow-listed API-stall recovery nudge: a SendLine of the fixed "continue" LITERAL,
 		// in the sanctioned file AND the sanctioned top-level wiring function. Exempt under either
 		// window spelling (literal "manager" or the managerWindow ident).
-		{name: "sanctioned nudge (managerWindow ident)", file: sanctionedStallNudgeFile, fn: sanctionedStallNudgeFunc, body: `return tmux.SendLine(session, managerWindow, "continue")`, injection: false},
-		{name: "sanctioned nudge (literal window)", file: sanctionedStallNudgeFile, fn: sanctionedStallNudgeFunc, body: `return tmux.SendLine(session, "manager", "continue")`, injection: false},
+		{name: "sanctioned nudge (managerWindow ident)", file: sanctionedStallNudgeFile, fn: sanctionedStallNudgeFunc, body: `return be.SendLine(session, managerWindow, "continue")`, injection: false},
+		{name: "sanctioned nudge (literal window)", file: sanctionedStallNudgeFile, fn: sanctionedStallNudgeFunc, body: `return be.SendLine(session, "manager", "continue")`, injection: false},
 		// TIGHT: the right function+literal but the WRONG file is still an injection (file scoping).
 		{name: "sanctioned func+literal but wrong file", file: "internal/scheduler/other.go", fn: sanctionedStallNudgeFunc, body: `return tmux.SendLine(session, managerWindow, "continue")`, injection: true},
 		// TIGHT: the right file+literal but the WRONG (non-sanctioned) function is still an injection.

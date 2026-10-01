@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nution101/ttorch/internal/backend/backendtest"
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/orchestrator"
 	"github.com/nution101/ttorch/internal/worktree"
@@ -307,6 +308,60 @@ func TestNew_WiresManagerStallSeams(t *testing.T) {
 	if sc.mgrPeek == nil || sc.mgrSend == nil {
 		t.Fatalf("New did not wire the manager stall-recovery seams: mgrPeek wired=%v, mgrSend wired=%v "+
 			"(the manager half would stay dormant in production)", sc.mgrPeek != nil, sc.mgrSend != nil)
+	}
+}
+
+// TestNew_ManagerStallSeamsUseManagerBackend proves the production seams read and nudge the
+// manager window through the Manager's session backend, not through tmux directly: with a fake
+// backend on the Manager, the pane read and the "continue" nudge must both land on the fake's
+// "manager" window. A direct tmux call would leave the fake untouched and address whatever tmux
+// window happens to be called "manager", which is a different window once the backend is not tmux.
+func TestNew_ManagerStallSeamsUseManagerBackend(t *testing.T) {
+	be := backendtest.New("ttorch-fake")
+	be.AddWindow("ttorch-fake", managerWindow, stallPane)
+	m := &orchestrator.Manager{Session: "ttorch-fake", Store: newStore(t), Pool: worktree.Pool{Max: 1}, Backend: be}
+	sc := New(m, DefaultInterval, nil)
+
+	out, ok := sc.mgrPeek(40)
+	if !ok || out != stallPane {
+		t.Fatalf("mgrPeek = (%q, %v), want the fake manager pane (%q, true)", out, ok, stallPane)
+	}
+	if err := sc.mgrSend(); err != nil {
+		t.Fatalf("mgrSend: %v", err)
+	}
+	want := []string{
+		"Available()",
+		"WindowExistsErr(ttorch-fake, manager)",
+		"CapturePane(ttorch-fake, manager, 40)",
+		"SendLine(ttorch-fake, manager, continue)",
+	}
+	if got := be.Calls(); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("backend calls:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+// TestNew_ManagerPeekUnobservableThroughBackend pins the fail-closed reads: an unavailable
+// backend, or a session with no manager window, is unobservable (ok=false), so it is never
+// mistaken for a stall and never nudged.
+func TestNew_ManagerPeekUnobservableThroughBackend(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		setup func(*backendtest.Fake)
+	}{
+		{"backend unavailable", func(f *backendtest.Fake) {
+			f.AddWindow("ttorch-fake", managerWindow, stallPane)
+			f.Unavailable = true
+		}},
+		{"no manager window", func(f *backendtest.Fake) { f.AddWindow("ttorch-fake", "wk-1", stallPane) }},
+		{"no session", func(*backendtest.Fake) {}},
+	} {
+		be := backendtest.New("ttorch-fake")
+		c.setup(be)
+		m := &orchestrator.Manager{Session: "ttorch-fake", Store: newStore(t), Pool: worktree.Pool{Max: 1}, Backend: be}
+		sc := New(m, DefaultInterval, nil)
+		if out, ok := sc.mgrPeek(40); ok {
+			t.Errorf("%s: mgrPeek = (%q, true), want unobservable", c.name, out)
+		}
 	}
 }
 

@@ -69,12 +69,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nution101/ttorch/internal/backend"
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/livestate"
 	"github.com/nution101/ttorch/internal/orchestrator"
 	"github.com/nution101/ttorch/internal/review"
 	"github.com/nution101/ttorch/internal/state"
-	"github.com/nution101/ttorch/internal/tmux"
 	"github.com/nution101/ttorch/internal/worktree"
 )
 
@@ -288,9 +288,9 @@ type Scheduler struct {
 	StallNudgeGrace time.Duration
 	MaxStallNudges  int
 
-	// mgrPeek / mgrSend reach the MANAGER tmux window for the stall-recovery pass. The manager
+	// mgrPeek / mgrSend reach the MANAGER window for the stall-recovery pass. The manager
 	// has no task row, so Fleet.Peek/Send (keyed by task id) cannot address it; these seams do.
-	// mgrPeek captures the manager pane (ok=false ⇒ unobservable — no tmux, the window is gone,
+	// mgrPeek captures the manager pane (ok=false ⇒ unobservable — no backend, the window is gone,
 	// or the pane could not be read — and is NEVER nudged); mgrSend types the fixed "continue"
 	// resume into it (it takes NO argument — the manager nudge is intrinsically the one resume word,
 	// so there is nothing to interpolate). A send is issued ONLY when the pane is APIStalled, so a
@@ -466,13 +466,18 @@ func New(m *orchestrator.Manager, interval time.Duration, log io.Writer) *Schedu
 	// "continue", exactly as it does a worker. The lead authorized resuming a stalled manager (it
 	// cannot nudge itself), and the increment-6 manager-injection invariant was evolved to
 	// allow-list precisely this one bounded resume nudge. See wireManagerStallNudgeSeams.
-	wireManagerStallNudgeSeams(sc, m.Session)
+	be := m.Backend
+	if be == nil {
+		be = backend.Tmux{} // a Manager built without orchestrator.New means tmux, as it does there
+	}
+	wireManagerStallNudgeSeams(sc, be, m.Session)
 	return sc
 }
 
 // wireManagerStallNudgeSeams installs the production manager-window stall-recovery seams on sc,
-// addressing the manager tmux window (session, managerWindow) — the SAME window
-// orchestrator.StartManager creates and internal/watch identifies.
+// addressing the manager window (session, managerWindow) through be, the Manager's session
+// backend — the SAME window, on the SAME host, that orchestrator.StartManager creates and
+// internal/watch identifies.
 //
 // This is the SOLE sanctioned path that types into the manager session (the increment-6 invariant
 // orchestrator.TestNoInjectionIntoManagerSession allow-lists exactly this file + function + payload).
@@ -487,19 +492,19 @@ func New(m *orchestrator.Manager, interval time.Duration, log io.Writer) *Schedu
 //     (turn ended at the prompt + a recoverable API-stall signature) and bounds it to MaxStallNudges
 //     per episode — so a working, streaming, or cleanly-idle manager is never injected into.
 //
-// mgrPeek mirrors the watcher's manager-pane capture: a transient probe failure (tmux unavailable,
+// mgrPeek mirrors the watcher's manager-pane capture: a transient probe failure (backend unavailable,
 // the window gone, or an unreadable pane) yields ok=false — unobservable, hence NEVER nudged — so a
 // hiccup can never be mistaken for a stall.
-func wireManagerStallNudgeSeams(sc *Scheduler, session string) {
+func wireManagerStallNudgeSeams(sc *Scheduler, be backend.Backend, session string) {
 	sc.mgrPeek = func(lines int) (string, bool) {
-		if !tmux.Available() {
+		if !be.Available() {
 			return "", false
 		}
-		exists, err := tmux.WindowExistsErr(session, managerWindow)
+		exists, err := be.WindowExistsErr(session, managerWindow)
 		if err != nil || !exists {
 			return "", false
 		}
-		out, err := tmux.CapturePane(session, managerWindow, lines)
+		out, err := be.CapturePane(session, managerWindow, lines)
 		if err != nil {
 			return "", false
 		}
@@ -509,7 +514,7 @@ func wireManagerStallNudgeSeams(sc *Scheduler, session string) {
 		// Fixed "continue" LITERAL (== stallNudgeText by value): see the doc above — a literal, not the
 		// constant identifier, is what lets the manager-injection invariant statically prove the pane
 		// can only ever receive the one recovery word.
-		return tmux.SendLine(session, managerWindow, "continue")
+		return be.SendLine(session, managerWindow, "continue")
 	}
 }
 

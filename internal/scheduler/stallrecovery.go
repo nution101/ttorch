@@ -16,13 +16,13 @@
 //
 // Manager window: the manager has no task row, so the per-task Fleet.Peek/Send cannot reach it.
 // The daemon — a SEPARATE process from the manager's harness — reads and nudges the manager pane
-// through the mgrPeek/mgrSend seams (the tmux window named "manager" on the Manager's session, the
+// through the mgrPeek/mgrSend seams (the window named "manager" on the Manager's session backend, the
 // SAME window orchestrator.StartManager and the watcher identify), sending ONLY when the pane is
 // APIStalled so a healthy manager is never injected into.
 //
 // The manager half is now LIVE in production: scheduler.New wires the seams (wireManagerStallNudgeSeams),
 // so a stalled manager — which cannot nudge itself — auto-recovers exactly like a worker. Nudging the
-// manager means a `tmux.SendLine` of "continue" INTO the manager window, which the increment-6 security
+// manager means a backend SendLine of "continue" INTO the manager window, which the increment-6 security
 // invariant TestNoInjectionIntoManagerSession (internal/orchestrator/inc6_test.go) once forbade
 // outright (after the supervisor's keystroke poke was retired, NO code could type into the manager
 // session). The lead authorized resuming a genuinely-stalled manager, and that invariant was EVOLVED to
