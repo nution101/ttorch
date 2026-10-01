@@ -18,6 +18,7 @@ import (
 	"bufio"
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -452,4 +453,65 @@ func validRefName(ref string) bool {
 		}
 	}
 	return true
+}
+
+// Kind is the shape of a task's working directory: a linked worktree of the lead's
+// repository, or a repository of its own.
+type Kind int
+
+const (
+	// KindUnknown is anything KindOf cannot place.
+	KindUnknown Kind = iota
+	// KindWorktree is a linked worktree: .git is a regular file naming its git dir.
+	KindWorktree
+	// KindClone is a repository of its own: .git is a directory.
+	KindClone
+)
+
+func (k Kind) String() string {
+	switch k {
+	case KindWorktree:
+		return "worktree"
+	case KindClone:
+		return "clone"
+	}
+	return "unknown"
+}
+
+// KindOf reports which kind of working directory dir is, from its .git entry alone: a
+// directory for a clone, a regular file for a linked worktree. It starts no process and
+// opens no file, so it is safe on a directory the worker controls, and a task's kind needs
+// no record of its own. Anything else is KindUnknown with an error saying why, and that
+// includes dir or its .git being a symlink: dir is the path ttorch recorded, and as in
+// ObserveHead a link swapped in there is refused rather than followed.
+//
+// The answer comes from the worker's files, so like ObserveHead's it is the worker's claim:
+// a worker can turn its clone's .git into a file and its task then reads as a worktree. The
+// lead's own checkout has a .git directory too, so a caller that can be handed one (a cc
+// session opened without isolation records its cwd) must not take KindClone to mean ttorch
+// provisioned the directory.
+func KindOf(dir string) (Kind, error) {
+	if dir == "" {
+		return KindUnknown, errors.New("no working directory recorded")
+	}
+	dir = filepath.Clean(dir)
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return KindUnknown, err
+	}
+	if !fi.IsDir() {
+		return KindUnknown, fmt.Errorf("%s is not a directory (mode %s)", dir, fi.Mode().Type())
+	}
+	dotgit := filepath.Join(dir, ".git")
+	gi, err := os.Lstat(dotgit)
+	if err != nil {
+		return KindUnknown, err
+	}
+	switch {
+	case gi.IsDir():
+		return KindClone, nil
+	case gi.Mode().IsRegular():
+		return KindWorktree, nil
+	}
+	return KindUnknown, fmt.Errorf("%s is neither a directory nor a regular file (mode %s)", dotgit, gi.Mode().Type())
 }
