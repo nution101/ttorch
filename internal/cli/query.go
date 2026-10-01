@@ -413,11 +413,16 @@ func cmdProjectAdd(args []string) error {
 // recordProjectDefaultBranch records the default branch the trust gate reads for proj when
 // none is recorded, taking it from the lead's checkout (worktree.DetectDefaultBranch), and
 // returns the branch recorded now. A recorded branch is kept: only `ttorch project set-branch`
-// changes it. When no branch can be detected it returns "" and why, and the gate refuses the
-// project until the lead records one.
+// changes it. The write sits behind the caller guard set-branch uses (checkLeadCaller), so a
+// worker's context or a caller without a terminal registers the project but records no branch.
+// When it records none it returns "" and why, and the gate refuses the project until the lead
+// records one.
 func recordProjectDefaultBranch(ctx context.Context, store *db.Store, proj db.Project) (branch string, why, err error) {
 	if proj.DefaultBranch != "" {
 		return proj.DefaultBranch, nil, nil
+	}
+	if gerr := checkLeadCaller("record the default branch the trust gate reads", os.Stdin); gerr != nil {
+		return "", gerr, nil
 	}
 	b, derr := worktree.DetectDefaultBranch(proj.RepoPath)
 	if derr != nil {

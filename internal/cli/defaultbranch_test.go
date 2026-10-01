@@ -45,12 +45,13 @@ func gitInRepo(t *testing.T, dir string, args ...string) {
 	}
 }
 
-// TestCmdProjectAddRecordsDefaultBranch: registering a project records the branch its checkout
-// is on as the default branch the trust gate reads, and says so. Registering it again from
+// TestCmdProjectAddRecordsDefaultBranch: registering a project, as the lead at a terminal,
+// records the branch its checkout is on as the default branch the trust gate reads, and says so. Registering it again from
 // another branch keeps the recorded one.
 func TestCmdProjectAddRecordsDefaultBranch(t *testing.T) {
 	repo := branchedRepo(t, "develop")
 	dbPath := withSeedDB(t, nil)
+	asLeadAtATerminal(t)
 	out, err := captureStdout(t, func() error { return cmdProjectAdd([]string{repo}) })
 	if err != nil {
 		t.Fatal(err)
@@ -122,8 +123,9 @@ func TestCmdProjectSetBranch(t *testing.T) {
 	}
 }
 
-// TestCmdInitRecordsDefaultBranch: `ttorch init` in a registered repository with no recorded
-// branch records the one its checkout is on, and says which branch the gate reads.
+// TestCmdInitRecordsDefaultBranch: `ttorch init`, run by the lead at a terminal in a registered
+// repository with no recorded branch, records the one its checkout is on, and says which branch
+// the gate reads.
 func TestCmdInitRecordsDefaultBranch(t *testing.T) {
 	repo := branchedRepo(t, "trunk")
 	dbPath := withSeedDB(t, func(ctx context.Context, s *db.Store) {
@@ -131,6 +133,7 @@ func TestCmdInitRecordsDefaultBranch(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+	asLeadAtATerminal(t)
 	out, err := captureStdout(t, func() error { return cmdInit([]string{"-mode", "trusted", repo}) })
 	if err != nil {
 		t.Fatal(err)
@@ -182,5 +185,76 @@ func TestDefaultBranchNotices(t *testing.T) {
 	}
 	if !strings.Contains(second.String(), "no default branch is recorded for "+missing) {
 		t.Fatalf("a missing branch is named every time:\n%s", second.String())
+	}
+}
+
+// asLeadAtATerminal puts the test in the lead's context with stdin on a character device, which
+// is what the caller guard set-branch uses accepts.
+func asLeadAtATerminal(t *testing.T) {
+	t.Helper()
+	clearWorkerContext(t)
+	prev := os.Stdin
+	os.Stdin = openInteractiveDevice(t)
+	t.Cleanup(func() { os.Stdin = prev })
+}
+
+// TestRecordingTheBranchNeedsTheLead: project add and init write the recorded default branch
+// only behind the caller guard set-branch uses. From a worker's context, or without a terminal,
+// they still register the project and refresh the mode, leave the branch unrecorded, and say why.
+func TestRecordingTheBranchNeedsTheLead(t *testing.T) {
+	devNull := func(t *testing.T) {
+		t.Helper()
+		f, err := os.Open(os.DevNull)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = f.Close() })
+		prev := os.Stdin
+		os.Stdin = f
+		t.Cleanup(func() { os.Stdin = prev })
+	}
+	for _, c := range []struct {
+		name   string
+		setup  func(t *testing.T)
+		reason string
+	}{
+		{"from a worker context", func(t *testing.T) { asLeadAtATerminal(t); t.Setenv("TTORCH_TASK_ID", "w1") }, "worker context"},
+		{"without a terminal", func(t *testing.T) { clearWorkerContext(t); devNull(t) }, "interactive terminal"},
+	} {
+		t.Run("project add "+c.name, func(t *testing.T) {
+			repo := branchedRepo(t, "develop")
+			dbPath := withSeedDB(t, nil)
+			c.setup(t)
+			out, err := captureStdout(t, func() error { return cmdProjectAdd([]string{repo}) })
+			if err != nil {
+				t.Fatalf("project add must still register the project: %v", err)
+			}
+			if !strings.Contains(out, "default-branch=none") || !strings.Contains(out, c.reason) {
+				t.Fatalf("project add must say the branch was not recorded and why (%q), got %q", c.reason, out)
+			}
+			p, ok, err := reopen(t, dbPath).GetProjectByRepo(context.Background(), repo)
+			if err != nil || !ok || p.DefaultBranch != "" {
+				t.Fatalf("the project must be registered with no branch: %+v ok=%v err=%v", p, ok, err)
+			}
+		})
+		t.Run("init "+c.name, func(t *testing.T) {
+			repo := branchedRepo(t, "trunk")
+			dbPath := withSeedDB(t, func(ctx context.Context, s *db.Store) {
+				if _, err := s.UpsertProject(ctx, repo, ""); err != nil {
+					t.Fatal(err)
+				}
+			})
+			c.setup(t)
+			out, err := captureStdout(t, func() error { return cmdInit([]string{"-mode", "trusted", repo}) })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(out, "no default branch recorded") || !strings.Contains(out, c.reason) {
+				t.Fatalf("init must say the branch was not recorded and why (%q), got:\n%s", c.reason, out)
+			}
+			if p, _, _ := reopen(t, dbPath).GetProjectByRepo(context.Background(), repo); p.DefaultBranch != "" || p.DeliveryMode != "trusted" {
+				t.Fatalf("init must refresh the mode and leave the branch unrecorded: %+v", p)
+			}
+		})
 	}
 }
