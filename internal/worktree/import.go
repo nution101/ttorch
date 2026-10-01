@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -214,6 +215,35 @@ func gitFixesCVE202432004(major, minor, patch int) bool {
 	return patch >= min
 }
 
+// ImportGitOK reports whether `git version` output names a git the clone import runs on:
+// one that carries the CVE-2024-32004 fix by the table above. readable is false when no
+// version can be read from the output, which the import refuses too. It is the one
+// definition of the floor; `ttorch doctor` calls it so that doctor warns about exactly the
+// versions the import refuses.
+func ImportGitOK(versionOutput string) (ok, readable bool) {
+	major, minor, patch, readable := parseGitVersion(versionOutput)
+	if !readable {
+		return false, false
+	}
+	return gitFixesCVE202432004(major, minor, patch), true
+}
+
+// ImportGitFloor states the floor ImportGitOK enforces, for messages, built from the same
+// table: "2.45.1, or the backport for its series (2.39.4, 2.40.2, ...)".
+func ImportGitFloor() string {
+	series := make([]int, 0, len(cveFixedPatch))
+	for minor := range cveFixedPatch {
+		series = append(series, minor)
+	}
+	sort.Ints(series)
+	newest := series[len(series)-1]
+	var backports []string
+	for _, minor := range series[:len(series)-1] {
+		backports = append(backports, fmt.Sprintf("2.%d.%d", minor, cveFixedPatch[minor]))
+	}
+	return fmt.Sprintf("2.%d.%d, or the backport for its series (%s)", newest, cveFixedPatch[newest], strings.Join(backports, ", "))
+}
+
 // checkImportGit refuses a git that does not carry the CVE-2024-32004 fix, or whose version
 // cannot be read. On an unfixed git the clone's upload-pack would run a worker-chosen program
 // during the import, which no flag of the fetch can stop.
@@ -222,14 +252,14 @@ func checkImportGit(ctx context.Context, hooks string) error {
 	if err != nil {
 		return fmt.Errorf("import: %w", err)
 	}
-	major, minor, patch, ok := parseGitVersion(out)
-	if !ok {
+	ok, readable := ImportGitOK(out)
+	if !readable {
 		return fmt.Errorf("import: cannot read the git version from %q", escapeForTerminal(out))
 	}
-	if !gitFixesCVE202432004(major, minor, patch) {
-		return fmt.Errorf("import: git %d.%d.%d does not carry the fix for CVE-2024-32004; "+
-			"the import needs 2.45.1, or the backport for its series (2.39.4, 2.40.2, 2.41.1, 2.42.2, 2.43.4, 2.44.1)",
-			major, minor, patch)
+	if !ok {
+		major, minor, patch, _ := parseGitVersion(out)
+		return fmt.Errorf("import: git %d.%d.%d does not carry the fix for CVE-2024-32004; the import needs %s",
+			major, minor, patch, ImportGitFloor())
 	}
 	return nil
 }

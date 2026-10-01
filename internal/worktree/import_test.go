@@ -838,6 +838,43 @@ func TestGitFixesCVE202432004(t *testing.T) {
 	}
 }
 
+// TestImportGitOK: the exported check accepts exactly what gitFixesCVE202432004 accepts, read
+// from `git version` output, and reports output it cannot read as unreadable.
+func TestImportGitOK(t *testing.T) {
+	for _, c := range []struct {
+		out          string
+		ok, readable bool
+	}{
+		{"git version 2.50.1 (vendor build 155)", true, true},
+		{"git version 2.45.1", true, true},
+		{"git version 2.45.0", false, true},
+		{"git version 2.45.0.rc1.17.gabcdef0", false, true},
+		{"git version 2.44.1", true, true},
+		{"git version 2.43.4", true, true},
+		{"git version 2.43.0", false, true},
+		{"git version 2.39.4", true, true},
+		{"git version 2.38.9", false, true},
+		{"git version 2.32.0\n", false, true},
+		{"git version 2.46.0.windows.1", true, true},
+		{"git version x.y.z", false, false},
+		{"", false, false},
+	} {
+		ok, readable := ImportGitOK(c.out)
+		if ok != c.ok || readable != c.readable {
+			t.Errorf("ImportGitOK(%q) = %v, %v; want %v, %v", c.out, ok, readable, c.ok, c.readable)
+		}
+	}
+}
+
+// TestImportGitFloor: the floor text is built from the same table the check reads, newest
+// series first and every backport after it.
+func TestImportGitFloor(t *testing.T) {
+	want := "2.45.1, or the backport for its series (2.39.4, 2.40.2, 2.41.1, 2.42.2, 2.43.4, 2.44.1)"
+	if got := ImportGitFloor(); got != want {
+		t.Errorf("ImportGitFloor() = %q, want %q", got, want)
+	}
+}
+
 // TestDropImports_DeletesOnlyThatTasksRefs: dropping a task's imports deletes every ref under
 // its directory in CloneRefs, imports and the other refs kept there alike, and nothing of a
 // task whose id merely starts the same way, nor any ref outside the namespace. main's hooks do
