@@ -99,7 +99,7 @@ func TestGitEnvForCloneSlot(t *testing.T) {
 	slot := cloneSlot(t, "repo-0123abcd", "3")
 	pool := filepath.Dir(slot)
 	got := GitEnvFor(slot)
-	want := WorkerGitEnv{CeilingDirectories: clonesRoot(), ConfigGlobal: filepath.Join(pool, ".global-3")}
+	want := WorkerGitEnv{CeilingDirectories: clonesRoot(), ConfigGlobal: filepath.Join(pool, ".global-3"), ConfigSystem: filepath.Join(pool, ".system-3")}
 	if got != want {
 		t.Fatalf("GitEnvFor(clone slot) = %+v, want %+v", got, want)
 	}
@@ -182,6 +182,7 @@ func TestCloneWorkerGitEnvOnEveryRoute(t *testing.T) {
 	slot := cloneSlot(t, "repo-0123abcd", "7")
 	pool := filepath.Dir(slot)
 	global := filepath.Join(pool, ".global-7")
+	system := filepath.Join(pool, ".system-7")
 
 	if err := WriteWorkerSettings("claude", slot); err != nil {
 		t.Fatal(err)
@@ -190,14 +191,16 @@ func TestCloneWorkerGitEnvOnEveryRoute(t *testing.T) {
 	if !ok {
 		t.Fatalf("clone worker settings have no env block")
 	}
-	if env[envGitCeiling] != clonesRoot() || env[envGitGlobal] != global || len(env) != 2 {
-		t.Errorf("settings env = %v, want %s=%s and %s=%s only", env, envGitCeiling, clonesRoot(), envGitGlobal, global)
+	if env[envGitCeiling] != clonesRoot() || env[envGitGlobal] != global || env[envGitSystem] != system || len(env) != 3 {
+		t.Errorf("settings env = %v, want %s=%s, %s=%s and %s=%s only", env, envGitCeiling, clonesRoot(), envGitGlobal, global, envGitSystem, system)
 	}
-	if _, err := os.Stat(global); err != nil {
-		t.Errorf("private global config not written: %v", err)
+	for _, f := range []string{global, system} {
+		if _, err := os.Stat(f); err != nil {
+			t.Errorf("private config not written: %v", err)
+		}
 	}
 
-	gitEnv := envGitCeiling + "=" + shq(clonesRoot()) + " " + envGitGlobal + "=" + shq(global) + " "
+	gitEnv := envGitCeiling + "=" + shq(clonesRoot()) + " " + envGitGlobal + "=" + shq(global) + " " + envGitSystem + "=" + shq(system) + " "
 	if got, want := WorkerLaunchPrefix("t1", "/db", slot), "TTORCH_TASK_ID='t1' TTORCH_DB='/db' "+gitEnv; got != want {
 		t.Errorf("launch prefix:\n got %q\nwant %q", got, want)
 	}
@@ -369,7 +372,7 @@ func TestPrivateGlobalConfigIncludes(t *testing.T) {
 	if got := leadGlobalConfigs(); len(got) != 1 || got[0] != odd {
 		t.Errorf("with GIT_CONFIG_GLOBAL set git reads only that file; includes = %q", got)
 	}
-	body, err := privateGlobalConfig([]string{odd})
+	body, err := privateConfig("global", []string{odd})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,7 +383,7 @@ func TestPrivateGlobalConfigIncludes(t *testing.T) {
 	if got := mustGit(t, gitIsolatedEnv(), root, "config", "--file", f, "--get", "include.path"); got != odd {
 		t.Errorf("include.path read back as %q, want %q", got, odd)
 	}
-	if _, err := privateGlobalConfig([]string{"/a\nb"}); err == nil {
+	if _, err := privateConfig("global", []string{"/a\nb"}); err == nil {
 		t.Errorf("a path with a newline must be refused, not written into the config")
 	}
 }
@@ -417,5 +420,112 @@ func TestCeilingStopsDiscoveryAbovePool(t *testing.T) {
 	}
 	if got := mustGit(t, withCeiling, sub, "rev-parse", "--show-toplevel"); got != slot {
 		t.Errorf("inside the clone the ceiling must change nothing: got %q, want %q", got, slot)
+	}
+	// The documented limit: git ignores a ceiling equal to the directory it runs from, so from
+	// the clones root itself discovery still reaches the ancestor repository.
+	if got := mustGit(t, withCeiling, clonesRoot(), "rev-parse", "--show-toplevel"); got != root {
+		t.Errorf("from the clones root git should still find the ancestor (git's ceiling rule); got %q", got)
+	}
+}
+
+// stubSystemConfig points the system-config discovery at path for the test.
+func stubSystemConfig(t *testing.T, path string) {
+	t.Helper()
+	old := systemConfigPath
+	t.Cleanup(func() { systemConfigPath = old })
+	systemConfigPath = func() string { return path }
+}
+
+// TestPrivateSystemConfigAbsorbsSystemWrites: under the env block a clone worker is given,
+// `git config --system` writes the slot's private system file, not the system file every git
+// process on the machine reads, while the system file's settings still apply through the
+// include. The test's own GIT_CONFIG_SYSTEM is a decoy that the worker env must override, so a
+// regression writes the decoy and never the machine's real system config.
+func TestPrivateSystemConfigAbsorbsSystemWrites(t *testing.T) {
+	root := realTempDir(t)
+	t.Setenv("HOME", root)
+	t.Setenv("GIT_CONFIG_GLOBAL", "")
+	t.Setenv("GIT_CONFIG_SYSTEM", "")
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "")
+	t.Setenv("TTORCH_HOME", filepath.Join(root, ".ttorch"))
+	realSystem := filepath.Join(root, "etc-gitconfig")
+	const systemBody = "[ttorchtest]\n\tfromsystem = yes\n"
+	if err := os.WriteFile(realSystem, []byte(systemBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stubSystemConfig(t, realSystem)
+	decoy := filepath.Join(root, "decoy-system")
+	slot := cloneSlot(t, "repo-0123abcd", "1")
+	if err := WriteWorkerSettings("claude", slot); err != nil {
+		t.Fatal(err)
+	}
+	settingsEnv, _ := readSettingsEnv(t, slot)
+	workerEnv := append(envWithoutGit(), "GIT_CONFIG_SYSTEM="+decoy)
+	workerEnv = append(workerEnv, envList(settingsEnv)...)
+
+	if got, _ := runGit(t, workerEnv, slot, "config", "ttorchtest.fromsystem"); got != "yes" {
+		t.Errorf("the system config's settings should apply through the include; got %q", got)
+	}
+	mustGit(t, workerEnv, slot, "config", "--system", "core.fsmonitor", "echo planted")
+	if b, _ := os.ReadFile(realSystem); string(b) != systemBody {
+		t.Errorf("git config --system changed the real system file:\n%s", b)
+	}
+	if _, err := os.Stat(decoy); !os.IsNotExist(err) {
+		t.Errorf("git config --system wrote outside the private file (decoy stat err = %v)", err)
+	}
+	priv, err := os.ReadFile(settingsEnv[envGitSystem])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(priv), "planted") {
+		t.Errorf("git config --system did not land in the private file:\n%s", priv)
+	}
+}
+
+// TestLeadSystemConfigs: the include follows what the lead's git reads at the system level.
+func TestLeadSystemConfigs(t *testing.T) {
+	stubSystemConfig(t, "/compiled/in/gitconfig")
+	t.Setenv("GIT_CONFIG_SYSTEM", "")
+	for _, v := range []string{"1", "true", "yes", "on", "2"} {
+		t.Setenv("GIT_CONFIG_NOSYSTEM", v)
+		if got := leadSystemConfigs(); got != nil {
+			t.Errorf("GIT_CONFIG_NOSYSTEM=%s: git reads no system config, includes = %q", v, got)
+		}
+	}
+	for _, v := range []string{"", "0", "false", "no", "off"} {
+		t.Setenv("GIT_CONFIG_NOSYSTEM", v)
+		if got := leadSystemConfigs(); len(got) != 1 || got[0] != "/compiled/in/gitconfig" {
+			t.Errorf("GIT_CONFIG_NOSYSTEM=%q: includes = %q, want git's compiled-in path", v, got)
+		}
+	}
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "")
+	t.Setenv("GIT_CONFIG_SYSTEM", "/lead/system")
+	if got := leadSystemConfigs(); len(got) != 1 || got[0] != "/lead/system" {
+		t.Errorf("with GIT_CONFIG_SYSTEM set git reads only that file; includes = %q", got)
+	}
+	t.Setenv("GIT_CONFIG_SYSTEM", "")
+	stubSystemConfig(t, "")
+	if got := leadSystemConfigs(); got != nil {
+		t.Errorf("when git cannot say where its system config is, include nothing; got %q", got)
+	}
+}
+
+// TestSystemConfigPathAsksGit: the real discovery returns an absolute path and leaves whatever
+// is at that path as it was (git seeds a missing file only for --global).
+func TestSystemConfigPathAsksGit(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	p := systemConfigPath()
+	if !filepath.IsAbs(p) {
+		t.Fatalf("systemConfigPath() = %q, want an absolute path", p)
+	}
+	before, beforeErr := os.Lstat(p)
+	if again := systemConfigPath(); again != p {
+		t.Errorf("systemConfigPath is not stable: %q then %q", p, again)
+	}
+	after, afterErr := os.Lstat(p)
+	if os.IsNotExist(beforeErr) != os.IsNotExist(afterErr) || (beforeErr == nil && !after.ModTime().Equal(before.ModTime())) {
+		t.Errorf("asking git for the system config path changed %s", p)
 	}
 }

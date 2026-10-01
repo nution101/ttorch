@@ -413,9 +413,9 @@ func shq(s string) string {
 // end for the hook liveness signal. They sit in their own hook groups, so the Stop hook's
 // entry is the same as before they existed.
 //
-// When worktree is a per-worker clone it also writes the slot's private global git config and
-// puts the worker's git environment (GitEnvFor) in the settings env block, which outlives the
-// launch prefix across a resume. Any other directory gets no env block.
+// When worktree is a per-worker clone it also rewrites the slot's private global and system git
+// config and puts the worker's git environment (GitEnvFor) in the settings env block, which
+// outlives the launch prefix across a resume. Any other directory gets no env block.
 func WriteWorkerSettings(kind, worktree string) error {
 	if kind != "claude" {
 		return nil
@@ -450,7 +450,7 @@ func WriteWorkerSettings(kind, worktree string) error {
 			})
 		}
 	}
-	env, err := settingsEnv(worktree)
+	env, err := prepareWorkerGitEnv(worktree)
 	if err != nil {
 		return err
 	}
