@@ -7,13 +7,13 @@ import (
 	"strconv"
 )
 
-const projectColumns = `id, repo_path, name, delivery_mode, status, owner, default_branch, default_branch_seed, last_landed_sha, created_at, updated_at`
+const projectColumns = `id, repo_path, name, delivery_mode, status, owner, default_branch, default_branch_seed, last_landed_sha, origin_url, created_at, updated_at`
 
 func scanProject(sc rowScanner) (Project, error) {
 	var p Project
 	var createdAt, updatedAt string
 	if err := sc.Scan(&p.ID, &p.RepoPath, &p.Name, &p.DeliveryMode, &p.Status, &p.Owner,
-		&p.DefaultBranch, &p.DefaultBranchSeed, &p.LastLandedSHA, &createdAt, &updatedAt); err != nil {
+		&p.DefaultBranch, &p.DefaultBranchSeed, &p.LastLandedSHA, &p.OriginURL, &createdAt, &updatedAt); err != nil {
 		return Project{}, err
 	}
 	var err error
@@ -119,31 +119,33 @@ func (s *Store) SetProjectModeByRepo(ctx context.Context, repoPath, mode string)
 }
 
 // SetProjectDefaultBranch records branch as the default branch the trust gate reads for
-// project id, replacing any branch already recorded and clearing a pending seed or notice. It
-// is the write behind `ttorch project set-branch`, which is the lead's to run.
-func (s *Store) SetProjectDefaultBranch(ctx context.Context, id int64, branch string) error {
+// project id, and originURL as the URL origin resolves to, replacing any recorded and clearing
+// a pending seed or notice. It is the write behind `ttorch project set-branch`, which is the
+// lead's to run.
+func (s *Store) SetProjectDefaultBranch(ctx context.Context, id int64, branch, originURL string) error {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE projects SET default_branch = ?, default_branch_seed = '', updated_at = ? WHERE id = ?`,
-		branch, formatTime(s.now()), id)
+		`UPDATE projects SET default_branch = ?, origin_url = ?, default_branch_seed = '', updated_at = ? WHERE id = ?`,
+		branch, originURL, formatTime(s.now()), id)
 	if err != nil {
 		return err
 	}
 	return requireRows(res, fmt.Sprintf("project %d", id))
 }
 
-// FillProjectDefaultBranch records branch for project id only while none is recorded, and
-// reports whether it wrote. A recorded branch is never replaced here, so registering a project
-// again, or seeding one twice, cannot move the branch the gate reads. notice marks the branch
-// for the one-time line `ttorch update` and `ttorch doctor` print (see
-// DefaultBranchSeedNotice); a caller that shows the branch itself passes false.
-func (s *Store) FillProjectDefaultBranch(ctx context.Context, id int64, branch string, notice bool) (bool, error) {
+// FillProjectDefaultBranch records branch, and originURL as the URL origin resolves to, for
+// project id only while no branch is recorded, and reports whether it wrote. A recorded branch
+// is never replaced here, so registering a project again, or seeding one twice, cannot move the
+// branch the gate reads or the origin it is compared against. notice marks the branch for the
+// one-time line `ttorch update` and `ttorch doctor` print (see DefaultBranchSeedNotice); a
+// caller that shows the branch itself passes false.
+func (s *Store) FillProjectDefaultBranch(ctx context.Context, id int64, branch, originURL string, notice bool) (bool, error) {
 	seed := ""
 	if notice {
 		seed = DefaultBranchSeedNotice
 	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE projects SET default_branch = ?, default_branch_seed = ?, updated_at = ? WHERE id = ? AND default_branch = ''`,
-		branch, seed, formatTime(s.now()), id)
+		`UPDATE projects SET default_branch = ?, origin_url = ?, default_branch_seed = ?, updated_at = ? WHERE id = ? AND default_branch = ''`,
+		branch, originURL, seed, formatTime(s.now()), id)
 	if err != nil {
 		return false, err
 	}

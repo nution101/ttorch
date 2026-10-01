@@ -28,7 +28,7 @@ func TestMigration0010MarksExistingProjectsForSeeding(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("GetProjectByRepo(/old): ok=%v err=%v", ok, err)
 	}
-	if old.DefaultBranch != "" || old.DefaultBranchSeed != DefaultBranchSeedPending || old.LastLandedSHA != "" {
+	if old.DefaultBranch != "" || old.DefaultBranchSeed != DefaultBranchSeedPending || old.LastLandedSHA != "" || old.OriginURL != "" {
 		t.Fatalf("a project from before 0010 must await a seed with no branch: %+v", old)
 	}
 	fresh, err := s.UpsertProject(ctx, "/new", "")
@@ -50,8 +50,8 @@ func TestMigration0010MarksExistingProjectsForSeeding(t *testing.T) {
 }
 
 // TestFillProjectDefaultBranch proves a fill writes only while no branch is recorded, so
-// registering or seeding a project again can never move the branch the gate reads, and that
-// the notice flag is set only when asked for.
+// registering or seeding a project again can never move the branch the gate reads or the origin
+// URL recorded with it, and that the notice flag is set only when asked for.
 func TestFillProjectDefaultBranch(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
@@ -59,11 +59,11 @@ func TestFillProjectDefaultBranch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wrote, err := s.FillProjectDefaultBranch(ctx, p.ID, "develop", true)
+	wrote, err := s.FillProjectDefaultBranch(ctx, p.ID, "develop", "https://example.com/a.git", true)
 	if err != nil || !wrote {
 		t.Fatalf("first fill: wrote=%v err=%v", wrote, err)
 	}
-	wrote, err = s.FillProjectDefaultBranch(ctx, p.ID, "main", false)
+	wrote, err = s.FillProjectDefaultBranch(ctx, p.ID, "main", "https://example.com/b.git", false)
 	if err != nil || wrote {
 		t.Fatalf("a second fill must not replace a recorded branch: wrote=%v err=%v", wrote, err)
 	}
@@ -71,19 +71,19 @@ func TestFillProjectDefaultBranch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.DefaultBranch != "develop" || got.DefaultBranchSeed != DefaultBranchSeedNotice {
-		t.Fatalf("got %+v, want develop with a pending notice", got)
+	if got.DefaultBranch != "develop" || got.OriginURL != "https://example.com/a.git" || got.DefaultBranchSeed != DefaultBranchSeedNotice {
+		t.Fatalf("got %+v, want develop and the first origin with a pending notice", got)
 	}
 
 	// The lead's set replaces it and clears the notice.
-	if err := s.SetProjectDefaultBranch(ctx, p.ID, "trunk"); err != nil {
+	if err := s.SetProjectDefaultBranch(ctx, p.ID, "trunk", ""); err != nil {
 		t.Fatal(err)
 	}
 	got, _, _ = s.GetProject(ctx, p.ID)
-	if got.DefaultBranch != "trunk" || got.DefaultBranchSeed != "" {
-		t.Fatalf("after set: %+v, want trunk with no notice", got)
+	if got.DefaultBranch != "trunk" || got.OriginURL != "" || got.DefaultBranchSeed != "" {
+		t.Fatalf("after set: %+v, want trunk and no origin with no notice", got)
 	}
-	if err := s.SetProjectDefaultBranch(ctx, 9999, "x"); err == nil {
+	if err := s.SetProjectDefaultBranch(ctx, 9999, "x", ""); err == nil {
 		t.Fatal("setting the branch of a missing project must fail")
 	}
 
@@ -92,7 +92,7 @@ func TestFillProjectDefaultBranch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.FillProjectDefaultBranch(ctx, q.ID, "main", false); err != nil {
+	if _, err := s.FillProjectDefaultBranch(ctx, q.ID, "main", "", false); err != nil {
 		t.Fatal(err)
 	}
 	got, _, _ = s.GetProject(ctx, q.ID)

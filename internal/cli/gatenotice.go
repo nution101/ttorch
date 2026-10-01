@@ -21,14 +21,15 @@ import (
 // changed; it names every git project with no default branch recorded, since the gate refuses
 // those; and it names every trusted project whose default branch has no gate-change-approval
 // line, since the human gate-change approval became off by default and installing a binary
-// with that default silently drops the approval for exactly those. It is best-effort and silent
-// on any read failure, and it never creates the state database.
+// with that default silently drops the approval for exactly those. With status (doctor), it
+// also prints, every time, what the gate reads for each trusted project (printGateStatus). It is
+// best-effort and silent on any read failure, and it never creates the state database.
 //
 // From a worker's context (harness.WorkerContextSignal) it prints the same lines and writes
 // nothing: the seed does not run and a notice is not cleared, so a worker that runs doctor in
 // its own pane neither records a branch from refs it can write nor uses up the notice meant for
 // the lead.
-func printGateNotices(w io.Writer, p paths.Paths) {
+func printGateNotices(w io.Writer, p paths.Paths, status bool) {
 	if _, err := os.Stat(p.StateDB()); err != nil {
 		return
 	}
@@ -47,6 +48,10 @@ func printGateNotices(w io.Writer, p paths.Paths) {
 		return
 	}
 	for _, proj := range projects {
+		shown := status && projectIsTrusted(proj)
+		if shown {
+			printGateStatus(w, proj)
+		}
 		switch {
 		case proj.DefaultBranchSeed == db.DefaultBranchSeedNotice && proj.DefaultBranch != "":
 			fmt.Fprintf(w, "recorded %s as the default branch the trust gate reads for %s; if that is wrong, run '%s %d <branch>'\n",
@@ -54,7 +59,7 @@ func printGateNotices(w io.Writer, p paths.Paths) {
 			if lead {
 				_ = store.SetProjectDefaultBranchSeed(ctx, proj.ID, "")
 			}
-		case proj.DefaultBranch == "" && isRepoRoot(proj.RepoPath):
+		case proj.DefaultBranch == "" && !shown && isRepoRoot(proj.RepoPath):
 			fmt.Fprintf(w, "no default branch is recorded for %s, so the trust gate refuses it; run '%s %d <branch>'\n",
 				proj.RepoPath, orchestrator.SetBranchCommand, proj.ID)
 		}
@@ -62,6 +67,66 @@ func printGateNotices(w io.Writer, p paths.Paths) {
 			fmt.Fprintf(w, "gate-change approval is now off by default for %s; add '- gate-change-approval: required' to its AGENTS.md to keep it\n", proj.RepoPath)
 		}
 	}
+}
+
+// projectIsTrusted reports whether doctor shows proj's gate status: its cached delivery mode or
+// the mode its checkout's AGENTS.md records is trusted. Either is enough, so a worker that edits
+// one of them does not drop the project from the status.
+func projectIsTrusted(proj db.Project) bool {
+	if proj.DeliveryMode == "trusted" {
+		return true
+	}
+	mode, ok := projectinit.LiveMode(proj.RepoPath)
+	return ok && mode == "trusted"
+}
+
+// printGateStatus prints what the trust gate reads for proj: the recorded default branch and
+// the commit it is at now, the commit the last land left it at, and the URL origin resolves to.
+// A worker can move the branch and rewrite origin from its own worktree, since refs and git
+// config are shared by every linked worktree, and nothing in ttorch prevents that (see "Known
+// limit: shared git state" in docs/ARCHITECTURE.md). This is where the lead checks them. It
+// warns when the branch no longer contains the last landed commit, and when origin differs from
+// the URL recorded with the branch. It reads only.
+func printGateStatus(w io.Writer, proj db.Project) {
+	fmt.Fprintf(w, "trust gate for %s (project %d):\n", proj.RepoPath, proj.ID)
+	var warnings []string
+	switch base, err := worktree.ResolveGateBase(proj.RepoPath, proj.DefaultBranch); {
+	case proj.DefaultBranch == "":
+		fmt.Fprintf(w, "  default branch: none recorded, so the trust gate refuses it; run '%s %d <branch>'\n",
+			orchestrator.SetBranchCommand, proj.ID)
+	case err != nil:
+		fmt.Fprintf(w, "  default branch: %s, which has no commit at refs/heads/%s, so the trust gate refuses it\n", proj.DefaultBranch, proj.DefaultBranch)
+	default:
+		fmt.Fprintf(w, "  default branch: %s at %s\n", proj.DefaultBranch, base.SHA)
+		if warn := orchestrator.LastLandedWarning(proj.RepoPath, proj.LastLandedSHA, base); warn != "" {
+			warnings = append(warnings, warn)
+		}
+	}
+	if proj.LastLandedSHA != "" {
+		fmt.Fprintf(w, "  last landed: %s\n", proj.LastLandedSHA)
+	} else {
+		fmt.Fprintln(w, "  last landed: none recorded")
+	}
+	origin := worktree.OriginURL(proj.RepoPath)
+	fmt.Fprintf(w, "  origin: %s\n", originForDisplay(origin))
+	if proj.DefaultBranch != "" && origin != proj.OriginURL {
+		warnings = append(warnings, fmt.Sprintf(
+			"warning: origin is %s, but it was %s when the default branch was recorded; the gate fetches and checks the land base against origin, and a worker can rewrite it. If you changed it, record it again with '%s %d %s'",
+			originForDisplay(origin), originForDisplay(proj.OriginURL), orchestrator.SetBranchCommand, proj.ID, proj.DefaultBranch))
+	}
+	for _, warn := range warnings {
+		fmt.Fprintf(w, "  %s\n", warn)
+	}
+}
+
+// originForDisplay renders an origin URL for the terminal: "none" for a repository without
+// one, and otherwise the URL with control characters escaped, since it comes from git config a
+// worker can write.
+func originForDisplay(url string) string {
+	if url == "" {
+		return "none"
+	}
+	return worktree.EscapeForTerminal(url)
 }
 
 // isRepoRoot reports whether dir is the top level of a git repository. Project rows are keyed

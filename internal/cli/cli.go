@@ -219,7 +219,7 @@ func cmdDoctor(args []string) error {
 		return err
 	}
 	err := doctor.Run(os.Stdout, os.Stdin, *yes)
-	printGateNotices(os.Stdout, paths.Default())
+	printGateNotices(os.Stdout, paths.Default(), true)
 	return err
 }
 
@@ -231,7 +231,7 @@ func cmdInstall() error {
 	}
 	printResult(os.Stdout, res)
 	fmt.Printf("Installed into %s and %s.\n", p.Claude, p.Agents)
-	printGateNotices(os.Stdout, p)
+	printGateNotices(os.Stdout, p, false)
 	return nil
 }
 
@@ -2296,7 +2296,7 @@ func reapplyContent(p paths.Paths) error {
 		return err
 	}
 	printResult(os.Stdout, res)
-	printGateNotices(os.Stdout, p)
+	printGateNotices(os.Stdout, p, false)
 	return nil
 }
 

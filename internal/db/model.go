@@ -109,8 +109,11 @@ type Project struct {
 	DefaultBranchSeed string
 	// LastLandedSHA is the commit the last successful land left the default branch at.
 	LastLandedSHA string
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	// OriginURL is the URL origin resolved to when DefaultBranch was recorded, '' when the
+	// repository had no origin then. `ttorch doctor` says when origin no longer matches it.
+	OriginURL string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // The DefaultBranchSeed states.

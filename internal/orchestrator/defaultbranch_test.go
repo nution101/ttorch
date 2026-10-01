@@ -37,6 +37,7 @@ func TestSeedDefaultBranches(t *testing.T) {
 	s := openTestStore(t)
 	pending := newRepoMain(t)
 	gitIn(t, pending, "checkout", "-q", "-b", "develop")
+	gitIn(t, pending, "remote", "add", "origin", "https://example.com/team/pending.git")
 	detached := newRepoMain(t)
 	gitIn(t, detached, "checkout", "-q", "--detach")
 	notARepo := t.TempDir()
@@ -54,7 +55,7 @@ func TestSeedDefaultBranches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetProjectDefaultBranch(ctx, sp.ID, "main"); err != nil {
+	if err := s.SetProjectDefaultBranch(ctx, sp.ID, "main", ""); err != nil {
 		t.Fatal(err)
 	}
 	gitIn(t, settled, "checkout", "-q", "-b", "elsewhere")
@@ -62,8 +63,8 @@ func TestSeedDefaultBranches(t *testing.T) {
 	if err := SeedDefaultBranches(ctx, s); err != nil {
 		t.Fatal(err)
 	}
-	if p := projectByRepo(t, s, pending); p.DefaultBranch != "develop" || p.DefaultBranchSeed != db.DefaultBranchSeedNotice {
-		t.Fatalf("pending project: %+v, want develop with a notice", p)
+	if p := projectByRepo(t, s, pending); p.DefaultBranch != "develop" || p.OriginURL != "https://example.com/team/pending.git" || p.DefaultBranchSeed != db.DefaultBranchSeedNotice {
+		t.Fatalf("pending project: %+v, want develop and its origin with a notice", p)
 	}
 	for _, r := range []string{detached, notARepo} {
 		if p := projectByRepo(t, s, r); p.DefaultBranch != "" || p.DefaultBranchSeed != "" {
@@ -94,9 +95,10 @@ func TestRegisterDefaultBranch(t *testing.T) {
 	m := &Manager{Store: s}
 
 	fresh := newRepoMain(t)
+	gitIn(t, fresh, "remote", "add", "origin", "https://example.com/team/fresh.git")
 	m.registerDefaultBranch(ctx, fresh)
-	if p := projectByRepo(t, s, fresh); p.DefaultBranch != "main" || p.DefaultBranchSeed != db.DefaultBranchSeedNotice {
-		t.Fatalf("a new project must get its checkout's branch with a notice: %+v", p)
+	if p := projectByRepo(t, s, fresh); p.DefaultBranch != "main" || p.OriginURL != "https://example.com/team/fresh.git" || p.DefaultBranchSeed != db.DefaultBranchSeedNotice {
+		t.Fatalf("a new project must get its checkout's branch and origin with a notice: %+v", p)
 	}
 
 	// A recorded branch stays, whatever the checkout is on now.

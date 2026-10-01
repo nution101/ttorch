@@ -3776,7 +3776,7 @@ func TestGate_RefusesWithoutARecordedDefaultBranch(t *testing.T) {
 	if p.DefaultBranch != "main" {
 		t.Fatalf("setup: spawn must have recorded main, got %+v", p)
 	}
-	if err := m.Store.SetProjectDefaultBranch(context.Background(), p.ID, ""); err != nil {
+	if err := m.Store.SetProjectDefaultBranch(context.Background(), p.ID, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.TrustPrep("nb1"); err == nil || !strings.Contains(err.Error(), "no default branch is recorded") || !strings.Contains(err.Error(), SetBranchCommand) {
@@ -3793,7 +3793,7 @@ func TestGate_RefusesWithoutARecordedDefaultBranch(t *testing.T) {
 	if gitIn(t, repo, "rev-parse", "refs/heads/main") != defHead {
 		t.Fatal("nothing may merge without a recorded default branch")
 	}
-	if err := m.Store.SetProjectDefaultBranch(context.Background(), p.ID, "gone"); err != nil {
+	if err := m.Store.SetProjectDefaultBranch(context.Background(), p.ID, "gone", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.TrustPrep("nb1"); err == nil || !strings.Contains(err.Error(), "refs/heads/gone") {

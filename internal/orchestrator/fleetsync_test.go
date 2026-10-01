@@ -31,7 +31,7 @@ func fleetSyncRepo(t *testing.T) (m *Manager, repo, wt, workerTip string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetProjectDefaultBranch(context.Background(), p.ID, "main"); err != nil {
+	if err := s.SetProjectDefaultBranch(context.Background(), p.ID, "main", ""); err != nil {
 		t.Fatal(err)
 	}
 	wt = filepath.Join(t.TempDir(), "wt")
@@ -112,7 +112,7 @@ func TestFleetSync_NoRecordedBranchSkipsTheFastForward(t *testing.T) {
 	m, repo, _, _ := fleetSyncRepo(t)
 	root := gitIn(t, repo, "rev-parse", "--show-toplevel")
 	p := projectByRepo(t, m.Store, root)
-	if err := m.Store.SetProjectDefaultBranch(context.Background(), p.ID, ""); err != nil {
+	if err := m.Store.SetProjectDefaultBranch(context.Background(), p.ID, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	notes, err := m.FleetSync(repo)

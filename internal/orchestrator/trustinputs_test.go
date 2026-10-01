@@ -68,7 +68,7 @@ func trustHarness(t *testing.T, id, mode, gateBody string) (m *Manager, repo, wt
 		t.Fatal(err)
 	}
 	// Registration records the default branch the gate reads (see registerDefaultBranch).
-	if err := store.SetProjectDefaultBranch(context.Background(), proj.ID, "main"); err != nil {
+	if err := store.SetProjectDefaultBranch(context.Background(), proj.ID, "main", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.CreateTask(context.Background(), db.Task{

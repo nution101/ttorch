@@ -128,3 +128,20 @@ func TestNetworkCallsGiveUpOnAStalledRemote(t *testing.T) {
 		}
 	})
 }
+
+// TestOriginURL: the URL is the one git fetches from, so an insteadOf rule that redirects
+// remote.origin.url is applied, and a repository with no origin gives "".
+func TestOriginURL(t *testing.T) {
+	repo, _, _, _ := gateBaseRepo(t)
+	if got := OriginURL(repo); got != "" {
+		t.Fatalf("OriginURL with no origin = %q, want empty", got)
+	}
+	gitT(t, repo, "remote", "add", "origin", "https://example.com/team/repo.git")
+	if got := OriginURL(repo); got != "https://example.com/team/repo.git" {
+		t.Fatalf("OriginURL = %q", got)
+	}
+	gitT(t, repo, "config", "url.https://example.com/elsewhere/.insteadOf", "https://example.com/team/")
+	if got := OriginURL(repo); got != "https://example.com/elsewhere/repo.git" {
+		t.Fatalf("OriginURL under an insteadOf rule = %q, want the rewritten URL", got)
+	}
+}

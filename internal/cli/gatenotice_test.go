@@ -70,13 +70,13 @@ func TestGateChangeApprovalNotices(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := s.SetProjectDefaultBranch(ctx, p.ID, "main"); err != nil {
+			if err := s.SetProjectDefaultBranch(ctx, p.ID, "main", ""); err != nil {
 				t.Fatal(err)
 			}
 		}
 	})
 	var out bytes.Buffer
-	printGateNotices(&out, paths.Default())
+	printGateNotices(&out, paths.Default(), false)
 	want := "gate-change approval is now off by default for " + unset + "; add '- gate-change-approval: required' to its AGENTS.md to keep it\n"
 	if out.String() != want {
 		t.Fatalf("notices:\n%s\nwant exactly:\n%s", out.String(), want)
@@ -89,7 +89,7 @@ func TestGateChangeApprovalNotices_NoStateDB(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "state.db")
 	t.Setenv("TTORCH_DB", dbPath)
 	var out bytes.Buffer
-	printGateNotices(&out, paths.Default())
+	printGateNotices(&out, paths.Default(), false)
 	if out.Len() != 0 {
 		t.Fatalf("want no notices without a state database, got %q", out.String())
 	}

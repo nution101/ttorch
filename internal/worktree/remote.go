@@ -87,3 +87,20 @@ func RemoteBranchSHA(repo, remote, branch string) (sha string, ok bool, err erro
 	}
 	return "", false, nil
 }
+
+// OriginURL returns the URL git fetches origin from in repo: remote.origin.url with any
+// url.<base>.insteadOf rewrite applied (git remote get-url), or "" when repo has no origin. The
+// value comes from git config, which a worker can edit, so it is printed for the lead to check
+// and compared with the URL recorded beside the default branch, never trusted as a check of its
+// own. Callers print it through EscapeForTerminal.
+func OriginURL(repo string) string {
+	out, _, err := gitRaw("-C", repo, "remote", "get-url", "origin")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
+// EscapeForTerminal is escapeForTerminal for callers outside the package that print text a
+// worker can control, such as a git config value.
+func EscapeForTerminal(s string) string { return escapeForTerminal(s) }

@@ -411,8 +411,9 @@ func cmdProjectAdd(args []string) error {
 }
 
 // recordProjectDefaultBranch records the default branch the trust gate reads for proj when
-// none is recorded, taking it from the lead's checkout (worktree.DetectDefaultBranch), and
-// returns the branch recorded now. A recorded branch is kept: only `ttorch project set-branch`
+// none is recorded, taking it from the lead's checkout (worktree.DetectDefaultBranch), with the
+// URL origin resolves to beside it for `ttorch doctor` to compare against, and returns the
+// branch recorded now. A recorded branch is kept: only `ttorch project set-branch`
 // changes it. The write sits behind the caller guard set-branch uses (checkLeadCaller), so a
 // worker's context or a caller without a terminal registers the project but records no branch.
 // When it records none it returns "" and why, and the gate refuses the project until the lead
@@ -428,7 +429,7 @@ func recordProjectDefaultBranch(ctx context.Context, store *db.Store, proj db.Pr
 	if derr != nil {
 		return "", derr, nil
 	}
-	if _, err := store.FillProjectDefaultBranch(ctx, proj.ID, b, false); err != nil {
+	if _, err := store.FillProjectDefaultBranch(ctx, proj.ID, b, worktree.OriginURL(proj.RepoPath), false); err != nil {
 		return "", nil, err
 	}
 	cur, _, err := store.GetProject(ctx, proj.ID)
@@ -439,7 +440,9 @@ func recordProjectDefaultBranch(ctx context.Context, store *db.Store, proj db.Pr
 }
 
 // cmdProjectSetBranch records the default branch the trust gate reads for a project. The
-// branch has to exist as a local branch in the project's repository. It is the lead's command,
+// branch has to exist as a local branch in the project's repository. It also records the URL
+// origin resolves to now, which `ttorch doctor` compares against from then on, and prints it so
+// the lead sees what they recorded. It is the lead's command,
 // so it refuses to run from a worker's context or without a terminal, the same guard
 // `ttorch approve` uses (see checkApproveCaller): that guard narrows who runs it by accident
 // and is not a boundary.
@@ -467,14 +470,15 @@ func cmdProjectSetBranch(args []string) error {
 	if !worktree.BranchExists(proj.RepoPath, branch) {
 		return fmt.Errorf("project set-branch: %s has no local branch refs/heads/%s", proj.RepoPath, branch)
 	}
-	if err := m.Store.SetProjectDefaultBranch(ctx, proj.ID, branch); err != nil {
+	origin := worktree.OriginURL(proj.RepoPath)
+	if err := m.Store.SetProjectDefaultBranch(ctx, proj.ID, branch, origin); err != nil {
 		return err
 	}
 	was := proj.DefaultBranch
 	if was == "" {
 		was = "none"
 	}
-	fmt.Printf("project %d: %s · default-branch=%s (was %s)\n", proj.ID, proj.RepoPath, branch, was)
+	fmt.Printf("project %d: %s · default-branch=%s (was %s) · origin=%s\n", proj.ID, proj.RepoPath, branch, was, originForDisplay(origin))
 	return nil
 }
 

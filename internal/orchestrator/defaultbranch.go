@@ -32,7 +32,7 @@ func SeedDefaultBranches(ctx context.Context, store *db.Store) error {
 		}
 		if p.DefaultBranch == "" {
 			if b, err := seedDetect(p.RepoPath); err == nil {
-				if wrote, err := store.FillProjectDefaultBranch(ctx, p.ID, b, true); err != nil {
+				if wrote, err := store.FillProjectDefaultBranch(ctx, p.ID, b, worktree.OriginURL(p.RepoPath), true); err != nil {
 					return err
 				} else if wrote {
 					continue
@@ -84,7 +84,7 @@ func (m *Manager) registerDefaultBranch(ctx context.Context, repo string) {
 			return
 		}
 	}
-	_, _ = m.Store.FillProjectDefaultBranch(ctx, p.ID, b, true)
+	_, _ = m.Store.FillProjectDefaultBranch(ctx, p.ID, b, worktree.OriginURL(repo), true)
 }
 
 // recordedDefaultBranch returns the default branch recorded for repo's project, or "" when the
@@ -126,14 +126,21 @@ func (m *Manager) gateBase(repo string) (worktree.GateBase, error) {
 // is not noticed.
 func (m *Manager) lastLandedWarning(repo string, base worktree.GateBase) string {
 	p, ok, err := m.Store.GetProjectByRepo(context.Background(), repo)
-	if err != nil || !ok || p.LastLandedSHA == "" {
+	if err != nil || !ok {
 		return ""
 	}
-	if p.LastLandedSHA == base.SHA || worktree.IsAncestor(repo, p.LastLandedSHA, base.SHA) {
+	return LastLandedWarning(repo, p.LastLandedSHA, base)
+}
+
+// LastLandedWarning is the check behind lastLandedWarning, for `ttorch doctor` as well as the
+// gate: a warning when base does not contain lastLanded, and "" when it does or when no land
+// has been recorded.
+func LastLandedWarning(repo, lastLanded string, base worktree.GateBase) string {
+	if lastLanded == "" || lastLanded == base.SHA || worktree.IsAncestor(repo, lastLanded, base.SHA) {
 		return ""
 	}
 	return fmt.Sprintf("warning: %s is at %s, which does not contain %s, the commit the last land left it at; something other than a ttorch land moved the branch",
-		base.Name, short(base.SHA), short(p.LastLandedSHA))
+		base.Name, short(base.SHA), short(lastLanded))
 }
 
 // recordLastLanded records sha as the commit a successful merge or land left repo's default

@@ -16,6 +16,12 @@
 -- projects.last_landed_sha is the commit the most recent successful land left the default
 -- branch at. A gate run warns when the branch no longer contains it.
 --
+-- projects.origin_url is the URL origin resolved to when the default branch was recorded
+-- (remote.origin.url after any insteadOf rewrite), '' when the repository had no origin then.
+-- The gate fetches and verifies the land base against origin, and remote.origin.url lives in
+-- the git config every linked worktree shares, so `ttorch doctor` compares the two and says
+-- when they differ.
+--
 -- verdicts.base_sha is the commit the reviewers' diff was staged against, so a merge can
 -- refuse a verdict whose review started somewhere other than the branch it merges into.
 --
@@ -31,6 +37,7 @@ PRAGMA foreign_keys = ON;
 ALTER TABLE projects ADD COLUMN default_branch      TEXT NOT NULL DEFAULT '';
 ALTER TABLE projects ADD COLUMN default_branch_seed TEXT NOT NULL DEFAULT '';
 ALTER TABLE projects ADD COLUMN last_landed_sha     TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN origin_url          TEXT NOT NULL DEFAULT '';
 UPDATE projects SET default_branch_seed = 'pending';
 
 ALTER TABLE verdicts ADD COLUMN base_sha TEXT NOT NULL DEFAULT '';

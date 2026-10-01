@@ -47,10 +47,12 @@ func gitInRepo(t *testing.T, dir string, args ...string) {
 }
 
 // TestCmdProjectAddRecordsDefaultBranch: registering a project, as the lead at a terminal,
-// records the branch its checkout is on as the default branch the trust gate reads, and says so. Registering it again from
-// another branch keeps the recorded one.
+// records the branch its checkout is on as the default branch the trust gate reads, and the URL
+// origin resolves to beside it, and says so. Registering it again from another branch, or after
+// origin has changed, keeps what was recorded.
 func TestCmdProjectAddRecordsDefaultBranch(t *testing.T) {
 	repo := branchedRepo(t, "develop")
+	gitInRepo(t, repo, "remote", "add", "origin", "https://example.com/team/repo.git")
 	dbPath := withSeedDB(t, nil)
 	asLeadAtATerminal(t)
 	out, err := captureStdout(t, func() error { return cmdProjectAdd([]string{repo}) })
@@ -61,12 +63,13 @@ func TestCmdProjectAddRecordsDefaultBranch(t *testing.T) {
 		t.Fatalf("project add must print the recorded branch, got %q", out)
 	}
 	gitInRepo(t, repo, "checkout", "-q", "-b", "feature")
+	gitInRepo(t, repo, "remote", "set-url", "origin", "https://example.com/elsewhere/repo.git")
 	if _, err := captureStdout(t, func() error { return cmdProjectAdd([]string{repo}) }); err != nil {
 		t.Fatal(err)
 	}
 	p, ok, err := reopen(t, dbPath).GetProjectByRepo(context.Background(), repo)
-	if err != nil || !ok || p.DefaultBranch != "develop" || p.DefaultBranchSeed != "" {
-		t.Fatalf("project = %+v ok=%v err=%v; want develop kept, nothing pending", p, ok, err)
+	if err != nil || !ok || p.DefaultBranch != "develop" || p.OriginURL != "https://example.com/team/repo.git" || p.DefaultBranchSeed != "" {
+		t.Fatalf("project = %+v ok=%v err=%v; want develop and the first origin kept, nothing pending", p, ok, err)
 	}
 	ls, err := captureStdout(t, func() error { return cmdProjectLs(nil) })
 	if err != nil || !strings.Contains(ls, "BRANCH") || !strings.Contains(ls, "develop") {
@@ -74,11 +77,13 @@ func TestCmdProjectAddRecordsDefaultBranch(t *testing.T) {
 	}
 }
 
-// TestCmdProjectSetBranch: the lead can change the recorded branch to another local branch.
-// The command refuses a worker context, a name that is not a branch, and a branch the
-// repository does not have, and changes nothing when it refuses.
+// TestCmdProjectSetBranch: the lead can change the recorded branch to another local branch,
+// which records the URL origin resolves to now and prints it. The command refuses a worker
+// context, a name that is not a branch, and a branch the repository does not have, and changes
+// nothing when it refuses.
 func TestCmdProjectSetBranch(t *testing.T) {
 	repo := branchedRepo(t, "main")
+	gitInRepo(t, repo, "remote", "add", "origin", "https://example.com/team/repo.git")
 	gitInRepo(t, repo, "branch", "develop")
 	gitInRepo(t, repo, "tag", "tagged")
 	var id int64
@@ -87,7 +92,7 @@ func TestCmdProjectSetBranch(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := s.SetProjectDefaultBranch(ctx, p.ID, "main"); err != nil {
+		if err := s.SetProjectDefaultBranch(ctx, p.ID, "main", ""); err != nil {
 			t.Fatal(err)
 		}
 		id = p.ID
@@ -116,11 +121,11 @@ func TestCmdProjectSetBranch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, "default-branch=develop (was main)") {
+	if !strings.Contains(out, "default-branch=develop (was main) · origin=https://example.com/team/repo.git") {
 		t.Fatalf("set-branch output = %q", out)
 	}
-	if p, _, _ := reopen(t, dbPath).GetProject(context.Background(), id); p.DefaultBranch != "develop" {
-		t.Fatalf("branch = %q, want develop", p.DefaultBranch)
+	if p, _, _ := reopen(t, dbPath).GetProject(context.Background(), id); p.DefaultBranch != "develop" || p.OriginURL != "https://example.com/team/repo.git" {
+		t.Fatalf("project = %+v, want develop and the current origin", p)
 	}
 }
 
@@ -168,7 +173,7 @@ func TestDefaultBranchNotices(t *testing.T) {
 		}
 	})
 	var first bytes.Buffer
-	printGateNotices(&first, paths.Default())
+	printGateNotices(&first, paths.Default(), false)
 	for _, want := range []string{
 		"recorded develop as the default branch the trust gate reads for " + seeded,
 		"no default branch is recorded for " + missing,
@@ -181,7 +186,7 @@ func TestDefaultBranchNotices(t *testing.T) {
 		t.Fatalf("a directory that is not a repository must not be named:\n%s", first.String())
 	}
 	var second bytes.Buffer
-	printGateNotices(&second, paths.Default())
+	printGateNotices(&second, paths.Default(), false)
 	if strings.Contains(second.String(), "recorded develop") {
 		t.Fatalf("a seeded branch is announced once, got it again:\n%s", second.String())
 	}
@@ -298,14 +303,14 @@ func TestGateNotices_ChangeNothingFromAWorkerContext(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, err := s.FillProjectDefaultBranch(ctx, n.ID, "trunk", true); err != nil {
+				if _, err := s.FillProjectDefaultBranch(ctx, n.ID, "trunk", "", true); err != nil {
 					t.Fatal(err)
 				}
 			})
 			clearWorkerContext(t)
 			c.setup(t)
 			var out bytes.Buffer
-			printGateNotices(&out, paths.Default())
+			printGateNotices(&out, paths.Default(), false)
 			if !strings.Contains(out.String(), "recorded trunk as the default branch the trust gate reads for "+noticed) {
 				t.Fatalf("the notice must still be printed:\n%s", out.String())
 			}
