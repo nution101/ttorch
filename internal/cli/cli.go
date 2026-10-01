@@ -929,6 +929,11 @@ func findTaskFile() (taskID, dbPath string) {
 	if err != nil {
 		return "", ""
 	}
+	return findTaskFileFrom(dir)
+}
+
+// findTaskFileFrom is findTaskFile starting at dir instead of the cwd.
+func findTaskFileFrom(dir string) (taskID, dbPath string) {
 	for {
 		if id, dbp, ok := harness.ReadWorkerTaskFile(dir); ok {
 			return id, dbp

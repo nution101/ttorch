@@ -21,9 +21,10 @@ const hookUsage = `usage: ttorch hook <turn-started|turn-ended|session-ended>   
 // `ttorch status` weigh beside the pane text (livestate.Reconcile).
 //
 // A missing or unknown event name is a usage error. Past that it is fail-open: with no
-// worker identity, a task id that is not a plain file name, a session running in a review
-// workspace (inReviewWorkspace), or a failed write it records nothing and returns nil, and a
-// missing record reads as no hook signal. It never writes to
+// worker identity, identity sources that name different tasks (hookIdentity), a task id
+// that is not a plain file name, a session running in a review workspace
+// (inReviewWorkspace), or a failed write it records nothing and returns nil, and a missing
+// record reads as no hook signal. It never writes to
 // stdout, because Claude Code adds a UserPromptSubmit hook's stdout to the worker's context.
 // It drains in, the hook payload, without parsing it, so the harness is never left writing
 // a large prompt into a pipe nobody reads.
@@ -42,16 +43,48 @@ func cmdHook(args []string, in io.Reader) error {
 	if inReviewWorkspace() {
 		return nil
 	}
-	// The worker's own identity, as `ttorch report` resolves it ($TTORCH_TASK_ID, then the
-	// worktree's .ttorch/task). None means this is not a spawned worker.
-	taskID, _ := callerIdentity()
-	if !plainTaskID(taskID) {
+	taskID, ok := hookIdentity()
+	if !ok || !plainTaskID(taskID) {
 		return nil
 	}
 	_ = livestate.WriteRecord(paths.Default().HookRecordFile(taskID), livestate.Record{
 		Event: ev, TaskID: taskID, At: time.Now().UTC(),
 	})
 	return nil
+}
+
+// hookIdentity resolves the task a hook writes for. ok is false when there is none (not a
+// spawned worker) or when the sources disagree.
+//
+// The sources are $TTORCH_TASK_ID, the .ttorch/task found walking up from the cwd, and the
+// one found walking up from CLAUDE_PROJECT_DIR (where the session started). Every source
+// that resolves must name the same task. `ttorch report` takes $TTORCH_TASK_ID over the
+// task file outright (callerIdentity), but a subprocess that inherited a worker's env and
+// runs in another task's worktree would then write that worker's record, and a record that
+// reads busy holds the other task's stall ladder quiet. So the hook writes nothing instead:
+// not when the env and a task file disagree, not when only the env is set and the cwd is
+// inside a different task's worktree, and not when the cwd and the project dir lie in
+// different worktrees.
+//
+// This stops accidents; it is not a security boundary. Any process running as the worker's
+// user can still write hook.json directly.
+func hookIdentity() (taskID string, ok bool) {
+	env := strings.TrimSpace(os.Getenv("TTORCH_TASK_ID"))
+	cwdID, _ := findTaskFile()
+	var projectID string
+	if dir := os.Getenv("CLAUDE_PROJECT_DIR"); dir != "" {
+		projectID, _ = findTaskFileFrom(dir)
+	}
+	for _, id := range []string{env, cwdID, projectID} {
+		switch {
+		case id == "":
+		case taskID == "":
+			taskID = id
+		case id != taskID:
+			return "", false
+		}
+	}
+	return taskID, taskID != ""
 }
 
 // inReviewWorkspace reports whether this hook's session started inside the review workspaces

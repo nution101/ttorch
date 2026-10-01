@@ -286,3 +286,86 @@ func TestHook_ReviewWorkspaceThroughASymlinkedHome(t *testing.T) {
 		t.Fatalf("a hook in a review workspace reached through a symlink wrote the record (stat err = %v)", err)
 	}
 }
+
+// assertNoHookRecord fails when any hook record exists for the given tasks.
+func assertNoHookRecord(t *testing.T, ids ...string) {
+	t.Helper()
+	for _, id := range ids {
+		if _, err := os.Stat(paths.Default().HookRecordFile(id)); !os.IsNotExist(err) {
+			t.Errorf("a hook record for %s was written (stat err = %v)", id, err)
+		}
+	}
+}
+
+// TestHook_DisagreeingIdentityRecordsNothing: when the sources of a hook's identity name
+// different tasks, the hook writes no record for either and still succeeds. A subprocess
+// that inherited one worker's TTORCH_TASK_ID and runs in another task's worktree must not
+// write the first worker's record (holding its stall ladder quiet), nor the second's.
+func TestHook_DisagreeingIdentityRecordsNothing(t *testing.T) {
+	cases := []struct {
+		name string
+		// env is TTORCH_TASK_ID; project and cwd name the task whose worktree
+		// CLAUDE_PROJECT_DIR and the cwd lie in ("" for a directory with no .ttorch/task).
+		env, project, cwd string
+	}{
+		{"env and the cwd's task file disagree", "wt1", "", "wt2"},
+		{"env and the project dir's task file disagree", "wt1", "wt2", ""},
+		{"env agrees with the project dir, the cwd is in another worktree", "wt1", "wt1", "wt2"},
+		{"no env, the project dir and the cwd are in different worktrees", "", "wt1", "wt2"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			hookWorker(t, "wt1")
+			t.Setenv("TTORCH_TASK_ID", c.env)
+			if c.project != "" {
+				t.Setenv("CLAUDE_PROJECT_DIR", workerWorktree(t, c.project))
+			}
+			if c.cwd != "" {
+				t.Chdir(workerWorktree(t, c.cwd))
+			}
+			for _, ev := range livestate.Events {
+				if err := cmdHook([]string{string(ev)}, strings.NewReader("")); err != nil {
+					t.Fatalf("hook %s with disagreeing identities should succeed, got %v", ev, err)
+				}
+			}
+			withStdin(t, "")
+			if code := Main([]string{"hook", "turn-started"}); code != 0 {
+				t.Fatalf("ttorch hook turn-started exited %d, want 0", code)
+			}
+			assertNoHookRecord(t, "wt1", "wt2")
+		})
+	}
+}
+
+// TestHook_AgreeingIdentityRecords: sources that all name the same task, or that leave some
+// unresolved, still record for it. That includes a resumed worker that lost its env and cd'd
+// out of its worktree: the project dir still finds its task file.
+func TestHook_AgreeingIdentityRecords(t *testing.T) {
+	cases := []struct {
+		name              string
+		env, project, cwd string
+	}{
+		{"env and the cwd's task file agree", "wt1", "", "wt1"},
+		{"env, project dir and cwd agree", "wt1", "wt1", "wt1"},
+		{"env and the project dir agree, cwd outside any worktree", "wt1", "wt1", ""},
+		{"no env, project dir only", "", "wt1", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			path := hookWorker(t, "wt1")
+			t.Setenv("TTORCH_TASK_ID", c.env)
+			if c.project != "" {
+				t.Setenv("CLAUDE_PROJECT_DIR", workerWorktree(t, c.project))
+			}
+			if c.cwd != "" {
+				t.Chdir(workerWorktree(t, c.cwd))
+			}
+			if err := cmdHook([]string{"turn-started"}, strings.NewReader("")); err != nil {
+				t.Fatal(err)
+			}
+			if r, ok := livestate.ReadRecord(path, "wt1"); !ok || r.Event != livestate.TurnStarted {
+				t.Fatalf("record = (%+v, %v), want turn-started for wt1", r, ok)
+			}
+		})
+	}
+}
