@@ -261,6 +261,10 @@ func RemoveFingerprint(path string) error {
 	return nil
 }
 
+// psPath is where ps lives on macOS and the BSDs. It is run by absolute path rather than
+// looked up on PATH, so a ps placed earlier on PATH cannot answer for the agent.
+const psPath = "/bin/ps"
+
 // psTimeout bounds one ps call. ps answers in milliseconds; the bound only matters for a
 // wedged one.
 const psTimeout = 5 * time.Second
@@ -282,7 +286,7 @@ func readPS(pid int) (Process, bool, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), psTimeout)
 	defer cancel()
-	c := Command(ctx, "ps", "-ww", "-o", "pid=,ppid=,pgid=,tpgid=,lstart=,command=", "-p", strconv.Itoa(pid))
+	c := Command(ctx, psPath, "-ww", "-o", "pid=,ppid=,pgid=,tpgid=,lstart=,command=", "-p", strconv.Itoa(pid))
 	c.Env = append(environWithout("TZ", "LC_ALL", "LANG"), "TZ=UTC", "LC_ALL=C")
 	var stdout, stderr bytes.Buffer
 	c.Stdout, c.Stderr = &stdout, &stderr

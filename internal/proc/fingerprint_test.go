@@ -313,3 +313,25 @@ func TestReadProcess_MissingPID(t *testing.T) {
 		t.Fatalf("ReadProcess(reaped pid %d) = ok %v err %v, want not found (%s)", pid, ok, err, runtime.GOOS)
 	}
 }
+
+// ps is run from its absolute path, not looked up on PATH, so a ps earlier on PATH cannot
+// answer for the agent. The fake here prints a well-formed line for a different command.
+func TestReadPS_IgnoresPSOnPath(t *testing.T) {
+	if runtime.GOOS == "linux" {
+		t.Skip("Linux reads /proc, not ps")
+	}
+	c := startSleeper(t)
+	dir := t.TempDir()
+	fake := "#!/bin/sh\nfor a; do pid=$a; done\necho \"$pid 1 1 1 Thu Jan 1 00:00:00 1970 not-the-agent\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "ps"), []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	p, ok, err := ReadProcess(c.Process.Pid)
+	if err != nil || !ok {
+		t.Fatalf("ReadProcess(%d) = ok %v, err %v; want the running sleep", c.Process.Pid, ok, err)
+	}
+	if !strings.Contains(p.Cmdline, "sleep") || p.PPID != os.Getpid() {
+		t.Fatalf("ReadProcess read %+v; the ps on PATH answered", p)
+	}
+}
