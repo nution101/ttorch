@@ -34,6 +34,8 @@ func writeTree(t *testing.T, root string, files map[string]string) {
 }
 
 func TestHeadIdentity_Layouts(t *testing.T) {
+	// Paths in file bodies may use @WT@ for the worktree's real path. Linked-worktree
+	// cases name the project as root/main.
 	cases := []struct {
 		name   string
 		files  map[string]string
@@ -57,13 +59,24 @@ func TestHeadIdentity_Layouts(t *testing.T) {
 			".git":                                "gitdir: ../main/.git/worktrees/wt\n",
 			"../main/.git/worktrees/wt/HEAD":      "ref: refs/heads/feature\n",
 			"../main/.git/worktrees/wt/commondir": "../..\n",
+			"../main/.git/worktrees/wt/gitdir":    "@WT@/.git\n",
 			"../main/.git/refs/heads/feature":     idB + "\n",
 		}, idB, true},
 		{"linked worktree, branch only in the common packed-refs", map[string]string{
 			".git":                                "gitdir: ../main/.git/worktrees/wt\n",
 			"../main/.git/worktrees/wt/HEAD":      "ref: refs/heads/feature\n",
 			"../main/.git/worktrees/wt/commondir": "../..\n",
+			"../main/.git/worktrees/wt/gitdir":    "@WT@/.git\n",
 			"../main/.git/packed-refs":            idA + " refs/heads/feature\n",
+		}, idA, true},
+		{"linked worktree with a relative back-link", map[string]string{
+			".git":                                "gitdir: ../main/.git/worktrees/wt\n",
+			"../main/.git/worktrees/wt/HEAD":      idA + "\n",
+			"../main/.git/worktrees/wt/commondir": "../..\n",
+			"../main/.git/worktrees/wt/gitdir":    "../../../../wt/.git\n",
+		}, idA, true},
+		{"gitdir inside the worktree itself", map[string]string{
+			".git": "gitdir: meta/git\n", "meta/git/HEAD": idA + "\n",
 		}, idA, true},
 		{"oversized HEAD", map[string]string{".git/HEAD": idA + strings.Repeat("\n", maxSmallGitFile)}, "", false},
 		{"ref escaping the gitdir", map[string]string{
@@ -90,8 +103,16 @@ func TestHeadIdentity_Layouts(t *testing.T) {
 			if err := os.MkdirAll(wt, 0o755); err != nil {
 				t.Fatal(err)
 			}
-			writeTree(t, wt, c.files)
-			got, ok := headIdentity(wt)
+			real, err := filepath.EvalSymlinks(wt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			files := map[string]string{}
+			for k, v := range c.files {
+				files[k] = strings.ReplaceAll(v, "@WT@", real)
+			}
+			writeTree(t, wt, files)
+			got, ok := headIdentity(wt, filepath.Join(root, "main"))
 			if ok != c.wantOK || got != c.want {
 				t.Fatalf("headIdentity = %q, %v; want %q, %v", got, ok, c.want, c.wantOK)
 			}
@@ -100,10 +121,10 @@ func TestHeadIdentity_Layouts(t *testing.T) {
 }
 
 func TestHeadIdentity_EmptyAndMissingWorktree(t *testing.T) {
-	if _, ok := headIdentity(""); ok {
+	if _, ok := headIdentity("", ""); ok {
 		t.Fatal("an empty worktree path must read as unknown")
 	}
-	if _, ok := headIdentity(filepath.Join(t.TempDir(), "absent")); ok {
+	if _, ok := headIdentity(filepath.Join(t.TempDir(), "absent"), ""); ok {
 		t.Fatal("a missing worktree must read as unknown")
 	}
 }
@@ -117,7 +138,7 @@ func TestHeadIdentity_RefusesSpecialFiles(t *testing.T) {
 		if err := syscall.Mkfifo(filepath.Join(wt, ".git", "HEAD"), 0o644); err != nil {
 			t.Skipf("mkfifo: %v", err)
 		}
-		if _, ok := headIdentity(wt); ok {
+		if _, ok := headIdentity(wt, ""); ok {
 			t.Fatal("a FIFO HEAD must read as unknown")
 		}
 	})
@@ -127,7 +148,7 @@ func TestHeadIdentity_RefusesSpecialFiles(t *testing.T) {
 		if err := syscall.Mkfifo(filepath.Join(wt, "meta", "git", "HEAD"), 0o644); err != nil {
 			t.Skipf("mkfifo: %v", err)
 		}
-		if _, ok := headIdentity(wt); ok {
+		if _, ok := headIdentity(wt, ""); ok {
 			t.Fatal("a FIFO HEAD behind gitdir: must read as unknown")
 		}
 	})
@@ -137,7 +158,7 @@ func TestHeadIdentity_RefusesSpecialFiles(t *testing.T) {
 		if err := os.Symlink(filepath.Join(wt, "elsewhere"), filepath.Join(wt, ".git", "HEAD")); err != nil {
 			t.Fatal(err)
 		}
-		if _, ok := headIdentity(wt); ok {
+		if _, ok := headIdentity(wt, ""); ok {
 			t.Fatal("a symlinked HEAD must read as unknown")
 		}
 	})
@@ -147,8 +168,89 @@ func TestHeadIdentity_RefusesSpecialFiles(t *testing.T) {
 		if err := os.Symlink(real, filepath.Join(wt, ".git")); err != nil {
 			t.Fatal(err)
 		}
-		if _, ok := headIdentity(wt); ok {
+		if _, ok := headIdentity(wt, ""); ok {
 			t.Fatal("a symlinked .git must read as unknown")
+		}
+	})
+}
+
+// TestHeadIdentity_ConfinesGitDir: the git dir a .git file names, and its commondir, must
+// be inside the worktree or be this worktree's admin entry under the project's common git
+// dir. Anywhere else reads as unknown, even when a valid HEAD is waiting there.
+func TestHeadIdentity_ConfinesGitDir(t *testing.T) {
+	// layout builds root/main (the project, with a valid admin entry for root/wt) and
+	// root/wt, then applies files under root/wt; it returns the worktree and project.
+	layout := func(t *testing.T, files map[string]string) (string, string) {
+		t.Helper()
+		root := t.TempDir()
+		wt, main := filepath.Join(root, "wt"), filepath.Join(root, "main")
+		if err := os.MkdirAll(wt, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		real, err := filepath.EvalSymlinks(wt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeTree(t, main, map[string]string{
+			".git/HEAD":                      idB + "\n",
+			".git/worktrees/wt/HEAD":         idA + "\n",
+			".git/worktrees/wt/commondir":    "../..\n",
+			".git/worktrees/wt/gitdir":       real + "/.git\n",
+			".git/worktrees/other/HEAD":      idA + "\n",
+			".git/worktrees/other/gitdir":    filepath.Join(root, "elsewhere", ".git") + "\n",
+			".git/worktrees/other/commondir": "../..\n",
+		})
+		writeTree(t, root, map[string]string{"outside/HEAD": idA + "\n", "outside/refs/heads/main": idA + "\n"})
+		writeTree(t, wt, files)
+		return wt, main
+	}
+	cases := []struct {
+		name  string
+		files map[string]string
+		setup func(t *testing.T, wt string)
+	}{
+		{"gitdir: /etc", map[string]string{".git": "gitdir: /etc\n"}, nil},
+		{"gitdir: a directory outside the worktree", map[string]string{".git": "gitdir: ../outside\n"}, nil},
+		{"gitdir: the project's common git dir", map[string]string{".git": "gitdir: ../main/.git\n"}, nil},
+		{"gitdir: another worktree's admin entry", map[string]string{".git": "gitdir: ../main/.git/worktrees/other\n"}, nil},
+		{"gitdir: inside the worktree through a symlink out of it", map[string]string{".git": "gitdir: meta\n"},
+			func(t *testing.T, wt string) {
+				if err := os.Symlink(filepath.Join(wt, "..", "outside"), filepath.Join(wt, "meta")); err != nil {
+					t.Fatal(err)
+				}
+			}},
+		{"commondir outside the worktree", map[string]string{
+			".git": "gitdir: meta/git\n", "meta/git/HEAD": "ref: refs/heads/main\n", "meta/git/commondir": "../../../outside\n",
+		}, nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			wt, main := layout(t, c.files)
+			if c.setup != nil {
+				c.setup(t, wt)
+			}
+			if id, ok := headIdentity(wt, main); ok {
+				t.Fatalf("headIdentity = %q, want unknown", id)
+			}
+		})
+	}
+	t.Run("worktree path swapped for a symlink", func(t *testing.T) {
+		wt, main := layout(t, map[string]string{".git/HEAD": idA + "\n"})
+		moved := wt + ".moved"
+		if err := os.Rename(wt, moved); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(moved, wt); err != nil {
+			t.Fatal(err)
+		}
+		if id, ok := headIdentity(wt, main); ok {
+			t.Fatalf("headIdentity = %q, want unknown", id)
+		}
+	})
+	t.Run("the worktree's own admin entry still reads", func(t *testing.T) {
+		wt, main := layout(t, map[string]string{".git": "gitdir: ../main/.git/worktrees/wt\n"})
+		if id, ok := headIdentity(wt, main); !ok || id != idA {
+			t.Fatalf("headIdentity = %q, %v; want %q", id, ok, idA)
 		}
 	})
 }
@@ -182,13 +284,28 @@ func TestHeadIdentity_AgreesWithGit(t *testing.T) {
 		t.Helper()
 		for _, dir := range []string{main, linked} {
 			want := gitIn(t, dir, "rev-parse", "HEAD")
-			got, ok := headIdentity(dir)
+			got, ok := headIdentity(dir, main)
 			if !ok || got != want {
 				t.Fatalf("%s, %s: headIdentity = %q, %v; git says %q", stage, filepath.Base(dir), got, ok, want)
 			}
 		}
 	}
 	check("loose refs")
+	for _, dir := range []string{main, linked} {
+		want, err := filepath.EvalSymlinks(gitIn(t, dir, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := commonGitDir(dir); got != want {
+			t.Fatalf("%s: commonGitDir = %q; git says %q", filepath.Base(dir), got, want)
+		}
+	}
+	if id, ok := headIdentity(linked, ""); ok {
+		t.Fatalf("a linked worktree with no recorded project read as %q; its git dir is outside the worktree", id)
+	}
+	if id, ok := headIdentity(linked, filepath.Join(t.TempDir(), "other")); ok {
+		t.Fatalf("a linked worktree read as %q under a project it was not cut from", id)
+	}
 	gitIn(t, main, "pack-refs", "--all")
 	check("packed refs")
 	gitIn(t, linked, "checkout", "-q", "--detach")
@@ -235,7 +352,7 @@ func TestHeadRead_SignatureConfigRunsNoProgram(t *testing.T) {
 		"gpgsig -----BEGIN PGP SIGNATURE-----\n \n AAAA\n -----END PGP SIGNATURE-----\n\nsigned\n")
 	gitIn(t, repo, "update-ref", "HEAD", sha)
 
-	got, ok := headIdentity(repo)
+	got, ok := headIdentity(repo, "")
 	if ran() {
 		t.Fatal("reading HEAD ran the repository's configured gpg.program")
 	}
@@ -263,7 +380,7 @@ func TestHeadRead_PromisorFetchRunsNoProgram(t *testing.T) {
 	missing := strings.Repeat("1", 40)
 	writeTree(t, repo, map[string]string{".git/refs/heads/main": missing + "\n"})
 
-	got, ok := headIdentity(repo)
+	got, ok := headIdentity(repo, "")
 	if ran() {
 		t.Fatal("reading HEAD ran the promisor remote's configured uploadpack")
 	}
