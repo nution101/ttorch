@@ -1189,6 +1189,24 @@ rebase. `ttorch check-overlap` previews the overlap for a proposed footprint. Fo
 be declared at **file granularity** — a whole-package footprint reports false overlap and
 inflates needless land-rebases (and, under `TTORCH_SERIALIZE_OVERLAP`, idles scheduler slots).
 
+### Per-worker clones: the git version floor
+
+When `TTORCH_WORKER_CLONES` is on (off by default, still being rolled out), a worker gets a
+private clone instead of a linked worktree, and its commits are brought back into the lead's
+repository by a single `git fetch` (`worktree.ImportCommit`). That fetch starts the clone's
+`git upload-pack` as the lead, so it refuses to run on a git that does not carry the fix for
+**CVE-2024-32004** — an unfixed upload-pack can be steered by the clone's own config into
+lazy-fetching through a promisor remote and running a program the worker chose. The floor is
+**git 2.45.1, or the per-series backport** (2.39.4, 2.40.2, 2.41.1, 2.42.2, 2.43.4, 2.44.1).
+
+The check reads the version **string**, so a distro git that has the fix backported onto an
+older string is refused anyway — Ubuntu 24.04's **git 2.43.0** carries the fix but reports
+`2.43.0`, below the `2.43.4` the floor wants. This is deliberate and has **no override flag**:
+a version string is all the check can read, and admitting one distro's backported string
+would admit every genuinely-unpatched build of that string too. The remedy is a git whose
+version string is at or above the floor (upstream, or a distro package that bumped the
+string). `ttorch doctor` reports the same when the flag is on.
+
 ## 8. Sessions and reasoning effort
 
 Every session is a `claude --dangerously-skip-permissions` process (work is confined to

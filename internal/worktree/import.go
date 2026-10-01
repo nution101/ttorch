@@ -135,6 +135,12 @@ func ImportCommit(ctx context.Context, repo, clone, task, sha string) (string, e
 		"--no-write-fetch-head",   // FETCH_HEAD would record the clone's path in repo
 		"--no-recurse-submodules", // nothing but the named commit's objects
 		"--no-auto-gc", "--no-auto-maintenance",
+		// --upload-pack fixes the program the local fetch starts in the clone. repo's own
+		// config can set remote."file://<clone>".uploadpack to any command, which
+		// GIT_ALLOW_PROTOCOL=file does not stop because it governs the transport, not the
+		// upload-pack binary. The command-line value beats that config key. git-upload-pack
+		// (not an absolute path) resolves on repo's PATH, which is the lead's, not the worker's.
+		"--upload-pack=git-upload-pack",
 		// No --update-shallow, ever: with it a shallow clone makes repo shallow. No "+": the
 		// name holds the sha, so the ref existing with another value is corruption. The source
 		// is a file:// URL, never a bare path, so git takes the file transport and never the
@@ -177,6 +183,15 @@ func ImportCommit(ctx context.Context, repo, clone, task, sha string) (string, e
 // GIT_CONFIG_GLOBAL (2.32), --no-write-fetch-head and --no-auto-maintenance (2.29). And
 // GIT_NO_LAZY_FETCH, importEnv's belt-and-suspenders against the same bug, is honoured by
 // every git at or above this floor (it is in promisor-remote.c as of 2.39.4).
+//
+// This reads the version STRING, not the actual behaviour, so it refuses a distro git that
+// carries the fix backported onto an older string: Ubuntu 24.04's git 2.43.0, for instance,
+// has the CVE-2024-32004 fix but reports 2.43.0, below the 2.43.4 the table wants. That is a
+// deliberate false refusal, not a flag to override: a version string is the only thing the
+// import can read, and loosening it to admit one distro's backport would admit every real
+// pre-fix 2.43.0 too. The remedy is to run a git whose version string is at or above the
+// floor (upstream, or a distro package that bumped the string), which doctor's floor message
+// also says.
 var cveFixedPatch = map[int]int{39: 4, 40: 2, 41: 1, 42: 2, 43: 4, 44: 1, 45: 1}
 
 // gitFixesCVE202432004 reports whether a 2.x.y git carries the CVE-2024-32004 fix.
@@ -267,27 +282,40 @@ func leadingInt(s string) int {
 // maintenance.auto, with the fetch's --no-auto-gc and --no-auto-maintenance, keep the import
 // from repacking repo.
 //
-// The fsck settings make git check every object it receives, which refuses a tree holding an
-// entry named .git and leaves no ref and no object behind. All three are needed, because
-// repo's OWN config can turn the check off even though -c outranks a config file: a key set
-// in repo beats the general key it specialises. fetch.fsckObjects=false in repo overrides
-// -c transfer.fsckObjects=true (fetch's own key wins over transfer's), so fetch.fsckObjects
-// is pinned too; and fetch.fsck.hasDotgit=ignore in repo turns off the one check that stops
-// the .git-tree attack even with fsck on, so that severity is pinned to error. Both were
-// shown importing the hostile tree before they were pinned.
+// The fsck settings make git check every object it receives and refuse a hostile tree,
+// leaving no ref and no object behind. fetch.fsckObjects and transfer.fsckObjects are both
+// turned on because repo's OWN config can turn the check off even though -c outranks a config
+// file: a key set in repo beats the general key it specialises, so fetch.fsckObjects=false in
+// repo defeats -c transfer.fsckObjects=true (fetch's key wins over transfer's). The specific
+// severities are pinned to error for the same reason, because repo could set any of them to
+// ignore: hasDotgit (a tree entry named .git), hasDotdot (an entry named ..), and
+// gitmodulesUrl / gitmodulesPath / gitmodulesSymlink (a .gitmodules whose url or path reads
+// as an option, or that is itself a symlink). Each was shown importing its hostile object
+// before it was pinned.
+//
+// What -c cannot fix is fetch.fsck.skipList: it names a file of object ids to exempt, it
+// ACCUMULATES across config sources, and -c fetch.fsck.skipList= does not clear an entry repo
+// already set. So a determined repo config can still exempt a specific object from fsck. That
+// is a known residual, not closed here; the backstop is the floor behind this: the gate never
+// checks out or follows a submodule from an imported commit except through AddDetached and
+// validate, which refuse a path collision, and submodule repos are out of scope for clones.
 //
 // These settings reach the git commands run in repo and their children, and not the clone's
 // upload-pack: git drops command-line config when it starts the local transport's
 // upload-pack. So core.fsmonitor, uploadpack.packObjectsHook and core.alternateRefsCommand
 // are set for the receiving side only, and what keeps upload-pack from running a program is
-// importEnv. upload-pack takes packObjectsHook only from global, system or command-line
-// config, and ran none of the programs the clone's own config named.
+// importEnv together with the fetch's --upload-pack (which fixes the program the local fetch
+// starts in the clone, against repo's remote.<url>.uploadpack).
 func importConfig(hooks string) []string {
 	return []string{
 		"-c", "protocol.version=2",
 		"-c", "transfer.fsckObjects=true",
 		"-c", "fetch.fsckObjects=true",
 		"-c", "fetch.fsck.hasDotgit=error",
+		"-c", "fetch.fsck.hasDotdot=error",
+		"-c", "fetch.fsck.gitmodulesUrl=error",
+		"-c", "fetch.fsck.gitmodulesPath=error",
+		"-c", "fetch.fsck.gitmodulesSymlink=error",
 		"-c", "core.hooksPath=" + hooks,
 		"-c", "core.fsmonitor=false",
 		"-c", "uploadpack.packObjectsHook=",

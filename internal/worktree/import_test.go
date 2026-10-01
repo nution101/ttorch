@@ -86,6 +86,30 @@ func realGit(t *testing.T) string {
 	return realGitPath
 }
 
+// skipIfGitBelowFloor skips a test that needs ImportCommit to run a real fetch when the host's
+// git does not carry the CVE-2024-32004 fix, because ImportCommit refuses such a git
+// (checkImportGit) before it ever fetches. The gate's build host runs an older git than this
+// Mac, so without this those tests would fail (or pass for the wrong reason) there rather than
+// on the behaviour they check. The refusal itself stays proven by the version-stub test, which
+// does not call this. A distro git with the fix backported onto an old version string skips
+// here too, for the same reason the import refuses it: the version string is what is read.
+func skipIfGitBelowFloor(t *testing.T) {
+	t.Helper()
+	out, err := exec.Command(realGit(t), "version").Output()
+	if err != nil {
+		t.Fatalf("git version: %v", err)
+	}
+	major, minor, patch, ok := parseGitVersion(strings.TrimSpace(string(out)))
+	if !ok {
+		t.Fatalf("cannot parse host git version %q", strings.TrimSpace(string(out)))
+	}
+	if !gitFixesCVE202432004(major, minor, patch) {
+		t.Skipf("host git %d.%d.%d is below the CVE-2024-32004 floor (2.45.1, or a per-series "+
+			"backport 2.39.4/2.40.2/2.41.1/2.42.2/2.43.4/2.44.1); ImportCommit refuses it, so this "+
+			"real-import test cannot run here", major, minor, patch)
+	}
+}
+
 // fixtureEnv is the environment fixture git commands run with: none of the test process's
 // GIT_* variables, no global or system config, and a fixed identity. A test that hands the
 // import a hostile environment does not change how its fixture is built.
@@ -248,6 +272,7 @@ func readCalls(t *testing.T, log string) [][]string {
 // imported is the one ObserveHead reads from the clone's files, and importing it again
 // changes nothing.
 func TestImportCommit_ImportsOneRefAndNothingElse(t *testing.T) {
+	skipIfGitBelowFloor(t)
 	f := newCloneFixture(t)
 	fgit(t, f.clone, "", "tag", "main")
 	fgit(t, f.clone, "", "update-ref", "refs/heads/main", f.tip)
@@ -300,6 +325,7 @@ func TestImportCommit_ImportsOneRefAndNothingElse(t *testing.T) {
 // tip's parent or a commit the worker orphaned, imports even when the lead's repository is
 // set to protocol version 0, which refuses an unadvertised sha.
 func TestImportCommit_ServesAnyCommitTheCloneHas(t *testing.T) {
+	skipIfGitBelowFloor(t)
 	f := newCloneFixture(t)
 	fgit(t, f.main, "", "config", "protocol.version", "0")
 	fgit(t, f.clone, "", "checkout", "-q", "-b", "scratch")
@@ -316,6 +342,7 @@ func TestImportCommit_ServesAnyCommitTheCloneHas(t *testing.T) {
 // TestImportCommit_RefusesADotGitTreeEntry: a commit whose tree holds an entry named .git is
 // refused by the receiving side's object check and leaves no ref and no object in main.
 func TestImportCommit_RefusesADotGitTreeEntry(t *testing.T) {
+	skipIfGitBelowFloor(t)
 	f := newCloneFixture(t)
 	blob := fgit(t, f.clone, "x\n", "hash-object", "-w", "--stdin")
 	raw, err := hex.DecodeString(blob)
@@ -342,6 +369,7 @@ func TestImportCommit_RefusesADotGitTreeEntry(t *testing.T) {
 // another blob's bytes serves those bytes under the first name. The receiving side hashes
 // what it is sent and refuses the commit, and no ref is left.
 func TestImportCommit_RefusesASwappedObject(t *testing.T) {
+	skipIfGitBelowFloor(t)
 	f := newCloneFixture(t)
 	blobA := fgit(t, f.clone, "", "rev-parse", f.tip+":two.txt")
 	blobB := fgit(t, f.clone, "BBB\n", "hash-object", "-w", "--stdin")
@@ -373,6 +401,7 @@ func TestImportCommit_RefusesASwappedObject(t *testing.T) {
 // import has to read its ref back to fail, and the refusal carries git's warning so whoever
 // adjudicates it can see why. main must not become shallow.
 func TestImportCommit_RefusesAShallowBoundary(t *testing.T) {
+	skipIfGitBelowFloor(t)
 	f := newCloneFixture(t)
 	up := filepath.Join(filepath.Dir(f.main), "unrelated")
 	fgit(t, filepath.Dir(up), "", "init", "-q", "-b", "main", up)
@@ -406,6 +435,7 @@ func TestImportCommit_RefusesAShallowBoundary(t *testing.T) {
 // the ref when it does not. A tag peels to the commit it names, which is not the sha asked
 // for.
 func TestImportCommit_RefusesANonCommit(t *testing.T) {
+	skipIfGitBelowFloor(t)
 	f := newCloneFixture(t)
 	fgit(t, f.clone, "", "tag", "-a", "v1", "-m", "x", f.tip)
 	for _, c := range []struct{ name, sha string }{
@@ -427,6 +457,7 @@ func TestImportCommit_RefusesANonCommit(t *testing.T) {
 // TestImportCommit_UnknownShaFailsClosed: a sha the clone does not have, as a stale
 // observation would be, fails and leaves no ref.
 func TestImportCommit_UnknownShaFailsClosed(t *testing.T) {
+	skipIfGitBelowFloor(t)
 	f := newCloneFixture(t)
 	missing := strings.Repeat("0123456789", 4)
 	if _, err := ImportCommit(context.Background(), f.main, f.clone, "t1", missing); err == nil {
@@ -471,6 +502,7 @@ func TestImportCommit_RefusesMalformedInputBeforeGit(t *testing.T) {
 // clone's upload-pack, which reads global config and does not see the -c settings the fetch
 // is given, so only the import's own GIT_CONFIG_GLOBAL keeps it from running.
 func TestImportCommit_RunsNoProgramItWasNotAskedTo(t *testing.T) {
+	skipIfGitBelowFloor(t)
 	f := newCloneFixture(t)
 	type sentinel struct {
 		script string
@@ -554,6 +586,7 @@ func TestImportCommit_RunsNoProgramItWasNotAskedTo(t *testing.T) {
 // that forks a child and waits on it, ends at the caller's deadline together with what it
 // forked, rather than whenever the child exits.
 func TestImportCommit_GivesUpOnACloneThatNeverAnswers(t *testing.T) {
+	skipIfGitBelowFloor(t)
 	f := newCloneFixture(t)
 	installGitShim(t, `for a in "$@"; do if [ "$a" = fetch ]; then sleep 30 & wait; exit 1; fi; done`)
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
@@ -575,6 +608,7 @@ func TestImportCommit_GivesUpOnACloneThatNeverAnswers(t *testing.T) {
 // a working directory in the clone, and the clone's path appears only as the fetch's source
 // after "--". An import whose ref is already in place does not fetch at all.
 func TestImportCommit_TouchesTheCloneOnlyThroughTheFetch(t *testing.T) {
+	skipIfGitBelowFloor(t)
 	f := newCloneFixture(t)
 	log := installGitShim(t, "")
 	head, ok := ObserveHead(f.clone, f.main)
@@ -639,6 +673,7 @@ func TestImportCommit_TouchesTheCloneOnlyThroughTheFetch(t *testing.T) {
 // in the foreground and two loose objects in objects/17 (the directory gc samples), the
 // loose objects are still there afterwards.
 func TestImportCommit_StartsNoRepackInMain(t *testing.T) {
+	skipIfGitBelowFloor(t)
 	f := newCloneFixture(t)
 	var loose []string
 	for i := 0; len(loose) < 2; i++ {
@@ -677,6 +712,7 @@ func TestImportCommit_StartsNoRepackInMain(t *testing.T) {
 // GIT_OBJECT_DIRECTORY would write the commit somewhere main does not read, while the import
 // still reported success.
 func TestImportCommit_IgnoresTheCallersGitEnvironment(t *testing.T) {
+	skipIfGitBelowFloor(t)
 	for _, c := range []struct {
 		name string
 		env  func(t *testing.T, f cloneFixture) (key, value string)
@@ -807,6 +843,7 @@ func TestGitFixesCVE202432004(t *testing.T) {
 // task whose id merely starts the same way, nor any ref outside the namespace. main's hooks do
 // not run, a second drop is a no-op, and the commit can be imported again afterwards.
 func TestDropImports_DeletesOnlyThatTasksRefs(t *testing.T) {
+	skipIfGitBelowFloor(t)
 	f := newCloneFixture(t)
 	ctx := context.Background()
 	for _, c := range []struct{ task, sha string }{{"t1", f.tip}, {"t1", f.parent}, {"t10", f.tip}, {"t1x", f.tip}} {
@@ -866,6 +903,29 @@ func TestDropImports_RefusesMalformedTaskIDBeforeGit(t *testing.T) {
 	}
 	if calls := readCalls(t, log); len(calls) != 0 {
 		t.Fatalf("a malformed task id reached git:\n%q", calls)
+	}
+}
+
+// TestImportEnv_DisablesLazyFetch: importEnv sets GIT_NO_LAZY_FETCH=1, and because it strips
+// every GIT_* first, a hostile GIT_NO_LAZY_FETCH=0 in the caller's environment cannot override
+// it, with no duplicate entry for resolution to depend on. On this git the behavioural promisor
+// test cannot show this line red (git's internal default already blocks the fetch), so this
+// direct assertion is what guards it; an earlier commit split dropped it and a removal of the
+// line went uncaught.
+func TestImportEnv_DisablesLazyFetch(t *testing.T) {
+	t.Setenv("GIT_NO_LAZY_FETCH", "0")
+	t.Setenv("GIT_DIR", "/somewhere/else")
+	last, count := "", 0
+	for _, kv := range importEnv() {
+		if v, ok := strings.CutPrefix(kv, "GIT_NO_LAZY_FETCH="); ok {
+			last, count = v, count+1
+		}
+		if strings.HasPrefix(kv, "GIT_DIR=") {
+			t.Error("importEnv kept the caller's GIT_DIR")
+		}
+	}
+	if last != "1" || count != 1 {
+		t.Errorf("importEnv GIT_NO_LAZY_FETCH: value %q, count %d; want \"1\", 1", last, count)
 	}
 }
 
@@ -950,6 +1010,7 @@ func promisorClone(t *testing.T) (main, clone, bad string, markerRan func() bool
 // same clone does run the marker when the fetch is let to lazy-fetch, so the test is not
 // vacuous.
 func TestImportCommit_RunsNoPromisorProgram(t *testing.T) {
+	skipIfGitBelowFloor(t)
 	// Control: a fetch allowed to lazy-fetch runs the worker's program.
 	t.Run("control: the attack is real", func(t *testing.T) {
 		main, clone, bad, ran := promisorClone(t)
@@ -988,23 +1049,63 @@ func dotGitTreeCommit(t *testing.T, clone string) string {
 	return fgit(t, clone, "", "commit-tree", tree, "-m", "dotgit")
 }
 
+// fsckHostileCommit commits, in the clone, an object that trips the named fsck check, and
+// returns the commit sha. The checks map to the severities importConfig pins.
+func fsckHostileCommit(t *testing.T, clone, check string) string {
+	t.Helper()
+	switch check {
+	case "hasDotgit":
+		return dotGitTreeCommit(t, clone)
+	case "hasDotdot":
+		blob := fgit(t, clone, "x\n", "hash-object", "-w", "--stdin")
+		tree := fgit(t, clone, "100644 blob "+blob+"\t..\n", "mktree")
+		return fgit(t, clone, "", "commit-tree", tree, "-m", "dotdot")
+	case "gitmodulesUrl":
+		return gitmodulesCommit(t, clone, "[submodule \"x\"]\n\tpath = x\n\turl = -u./payload\n")
+	case "gitmodulesPath":
+		return gitmodulesCommit(t, clone, "[submodule \"x\"]\n\tpath = -evil\n\turl = ./ok\n")
+	case "gitmodulesSymlink":
+		blob := fgit(t, clone, "/etc/passwd", "hash-object", "-w", "--stdin")
+		tree := fgit(t, clone, "120000 blob "+blob+"\t.gitmodules\n", "mktree")
+		return fgit(t, clone, "", "commit-tree", tree, "-m", "gmsymlink")
+	}
+	t.Fatalf("unknown fsck check %q", check)
+	return ""
+}
+
+// gitmodulesCommit commits a tree whose .gitmodules blob is body.
+func gitmodulesCommit(t *testing.T, clone, body string) string {
+	t.Helper()
+	blob := fgit(t, clone, body, "hash-object", "-w", "--stdin")
+	tree := fgit(t, clone, "100644 blob "+blob+"\t.gitmodules\n", "mktree")
+	return fgit(t, clone, "", "commit-tree", tree, "-m", "gitmodules")
+}
+
 // TestImportCommit_FsckPinnedAgainstMainConfig: repo's own config must not be able to turn off
-// the object check. fetch.fsckObjects=false beats -c transfer.fsckObjects=true, and
-// fetch.fsck.hasDotgit=ignore turns off the one check even with fsck on; the import pins both,
-// so the hostile .git-tree commit is refused with either set in repo.
+// the object check. fetch.fsckObjects=false beats -c transfer.fsckObjects=true, and each
+// fetch.fsck.<check>=ignore turns off that one check even with fsck on; the import pins
+// fetch.fsckObjects and every severity it relies on, so the matching hostile object is refused
+// with any of them set in repo.
 func TestImportCommit_FsckPinnedAgainstMainConfig(t *testing.T) {
-	for _, c := range []struct{ name, key, value string }{
-		{"fetch.fsckObjects=false", "fetch.fsckObjects", "false"},
-		{"fetch.fsck.hasDotgit=ignore", "fetch.fsck.hasDotgit", "ignore"},
-		{"transfer.fsckObjects=false", "transfer.fsckObjects", "false"},
+	skipIfGitBelowFloor(t)
+	for _, c := range []struct {
+		name, key, value, check string
+	}{
+		{"fetch.fsckObjects=false", "fetch.fsckObjects", "false", "hasDotgit"},
+		{"transfer.fsckObjects=false", "transfer.fsckObjects", "false", "hasDotgit"},
+		{"fetch.fsck.hasDotgit=ignore", "fetch.fsck.hasDotgit", "ignore", "hasDotgit"},
+		{"fetch.fsck.hasDotdot=ignore", "fetch.fsck.hasDotdot", "ignore", "hasDotdot"},
+		{"fetch.fsck.gitmodulesUrl=ignore", "fetch.fsck.gitmodulesUrl", "ignore", "gitmodulesUrl"},
+		{"fetch.fsck.gitmodulesPath=ignore", "fetch.fsck.gitmodulesPath", "ignore", "gitmodulesPath"},
+		{"fetch.fsck.gitmodulesSymlink=ignore", "fetch.fsck.gitmodulesSymlink", "ignore", "gitmodulesSymlink"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			f := newCloneFixture(t)
 			fgit(t, f.main, "", "config", c.key, c.value)
-			bad := dotGitTreeCommit(t, f.clone)
+			bad := fsckHostileCommit(t, f.clone, c.check)
 			_, err := ImportCommit(context.Background(), f.main, f.clone, "t1", bad)
 			if err == nil {
-				t.Fatalf("imported a .git-tree commit with %s set in main", c.name)
+				t.Fatalf("imported a %s object with %s set in main", c.check, c.name)
 			}
 			t.Logf("refused: %v", err)
 			assertNoRef(t, f.main, CloneRefs+"t1/"+bad)
@@ -1020,6 +1121,7 @@ func TestImportCommit_FsckPinnedAgainstMainConfig(t *testing.T) {
 // sets GIT_ALLOW_PROTOCOL=file, so the ext helper never runs. The control shows the rewrite
 // does run it when the protocol is not restricted.
 func TestImportCommit_RefusesExtProtocolRewrite(t *testing.T) {
+	skipIfGitBelowFloor(t)
 	setup := func(t *testing.T) (f cloneFixture, ran func() bool) {
 		t.Helper()
 		f = newCloneFixture(t)
@@ -1063,6 +1165,7 @@ func TestImportCommit_RefusesExtProtocolRewrite(t *testing.T) {
 // not a real directory before it fetches, and passes the source as a file:// URL, which never
 // takes the bundle route. The control shows a bare-path fetch does consume the bundle.
 func TestImportCommit_RefusesABundleAtThePath(t *testing.T) {
+	skipIfGitBelowFloor(t)
 	build := func(t *testing.T) (main, bundle, ref, want string) {
 		t.Helper()
 		f := newCloneFixture(t)
@@ -1095,4 +1198,48 @@ func TestImportCommit_RefusesABundleAtThePath(t *testing.T) {
 		t.Errorf("the refusal does not name the real reason: %v", err)
 	}
 	assertNoRef(t, main, CloneRefs+"t1/"+strings.Repeat("a", 40))
+}
+
+// TestImportCommit_RefusesUploadPackConfigOverride: repo's own config can set
+// remote."file://<clone>".uploadpack to any command, which runs when the local fetch starts
+// the upload-pack for that URL; GIT_ALLOW_PROTOCOL=file does not stop it, because it governs
+// the transport, not the upload-pack binary. The import passes --upload-pack=git-upload-pack,
+// which the command line wins over the config key, so the command never runs. The control
+// shows the same config runs the command when --upload-pack is not passed.
+func TestImportCommit_RefusesUploadPackConfigOverride(t *testing.T) {
+	skipIfGitBelowFloor(t)
+	setup := func(t *testing.T) (f cloneFixture, ran func() bool) {
+		t.Helper()
+		f = newCloneFixture(t)
+		marker := filepath.Join(filepath.Dir(f.main), "ran-up")
+		script := filepath.Join(filepath.Dir(f.main), "up.sh")
+		if err := os.WriteFile(script, []byte("#!/bin/sh\ntouch '"+marker+"'\nexec git-upload-pack \"$@\"\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		fgit(t, f.main, "", "config", "remote.file://"+f.clone+".uploadpack", script)
+		return f, func() bool { _, err := os.Stat(marker); return err == nil }
+	}
+
+	t.Run("control: the config key runs a command", func(t *testing.T) {
+		f, ran := setup(t)
+		cmd := exec.Command(realGit(t), "-C", f.main, "-c", "protocol.version=2",
+			"fetch", "-q", "--no-tags", "--no-write-fetch-head", "--", "file://"+f.clone, f.tip+":refs/ttorch/clones/t1/"+f.tip)
+		cmd.Env = append(fixtureEnv(), "GIT_ALLOW_PROTOCOL=file") // no --upload-pack
+		_ = cmd.Run()
+		if !ran() {
+			t.Skip("git did not run the configured upload-pack; cannot demonstrate the attack on this git")
+		}
+	})
+
+	f, ran := setup(t)
+	ref, err := ImportCommit(context.Background(), f.main, f.clone, "t1", f.tip)
+	if ran() {
+		t.Fatal("the import ran the upload-pack command repo config named")
+	}
+	if err != nil {
+		t.Fatalf("the import should still succeed with the config key present: %v", err)
+	}
+	if got := fgit(t, f.main, "", "rev-parse", "--verify", "--quiet", ref+"^{commit}"); got != f.tip {
+		t.Fatalf("%s in main = %q, want %q", ref, got, f.tip)
+	}
 }
