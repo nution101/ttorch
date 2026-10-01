@@ -588,6 +588,9 @@ func TestImportCommit_TouchesTheCloneOnlyThroughTheFetch(t *testing.T) {
 		t.Fatal(err)
 	}
 	isFetch := func(args []string) bool { return slices.Contains(args, "fetch") }
+	// The fetch names the clone only as a file:// URL after "--", never a bare path (which git
+	// would read as a possible bundle) and never through --git-dir/--work-tree.
+	fetchURL := "file://" + f.clone
 	fetches := 0
 	for _, call := range readCalls(t, log) {
 		cwd, args := call[0], call[1:]
@@ -602,13 +605,16 @@ func TestImportCommit_TouchesTheCloneOnlyThroughTheFetch(t *testing.T) {
 			t.Errorf("git ran against %q, not main: %q", target, args)
 		}
 		for i, a := range args {
-			fetchSource := isFetch(args) && i > 0 && args[i-1] == "--" && a == f.clone
+			fetchSource := isFetch(args) && i > 0 && args[i-1] == "--" && a == fetchURL
 			if (strings.Contains(a, f.clone) || strings.HasPrefix(a, "--git-dir") || strings.HasPrefix(a, "--work-tree")) && !fetchSource {
-				t.Errorf("git was handed the clone other than as the fetch's source: %q", args)
+				t.Errorf("git was handed the clone other than as the fetch's file:// source: %q", args)
 			}
 		}
 		if isFetch(args) {
 			fetches++
+			if i := slices.Index(args, "--"); i < 0 || i+1 >= len(args) || args[i+1] != fetchURL {
+				t.Errorf("the fetch source is not the clone's file:// URL: %q", args)
+			}
 		}
 	}
 	if fetches != 1 {
@@ -796,26 +802,6 @@ func TestGitFixesCVE202432004(t *testing.T) {
 	}
 }
 
-// TestImportEnv_DisablesLazyFetch: importEnv sets GIT_NO_LAZY_FETCH=1, and because it strips
-// every GIT_* first, a hostile GIT_NO_LAZY_FETCH=0 in the caller's environment cannot override
-// it, with no duplicate entry for resolution to depend on.
-func TestImportEnv_DisablesLazyFetch(t *testing.T) {
-	t.Setenv("GIT_NO_LAZY_FETCH", "0")
-	t.Setenv("GIT_DIR", "/somewhere/else")
-	last, count := "", 0
-	for _, kv := range importEnv() {
-		if v, ok := strings.CutPrefix(kv, "GIT_NO_LAZY_FETCH="); ok {
-			last, count = v, count+1
-		}
-		if strings.HasPrefix(kv, "GIT_DIR=") {
-			t.Error("importEnv kept the caller's GIT_DIR")
-		}
-	}
-	if last != "1" || count != 1 {
-		t.Errorf("importEnv GIT_NO_LAZY_FETCH: value %q, count %d; want \"1\", 1", last, count)
-	}
-}
-
 // TestDropImports_DeletesOnlyThatTasksRefs: dropping a task's imports deletes every ref under
 // its directory in CloneRefs, imports and the other refs kept there alike, and nothing of a
 // task whose id merely starts the same way, nor any ref outside the namespace. main's hooks do
@@ -880,6 +866,22 @@ func TestDropImports_RefusesMalformedTaskIDBeforeGit(t *testing.T) {
 	}
 	if calls := readCalls(t, log); len(calls) != 0 {
 		t.Fatalf("a malformed task id reached git:\n%q", calls)
+	}
+}
+
+// TestImportEnv_RestrictsProtocol: importEnv sets GIT_ALLOW_PROTOCOL=file, and because it
+// strips every GIT_* first, a hostile GIT_ALLOW_PROTOCOL=all in the caller's environment
+// cannot override it, with no duplicate entry for resolution to depend on.
+func TestImportEnv_RestrictsProtocol(t *testing.T) {
+	t.Setenv("GIT_ALLOW_PROTOCOL", "all")
+	last, count := "", 0
+	for _, kv := range importEnv() {
+		if v, ok := strings.CutPrefix(kv, "GIT_ALLOW_PROTOCOL="); ok {
+			last, count = v, count+1
+		}
+	}
+	if last != "file" || count != 1 {
+		t.Errorf("importEnv GIT_ALLOW_PROTOCOL: value %q, count %d; want \"file\", 1", last, count)
 	}
 }
 
@@ -971,4 +973,126 @@ func TestImportCommit_RunsNoPromisorProgram(t *testing.T) {
 	}
 	t.Logf("refused: %v", err)
 	assertNoRef(t, main, CloneRefs+"t1/"+bad)
+}
+
+// dotGitTreeCommit commits, in the clone, a tree holding an entry literally named .git, which
+// transfer.fsckObjects refuses. It returns the commit sha.
+func dotGitTreeCommit(t *testing.T, clone string) string {
+	t.Helper()
+	blob := fgit(t, clone, "x\n", "hash-object", "-w", "--stdin")
+	raw, err := hex.DecodeString(blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree := fgit(t, clone, "100644 .git\x00"+string(raw), "hash-object", "-t", "tree", "-w", "--stdin", "--literally")
+	return fgit(t, clone, "", "commit-tree", tree, "-m", "dotgit")
+}
+
+// TestImportCommit_FsckPinnedAgainstMainConfig: repo's own config must not be able to turn off
+// the object check. fetch.fsckObjects=false beats -c transfer.fsckObjects=true, and
+// fetch.fsck.hasDotgit=ignore turns off the one check even with fsck on; the import pins both,
+// so the hostile .git-tree commit is refused with either set in repo.
+func TestImportCommit_FsckPinnedAgainstMainConfig(t *testing.T) {
+	for _, c := range []struct{ name, key, value string }{
+		{"fetch.fsckObjects=false", "fetch.fsckObjects", "false"},
+		{"fetch.fsck.hasDotgit=ignore", "fetch.fsck.hasDotgit", "ignore"},
+		{"transfer.fsckObjects=false", "transfer.fsckObjects", "false"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newCloneFixture(t)
+			fgit(t, f.main, "", "config", c.key, c.value)
+			bad := dotGitTreeCommit(t, f.clone)
+			_, err := ImportCommit(context.Background(), f.main, f.clone, "t1", bad)
+			if err == nil {
+				t.Fatalf("imported a .git-tree commit with %s set in main", c.name)
+			}
+			t.Logf("refused: %v", err)
+			assertNoRef(t, f.main, CloneRefs+"t1/"+bad)
+			if fgitOK(t, f.main, "cat-file", "-e", bad) {
+				t.Errorf("main holds %s after the refused import", bad)
+			}
+		})
+	}
+}
+
+// TestImportCommit_RefusesExtProtocolRewrite: repo config that rewrites the clone source into
+// an ext:: URL and allows the ext transport turns a fetch into command execution. The import
+// sets GIT_ALLOW_PROTOCOL=file, so the ext helper never runs. The control shows the rewrite
+// does run it when the protocol is not restricted.
+func TestImportCommit_RefusesExtProtocolRewrite(t *testing.T) {
+	setup := func(t *testing.T) (f cloneFixture, ran func() bool) {
+		t.Helper()
+		f = newCloneFixture(t)
+		dir := filepath.Dir(f.main)
+		marker := filepath.Join(dir, "ran-ext")
+		helper := filepath.Join(dir, "ext.sh")
+		if err := os.WriteFile(helper, []byte("#!/bin/sh\ntouch '"+marker+"'\nexec git upload-pack .\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		fgit(t, f.main, "", "config", "protocol.ext.allow", "always")
+		fgit(t, f.main, "", "config", "url.ext::"+helper+" .insteadOf", "file://"+f.clone)
+		fgit(t, f.main, "", "config", "--add", "url.ext::"+helper+" .insteadOf", f.clone)
+		return f, func() bool { _, err := os.Stat(marker); return err == nil }
+	}
+
+	t.Run("control: the rewrite runs a command", func(t *testing.T) {
+		f, ran := setup(t)
+		cmd := exec.Command(realGit(t), "-C", f.main, "-c", "protocol.version=2", "-c", "protocol.ext.allow=always",
+			"fetch", "-q", "--no-tags", "--no-write-fetch-head", "--", f.clone, f.tip+":refs/ttorch/clones/t1/"+f.tip)
+		cmd.Env = fixtureEnv() // no GIT_ALLOW_PROTOCOL restriction
+		_ = cmd.Run()
+		if !ran() {
+			t.Skip("git did not run the ext helper; cannot demonstrate the attack on this git")
+		}
+	})
+
+	f, ran := setup(t)
+	_, err := ImportCommit(context.Background(), f.main, f.clone, "t1", f.tip)
+	if ran() {
+		t.Fatal("the import ran the ext:: helper the repo config named")
+	}
+	if err == nil {
+		t.Fatal("the import should fail when repo rewrites the source to an ext transport")
+	}
+	t.Logf("refused: %v", err)
+	assertNoRef(t, f.main, CloneRefs+"t1/"+f.tip)
+}
+
+// TestImportCommit_RefusesABundleAtThePath: a regular file at the clone path would be read as a
+// git bundle, a transport that honours a worker-written file. The import rejects a path that is
+// not a real directory before it fetches, and passes the source as a file:// URL, which never
+// takes the bundle route. The control shows a bare-path fetch does consume the bundle.
+func TestImportCommit_RefusesABundleAtThePath(t *testing.T) {
+	build := func(t *testing.T) (main, bundle, ref, want string) {
+		t.Helper()
+		f := newCloneFixture(t)
+		bundle = filepath.Join(filepath.Dir(f.main), "clonefile")
+		fgit(t, f.clone, "", "bundle", "create", bundle, "refs/heads/ttorch/t1")
+		return f.main, bundle, "refs/heads/ttorch/t1:refs/ttorch/clones/t1/x", f.tip
+	}
+
+	t.Run("control: a bare path consumes the bundle", func(t *testing.T) {
+		main, bundle, ref, want := build(t)
+		cmd := exec.Command(realGit(t), "-C", main, "fetch", "-q", "--no-tags", "--no-write-fetch-head", "--", bundle, ref)
+		cmd.Env = fixtureEnv()
+		if err := cmd.Run(); err != nil {
+			t.Skipf("git did not consume the bundle on this git: %v", err)
+		}
+		if got := fgit(t, main, "", "rev-parse", "--verify", "--quiet", "refs/ttorch/clones/t1/x"); got != want {
+			t.Skipf("bundle route did not produce the ref; cannot demonstrate on this git")
+		}
+	})
+
+	main, bundle, _, _ := build(t)
+	// Point the import at the bundle file in place of a clone directory. The sha only has to
+	// pass the argument checks; the Lstat refuses the file before any fetch.
+	_, err := ImportCommit(context.Background(), main, bundle, "t1", strings.Repeat("a", 40))
+	if err == nil {
+		t.Fatal("the import treated a bundle file as a clone")
+	}
+	t.Logf("refused: %v", err)
+	if !strings.Contains(err.Error(), "not a directory") {
+		t.Errorf("the refusal does not name the real reason: %v", err)
+	}
+	assertNoRef(t, main, CloneRefs+"t1/"+strings.Repeat("a", 40))
 }

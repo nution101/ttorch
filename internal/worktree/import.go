@@ -80,7 +80,8 @@ const importTimeout = 2 * time.Minute
 // When the ref already names the commit, nothing is fetched. task and sha are checked with
 // ValidTaskID and ValidObjectID, and clone must be an absolute clean path, before any git
 // command runs. Before it fetches, it refuses a git without the CVE-2024-32004 fix
-// (checkImportGit). The whole call runs under importTimeout as well as ctx.
+// (checkImportGit) and confirms clone is a real directory, and it hands the source to git as
+// a file:// URL. The whole call runs under importTimeout as well as ctx.
 func ImportCommit(ctx context.Context, repo, clone, task, sha string) (string, error) {
 	if repo == "" {
 		return "", errors.New("import: no repository to import into")
@@ -111,11 +112,22 @@ func ImportCommit(ctx context.Context, repo, clone, task, sha string) (string, e
 		return id, err == nil
 	}
 
+	from := escapeForTerminal(clone)
 	if id, ok := resolve(ref + "^{commit}"); ok && id == sha {
 		return ref, nil
 	}
 	if err := checkImportGit(ctx, hooks); err != nil {
 		return "", err
+	}
+	// Immediately before the fetch, confirm the source is a real directory. Lstat, not Stat,
+	// so a symlink at the path is rejected rather than followed, as ObserveHead does. A
+	// regular file here would otherwise be read as a git bundle, a transport that honours a
+	// worker-written file; passing the source as a file:// URL already refuses the bundle
+	// route, and this refuses it a step earlier with a clearer message.
+	if fi, err := os.Lstat(clone); err != nil {
+		return "", fmt.Errorf("import %s: clone path %s: %w", sha, from, err)
+	} else if !fi.IsDir() {
+		return "", fmt.Errorf("import %s: clone path %s is not a directory (mode %s)", sha, from, fi.Mode().Type())
 	}
 	_, stderr, err := run(
 		"fetch", "--quiet",
@@ -124,10 +136,11 @@ func ImportCommit(ctx context.Context, repo, clone, task, sha string) (string, e
 		"--no-recurse-submodules", // nothing but the named commit's objects
 		"--no-auto-gc", "--no-auto-maintenance",
 		// No --update-shallow, ever: with it a shallow clone makes repo shallow. No "+": the
-		// name holds the sha, so the ref existing with another value is corruption.
-		"--", clone, sha+":"+ref,
+		// name holds the sha, so the ref existing with another value is corruption. The source
+		// is a file:// URL, never a bare path, so git takes the file transport and never the
+		// bundle route a bare path to a file would.
+		"--", "file://"+clone, sha+":"+ref,
 	)
-	from := escapeForTerminal(clone)
 	if err != nil {
 		return "", fmt.Errorf("import %s from %s: %w", sha, from, err)
 	}
@@ -249,11 +262,19 @@ func leadingInt(s string) int {
 
 // importConfig is the configuration every git command of the import runs with, on top of
 // repo's own. protocol.version=2 serves any object the clone has; version 0 refuses a sha no
-// ref advertises, such as the parent of the tip. transfer.fsckObjects makes git check every
-// object it receives, which refuses a tree holding an entry named .git and leaves no ref and
-// no object behind. The empty hooks directory keeps repo's own hooks (reference-transaction
-// runs on the import's ref update) from running. gc.auto and maintenance.auto, with the
-// fetch's --no-auto-gc and --no-auto-maintenance, keep the import from repacking repo.
+// ref advertises, such as the parent of the tip. The empty hooks directory keeps repo's own
+// hooks (reference-transaction runs on the import's ref update) from running. gc.auto and
+// maintenance.auto, with the fetch's --no-auto-gc and --no-auto-maintenance, keep the import
+// from repacking repo.
+//
+// The fsck settings make git check every object it receives, which refuses a tree holding an
+// entry named .git and leaves no ref and no object behind. All three are needed, because
+// repo's OWN config can turn the check off even though -c outranks a config file: a key set
+// in repo beats the general key it specialises. fetch.fsckObjects=false in repo overrides
+// -c transfer.fsckObjects=true (fetch's own key wins over transfer's), so fetch.fsckObjects
+// is pinned too; and fetch.fsck.hasDotgit=ignore in repo turns off the one check that stops
+// the .git-tree attack even with fsck on, so that severity is pinned to error. Both were
+// shown importing the hostile tree before they were pinned.
 //
 // These settings reach the git commands run in repo and their children, and not the clone's
 // upload-pack: git drops command-line config when it starts the local transport's
@@ -265,6 +286,8 @@ func importConfig(hooks string) []string {
 	return []string{
 		"-c", "protocol.version=2",
 		"-c", "transfer.fsckObjects=true",
+		"-c", "fetch.fsckObjects=true",
+		"-c", "fetch.fsck.hasDotgit=error",
 		"-c", "core.hooksPath=" + hooks,
 		"-c", "core.fsmonitor=false",
 		"-c", "uploadpack.packObjectsHook=",
@@ -278,14 +301,20 @@ func importConfig(hooks string) []string {
 // upload-pack included. None of the caller's GIT_* variables, so the import means the same
 // whoever runs it: a GIT_DIR would point it at another repository, and a
 // GIT_OBJECT_DIRECTORY would write the commit where repo does not read it, with the import
-// still reporting success. Stripping them all also means an ambient GIT_NO_LAZY_FETCH=0
-// cannot override the value this function then sets.
+// still reporting success. Stripping them all also means an ambient GIT_NO_LAZY_FETCH=0 or
+// GIT_ALLOW_PROTOCOL=all cannot override the two this function then sets.
 //
-// GIT_NO_LAZY_FETCH=1 forces the clone's upload-pack not to lazy-fetch a missing object
-// through a promisor remote the worker named, which is the CVE-2024-32004 code path. The
-// version floor refuses a git that lacks the fix; this enforces it even on a fixed git, whose
-// default a worker's clone config could otherwise flip. Measured: with the value 0 the clone's
-// upload-pack ran the worker's promisor program; with 1 it did not.
+// It sets, beyond the originals:
+//   - GIT_NO_LAZY_FETCH=1 forces the clone's upload-pack not to lazy-fetch a missing object
+//     through a promisor remote the worker named, which is the CVE-2024-32004 code path. The
+//     version floor refuses a git that lacks the fix; this enforces it even on a fixed git,
+//     whose default a worker's clone config could otherwise flip. Measured: with the value 0
+//     the clone's upload-pack ran the worker's promisor program; with 1 it did not.
+//   - GIT_ALLOW_PROTOCOL=file restricts git to the file transport, so url.<ext::…>.insteadOf
+//     plus protocol.ext.allow=always in repo cannot rewrite the clone source into an ext::
+//     command and run it. Measured: that rewrite ran a worker-chosen command without this,
+//     and was refused as "transport 'ext' not allowed" with it. The import only ever speaks
+//     to a local path, so file is the only transport it needs.
 //
 // No global or system config: the import needs neither, the worker could have edited the
 // lead's global file, and upload-pack reads it, where a global uploadpack.packObjectsHook
@@ -302,6 +331,7 @@ func importEnv() []string {
 		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_NO_LAZY_FETCH=1",
+		"GIT_ALLOW_PROTOCOL=file",
 	)
 }
 
