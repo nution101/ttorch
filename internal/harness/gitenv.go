@@ -68,8 +68,8 @@ func (e WorkerGitEnv) pairs() [][2]string {
 	return [][2]string{{envGitCeiling, e.CeilingDirectories}, {envGitGlobal, e.ConfigGlobal}, {envGitSystem, e.ConfigSystem}}
 }
 
-// clonesRoot is the directory clone pools live under: ~/.ttorch/clones/<repo>-<hash8>/<N>.
-func clonesRoot() string { return filepath.Join(paths.Default().Home, "clones") }
+// clonesRoot is the directory clone pools live under: <clones>/<repo>-<hash8>/<N>.
+func clonesRoot() string { return paths.Default().Clones() }
 
 // IsCloneWorkdir reports whether workdir is a per-worker clone slot: a numeric directory in a
 // pool directly under the clones root, whose .git is a real directory. A linked worktree's .git
