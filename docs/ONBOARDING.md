@@ -210,7 +210,12 @@ you run them yourself at a terminal), or the first spawn, records it from your c
 branch `origin/HEAD` names, else the branch you are on. `ttorch project ls` shows it and `ttorch project set-branch <project> <branch>` changes
 it; run that yourself, since it refuses a worker's context. A project registered before the
 branch was recorded is seeded once, and `ttorch update` and `ttorch doctor` print the seeded
-branch once so you can correct it.
+branch once so you can correct it. `ttorch doctor` also prints, on every run and for each
+trusted project, the recorded branch and the commit it is at, the commit the last land left it
+at, and the URL origin resolves to, with a warning when the branch has lost the last landed
+commit or origin no longer matches the URL recorded with the branch. A worker can move the
+branch or rewrite origin from its own worktree, and the gate does not stop a land when that
+happens, so check this output (see "Known limit: shared git state" in `docs/ARCHITECTURE.md`).
 
 `ttorch init` also derives a **project profile** (stack, exact build/test/lint commands,
 layout, and a few exemplar files) into `AGENTS.md` so workers match the repo's style; refresh
@@ -325,7 +330,8 @@ fallback) opens a separate window per worker. Toggle with `TTORCH_WORKER_TABS` a
 
 ## 15. Troubleshooting
 
-- `ttorch doctor` — missing dependencies, package manager, WSL status.
+- `ttorch doctor` — missing dependencies, package manager, WSL status, and what the trust gate
+  reads for each trusted project.
 - `ttorch status` — active workers and their state. `ttorch recovery` reconciles tracked
   tasks against live tmux windows after a crash or restart.
 - `ttorch tasks` — the full board, including pending backlog and any task the scheduler

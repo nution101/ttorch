@@ -240,9 +240,15 @@ invalidates the verdict — re-prep, re-review, re-record.
   repository it controls, which the land's and fleet-sync's origin checks then consult; by
   repointing `origin/HEAD` or planting branches before the first run after an upgrade, which the
   one-time default-branch seed trusts; and by leaving refs that a later spawn records as the
-  default branch for a project that has none. Per-worker clones are the planned fix. Until then
-  the lead should check the recorded default branch that `ttorch update` and `ttorch doctor`
-  print.
+  default branch for a project that has none. The first of these can empty the reviewers' diff:
+  when the default branch in the worker's repository is at the worker's own commit, the review
+  covers nothing and the commit lands unreviewed, including changes to the gate's own files
+  while gate-change approval is off (the default). Per-worker clones are the planned fix. Until
+  then the lead checks `ttorch doctor`. On every run it prints, for each trusted project, the
+  recorded default branch and its commit, the last landed commit and origin's URL, and it warns
+  when the branch has lost the last landed commit or origin differs from the URL recorded with
+  the branch. `ttorch project ls` shows the recorded branch in its BRANCH column. Nothing
+  refuses a land on these warnings, so they only help once the lead looks.
 
   **Matching on the name alone is not enough, so the guard does not rely on it.** Paths are
   compared under `fsIdentityKey` — NFD, Unicode FULL case folding, then SimpleFold

@@ -323,9 +323,10 @@ passing commit-pinned verdict plus a fresh green validate auto-mints the approva
   terminal, behind the same guard as `set-branch`), or by the first spawn, but only while no
   worker has had a checkout of the repository. Only the lead changes it, with
   `ttorch project set-branch <project> <branch>`, which refuses a worker context and a
-  non-interactive stdin. Projects registered before the branch was recorded are seeded once by
-  the same detection, and `ttorch update` and `ttorch doctor` print each seeded branch once, so
-  a wrong seed is seen. A project with no recorded branch, or one whose recorded branch has no
+  non-interactive stdin. Projects registered before the branch was recorded are seeded once with
+  the same detection, on the first ttorch command run outside a worker's context. `ttorch update`
+  and `ttorch doctor` print each seeded branch once, so a wrong seed is seen, and `ttorch doctor`
+  prints every trusted project's branch on each run (see "Known limit: shared git state" below). A project with no recorded branch, or one whose recorded branch has no
   local ref, is refused at every gate read with the command that fixes it. `MergeLocal` refuses
   the fast-forward if the branch has moved off that commit since the gate read it. The base of
   the diff the reviewers are shown, the land's rebase base, the post-merge verify and
@@ -366,16 +367,29 @@ recorded default branch, the pinned review base and the origin checks above cove
 worker can move from its own worktree, but a worker running ordinary git commands there can
 still mislead the gate in three ways:
 
-- It can rewrite `remote.origin.url` in the shared `.git/config`, so the origin checks in
-  `landPrep` and `ttorch fleet-sync` consult a repository the worker controls.
+- It can rewrite `remote.origin.url` in the shared `.git/config`, or add a `url.*.insteadOf`
+  rule, so the origin checks in `landPrep` and `ttorch fleet-sync` consult a repository the
+  worker controls. If that repository's default branch is at the worker's own commit, the review
+  base is that commit, the reviewers' diff is empty, and the land brings in a commit no reviewer
+  saw. While gate-change approval is off, which is the default, that commit can change the
+  gate's own files too.
 - It can repoint `refs/remotes/origin/HEAD` or plant branches before the first run of an
-  upgraded binary, and the one-time default-branch seed trusts what it finds.
+  upgraded binary, and the one-time default-branch seed trusts what it finds. The seed does not
+  run from a worker's context, so it runs on the lead's next command, but it reads whatever
+  the worker left.
 - It can leave refs behind that a later spawn records as the default branch when a project has
   none recorded.
 
 The planned fix gives each worker its own clone instead of a worktree that shares the main
-checkout's `.git`. Until then, the lead should check the recorded default branch that
-`ttorch update` and `ttorch doctor` print, and correct it with `ttorch project set-branch`.
+checkout's `.git`. Until then, the lead checks what the gate reads with `ttorch doctor`. On every
+run it prints, for each trusted project, the recorded default branch and the commit it is at,
+the commit the last land left it at, and the URL origin resolves to (after any `insteadOf`
+rule). It warns when the branch no longer contains the last landed commit, and when origin
+differs from the URL recorded with the branch. `ttorch project ls` shows the recorded branch in
+its BRANCH column. `ttorch project set-branch` corrects a wrong branch and records the current
+origin URL, which is also how the lead accepts an origin they changed themselves. These are
+warnings for the lead to act on. The gate does not refuse a land because of them, so a land that
+runs before the lead looks is not stopped.
 
 ### Why the gate-config set stops where it does
 
