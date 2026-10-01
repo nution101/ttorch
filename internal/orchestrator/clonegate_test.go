@@ -250,6 +250,61 @@ func TestCloneTask_PrepMatchesAWorktreeAtTheSameCommit(t *testing.T) {
 	}
 }
 
+// TestCloneTask_ReviewMirrorHoldsTheImportWithoutTheClone runs the daemon gate on a clone task
+// and builds the reviewer's workspace the way dispatch does. The dispatcher must get no clone
+// to fall back to, and the mirror of the project must already hold the commit, because prep
+// imported it under a ref the mirror copies.
+func TestCloneTask_ReviewMirrorHoldsTheImportWithoutTheClone(t *testing.T) {
+	m, repo, _ := trustHarness(t, "wt1", "trusted", "exit 0")
+	clone := cloneTask(t, m, repo, "cl1")
+	commitInClone(t, clone, "a.go", "package a\n")
+	head := commitInClone(t, clone, "b.go", "package b\n")
+	armClone(t, clone)
+	calls := recordGitCalls(t)
+
+	var sources []string
+	var mirrored []bool
+	prev := reviewerDispatcher
+	t.Cleanup(func() { reviewerDispatcher = prev })
+	reviewerDispatcher = func(m *Manager, taskID, dim, dir, head, repo, wt string) error {
+		sources = append(sources, wt)
+		_, bare, err := prepareReviewWorkspace(filepath.Join(t.TempDir(), dim), dir, repo, wt, head)
+		if err != nil {
+			return err
+		}
+		mirrored = append(mirrored, commitInMirror(bare, head))
+		return nil
+	}
+	if out, err := m.gateOnceAt("cl1", time.Minute, 2, time.Hour, time.Now()); err != nil || out != GateDispatched {
+		t.Fatalf("gateOnceAt = %q, %v; want %q", out, err, GateDispatched)
+	}
+	if len(sources) == 0 {
+		t.Fatal("no reviewer was dispatched")
+	}
+	for i, wt := range sources {
+		if wt != "" {
+			t.Errorf("dispatch %d was handed %q to fetch the reviewed commit from; a clone task must hand none", i, wt)
+		}
+	}
+	for i, ok := range mirrored {
+		if !ok {
+			t.Errorf("the review mirror for dispatch %d does not hold the reviewed commit %s", i, short(head))
+		}
+	}
+	assertNoGitInClone(t, calls(), clone)
+}
+
+// TestCloneTask_ReviewMirrorRefusesAMissingCommit is the other half: with no clone to fetch
+// from, a mirror that lacks the reviewed commit is an error, not a quiet review of nothing.
+func TestCloneTask_ReviewMirrorRefusesAMissingCommit(t *testing.T) {
+	_, repo, _ := trustHarness(t, "wt1", "trusted", "exit 0")
+	missing := strings.Repeat("ab", 20)
+	_, _, err := prepareReviewWorkspace(filepath.Join(t.TempDir(), "ws"), t.TempDir(), repo, "", missing)
+	if err == nil || !strings.Contains(err.Error(), "which trust prep imports into the project repository") {
+		t.Fatalf("prepareReviewWorkspace = %v, want the refusal for a missing import, reached without a fetch", err)
+	}
+}
+
 // TestCloneTask_ReviewDiffAndApproveReadTheImportedCommit checks the lead's two direct reads of
 // a clone task. review-diff shows the committed change and not an edit the worker left
 // uncommitted, and approve pins the token to the clone's head after importing it.

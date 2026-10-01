@@ -1826,7 +1826,7 @@ func (m *Manager) gateOnceAt(taskID string, ttl time.Duration, maxReviewerAttemp
 	if len(toDispatch) > 0 {
 		charged := false
 		for _, dim := range toDispatch {
-			if err := reviewerDispatcher(m, taskID, dim, dir, head, t.Project, t.Worktree); err != nil {
+			if err := reviewerDispatcher(m, taskID, dim, dir, head, t.Project, w.mirrorSource()); err != nil {
 				fmt.Fprintf(os.Stderr, "ttorch: gate could not dispatch reviewer %s/%s: %v\n", taskID, dim, err)
 				if errors.Is(err, errReviewerNotStarted) {
 					// Nothing started and a retry is likely to work. Costs no attempt and does
@@ -2112,7 +2112,12 @@ func prepareReviewWorkspace(dir, inputsDir, repo, wt, head string) (cwd, bare st
 	}
 	// The reviewed commit is normally reachable from the worker's branch, which the mirror
 	// copies. Fall back to fetching it from the worktree when it is not (a detached worker
-	// HEAD), so the reviewer can always read the source it is judging.
+	// HEAD), so the reviewer can always read the source it is judging. A clone passes no wt
+	// and gets no fallback: its commit was imported under refs/ttorch/clones/, which the
+	// mirror copies, and fetching from the clone would read the worker's own repository.
+	if wt == "" && !commitInMirror(bare, head) {
+		return "", "", fmt.Errorf("the review mirror for %s does not contain the reviewed commit %s, which trust prep imports into the project repository", filepath.Base(dir), short(head))
+	}
 	if !commitInMirror(bare, head) {
 		if out, ferr := exec.Command("git", "-C", bare, "fetch", "--no-tags", "--quiet", wt, "+HEAD:refs/ttorch/reviewed").CombinedOutput(); ferr != nil {
 			return "", "", fmt.Errorf("fetch the reviewed commit %s into the review mirror: %w: %s", short(head), ferr, strings.TrimSpace(string(out)))
