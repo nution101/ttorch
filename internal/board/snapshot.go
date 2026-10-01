@@ -316,6 +316,18 @@ func splitFindings(s string) []string {
 	return out
 }
 
+// shellQuote renders s as one POSIX shell word, because the lead pastes the approval command
+// into a shell and a task id is text the board did not choose. An id made only of characters
+// no shell treats specially is left bare, so the common case reads as typed; anything else is
+// single-quoted, where nothing expands, and a quote inside the id is closed, escaped with a
+// backslash and reopened.
+func shellQuote(s string) string {
+	if s != "" && strings.Trim(s, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@%+=:,./_-") == "" {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 // approvalFor decides whether a done task waits on the lead's approval, and why. Approving
 // is not something the board can do (see routes): it lists the task with the command the
 // lead runs at their own terminal.
@@ -331,7 +343,7 @@ func (s *Server) approvalFor(ctx context.Context, t db.Task, evs []db.Event) (Ap
 	if approved {
 		return Approval{}, false, nil
 	}
-	a := Approval{TaskID: t.ID, Project: project(t.Project), Mode: mode, Command: "ttorch approve " + t.ID}
+	a := Approval{TaskID: t.ID, Project: project(t.Project), Mode: mode, Command: "ttorch approve " + shellQuote(t.ID)}
 
 	// The gate escalated to a human: an auto-approval lapsed (approval_required), and no
 	// approval has been granted since.

@@ -2,6 +2,8 @@ package board
 
 import (
 	"context"
+	"os"
+	"os/exec"
 	"regexp"
 	"strings"
 	"testing"
@@ -177,5 +179,49 @@ func TestRecentCompletionsAreNewestFirstOncePerTask(t *testing.T) {
 	}
 	if len(snap.Completions) != 2 || snap.Completions[0].TaskID != "a" || snap.Completions[1].TaskID != "b" {
 		t.Fatalf("completions = %+v", snap.Completions)
+	}
+}
+
+// TestApprovalCommandIsOneInertArgument: the lead pastes the approval command into a shell,
+// and a task id is text the board did not choose. Whatever the id holds, a POSIX shell must
+// read it back as exactly one argument, with nothing run on the way.
+func TestApprovalCommandIsOneInertArgument(t *testing.T) {
+	h := newHarness(t)
+	h.srv.cfg.Mode = func(string) string { return "local" }
+	ids := []string{"t1; touch pwned", "$(touch pwned)", "`touch pwned`", "it's", "a b\tc", "plain-id_1.2"}
+	for _, id := range ids {
+		h.addTask(taskDone(id))
+	}
+	snap, err := h.srv.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Approvals) != len(ids) {
+		t.Fatalf("approvals = %+v, want %d", snap.Approvals, len(ids))
+	}
+	dir := t.TempDir()
+	for _, a := range snap.Approvals {
+		arg, ok := strings.CutPrefix(a.Command, "ttorch approve ")
+		if !ok {
+			t.Fatalf("command %q does not start with ttorch approve", a.Command)
+		}
+		cmd := exec.Command("/bin/sh", "-c", `set -- `+arg+`; printf '%s|%s' "$#" "$1"`)
+		cmd.Dir = dir
+		out, err := cmd.Output()
+		if err != nil {
+			t.Errorf("sh rejected %q: %v", a.Command, err)
+			continue
+		}
+		if want := "1|" + a.TaskID; string(out) != want {
+			t.Errorf("command %q parses as %q, want %q", a.Command, out, want)
+		}
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Errorf("pasting an approval command ran something: %v", entries)
+	}
+	for _, a := range snap.Approvals {
+		if a.TaskID == "plain-id_1.2" && a.Command != "ttorch approve plain-id_1.2" {
+			t.Errorf("a plain id is quoted needlessly: %q", a.Command)
+		}
 	}
 }
