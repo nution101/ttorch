@@ -463,7 +463,7 @@ func TestStall_UnknownHeadNeitherResetsNorRaises(t *testing.T) {
 	t.Run("unreadable at the due time", func(t *testing.T) {
 		w, s, clk, start := stallFixture(t, "unk")
 		readable := true
-		w.stall.headIdentity = func(string) (string, bool) {
+		w.stall.headIdentity = func(db.Task) (string, bool) {
 			if !readable {
 				return "", false
 			}
@@ -479,7 +479,7 @@ func TestStall_UnknownHeadNeitherResetsNorRaises(t *testing.T) {
 	})
 	t.Run("readable only after the clock started", func(t *testing.T) {
 		w, s, clk, start := stallFixture(t, "late")
-		w.stall.headIdentity = func(string) (string, bool) {
+		w.stall.headIdentity = func(db.Task) (string, bool) {
 			if clk.t.Before(start.Add(5 * time.Minute)) {
 				return "", false
 			}

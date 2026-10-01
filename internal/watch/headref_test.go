@@ -5,8 +5,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
+
+	"github.com/nution101/ttorch/internal/db"
 )
 
 const (
@@ -114,6 +119,16 @@ func TestHeadIdentity_RefusesSpecialFiles(t *testing.T) {
 		}
 		if _, ok := headIdentity(wt); ok {
 			t.Fatal("a FIFO HEAD must read as unknown")
+		}
+	})
+	t.Run("fifo HEAD through a gitdir: line", func(t *testing.T) {
+		wt := t.TempDir()
+		writeTree(t, wt, map[string]string{".git": "gitdir: meta/git\n", "meta/git/refs/heads/main": idA + "\n"})
+		if err := syscall.Mkfifo(filepath.Join(wt, "meta", "git", "HEAD"), 0o644); err != nil {
+			t.Skipf("mkfifo: %v", err)
+		}
+		if _, ok := headIdentity(wt); ok {
+			t.Fatal("a FIFO HEAD behind gitdir: must read as unknown")
 		}
 	})
 	t.Run("symlinked HEAD", func(t *testing.T) {
@@ -289,5 +304,72 @@ func TestJoinWithin(t *testing.T) {
 		if _, got := joinWithin(base, ref); got != want {
 			t.Errorf("joinWithin(%q) = %v, want %v", ref, got, want)
 		}
+	}
+}
+
+// TestBoundedHead_SlowOpenTimesOutWithoutPileUp: a HEAD open that never returns (an
+// automount or FUSE path behind gitdir:) must read as unknown once the deadline passes,
+// and must not start a second read for the task while the first is still hanging.
+func TestBoundedHead_SlowOpenTimesOutWithoutPileUp(t *testing.T) {
+	release := make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	var opens atomic.Int32
+	orig := openGitFile
+	t.Cleanup(func() { openGitFile = orig })
+	t.Cleanup(unblock) // runs first: let any hung read finish
+	openGitFile = func(path string) (*os.File, error) {
+		if filepath.Base(path) == "HEAD" {
+			opens.Add(1)
+			<-release
+		}
+		return orig(path)
+	}
+
+	wt := t.TempDir()
+	writeTree(t, wt, map[string]string{".git": "gitdir: meta/git\n", "meta/git/HEAD": idA + "\n"})
+	b := newBoundedHead(50*time.Millisecond, headReader.read)
+	task := db.Task{ID: "slow", Worktree: wt}
+
+	read := func(stage string) (string, bool) {
+		t.Helper()
+		type res struct {
+			id string
+			ok bool
+		}
+		done := make(chan res, 1)
+		go func() { id, ok := b.identity(task); done <- res{id, ok} }()
+		select {
+		case r := <-done:
+			return r.id, r.ok
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: the HEAD read blocked past its deadline", stage)
+			return "", false
+		}
+	}
+
+	if id, ok := read("hung open"); ok {
+		t.Fatalf("hung open: got %q, want unknown", id)
+	}
+	if id, ok := read("second sweep"); ok {
+		t.Fatalf("second sweep: got %q, want unknown", id)
+	}
+	if n := opens.Load(); n != 1 {
+		t.Fatalf("started %d reads while the first still hung, want 1", n)
+	}
+
+	unblock()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if id, ok := read("after release"); ok {
+			if id != idA {
+				t.Fatalf("after release: got %q, want %q", id, idA)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the task's slot was never freed after the hung read returned")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

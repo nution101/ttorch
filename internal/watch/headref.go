@@ -10,7 +10,8 @@ package watch
 // Only the identity (the commit id HEAD resolves to) is read, never a timestamp: the ladder
 // asks whether HEAD changed since the clock last restarted, which a committer date forged
 // into the future cannot fake. Anything unexpected reads as unknown, and an unknown HEAD
-// neither restarts the clock nor counts against the worker.
+// neither restarts the clock nor counts against the worker. The read runs under a short
+// deadline (boundedHead), so a path that never answers cannot hold up the sweep.
 
 import (
 	"bufio"
@@ -19,8 +20,69 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
+
+	"github.com/nution101/ttorch/internal/db"
 )
+
+// headReadTimeout bounds one HEAD read. The files are the worker's, and a gitdir: line or
+// commondir can name an automount or FUSE path whose open never returns; past the deadline
+// the read is unknown and the sweep moves on to the next task.
+const headReadTimeout = 2 * time.Second
+
+// boundedHead runs a HEAD read under headReadTimeout, at most one per task at a time. A
+// read that outlives its deadline keeps its slot until it returns, so a hung path costs
+// one goroutine per task rather than one per sweep; until then the task reads as unknown.
+type boundedHead struct {
+	timeout time.Duration
+	read    func(worktree, project string) (string, bool)
+
+	mu       sync.Mutex
+	inflight map[string]bool // task id → a read is still running
+}
+
+// headReader is shared by every Watcher in the process, so a read left hanging by one
+// arm still holds its task's slot in the next.
+var headReader = newBoundedHead(headReadTimeout, func(worktree, _ string) (string, bool) { return headIdentity(worktree) })
+
+func newBoundedHead(timeout time.Duration, read func(worktree, project string) (string, bool)) *boundedHead {
+	return &boundedHead{timeout: timeout, read: read, inflight: map[string]bool{}}
+}
+
+// identity reads the HEAD id of t's worktree. ok is false when the read fails, times out,
+// or an earlier read for t has not returned yet.
+func (b *boundedHead) identity(t db.Task) (string, bool) {
+	b.mu.Lock()
+	if b.inflight[t.ID] {
+		b.mu.Unlock()
+		return "", false
+	}
+	b.inflight[t.ID] = true
+	b.mu.Unlock()
+
+	type result struct {
+		id string
+		ok bool
+	}
+	done := make(chan result, 1) // buffered: a read that outlives its deadline never blocks on send
+	go func() {
+		id, ok := b.read(t.Worktree, t.Project)
+		b.mu.Lock()
+		delete(b.inflight, t.ID)
+		b.mu.Unlock()
+		done <- result{id, ok}
+	}()
+	timer := time.NewTimer(b.timeout)
+	defer timer.Stop()
+	select {
+	case r := <-done:
+		return r.id, r.ok
+	case <-timer.C:
+		return "", false
+	}
+}
 
 // Read bounds. HEAD, a .git file, commondir and a loose ref are one short line each; a
 // packed-refs file can hold many refs, so it gets a larger cap. Over the cap reads as unknown.
@@ -134,7 +196,7 @@ func packedRef(path, ref string) (string, bool) {
 func readGitFile(path string, max int64) ([]byte, bool) {
 	// O_NOFOLLOW refuses a symlink in the last component; O_NONBLOCK keeps a FIFO planted
 	// in place of the file from blocking the open, and the regular-file check then refuses it.
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	f, err := openGitFile(path)
 	if err != nil {
 		return nil, false
 	}
@@ -148,6 +210,11 @@ func readGitFile(path string, max int64) ([]byte, bool) {
 		return nil, false
 	}
 	return b, true
+}
+
+// openGitFile opens one git file for readGitFile. Tests swap it for a slow opener.
+var openGitFile = func(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 }
 
 // joinWithin joins a ref name onto base and reports whether the result, once cleaned,
