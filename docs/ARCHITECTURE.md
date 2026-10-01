@@ -456,6 +456,7 @@ once if it touches any covered path.
 | `internal/orchestrator/gate.go` | 5 | +2 |
 | `internal/orchestrator/gateattacks_test.go` | 0 | +0 |
 | `internal/orchestrator/gateconfig_test.go` | 0 | +0 |
+| `internal/orchestrator/landscratch.go` | 0 | +0 |
 | `internal/orchestrator/merge.go` | 6 | +1 |
 | `internal/orchestrator/validate.go` | 2 | +0 |
 | `internal/orchestrator/validatecache.go` | 1 | +0 |

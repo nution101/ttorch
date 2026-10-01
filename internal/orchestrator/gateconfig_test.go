@@ -89,6 +89,8 @@ var decidingFunctions = []string{
 	"writeAudit", "sanitizeAuditLine",
 	// which commit a task's gate pins to, and where its diffs of that commit run
 	"openWork", "workHead", "observedHead",
+	// the commit a clone task's land rebases its head into, and when it refuses to make one
+	"rebaseInScratch", "landRebaseClone",
 	// the path-spelling and collision controls the guard rests on
 	"fsIdentityKey", "orbitMin", "hostilePath", "collidesInTree", "entriesWithDirs",
 	"sanitizePathForMessage", "isAuditControl",

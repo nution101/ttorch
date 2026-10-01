@@ -53,10 +53,12 @@ const eventGateChangeUnapproved = "gate_change_unapproved"
 // CURRENT default tip hit genuine git merge conflicts — a real overlapping edit already on the
 // default — as distinct from the other land failures (a stale/uncarryable verdict, a red
 // validate on the rebased tree, a lost fast-forward race). landPrep ALWAYS aborts the rebase
-// and restores the worktree on conflict and never merges a conflicted result; this sentinel
-// only CLASSIFIES that failure so the autonomous land pass (scheduler.RunLandOnce) can surface
-// an actionable land_rebase_conflict event for the manager to resolve, rather than just
-// logging-and-retrying it like a transient failure. It never authorizes a forced merge. It is
+// and restores the worktree on conflict and never merges a conflicted result; a clone task's
+// rebase runs in a scratch worktree of the project, which is removed, and never touches the
+// clone (rebaseInScratch). This sentinel only CLASSIFIES that failure so the autonomous land
+// pass (scheduler.RunLandOnce) can surface an actionable land_rebase_conflict event for the
+// manager to resolve, rather than just logging-and-retrying it like a transient failure. It
+// never authorizes a forced merge. It is
 // deliberately NOT attached to the clean-but-content-changed re-gate (carryVerdictForward),
 // which is the separate C1 fail-closed path: a clean rebase that changed the reviewed diff
 // re-gates, it is not a "rebase conflict".
@@ -1061,9 +1063,11 @@ type landPrepResult struct {
 // reuses it instead of re-running the suite under the FF lock, and — for a gated local land —
 // carries the verdict forward over a clean rebase and confirms the gate covers the rebased
 // commit. It operates on the task's own worktree and an immutable detached checkout, never the
-// shared default, so concurrent landPreps for disjoint tasks do not block one another. Every
-// failure is terminal for this attempt (rebase conflict, red validate, a verdict that cannot be
-// carried) and is returned for the caller to surface; landPrep never mutates the default branch.
+// shared default, so concurrent landPreps for disjoint tasks do not block one another. A clone
+// task is rebased in a scratch worktree of the project instead (landRebaseClone), one per
+// landPrep, and its clone is only read, from its files. Every failure is terminal for this
+// attempt (rebase conflict, red validate, a verdict that cannot be carried) and is returned for
+// the caller to surface; landPrep never mutates the default branch.
 func (m *Manager) landPrep(t db.Task, spec landSpec, fetchMu *sync.Mutex) (landPrepResult, error) {
 	var zero landPrepResult
 	// (1) Fetch origin so the rebase targets the current default-branch tip, not a stale local
@@ -1103,7 +1107,17 @@ func (m *Manager) landPrep(t db.Task, spec landSpec, fetchMu *sync.Mutex) (landP
 		return zero, err
 	}
 	rebasedHead := preRebase
-	if !worktree.IsAncestor(spec.repo, baseSha, preRebase) {
+	switch {
+	case worktree.IsAncestor(spec.repo, baseSha, preRebase):
+		// Already a fast-forward of the base: nothing to replay.
+	case spec.w.clone:
+		// A clone is never rebased in place. The rebase runs in a scratch worktree of the
+		// project, so a conflict leaves the clone untouched and a clean rebase leaves a
+		// commit the steps below find in the project (landRebaseClone).
+		if rebasedHead, err = landRebaseClone(spec, base, baseSha, preRebase); err != nil {
+			return zero, err
+		}
+	default:
 		// Onto the commit landBase resolved and verifyRemoteBase checked, not the ref again,
 		// which could have moved since.
 		if err := landRebase(spec.wt, baseSha); err != nil {

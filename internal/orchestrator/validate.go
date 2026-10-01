@@ -159,6 +159,9 @@ var ttorchSourceFiles = []string{
 	// where its diffs of that commit run, so a change there moves what every other entry
 	// here is checking.
 	"internal/orchestrator/workdir.go",
+	// landscratch.go makes the commit a clone task's land validates and merges, by rebasing the
+	// clone's imported head in a scratch worktree of the project.
+	"internal/orchestrator/landscratch.go",
 	// The gate's own proofs. Without these, the backstop can be deleted in the same merge
 	// as the attack it would catch: TestTtorchRepoIsScopedIn goes red on a .gitattributes
 	// that un-scopes the repo, but a diff that adds the attribute AND deletes the test
