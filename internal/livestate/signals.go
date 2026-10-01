@@ -8,6 +8,7 @@ package livestate
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -93,22 +94,11 @@ func WriteRecord(path string, r Record) error {
 // unknown event or carries no timestamp, or when it belongs to a different task. A bad
 // record never reads as busy or idle; the caller falls back to the pane.
 //
-// The watcher calls this for every worker on every sweep, so whatever sits at path must not
-// be able to stall it or fill its memory. A symlink there is refused rather than followed
-// (O_NOFOLLOW), the open never waits for a FIFO's writer (O_NONBLOCK), anything but a regular
-// file is refused on the open descriptor before a byte is read, and at most one byte past
-// maxRecordBytes is read.
+// The watcher calls this for every worker on every sweep, so the file is read with
+// ReadWorkerFile, which nothing at path can stall or use to fill the reader's memory.
 func ReadRecord(path, taskID string) (Record, bool) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	b, err := ReadWorkerFile(path, maxRecordBytes)
 	if err != nil {
-		return Record{}, false
-	}
-	defer f.Close()
-	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
-		return Record{}, false
-	}
-	b, err := io.ReadAll(io.LimitReader(f, maxRecordBytes+1))
-	if err != nil || len(b) > maxRecordBytes {
 		return Record{}, false
 	}
 	var r Record
@@ -119,6 +109,36 @@ func ReadRecord(path, taskID string) (Record, bool) {
 		return Record{}, false
 	}
 	return r, true
+}
+
+// ReadWorkerFile reads a small file that a worker can write, such as its hook record or its
+// agent fingerprint, and returns an error rather than its contents when the file is not safe
+// to read. A symlink at path is refused rather than followed (O_NOFOLLOW), the open never
+// waits for a FIFO's writer (O_NONBLOCK), anything but a regular file is refused on the open
+// descriptor before a byte is read, and a file longer than limit bytes is refused after
+// reading at most one byte past it. A missing file returns an error satisfying
+// errors.Is(err, os.ErrNotExist); a symlink, even a dangling one, does not.
+func ReadWorkerFile(path string, limit int) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", path)
+	}
+	b, err := io.ReadAll(io.LimitReader(f, int64(limit)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > limit {
+		return nil, fmt.Errorf("%s is larger than %d bytes", path, limit)
+	}
+	return b, nil
 }
 
 // State is a worker's reconciled live state.
