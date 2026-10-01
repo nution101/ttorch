@@ -1266,10 +1266,11 @@ overrides for the hooks path, the fsmonitor, the alternate-refs command and auto
 maintenance. Without them, a fetch in a clone runs the clone's `reference-transaction` hook,
 its `core.alternateRefsCommand` and its `core.fsmonitor`.
 
-`ttorch doctor` reports a git below 2.45.1 when the flag is on. 2.45.1 carries the fixes for
-CVE-2024-32002, -32004, -32020, -32021 and -32465, the second of which let a fetch from a
-clone run a program the clone's config named; the private config files also need 2.32, where
-`GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` arrived.
+With the flag on, `ttorch doctor` checks git with the import's own check
+(`worktree.ImportGitOK`), so it warns about exactly the versions the import refuses: anything
+without the CVE-2024-32004 fix, which is 2.45.1 or the backport for its series, read from the
+version string as described in the section above. That floor also covers the 2.32 the private
+config files need, where `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` arrived.
 
 ## 8. Sessions and reasoning effort
 

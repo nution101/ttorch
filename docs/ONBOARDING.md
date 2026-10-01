@@ -325,7 +325,7 @@ fallback) opens a separate window per worker. Toggle with `TTORCH_WORKER_TABS` a
 | `TTORCH_STALL_REPEAT` | `15m` | how often `ttorch watch` re-raises a worker that stays stalled (minimum `1m`) |
 | `TTORCH_STALL_RERAISES` | `3` | re-raises before further `stalled` updates carry the `needs-inspection` level |
 | `TTORCH_NO_AUTOINIT` | unset | set to any value to disable zero-config auto-init on first use (§7) |
-| `TTORCH_WORKER_CLONES` | off | give each new worker a private clone instead of a linked worktree, so git commands it runs in its clone act on the clone rather than the lead's repository. It does not stop a worker naming the lead's repository explicitly (`git -C <main>`, `cd <main>`) or writing files by path, since workers run as your user. **In progress: do not turn on yet.** Needs git 2.45.1+ (`ttorch doctor` checks it when the flag is on); a clone worker refreshes its base with `ttorch sync`. See [`ARCHITECTURE.md`](ARCHITECTURE.md) §7. Read at spawn, so restart the scheduler after changing it |
+| `TTORCH_WORKER_CLONES` | off | give each new worker a private clone instead of a linked worktree, so git commands it runs in its clone act on the clone rather than the lead's repository. It does not stop a worker naming the lead's repository explicitly (`git -C <main>`, `cd <main>`) or writing files by path, since workers run as your user. **In progress: do not turn on yet.** Needs a git with the CVE-2024-32004 fix: 2.45.1, or 2.39.4, 2.40.2, 2.41.1, 2.42.2, 2.43.4 or 2.44.1 in those series (`ttorch doctor` checks it when the flag is on); a clone worker refreshes its base with `ttorch sync`. See [`ARCHITECTURE.md`](ARCHITECTURE.md) §7. Read at spawn, so restart the scheduler after changing it |
 | `TTORCH_WORKER_TABS` | enabled | macOS-only: native-terminal worker views + the manager-in-iTerm2 launch; set `0`/`off`/`false`/`no` to disable (workers still run as tmux windows) |
 | `TTORCH_TERMINAL` | `auto` | which terminal to use for worker views: `auto` (iTerm then Terminal.app), `iterm`, or `terminal` |
 | `TTORCH_REPO` | `nution101/ttorch` | release source for install/update |
@@ -334,7 +334,7 @@ fallback) opens a separate window per worker. Toggle with `TTORCH_WORKER_TABS` a
 
 - `ttorch doctor` — missing dependencies, package manager, WSL status, what the trust gate
   reads for each trusted project, and, with `TTORCH_WORKER_CLONES` on, whether git meets the
-  2.45.1 floor clones need.
+  floor the clone import enforces.
 - `ttorch status` — active workers and their state. `ttorch recovery` reconciles tracked
   tasks against live tmux windows after a crash or restart.
 - `ttorch tasks` — the full board, including pending backlog and any task the scheduler
