@@ -1029,7 +1029,9 @@ row is there, is on `Reconcile`.
   actionable `agent_exited` watch update, and a pid with a different start time counts as a
   different process. A read that fails, or a fingerprint file that cannot be loaded, is
   `unknown`, never exited or alive; the watcher raises nothing for it and goes on to the usual
-  pane and idle checks, so a corrupt file cannot hide an idle worker. A task with no
+  pane and idle checks, so a corrupt file cannot hide an idle worker. The file is opened
+  without following a symlink or waiting on a FIFO, must be a regular file of at most 1 KiB,
+  and anything else reads as `unknown`, the same way the hook record is read. A task with no
   fingerprint (spawned before fingerprints, or rebuilt by `ttorch resume`, which does not
   wait for its agent) keeps window-presence liveness. The scheduler does not reclaim on
   `agent_exited`; the manager decides. The fingerprint file carries no integrity check, so

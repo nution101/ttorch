@@ -36,6 +36,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/nution101/ttorch/internal/livestate"
 )
 
 // Fingerprint identifies one process instance. Start is the platform's encoding of the
@@ -222,10 +224,17 @@ func SaveFingerprint(path string, fp Fingerprint) error {
 	return nil
 }
 
+// maxFingerprintBytes caps what LoadFingerprint will parse. A real fingerprint is under 200
+// bytes; anything larger is not one.
+const maxFingerprintBytes = 1024
+
 // LoadFingerprint reads a fingerprint written by SaveFingerprint. ok is false, with a nil
-// error, when no file exists at path.
+// error, when no file exists at path. The file sits in the task's data dir, where the worker
+// can write, and the watcher and ttorch status read every task's fingerprint, so it is read
+// with livestate.ReadWorkerFile: a symlink, a FIFO or another non-regular file, or an
+// oversized file, is an error, never a block and never a fingerprint.
 func LoadFingerprint(path string) (Fingerprint, bool, error) {
-	b, err := os.ReadFile(path)
+	b, err := livestate.ReadWorkerFile(path, maxFingerprintBytes)
 	if errors.Is(err, os.ErrNotExist) {
 		return Fingerprint{}, false, nil
 	}
