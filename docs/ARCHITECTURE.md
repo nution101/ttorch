@@ -1208,6 +1208,45 @@ would admit every genuinely-unpatched build of that string too. The remedy is a 
 version string is at or above the floor (upstream, or a distro package that bumped the
 string). `ttorch doctor` reports the same when the flag is on.
 
+### Per-worker clones (`TTORCH_WORKER_CLONES`, in progress)
+
+A linked worktree shares its main repository's refs, tags, config, hooks and `info/exclude`,
+so a git command a worker runs in its worktree can change the lead's repository. Per-worker
+clones replace the worktree with a private repository whose object store borrows the main
+repository's through an alternates file, with no remote that points at main. The flag is
+**off by default** and is being built in several independent changes; it is not safe to turn
+on until all of them have landed. With it off, nothing below applies and workers get exactly
+what they got before. A task keeps the kind it was spawned with: a clone's `.git` is a
+directory and a linked worktree's is a file, so the kind is read from the working directory
+and the flag only decides what a new spawn gets.
+
+A clone worker runs with two git variables that a worktree worker does not get:
+
+| Variable | Value | Effect |
+| --- | --- | --- |
+| `GIT_CEILING_DIRECTORIES` | `~/.ttorch/clones` | git run from a pool directory, or from any non-repository directory inside a pool, does not discover a repository in an ancestor (a dotfiles repo in `$HOME`, say). Inside the clone, discovery is unchanged. git applies a ceiling only to directories strictly below it, which is why the value is the clones root and not the pool directory |
+| `GIT_CONFIG_GLOBAL` | `~/.ttorch/clones/<pool>/.global-<N>` | a private file per slot that `[include]`s the lead's global config (the XDG file then `~/.gitconfig`, or the lead's own `GIT_CONFIG_GLOBAL`), so identity and `includeIf` rules still resolve while `git config --global` writes the private file. It is rewritten at every spawn, so a key one task wrote never reaches the next task in the slot |
+
+They are set in three places, because each covers a case the others miss: the launch prefix
+of a fresh spawn, both halves of the resume command a restore sends (a resume has no launch
+prefix, and an assignment before `a || b` reaches only `a`), and the `env` block of the
+worker's `.claude/settings.local.json`, which the harness applies to the processes its tools
+start and which survives a resume. `GIT_DIR` and `GIT_WORK_TREE` are deliberately not set:
+exported, they break every test fixture that runs `git init` in a temp directory.
+
+A clone's `origin/<default>` is a snapshot taken when the clone is provisioned, not the lead's
+remote-tracking ref. When the default branch moves, the worker runs **`ttorch sync`**, which
+reads the base the land gate would use (`origin/<default>` when the local default is an
+ancestor of it, else the local default, both read by full ref name so a tag cannot stand in
+for either) from the lead's repository and fetches that commit into the clone's
+`refs/remotes/origin/<default>`. The lead's side of that fetch is an upload-pack, which
+writes nothing; sync does not fetch origin in the lead's repository first. It refuses in a
+linked worktree, where `origin/<default>` is already the lead's ref, and it refuses outside
+a worker, since the manager never runs git in a worker's clone.
+
+`GIT_CONFIG_GLOBAL` arrived in git 2.32. An older git ignores it, so `ttorch doctor` reports a
+git below 2.32 when the flag is on.
+
 ## 8. Sessions and reasoning effort
 
 Every session is a `claude --dangerously-skip-permissions` process (work is confined to
@@ -1362,6 +1401,8 @@ These properties are load-bearing:
   state/tasks/<id>/     a worker's hook liveness record (hook.json)
   data/<id>/            a task's stored brief.md, review inputs and agent.fingerprint
   worktrees/            the per-repository worktree pool
+  clones/<pool>/<N>/    per-worker clone slots (TTORCH_WORKER_CLONES), with each slot's
+                        private global git config beside them as .global-<N>
   audit.log             approvals + merges
   scheduler.log         the auto-started daemon's output
 ~/.claude/
