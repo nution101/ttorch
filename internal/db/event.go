@@ -112,34 +112,15 @@ func (s *Store) MaxActionableEventID(ctx context.Context) (int64, error) {
 	return max, err
 }
 
-// HasActionableEventForTask reports whether a task has an actionable event at or
-// after the cutoff timestamp (a nil cutoff means "any actionable event, ever").
-// The watcher's liveness net uses it to exclude a task that is already surfaced /
-// unresolved (§4.4): a worker-actor transition into needs_input/blocked/done, or a
-// previously emitted window_gone / idle_unreported, leaves an actionable event on
-// the row, so the net does not re-flag a worker the manager has already been told
-// about. Passing the task's last_progress_at as the cutoff makes a fresh worker
-// progress report (which advances last_progress_at) clear the exclusion.
-func (s *Store) HasActionableEventForTask(ctx context.Context, taskID string, cutoff *time.Time) (bool, error) {
-	query := `SELECT EXISTS(SELECT 1 FROM events
-		WHERE entity_type = 'task' AND entity_id = ? AND actionable = 1`
-	args := []any{taskID}
-	if cutoff != nil {
-		query += ` AND ts >= ?`
-		args = append(args, formatTime(*cutoff))
-	}
-	query += `)`
-	var exists int64
-	if err := s.db.QueryRowContext(ctx, query, args...).Scan(&exists); err != nil {
-		return false, err
-	}
-	return exists != 0, nil
-}
-
 // ActionableEventTypesForTask returns the set of event types among a task's actionable
-// events at or after the cutoff (a nil cutoff means "ever"). It is HasActionableEventForTask
-// broken out by type, for a caller that weighs some event types differently from others: the
-// watcher's liveness net does not let an agent_exited event count as already surfaced.
+// events at or after the cutoff (a nil cutoff means "ever"). The watcher's liveness net uses
+// it to exclude a task that is already surfaced / unresolved (§4.4): a worker-actor
+// transition into needs_input/blocked/done, or a previously emitted window_gone /
+// idle_unreported, leaves an actionable event on the row, so the net does not re-flag a
+// worker the manager has already been told about. Passing the task's last_progress_at as the
+// cutoff makes a fresh worker progress report (which advances last_progress_at) clear the
+// exclusion. The result is broken out by type because the net weighs types differently: an
+// agent_exited event does not count as already surfaced.
 func (s *Store) ActionableEventTypesForTask(ctx context.Context, taskID string, cutoff *time.Time) (map[string]bool, error) {
 	query := `SELECT DISTINCT type FROM events
 		WHERE entity_type = 'task' AND entity_id = ? AND actionable = 1`

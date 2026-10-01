@@ -329,7 +329,7 @@ func TestPollLiveness_WindowGone(t *testing.T) {
 // the re-dispatched incarnation must still surface a fresh window_gone — it must not be
 // suppressed by the prior incarnation's stale window_gone. ClaimTask advances last_progress_at
 // to the claim time, which moves the already-surfaced gate's cutoff
-// (HasActionableEventForTask, keyed on last_progress_at) past the stale event, so the new
+// (ActionableEventTypesForTask, keyed on last_progress_at) past the stale event, so the new
 // crash is emitted promptly instead of waiting out the slow lease-expiry backstop. Without the
 // stamp the cutoff would be nil (this incarnation never reported), the stale window_gone would
 // count as "already surfaced", and the new crash would be silently dropped here.

@@ -32,42 +32,9 @@ func TestHasEventType(t *testing.T) {
 	}
 }
 
-// TestHasActionableEventForTask covers the watcher's liveness exclusion: a
-// non-actionable event never counts, an actionable one does, and the optional cutoff
-// (the task's last_progress_at) bounds the window with a >= comparison.
-func TestHasActionableEventForTask(t *testing.T) {
-	s, clk := newTestStoreClock(t)
-	ctx := context.Background()
-	proj, _ := s.UpsertProject(ctx, "/r", "r")
-	if _, err := s.CreateTask(ctx, Task{ID: "t1", ProjectID: proj.ID, Status: StatusActive}, ActorManager); err != nil {
-		t.Fatal(err)
-	}
-	// The 'created' event is non-actionable, so it must not count.
-	if has, err := s.HasActionableEventForTask(ctx, "t1", nil); err != nil || has {
-		t.Fatalf("created (non-actionable) must not count: has=%v err=%v", has, err)
-	}
-
-	clk.advance(time.Hour)
-	ev, err := s.ReportStatus(ctx, "t1", StatusBlocked, "worker:t1", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if has, err := s.HasActionableEventForTask(ctx, "t1", nil); err != nil || !has {
-		t.Fatalf("an actionable worker transition must count: has=%v err=%v", has, err)
-	}
-	after := ev.TS.Add(time.Minute)
-	if has, _ := s.HasActionableEventForTask(ctx, "t1", &after); has {
-		t.Fatal("an event before the cutoff must not count")
-	}
-	at := ev.TS
-	if has, _ := s.HasActionableEventForTask(ctx, "t1", &at); !has {
-		t.Fatal("an event at the cutoff must count (>=)")
-	}
-}
-
-// TestActionableEventTypesForTask: the types of a task's actionable events, bounded by the
-// same >= cutoff as HasActionableEventForTask, with non-actionable events and other tasks'
-// events left out.
+// TestActionableEventTypesForTask covers the watcher's liveness exclusion: the types of a
+// task's actionable events, bounded by the optional cutoff (the task's last_progress_at) with
+// a >= comparison, with non-actionable events and other tasks' events left out.
 func TestActionableEventTypesForTask(t *testing.T) {
 	s, clk := newTestStoreClock(t)
 	ctx := context.Background()
