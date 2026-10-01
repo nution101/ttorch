@@ -166,6 +166,16 @@ func (s *Store) SetProjectDefaultBranchSeed(ctx context.Context, id int64, state
 	return requireRows(res, fmt.Sprintf("project %d", id))
 }
 
+// ClearPendingDefaultBranchSeed clears project id's seed state only while it is still
+// DefaultBranchSeedPending, so a seed that finished without writing a branch cannot clear the
+// notice a registration set in the meantime (see FillProjectDefaultBranch).
+func (s *Store) ClearPendingDefaultBranchSeed(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE projects SET default_branch_seed = '', updated_at = ? WHERE id = ? AND default_branch_seed = ?`,
+		formatTime(s.now()), id, DefaultBranchSeedPending)
+	return err
+}
+
 // SetProjectLastLanded records sha as the commit the latest successful land left the project
 // at repoPath's default branch at. Like SetProjectModeByRepo it reports whether a row matched
 // rather than failing on an unregistered repo.

@@ -160,3 +160,28 @@ func TestVerdictBaseSHARoundTrip(t *testing.T) {
 		t.Fatalf("BaseSHA round trip: %+v ok=%v err=%v", v, ok, err)
 	}
 }
+
+// TestClearPendingDefaultBranchSeed clears only a pending seed, never a notice.
+func TestClearPendingDefaultBranchSeed(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	p, err := s.UpsertProject(ctx, "/repo", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ from, want string }{
+		{DefaultBranchSeedPending, ""},
+		{DefaultBranchSeedNotice, DefaultBranchSeedNotice},
+		{"", ""},
+	} {
+		if err := s.SetProjectDefaultBranchSeed(ctx, p.ID, c.from); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.ClearPendingDefaultBranchSeed(ctx, p.ID); err != nil {
+			t.Fatal(err)
+		}
+		if got, _, _ := s.GetProject(ctx, p.ID); got.DefaultBranchSeed != c.want {
+			t.Fatalf("from %q: seed = %q, want %q", c.from, got.DefaultBranchSeed, c.want)
+		}
+	}
+}

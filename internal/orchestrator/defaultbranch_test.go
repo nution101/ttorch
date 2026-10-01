@@ -133,3 +133,33 @@ func TestRegisterDefaultBranch(t *testing.T) {
 		t.Fatalf("a cc session is the lead's, so its row must be recorded: %+v", p)
 	}
 }
+
+// TestSeedDefaultBranches_KeepsTheNoticeWhenRegistrationWins: the seed reads the project list,
+// detects, then writes only if no branch is recorded. A spawn can record the branch in between,
+// marking it for the one-time notice. The seed then loses the write and must leave that notice
+// in place rather than clear the row's seed state, or the lead is never shown the branch.
+func TestSeedDefaultBranches_KeepsTheNoticeWhenRegistrationWins(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	m := &Manager{Store: s}
+	repo := newRepoMain(t)
+	p, err := s.UpsertProject(ctx, repo, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetProjectDefaultBranchSeed(ctx, p.ID, db.DefaultBranchSeedPending); err != nil {
+		t.Fatal(err)
+	}
+	prev := seedDetect
+	t.Cleanup(func() { seedDetect = prev })
+	seedDetect = func(r string) (string, error) {
+		m.registerDefaultBranch(ctx, repo) // the spawn that wins the race
+		return prev(r)
+	}
+	if err := SeedDefaultBranches(ctx, s); err != nil {
+		t.Fatal(err)
+	}
+	if got := projectByRepo(t, s, repo); got.DefaultBranch != "main" || got.DefaultBranchSeed != db.DefaultBranchSeedNotice {
+		t.Fatalf("after losing the race the seed must leave the registration's notice: %+v", got)
+	}
+}

@@ -30,7 +30,7 @@ func SeedDefaultBranches(ctx context.Context, store *db.Store) error {
 			continue
 		}
 		if p.DefaultBranch == "" {
-			if b, err := worktree.DetectDefaultBranch(p.RepoPath); err == nil {
+			if b, err := seedDetect(p.RepoPath); err == nil {
 				if wrote, err := store.FillProjectDefaultBranch(ctx, p.ID, b, true); err != nil {
 					return err
 				} else if wrote {
@@ -38,12 +38,18 @@ func SeedDefaultBranches(ctx context.Context, store *db.Store) error {
 				}
 			}
 		}
-		if err := store.SetProjectDefaultBranchSeed(ctx, p.ID, ""); err != nil {
+		// Only while still pending: a registration that recorded the branch since the list was
+		// read set its own notice, and clearing it would hide the branch from the lead.
+		if err := store.ClearPendingDefaultBranchSeed(ctx, p.ID); err != nil {
 			return err
 		}
 	}
 	return nil
 }
+
+// seedDetect is the detection SeedDefaultBranches runs, a variable so a test can make a
+// registration land between the seed's read of the project and its write.
+var seedDetect = worktree.DetectDefaultBranch
 
 // registerDefaultBranch records repo's default branch on its project row at spawn, when none
 // is recorded yet and no worker has had a checkout of the repository. Once a worker has one, the
