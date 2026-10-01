@@ -73,9 +73,9 @@ func clonesRoot() string { return filepath.Join(paths.Default().Home, "clones") 
 
 // IsCloneWorkdir reports whether workdir is a per-worker clone slot: a numeric directory in a
 // pool directly under the clones root, whose .git is a real directory. A linked worktree's .git
-// is a file, and a symlinked .git is refused, so neither reads as a clone. The kind is read
-// from the workdir itself, which is how a task keeps the kind it was spawned with whatever the
-// flag says now.
+// is a file, and a symlink at the slot, at its pool or at its .git is refused, so none of those
+// reads as a clone. The kind is read from the workdir itself, which is how a task keeps the
+// kind it was spawned with whatever the flag says now.
 func IsCloneWorkdir(workdir string) bool {
 	if workdir == "" || !filepath.IsAbs(workdir) {
 		return false
@@ -85,8 +85,13 @@ func IsCloneWorkdir(workdir string) bool {
 	if filepath.Dir(pool) != filepath.Clean(clonesRoot()) || !isSlotName(filepath.Base(workdir)) {
 		return false
 	}
-	fi, err := os.Lstat(filepath.Join(workdir, ".git"))
-	return err == nil && fi.IsDir()
+	for _, p := range []string{pool, workdir, filepath.Join(workdir, ".git")} {
+		fi, err := os.Lstat(p)
+		if err != nil || !fi.IsDir() {
+			return false
+		}
+	}
+	return true
 }
 
 func isSlotName(s string) bool {

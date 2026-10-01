@@ -148,6 +148,21 @@ func TestGitEnvForNotAClone(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// A slot that is itself a symlink to a real clone, and a pool that is a symlink to a real
+	// pool directory.
+	realClone := cloneSlot(t, "pool-g", "1")
+	symSlotDir := filepath.Join(clonesRoot(), "pool-h", "1")
+	if err := os.MkdirAll(filepath.Dir(symSlotDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realClone, symSlotDir); err != nil {
+		t.Fatal(err)
+	}
+	symPool := filepath.Join(clonesRoot(), "pool-i")
+	if err := os.Symlink(filepath.Dir(realClone), symPool); err != nil {
+		t.Fatal(err)
+	}
+
 	// A numeric slot with no .git at all.
 	empty := filepath.Join(clonesRoot(), "pool-f", "1")
 	if err := os.MkdirAll(empty, 0o755); err != nil {
@@ -161,6 +176,8 @@ func TestGitEnvForNotAClone(t *testing.T) {
 		"non-numeric slot":    named,
 		"nested too deep":     deep,
 		"symlinked .git":      symSlot,
+		"symlinked slot":      symSlotDir,
+		"symlinked pool":      filepath.Join(symPool, "1"),
 		"no .git":             empty,
 		"empty":               "",
 		"relative":            filepath.Join("clones", "pool-a", "1"),
