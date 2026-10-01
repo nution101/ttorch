@@ -834,15 +834,18 @@ func (m *Manager) ArmPRCheck(taskID, url string) error {
 // resolves a bare origin/<def> to refs/tags/origin/<def> ahead of the remote-tracking ref, which
 // `fetch --prune` never removes: a worker's tag of that name moved the lead's branch to the
 // worker's commit. The remote-tracking ref is a local ref too, and the fetch resets it only when
-// its refspec covers it, so a disagreement with origin skips the fast-forward and says why.
+// its refspec covers it, so a disagreement with origin skips the fast-forward and says why. When
+// the fetch fails (offline, or origin stopped answering within worktree.NetworkTimeout) the
+// default branch is not synced at all: the ls-remote would only wait on the same origin again.
 func (m *Manager) FleetSync(repoPath string) ([]string, error) {
 	repo, err := worktree.RepoRoot(repoPath)
 	if err != nil {
 		return nil, fmt.Errorf("%s is not inside a git repository", repoPath)
 	}
 	var notes []string
-	if err := worktree.Fetch(repo); err != nil {
-		notes = append(notes, "fetch skipped (offline?)")
+	fetchErr := worktree.Fetch(repo)
+	if fetchErr != nil {
+		notes = append(notes, "fetch failed (offline, or origin did not answer), so the default branch was not synced")
 	}
 	if gone, err := worktree.GoneBranches(repo); err == nil {
 		cur, _ := worktree.CurrentBranch(repo)
@@ -858,7 +861,7 @@ func (m *Manager) FleetSync(repoPath string) ([]string, error) {
 	def := m.recordedDefaultBranch(repo)
 	if def == "" {
 		notes = append(notes, fmt.Sprintf("no default branch is recorded for %s, so none was fast-forwarded; run '%s %s <branch>'", repo, SetBranchCommand, repo))
-	} else if cur, _ := worktree.CurrentBranch(repo); cur == def {
+	} else if cur, _ := worktree.CurrentBranch(repo); fetchErr == nil && cur == def {
 		if dirty, _ := worktree.IsDirty(repo); !dirty {
 			if note := syncDefaultBranch(repo, def); note != "" {
 				notes = append(notes, note)

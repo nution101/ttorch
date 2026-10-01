@@ -2,11 +2,16 @@ package orchestrator
 
 import (
 	"context"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/nution101/ttorch/internal/worktree"
 )
 
 // fleetSyncRepo builds a repository on main with an origin in sync, registered with main as its
@@ -116,5 +121,80 @@ func TestFleetSync_NoRecordedBranchSkipsTheFastForward(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(notes, "\n"), SetBranchCommand) {
 		t.Fatalf("fleet-sync must name %q when no branch is recorded, got %q", SetBranchCommand, notes)
+	}
+}
+
+// stallingRemote listens on a loopback port, accepts every connection and never answers, and
+// counts the connections. Cleanup closes everything, which releases a git still waiting on it.
+func stallingRemote(t *testing.T) (url string, accepted func() int) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("no loopback listener: %v", err)
+	}
+	var mu sync.Mutex
+	var conns []net.Conn
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, c)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+	return "git://" + ln.Addr().String() + "/repo.git", func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(conns)
+	}
+}
+
+// TestFleetSync_StalledFetchSkipsTheSync: with origin accepting the connection and never
+// answering, fleet-sync used to wait on the fetch forever. It now gives up after
+// worktree.NetworkTimeout, and, the fetch having failed, does not go back to origin for an
+// ls-remote: one connection, the fetch's.
+func TestFleetSync_StalledFetchSkipsTheSync(t *testing.T) {
+	m, repo, _, _ := fleetSyncRepo(t)
+	url, accepted := stallingRemote(t)
+	gitIn(t, repo, "remote", "set-url", "origin", url)
+	prev := worktree.NetworkTimeout
+	worktree.NetworkTimeout = time.Second
+	t.Cleanup(func() { worktree.NetworkTimeout = prev })
+	before := gitIn(t, repo, "rev-parse", "refs/heads/main")
+
+	done := make(chan struct{})
+	var notes []string
+	var err error
+	go func() {
+		defer close(done)
+		notes, err = m.FleetSync(repo)
+	}()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("fleet-sync is still waiting on the stalled origin after 20s")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := accepted(); n != 1 {
+		t.Fatalf("after its fetch failed, fleet-sync must not ask origin again; origin saw %d connections (notes %q)", n, notes)
+	}
+	if !strings.Contains(strings.Join(notes, "\n"), "fetch failed") {
+		t.Fatalf("fleet-sync must say the fetch failed, got %q", notes)
+	}
+	if got := gitIn(t, repo, "rev-parse", "refs/heads/main"); got != before {
+		t.Fatalf("main moved to %s", got)
 	}
 }

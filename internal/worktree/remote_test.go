@@ -1,8 +1,11 @@
 package worktree
 
 import (
+	"net"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // TestResolveCommit: a fully qualified ref resolves to its branch even with a tag of the same
@@ -44,4 +47,84 @@ func TestRemoteBranchSHA(t *testing.T) {
 	if _, _, err := RemoteBranchSHA(repo, "nosuchremote", "main"); err == nil || !strings.Contains(err.Error(), "nosuchremote") {
 		t.Fatalf("an unknown remote must be an error, got %v", err)
 	}
+}
+
+// stallingRemote listens on a loopback port, accepts every connection and never answers: a
+// remote that took the connection and then stopped responding. It returns a git:// URL for it
+// and a count of the connections it has accepted. Cleanup closes the listener and every
+// connection, which also releases a git still waiting on it.
+func stallingRemote(t *testing.T) (url string, accepted func() int) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("no loopback listener: %v", err)
+	}
+	var mu sync.Mutex
+	var conns []net.Conn
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, c)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+	return "git://" + ln.Addr().String() + "/repo.git", func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(conns)
+	}
+}
+
+// returnsWithin runs f and fails the test if it has not returned after limit.
+func returnsWithin(t *testing.T, limit time.Duration, f func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f()
+	}()
+	select {
+	case <-done:
+	case <-time.After(limit):
+		t.Fatalf("still waiting on the stalled remote after %s", limit)
+	}
+}
+
+// TestNetworkCallsGiveUpOnAStalledRemote: a fetch or ls-remote against a remote that accepts
+// the connection and never answers used to wait forever, holding a land, a trust prep or a
+// fleet-sync with it. Both now give up after NetworkTimeout and say why.
+func TestNetworkCallsGiveUpOnAStalledRemote(t *testing.T) {
+	url, _ := stallingRemote(t)
+	repo, _, _, _ := gateBaseRepo(t)
+	gitT(t, repo, "remote", "add", "origin", url)
+	prev := NetworkTimeout
+	NetworkTimeout = time.Second
+	t.Cleanup(func() { NetworkTimeout = prev })
+
+	t.Run("Fetch", func(t *testing.T) {
+		var err error
+		returnsWithin(t, 20*time.Second, func() { err = Fetch(repo) })
+		if err == nil || !strings.Contains(err.Error(), "no answer") {
+			t.Fatalf("Fetch from a stalled remote = %v, want a timeout error", err)
+		}
+	})
+	t.Run("RemoteBranchSHA", func(t *testing.T) {
+		var err error
+		returnsWithin(t, 20*time.Second, func() { _, _, err = RemoteBranchSHA(repo, "origin", "main") })
+		if err == nil || !strings.Contains(err.Error(), "no answer") {
+			t.Fatalf("RemoteBranchSHA from a stalled remote = %v, want a timeout error", err)
+		}
+	})
 }

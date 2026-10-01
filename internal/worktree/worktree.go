@@ -1069,9 +1069,10 @@ func MergeFastForward(repo, commit string) error {
 	return err
 }
 
-// Fetch updates remotes and prunes deleted remote branches.
+// Fetch updates remotes and prunes deleted remote branches. It gives up after NetworkTimeout
+// (see gitNetwork).
 func Fetch(repo string) error {
-	_, err := git("-C", repo, "fetch", "--prune", "--quiet")
+	_, _, err := gitNetwork("-C", repo, "fetch", "--prune", "--quiet")
 	return err
 }
 
