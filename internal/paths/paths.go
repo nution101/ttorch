@@ -100,6 +100,11 @@ func (p Paths) ReviewWorkspaceDir(id string) string {
 // Worktrees is the root for per-task isolated git worktrees.
 func (p Paths) Worktrees() string { return filepath.Join(p.Home, "worktrees") }
 
+// Clones is the root for per-worker private git clones (TTORCH_WORKER_CLONES). It sits
+// beside Worktrees and mirrors its layout: one pool directory per repository, holding
+// numbered slot directories.
+func (p Paths) Clones() string { return filepath.Join(p.Home, "clones") }
+
 // BriefPath is where a task's brief lives.
 func (p Paths) BriefPath(id string) string { return filepath.Join(p.DataDir(), id, "brief.md") }
 
