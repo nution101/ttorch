@@ -653,7 +653,7 @@ func (m *Manager) restore() []string {
 		// A resume does not wait for its agent to come up, so it records no fingerprint; clear
 		// the old incarnation's so the rebuilt window is judged by presence, not by a dead pid.
 		m.clearAgentFingerprint(t.ID)
-		_ = m.backend().SendLine(m.Session, t.Window, harness.WorkerResumeOrFresh(h, t.SessionID, m.P.BriefPath(t.ID), t.Effort, t.Model))
+		_ = m.backend().SendLine(m.Session, t.Window, harness.WorkerResumeOrFresh(h, t.SessionID, m.P.BriefPath(t.ID), t.Effort, t.Model, t.Worktree))
 		_ = termtab.Open(m.Session, t.Window)
 		// Refresh the supervisor's sign-of-life anchor for the worker just rebuilt in place. A
 		// resume re-drives the window but, on its own, appends no event — so a window_gone

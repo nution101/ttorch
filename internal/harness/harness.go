@@ -364,11 +364,15 @@ func ManagerResumeOrFresh(kind, sessionID, charterFile string) string {
 // it from its brief (same session id) if the resume fails, so a worker is never
 // left at a dead shell after a stop/reboot/upgrade. effort and model are the persisted
 // per-task reasoning effort and model both the resume and the re-brief relaunch at.
-func WorkerResumeOrFresh(kind, sessionID, briefPath, effort, model string) string {
+// workdir is the task's working directory: for a clone it prefixes both halves with the
+// worker's git environment (see GitEnvFor), since an assignment before `a || b` reaches
+// only a; for a linked worktree the command is unchanged.
+func WorkerResumeOrFresh(kind, sessionID, briefPath, effort, model, workdir string) string {
+	env := gitEnvPrefix(workdir)
 	if kind != "claude" {
-		return ResumeCommand(kind, sessionID, effort, model)
+		return env + ResumeCommand(kind, sessionID, effort, model)
 	}
-	return ResumeCommand(kind, sessionID, effort, model) + " || " + BriefCommand(kind, briefPath, sessionID, effort, model)
+	return env + ResumeCommand(kind, sessionID, effort, model) + " || " + env + BriefCommand(kind, briefPath, sessionID, effort, model)
 }
 
 // NewSessionID returns a random RFC-4122 version-4 UUID, used as a stable Claude
@@ -408,6 +412,10 @@ func shq(s string) string {
 // Beside it go the harness's lifecycle hooks (HooksFor), which record each turn's start and
 // end for the hook liveness signal. They sit in their own hook groups, so the Stop hook's
 // entry is the same as before they existed.
+//
+// When worktree is a per-worker clone it also writes the slot's private global git config and
+// puts the worker's git environment (GitEnvFor) in the settings env block, which outlives the
+// launch prefix across a resume. Any other directory gets no env block.
 func WriteWorkerSettings(kind, worktree string) error {
 	if kind != "claude" {
 		return nil
@@ -426,6 +434,8 @@ func WriteWorkerSettings(kind, worktree string) error {
 		// Hooks, keyed by Claude Code hook event: the worker Stop hook that enforces
 		// `ttorch report` (see above) and the lifecycle hooks.
 		Hooks map[string][]hookGroup `json:"hooks"`
+		// Env is set only for a clone worker; omitted, the file is what it always was.
+		Env map[string]string `json:"env,omitempty"`
 	}
 	// The absolute ttorch binary so the hook resolves regardless of the hook process's PATH.
 	stopHookCmd := shq(paths.Default().Binary()) + " stop-hook"
@@ -440,6 +450,10 @@ func WriteWorkerSettings(kind, worktree string) error {
 			})
 		}
 	}
+	env, err := settingsEnv(worktree)
+	if err != nil {
+		return err
+	}
 	dir := filepath.Join(worktree, ".claude")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
@@ -447,6 +461,7 @@ func WriteWorkerSettings(kind, worktree string) error {
 	b, err := json.MarshalIndent(settings{
 		IncludeCoAuthoredBy: false,
 		Hooks:               hooks,
+		Env:                 env,
 	}, "", "  ")
 	if err != nil {
 		return err
@@ -492,9 +507,10 @@ func quote(s string) string {
 // worker's launch command so the worker's `ttorch report/stage/note/follow-on`
 // resolve their task and DB from the environment without a flag (§3.1). Each value
 // is single-quoted so a path or id with shell metacharacters survives verbatim; an
-// empty value is omitted. The returned string ends in a trailing space (ready to
-// prepend) or is empty when nothing is set.
-func WorkerLaunchPrefix(taskID, dbPath string) string {
+// empty value is omitted. When workdir is a per-worker clone the worker's git
+// environment (GitEnvFor) follows. The returned string ends in a trailing space (ready
+// to prepend) or is empty when nothing is set.
+func WorkerLaunchPrefix(taskID, dbPath, workdir string) string {
 	var parts []string
 	if taskID != "" {
 		parts = append(parts, "TTORCH_TASK_ID="+shq(taskID))
@@ -503,9 +519,9 @@ func WorkerLaunchPrefix(taskID, dbPath string) string {
 		parts = append(parts, "TTORCH_DB="+shq(dbPath))
 	}
 	if len(parts) == 0 {
-		return ""
+		return gitEnvPrefix(workdir)
 	}
-	return strings.Join(parts, " ") + " "
+	return strings.Join(parts, " ") + " " + gitEnvPrefix(workdir)
 }
 
 // workerTaskFileRel is the worktree-relative path of the git-excluded file a spawned

@@ -193,7 +193,7 @@ func (m *Manager) spawnWorker(taskID, projectPath string, scout bool, rawCmd str
 		// Prepend TTORCH_TASK_ID/TTORCH_DB so the worker's reporting commands resolve
 		// their task + DB from the launch env (the .ttorch/task file is the durable
 		// fallback that also survives a resume). §3.1.
-		cmd = harness.WorkerLaunchPrefix(taskID, dbPath) + harness.BriefCommand(h, brief, sid, resolvedEffort, resolvedModel)
+		cmd = harness.WorkerLaunchPrefix(taskID, dbPath, wt) + harness.BriefCommand(h, brief, sid, resolvedEffort, resolvedModel)
 	}
 	m.clearAgentFingerprint(taskID)
 	if err := m.backend().SendLine(m.Session, window, cmd); err != nil {

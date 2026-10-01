@@ -392,7 +392,7 @@ func TestManagerResumeOrFresh(t *testing.T) {
 
 func TestWorkerResumeOrFresh(t *testing.T) {
 	t.Setenv("TTORCH_EFFORT", "off")
-	cmd := WorkerResumeOrFresh("claude", "wk-sid", "/tmp/b.md", "", "")
+	cmd := WorkerResumeOrFresh("claude", "wk-sid", "/tmp/b.md", "", "", "")
 	if !strings.Contains(cmd, " --resume 'wk-sid'") || !strings.Contains(cmd, " || ") {
 		t.Errorf("should attempt resume then fall back, got %q", cmd)
 	}
@@ -401,7 +401,7 @@ func TestWorkerResumeOrFresh(t *testing.T) {
 		t.Errorf("fallback should re-brief with the same id, got %q", cmd)
 	}
 	// The persisted effort flows into BOTH the resume and the re-brief fallback.
-	withEffort := WorkerResumeOrFresh("claude", "wk-sid", "/tmp/b.md", "high", "")
+	withEffort := WorkerResumeOrFresh("claude", "wk-sid", "/tmp/b.md", "high", "", "")
 	if strings.Count(withEffort, " --effort high") != 2 {
 		t.Errorf("both resume and fallback should carry the effort, got %q", withEffort)
 	}

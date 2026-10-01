@@ -99,7 +99,7 @@ func TestLaunchCommandsCarryModel(t *testing.T) {
 		t.Errorf("unset model should add no --model, got %q", got)
 	}
 	// The persisted model flows into BOTH the resume and the re-brief fallback.
-	rf := WorkerResumeOrFresh("claude", "wk", "/tmp/b.md", "", "haiku")
+	rf := WorkerResumeOrFresh("claude", "wk", "/tmp/b.md", "", "haiku", "")
 	if strings.Count(rf, " --model 'haiku'") != 2 {
 		t.Errorf("both resume and fallback should carry the model, got %q", rf)
 	}

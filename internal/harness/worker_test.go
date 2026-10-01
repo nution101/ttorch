@@ -12,19 +12,19 @@ import (
 // command (§3.1): both vars set, single-quoted (so a value with shell metacharacters
 // survives verbatim), and empty values omitted.
 func TestWorkerLaunchPrefix(t *testing.T) {
-	if got := WorkerLaunchPrefix("", ""); got != "" {
+	if got := WorkerLaunchPrefix("", "", ""); got != "" {
 		t.Fatalf("empty inputs should yield an empty prefix, got %q", got)
 	}
-	if got, want := WorkerLaunchPrefix("t1", "/home/.ttorch/state.db"),
+	if got, want := WorkerLaunchPrefix("t1", "/home/.ttorch/state.db", ""),
 		"TTORCH_TASK_ID='t1' TTORCH_DB='/home/.ttorch/state.db' "; got != want {
 		t.Fatalf("prefix = %q, want %q", got, want)
 	}
 	// An id with an embedded single quote is closed/escaped/reopened by shq.
-	if got, want := WorkerLaunchPrefix("a'b", ""), "TTORCH_TASK_ID='a'\\''b' "; got != want {
+	if got, want := WorkerLaunchPrefix("a'b", "", ""), "TTORCH_TASK_ID='a'\\''b' "; got != want {
 		t.Fatalf("metachar id prefix = %q, want %q", got, want)
 	}
 	// An empty task id is omitted but the db is still carried.
-	if got, want := WorkerLaunchPrefix("", "/db"), "TTORCH_DB='/db' "; got != want {
+	if got, want := WorkerLaunchPrefix("", "/db", ""), "TTORCH_DB='/db' "; got != want {
 		t.Fatalf("db-only prefix = %q, want %q", got, want)
 	}
 }
