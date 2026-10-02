@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/nution101/ttorch/internal/db"
+	"github.com/nution101/ttorch/internal/gittest"
 	"github.com/nution101/ttorch/internal/paths"
 )
 
@@ -21,9 +22,7 @@ func fixtureGit(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	full := append([]string{"-c", "user.name=sync fixture", "-c", "user.email=fixture@example.invalid",
 		"-c", "commit.gpgsign=false"}, args...)
-	cmd := exec.Command("git", full...)
-	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
+	out, err := gittest.Command(dir, full...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v in %s: %v: %s", args, dir, err, out)
 	}
@@ -371,7 +370,7 @@ func TestSyncCloneIgnoresCallerGitEnv(t *testing.T) {
 	if got, want := fixtureGit(t, slot, "rev-parse", "refs/remotes/origin/main"), fixtureGit(t, repo, "rev-parse", "refs/heads/main"); got != want {
 		t.Errorf("clone origin/main = %s, want %s", got, want)
 	}
-	if out, err := exec.Command("git", "-C", other, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/main").CombinedOutput(); err == nil {
+	if out, err := gittest.Command(other, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/main").CombinedOutput(); err == nil {
 		t.Errorf("sync wrote the repository GIT_DIR named: %s", out)
 	}
 }

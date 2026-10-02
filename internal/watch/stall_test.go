@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/nution101/ttorch/internal/db"
+	"github.com/nution101/ttorch/internal/gittest"
 	"github.com/nution101/ttorch/internal/paths"
 )
 
@@ -264,9 +265,9 @@ func TestStall_CommitCountsAsProgress(t *testing.T) {
 	repo := t.TempDir()
 	gitAt := func(when time.Time, args ...string) {
 		t.Helper()
-		cmd := exec.Command("git", append([]string{"-C", repo, "-c", "commit.gpgsign=false"}, args...)...)
+		cmd := gittest.Command(repo, append([]string{"-c", "commit.gpgsign=false"}, args...)...)
 		stamp := fmt.Sprintf("@%d +0000", when.Unix())
-		cmd.Env = append(cmd.Environ(),
+		cmd.Env = append(cmd.Env,
 			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.invalid", "GIT_AUTHOR_DATE="+stamp,
 			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.invalid", "GIT_COMMITTER_DATE="+stamp)
 		if out, err := cmd.CombinedOutput(); err != nil {
@@ -477,8 +478,8 @@ func TestStall_BackdatedCommitStillCountsAsProgress(t *testing.T) {
 	}
 	sweepUntil(t, w, clk, start.Add(9*time.Minute), 30*time.Second)
 	stamp := fmt.Sprintf("@%d +0000", start.Add(-time.Hour).Unix())
-	cmd := exec.Command("git", "-C", repo, "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "old dates")
-	cmd.Env = append(cmd.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.invalid", "GIT_AUTHOR_DATE="+stamp,
+	cmd := gittest.Command(repo, "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "old dates")
+	cmd.Env = append(cmd.Env, "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.invalid", "GIT_AUTHOR_DATE="+stamp,
 		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.invalid", "GIT_COMMITTER_DATE="+stamp)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git commit: %v\n%s", err, out)

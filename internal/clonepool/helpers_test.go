@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/nution101/ttorch/internal/gittest"
 )
 
 // realGit is the git binary the test helpers run directly, so their own commands never
@@ -41,7 +43,9 @@ func isolateGit(t *testing.T) {
 // run runs git -C dir args with the real binary and returns trimmed output.
 func run(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	out, err := exec.Command(realGit, append([]string{"-C", dir}, args...)...).CombinedOutput()
+	cmd := exec.Command(realGit, append([]string{"-C", dir}, args...)...)
+	cmd.Env = gittest.Env()
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git -C %s %v: %v: %s", dir, args, err, out)
 	}
@@ -50,7 +54,9 @@ func run(t *testing.T, dir string, args ...string) string {
 
 // tryRun is run without failing the test.
 func tryRun(dir string, args ...string) (string, error) {
-	out, err := exec.Command(realGit, append([]string{"-C", dir}, args...)...).CombinedOutput()
+	cmd := exec.Command(realGit, append([]string{"-C", dir}, args...)...)
+	cmd.Env = gittest.Env()
+	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
 }
 

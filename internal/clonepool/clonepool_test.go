@@ -8,8 +8,16 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/nution101/ttorch/internal/gittest"
 	"github.com/nution101/ttorch/internal/harness"
 )
+
+// TestMain clears any inherited GIT_DIR and the like (git rebase --exec exports one), so the
+// git that fixtures and the code under test run acts on the temp repository it names.
+func TestMain(m *testing.M) {
+	gittest.Scrub()
+	os.Exit(m.Run())
+}
 
 // TestAcquireProvisionsAPrivateClone checks the shape of a provisioned slot: its own git
 // directory, the task branch at main's tip, a clean checkout, objects borrowed from main

@@ -4,13 +4,13 @@ import (
 	"context"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/nution101/ttorch/internal/gittest"
 	"github.com/nution101/ttorch/internal/worktree"
 )
 
@@ -52,7 +52,7 @@ func fleetSyncRepo(t *testing.T) (m *Manager, repo, wt, workerTip string) {
 func TestFleetSync_TagCannotMoveTheDefaultBranch(t *testing.T) {
 	m, repo, wt, workerTip := fleetSyncRepo(t)
 	gitIn(t, repo, "config", "remote.origin.followRemoteHEAD", "never")
-	_, _ = exec.Command("git", "-C", repo, "symbolic-ref", "-d", "refs/remotes/origin/HEAD").CombinedOutput()
+	_, _ = gittest.Command(repo, "symbolic-ref", "-d", "refs/remotes/origin/HEAD").CombinedOutput()
 	gitIn(t, wt, "tag", "origin/main", workerTip)
 	before := gitIn(t, repo, "rev-parse", "refs/heads/main")
 	if _, err := m.FleetSync(repo); err != nil {

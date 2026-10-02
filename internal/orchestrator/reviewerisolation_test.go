@@ -3,12 +3,12 @@ package orchestrator
 import (
 	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
 
+	"github.com/nution101/ttorch/internal/gittest"
 	"github.com/nution101/ttorch/internal/paths"
 	"github.com/nution101/ttorch/internal/review"
 )
@@ -257,7 +257,7 @@ func TestTeardownReviewers_DropsTheScratchWorkspace(t *testing.T) {
 // gitOutOrFail runs git in dir and returns trimmed stdout, failing the test on error.
 func gitOutOrFail(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
+	out, err := gittest.Command(dir, args...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v in %s: %v: %s", args, dir, err, out)
 	}
@@ -380,10 +380,10 @@ func TestReviewWorkspace_RefusesWhenTheReviewedCommitIsMissing(t *testing.T) {
 	// it back.
 	gitIn(t, wt, "reset", "--hard", "-q", "HEAD~1")
 	moved := commitFeature(t, wt, "amended.go", "package amended\n")
-	if exec.Command("git", "-C", wt, "merge-base", "--is-ancestor", head, moved).Run() == nil {
+	if gittest.Command(wt, "merge-base", "--is-ancestor", head, moved).Run() == nil {
 		t.Fatal("the proof is vacuous: the reviewed commit is still an ancestor of the worker HEAD, so a fetch would bring it back")
 	}
-	if exec.Command("git", "-C", repo, "cat-file", "-e", head+"^{commit}").Run() == nil {
+	if gittest.Command(repo, "cat-file", "-e", head+"^{commit}").Run() == nil {
 		t.Fatal("the proof is vacuous: the reviewed commit is in the source repo, so the mirror will have it")
 	}
 

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nution101/ttorch/internal/gittest"
 	"github.com/nution101/ttorch/internal/paths"
 	"github.com/nution101/ttorch/internal/proc"
 	"github.com/nution101/ttorch/internal/tmux"
@@ -44,7 +45,7 @@ func fingerprintTestRepo(t *testing.T) string {
 		{"init", "-q"},
 		{"-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "init"},
 	} {
-		if out, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput(); err != nil {
+		if out, err := gittest.Command(repo, args...).CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v: %s", args, err, out)
 		}
 	}

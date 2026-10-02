@@ -4,13 +4,13 @@ import (
 	"bytes"
 	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/nution101/ttorch/internal/db"
+	"github.com/nution101/ttorch/internal/gittest"
 	"github.com/nution101/ttorch/internal/paths"
 	"github.com/nution101/ttorch/internal/worktree"
 )
@@ -24,8 +24,8 @@ func branchedRepo(t *testing.T, branch string) string {
 		{"init", "-q", "-b", branch},
 		{"commit", "-q", "--allow-empty", "-m", "base"},
 	} {
-		c := exec.Command("git", append([]string{"-C", dir}, args...)...)
-		c.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com",
+		c := gittest.Command(dir, args...)
+		c.Env = append(c.Env, "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com",
 			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com")
 		if out, err := c.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v: %s", args, err, out)
@@ -40,8 +40,7 @@ func branchedRepo(t *testing.T, branch string) string {
 
 func gitInRepo(t *testing.T, dir string, args ...string) {
 	t.Helper()
-	c := exec.Command("git", append([]string{"-C", dir}, args...)...)
-	if out, err := c.CombinedOutput(); err != nil {
+	if out, err := gittest.Command(dir, args...).CombinedOutput(); err != nil {
 		t.Fatalf("git %v: %v: %s", args, err, out)
 	}
 }

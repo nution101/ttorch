@@ -3,18 +3,18 @@ package cli
 import (
 	"bytes"
 	"context"
-	"os/exec"
 	"strings"
 	"testing"
 
 	"github.com/nution101/ttorch/internal/db"
+	"github.com/nution101/ttorch/internal/gittest"
 	"github.com/nution101/ttorch/internal/paths"
 	"github.com/nution101/ttorch/internal/worktree"
 )
 
 func gitRev(t *testing.T, dir, rev string) string {
 	t.Helper()
-	out, err := exec.Command("git", "-C", dir, "rev-parse", "--verify", rev).Output()
+	out, err := gittest.Command(dir, "rev-parse", "--verify", rev).Output()
 	if err != nil {
 		t.Fatalf("git rev-parse %s: %v", rev, err)
 	}

@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/nution101/ttorch/internal/gittest"
 )
 
 // --- fixtures ---------------------------------------------------------------------------
@@ -39,6 +41,9 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	// Clear any inherited GIT_DIR and the like (git rebase --exec exports one), so the git
+	// that fixtures and the code under test run acts on the temp repository it names.
+	gittest.Scrub()
 	if v := os.Getenv(childEnv); v != "" {
 		runTestChild(v)
 		return
@@ -58,9 +63,7 @@ func gitIn(dir string, args ...string) error {
 		"-c", "user.name=lint fixture", "-c", "user.email=fixture@example.invalid",
 		"-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main",
 	}, args...)
-	cmd := exec.Command("git", full...)
-	cmd.Dir = dir
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := gittest.Command(dir, full...).CombinedOutput(); err != nil {
 		return fmt.Errorf("git %v in %s: %v: %s", args, dir, err, out)
 	}
 	return nil
@@ -111,7 +114,7 @@ func buildPrototype() {
 			return
 		}
 	}
-	out, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+	out, err := gittest.Command(repo, "rev-parse", "HEAD").Output()
 	if err != nil {
 		protoErr = err
 		return

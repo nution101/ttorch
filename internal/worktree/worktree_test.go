@@ -7,7 +7,16 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/nution101/ttorch/internal/gittest"
 )
+
+// TestMain clears any inherited GIT_DIR and the like (git rebase --exec exports one), so the
+// git that fixtures and the code under test run acts on the temp repository it names.
+func TestMain(m *testing.M) {
+	gittest.Scrub()
+	os.Exit(m.Run())
+}
 
 func makeRepo(t *testing.T) string {
 	t.Helper()
@@ -16,8 +25,8 @@ func makeRepo(t *testing.T) string {
 	}
 	repo := t.TempDir()
 	run := func(args ...string) {
-		c := exec.Command("git", append([]string{"-C", repo}, args...)...)
-		c.Env = append(os.Environ(),
+		c := gittest.Command(repo, args...)
+		c.Env = append(c.Env,
 			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com",
 			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com")
 		if out, err := c.CombinedOutput(); err != nil {
@@ -349,8 +358,8 @@ func TestPool_SkipsSlotWithTrackedChanges(t *testing.T) {
 
 func gitT(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	c := exec.Command("git", append([]string{"-C", dir}, args...)...)
-	c.Env = append(os.Environ(),
+	c := gittest.Command(dir, args...)
+	c.Env = append(c.Env,
 		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com",
 		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com")
 	out, err := c.CombinedOutput()

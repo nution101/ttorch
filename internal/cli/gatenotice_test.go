@@ -4,12 +4,12 @@ import (
 	"bytes"
 	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/nution101/ttorch/internal/db"
+	"github.com/nution101/ttorch/internal/gittest"
 	"github.com/nution101/ttorch/internal/paths"
 	"github.com/nution101/ttorch/internal/projectinit"
 )
@@ -21,8 +21,8 @@ func noticeRepo(t *testing.T, mode, policy string, commit bool) string {
 	repo := t.TempDir()
 	run := func(args ...string) {
 		t.Helper()
-		c := exec.Command("git", append([]string{"-C", repo}, args...)...)
-		c.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com",
+		c := gittest.Command(repo, args...)
+		c.Env = append(c.Env, "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com",
 			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com")
 		if out, err := c.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v: %s", args, err, out)

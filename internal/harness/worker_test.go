@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/nution101/ttorch/internal/gittest"
 )
 
 // TestWorkerLaunchPrefix pins the env assignments prepended to a worker's launch
@@ -84,8 +86,8 @@ func TestWriteWorkerTaskFileExcludesFromGit(t *testing.T) {
 
 func runGitWT(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	c := exec.Command("git", append([]string{"-C", dir}, args...)...)
-	c.Env = append(os.Environ(),
+	c := gittest.Command(dir, args...)
+	c.Env = append(c.Env,
 		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com",
 		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com")
 	out, err := c.CombinedOutput()

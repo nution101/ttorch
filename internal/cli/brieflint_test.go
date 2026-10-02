@@ -13,6 +13,7 @@ import (
 
 	"github.com/nution101/ttorch/internal/brieflint"
 	"github.com/nution101/ttorch/internal/db"
+	"github.com/nution101/ttorch/internal/gittest"
 	"github.com/nution101/ttorch/internal/paths"
 	"github.com/nution101/ttorch/internal/worktree"
 )
@@ -30,9 +31,7 @@ func lintRepo(t *testing.T) string {
 			"-c", "user.name=lint fixture", "-c", "user.email=fixture@example.invalid",
 			"-c", "commit.gpgsign=false",
 		}, args...)
-		cmd := exec.Command("git", full...)
-		cmd.Dir = dir
-		if out, err := cmd.CombinedOutput(); err != nil {
+		if out, err := gittest.Command(dir, full...).CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v: %s", args, err, out)
 		}
 	}
@@ -338,7 +337,7 @@ func TestCmdBriefLintDistinguishesReducedCoverage(t *testing.T) {
 func TestCmdBriefLintOfflineKeepsTheLocalRules(t *testing.T) {
 	repo := lintRepo(t)
 	// A remote that cannot be reached: the target-branch rule is the only rule that asks.
-	if out, err := exec.Command("git", "-C", repo, "remote", "set-url", "origin", filepath.Join(t.TempDir(), "gone.git")).CombinedOutput(); err != nil {
+	if out, err := gittest.Command(repo, "remote", "set-url", "origin", filepath.Join(t.TempDir(), "gone.git")).CombinedOutput(); err != nil {
 		t.Fatalf("pointing origin at nothing: %v: %s", err, out)
 	}
 
@@ -394,7 +393,7 @@ func captureStderr(t *testing.T, fn func() error) (string, error) {
 // coverage() just contradicted: --brief-lint-offline disables nothing in AGENTS.md.
 func TestLintBriefForAddNamesNoWrongReason(t *testing.T) {
 	repo := lintRepo(t)
-	if out, err := exec.Command("git", "-C", repo, "remote", "set-url", "origin", filepath.Join(t.TempDir(), "gone.git")).CombinedOutput(); err != nil {
+	if out, err := gittest.Command(repo, "remote", "set-url", "origin", filepath.Join(t.TempDir(), "gone.git")).CombinedOutput(); err != nil {
 		t.Fatalf("pointing origin at nothing: %v: %s", err, out)
 	}
 	out, err := captureStderr(t, func() error { return lintBriefForAdd(cleanBrief, repo, "", true) })

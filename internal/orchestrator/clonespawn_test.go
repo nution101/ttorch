@@ -3,12 +3,12 @@ package orchestrator
 import (
 	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/nution101/ttorch/internal/clonepool"
+	"github.com/nution101/ttorch/internal/gittest"
 	"github.com/nution101/ttorch/internal/worktree"
 )
 
@@ -110,7 +110,7 @@ func TestReleaseWorkdirRoutesByLocation(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(wt, ".git")); err != nil {
 		t.Fatalf("released worktree was not kept for reuse: %v", err)
 	}
-	if out, _ := exec.Command("git", "-C", wt, "rev-parse", "--abbrev-ref", "HEAD").Output(); strings.TrimSpace(string(out)) != "HEAD" {
+	if out, _ := gittest.Command(wt, "rev-parse", "--abbrev-ref", "HEAD").Output(); strings.TrimSpace(string(out)) != "HEAD" {
 		t.Fatalf("released worktree is on %q, want detached as Pool.Release leaves it", out)
 	}
 }

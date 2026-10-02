@@ -13,6 +13,7 @@ import (
 
 	"github.com/nution101/ttorch/internal/approval"
 	"github.com/nution101/ttorch/internal/db"
+	"github.com/nution101/ttorch/internal/gittest"
 	"github.com/nution101/ttorch/internal/paths"
 	"github.com/nution101/ttorch/internal/projectinit"
 	"github.com/nution101/ttorch/internal/review"
@@ -44,6 +45,9 @@ func TestMain(m *testing.M) {
 	// guard then fails the run). Clear it so TTORCH_HOME and each test's own
 	// t.Setenv("TTORCH_HOME", ...) fully govern where state resolves.
 	os.Unsetenv("TTORCH_DB")
+	// Clear any inherited GIT_DIR and the like (git rebase --exec exports one), so the git
+	// that fixtures and the code under test run acts on the temp repository it names.
+	gittest.Scrub()
 	code := m.Run()
 	_ = os.RemoveAll(home)
 	os.Exit(code)
@@ -300,8 +304,8 @@ func TestSpawnPeekTeardown(t *testing.T) {
 
 	repo := t.TempDir()
 	runGit := func(args ...string) {
-		c := exec.Command("git", append([]string{"-C", repo}, args...)...)
-		c.Env = append(os.Environ(),
+		c := gittest.Command(repo, args...)
+		c.Env = append(c.Env,
 			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com",
 			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com")
 		if out, err := c.CombinedOutput(); err != nil {
@@ -776,8 +780,8 @@ func TestTeardownRefusesDirtyWorktree(t *testing.T) {
 	}
 	repo := t.TempDir()
 	runGit := func(args ...string) {
-		c := exec.Command("git", append([]string{"-C", repo}, args...)...)
-		c.Env = append(os.Environ(),
+		c := gittest.Command(repo, args...)
+		c.Env = append(c.Env,
 			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com",
 			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com")
 		if out, err := c.CombinedOutput(); err != nil {
@@ -818,8 +822,8 @@ func TestTeardownRefusesDirtyWorktree(t *testing.T) {
 
 func gitIn(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	c := exec.Command("git", append([]string{"-C", dir}, args...)...)
-	c.Env = append(os.Environ(),
+	c := gittest.Command(dir, args...)
+	c.Env = append(c.Env,
 		"GIT_AUTHOR_NAME=w", "GIT_AUTHOR_EMAIL=w@example.com",
 		"GIT_COMMITTER_NAME=w", "GIT_COMMITTER_EMAIL=w@example.com")
 	out, err := c.CombinedOutput()
@@ -2150,7 +2154,7 @@ func TestUninitNotice(t *testing.T) {
 
 	// Uninitialized git repo: a notice that defaults to pr and points at `ttorch init`.
 	repo := t.TempDir()
-	exec.Command("git", "-C", repo, "init").Run()
+	gittest.Command(repo, "init").Run()
 	msg := uninitNotice(repo)
 	if msg == "" {
 		t.Fatal("an uninitialized git repo should produce a notice")
@@ -2192,7 +2196,7 @@ func TestInitRepo(t *testing.T) {
 	}
 	t.Setenv("TTORCH_HOME", t.TempDir())
 	repo := t.TempDir()
-	exec.Command("git", "-C", repo, "init").Run()
+	gittest.Command(repo, "init").Run()
 
 	m, err := New(paths.Default())
 	if err != nil {

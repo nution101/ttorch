@@ -7,7 +7,16 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/nution101/ttorch/internal/gittest"
 )
+
+// TestMain clears any inherited GIT_DIR and the like (git rebase --exec exports one), so the
+// git that fixtures and the code under test run acts on the temp repository it names.
+func TestMain(m *testing.M) {
+	gittest.Scrub()
+	os.Exit(m.Run())
+}
 
 func loadProjects(t *testing.T, path string) map[string]any {
 	t.Helper()

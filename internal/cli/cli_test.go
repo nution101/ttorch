@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/nution101/ttorch/internal/db"
+	"github.com/nution101/ttorch/internal/gittest"
 	"github.com/nution101/ttorch/internal/orchestrator"
 	"github.com/nution101/ttorch/internal/worktree"
 )
@@ -28,6 +29,9 @@ func TestMain(m *testing.M) {
 	// real ~/.ttorch/state.db); StateDB() prefers it over TTORCH_HOME, so leaving it set
 	// would resolve the DB back into the real home despite the pin above.
 	os.Unsetenv("TTORCH_DB")
+	// Clear any inherited GIT_DIR and the like (git rebase --exec exports one), so the git
+	// that fixtures and the code under test run acts on the temp repository it names.
+	gittest.Scrub()
 	code := m.Run()
 	_ = os.RemoveAll(home)
 	os.Exit(code)

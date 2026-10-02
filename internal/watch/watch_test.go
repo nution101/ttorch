@@ -14,6 +14,7 @@ import (
 
 	"github.com/nution101/ttorch/internal/backend"
 	"github.com/nution101/ttorch/internal/db"
+	"github.com/nution101/ttorch/internal/gittest"
 	"github.com/nution101/ttorch/internal/paths"
 )
 
@@ -31,6 +32,9 @@ import (
 // passes whether or not the calling shell has TTORCH_DB set.
 func TestMain(m *testing.M) {
 	os.Unsetenv("TTORCH_DB")
+	// Clear any inherited GIT_DIR and the like (git rebase --exec exports one), so the git
+	// that fixtures and the code under test run acts on the temp repository it names.
+	gittest.Scrub()
 	if os.Getenv("TTORCH_HOME") == "" {
 		home, err := os.MkdirTemp("", "ttorch-watch-test-home-*")
 		if err != nil {

@@ -7,6 +7,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"github.com/nution101/ttorch/internal/gittest"
 )
 
 const (
@@ -271,8 +273,8 @@ func TestObserveHead_ConfinesGitDir(t *testing.T) {
 
 func gitIn(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command("git", append([]string{"-C", dir, "-c", "commit.gpgsign=false"}, args...)...)
-	cmd.Env = append(cmd.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.invalid",
+	cmd := gittest.Command(dir, append([]string{"-c", "commit.gpgsign=false"}, args...)...)
+	cmd.Env = append(cmd.Env, "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.invalid",
 		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.invalid")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -352,7 +354,7 @@ func TestObserveHead_SignatureConfigRunsNoProgram(t *testing.T) {
 	gitIn(t, repo, "config", "gpg.program", script)
 	hash := func(typ, body string) string {
 		t.Helper()
-		cmd := exec.Command("git", "-C", repo, "hash-object", "-t", typ, "-w", "--stdin")
+		cmd := gittest.Command(repo, "hash-object", "-t", typ, "-w", "--stdin")
 		cmd.Stdin = strings.NewReader(body)
 		out, err := cmd.Output()
 		if err != nil {
@@ -483,7 +485,7 @@ func TestObserveHead_ReftableReadsAsUnknown(t *testing.T) {
 			t.Skip("git not installed")
 		}
 		repo := filepath.Join(t.TempDir(), "r")
-		cmd := exec.Command("git", "init", "-q", "--ref-format=reftable", repo)
+		cmd := gittest.Command(filepath.Dir(repo), "init", "-q", "--ref-format=reftable", repo)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Skipf("git cannot create a reftable repository: %v\n%s", err, out)
 		}

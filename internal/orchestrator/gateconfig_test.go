@@ -8,7 +8,6 @@ import (
 	"go/token"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -26,6 +25,7 @@ import (
 
 	"github.com/nution101/ttorch/internal/approval"
 	"github.com/nution101/ttorch/internal/db"
+	"github.com/nution101/ttorch/internal/gittest"
 	"github.com/nution101/ttorch/internal/projectinit"
 	"github.com/nution101/ttorch/internal/review"
 	"github.com/nution101/ttorch/internal/worktree"
@@ -449,7 +449,7 @@ var absentByDesign = map[string]string{
 // committable and not ignored is itself part of why it is covered.)
 func TestGateConfigFilesAreRealPaths(t *testing.T) {
 	root := repoRootForGateConfig(t)
-	out, err := exec.Command("git", "-C", root, "ls-files", "-z").Output()
+	out, err := gittest.Command(root, "ls-files", "-z").Output()
 	if err != nil {
 		t.Skipf("git ls-files: %v", err)
 	}
@@ -1329,7 +1329,7 @@ func TestGateCostFiguresMatchTheDoc(t *testing.T) {
 	skipIfShort(t)
 	root := repoRootForGateConfig(t)
 	git := func(args ...string) (string, error) {
-		out, err := exec.Command("git", append([]string{"-C", root}, args...)...).Output()
+		out, err := gittest.Command(root, args...).Output()
 		return string(out), err
 	}
 	if _, err := git("rev-parse", "--verify", gateCostBase+"^{commit}"); err != nil {

@@ -3,12 +3,12 @@ package cli
 import (
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/nution101/ttorch/internal/clonepool"
+	"github.com/nution101/ttorch/internal/gittest"
 	"github.com/nution101/ttorch/internal/tmux"
 )
 
@@ -45,8 +45,8 @@ func TestCmdSpawn_WorkdirCloneReachesTheClonePool(t *testing.T) {
 	repo := t.TempDir()
 	gitRun := func(args ...string) {
 		t.Helper()
-		c := exec.Command("git", append([]string{"-C", repo}, args...)...)
-		c.Env = append(os.Environ(), "GIT_AUTHOR_NAME=w", "GIT_AUTHOR_EMAIL=w@example.com",
+		c := gittest.Command(repo, args...)
+		c.Env = append(c.Env, "GIT_AUTHOR_NAME=w", "GIT_AUTHOR_EMAIL=w@example.com",
 			"GIT_COMMITTER_NAME=w", "GIT_COMMITTER_EMAIL=w@example.com")
 		if out, err := c.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v: %s", args, err, out)

@@ -5,12 +5,12 @@ import (
 	"errors"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/nution101/ttorch/internal/db"
+	"github.com/nution101/ttorch/internal/gittest"
 	"github.com/nution101/ttorch/internal/paths"
 	"github.com/nution101/ttorch/internal/singleton"
 )
@@ -872,7 +872,7 @@ func containsTask(ts []db.Task, id string) bool {
 func initGitRepo(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	cmd := exec.Command("git", "-C", dir, "init")
+	cmd := gittest.Command(dir, "init")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Skipf("git init unavailable: %v: %s", err, out)
 	}
