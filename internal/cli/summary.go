@@ -15,15 +15,17 @@ import (
 )
 
 // cmdSummary prints the coordinator's state in one pass: task counts, live workers, the
-// decisions waiting on the lead (ids and ages, not their text), scheduler and manager health,
-// and each repo's mode and free slots. --json prints it as a versioned object
-// (peer.SchemaVersion) for scripts.
+// decisions waiting on the lead (ids and ages, not their text), the open escalation count and
+// highest open id, scheduler and manager health, and each repo's mode and free slots. --json
+// prints it as a versioned object (peer.SchemaVersion) for scripts.
 //
 // The summary itself issues only reads, but it is not a read-only command. It opens the store
 // through mgr() like every other command, and orchestrator.New runs pending migrations,
-// imports legacy state and seeds default branches before anything is read. Those writes are
-// idempotent, so polling is harmless today; a caller that must not write (the peer serve verb)
-// needs its own read-only open.
+// imports legacy state and seeds default branches before anything is read, and the command
+// then syncs approval escalations (db.SyncApprovalEscalations) so its escalation count agrees
+// with `ttorch decisions`. Those writes are idempotent, so polling is harmless today; a caller
+// that must not write (the peer serve verb) needs its own read-only open, and will count
+// approvals nobody has synced yet as not open.
 func cmdSummary(args []string) error {
 	fs := flag.NewFlagSet("summary", flag.ContinueOnError)
 	asJSON := fs.Bool("json", false, "print the summary as one JSON object")
@@ -38,6 +40,9 @@ func cmdSummary(args []string) error {
 		return err
 	}
 	defer m.Close()
+	if _, err := m.Store.SyncApprovalEscalations(context.Background()); err != nil {
+		return err
+	}
 	src, err := summarySources(m)
 	if err != nil {
 		return err

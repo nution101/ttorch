@@ -4,8 +4,8 @@
 // coordinator gets the same state as data instead of screen text.
 //
 // The summary carries counts, ids and ages, and no free text: no worker's question, no gate
-// reason or finding, no approval reason, no scheduler error message. That text reaches a
-// parent only through the decisions verb, which caps and quotes it (design section 4.1).
+// reason or finding, no approval reason, no scheduler error message, no escalation body.
+// Escalation text is listed by `ttorch decisions`, which escapes and caps it (decisions.go).
 package peer
 
 import (
@@ -26,8 +26,9 @@ import (
 )
 
 // SchemaVersion is the summary's schema. A consumer refuses a version it does not know rather
-// than guess at fields; any change to a field's name, type or meaning moves it.
-const SchemaVersion = 1
+// than guess at fields; any change to a field's name, type or meaning moves it. Version 2 added
+// escalations.
+const SchemaVersion = 2
 
 // Summary is one coordinator's state at GeneratedAt. Every age is whole seconds before
 // GeneratedAt, floored at zero, and null when the thing it measures has never happened. The
@@ -39,6 +40,7 @@ type Summary struct {
 	Tasks         TaskCounts   `json:"tasks"`
 	Workers       WorkerCounts `json:"workers"`
 	Decisions     Decisions    `json:"decisions"`
+	Escalations   Escalations  `json:"escalations"`
 	Scheduler     Scheduler    `json:"scheduler"`
 	Manager       Manager      `json:"manager"`
 	Repos         []Repo       `json:"repos"`
@@ -66,6 +68,14 @@ type Decisions struct {
 	Pending       int        `json:"pending"`
 	NewestEventID int64      `json:"newest_event_id"`
 	Items         []Decision `json:"items"`
+}
+
+// Escalations counts the open escalations (db.Escalation) and gives the highest open id, 0 when
+// none is open. A parent compares HighestOpenID with the last id it has seen to know whether
+// `decisions` has anything new.
+type Escalations struct {
+	Open          int   `json:"open"`
+	HighestOpenID int64 `json:"highest_open_id"`
 }
 
 // The kinds of decision.
@@ -176,6 +186,9 @@ func Build(ctx context.Context, src Sources, now time.Time) (Summary, error) {
 	}
 	sum.Workers = workers(snap)
 	sum.Decisions = decisions(snap, now)
+	if sum.Escalations.Open, sum.Escalations.HighestOpenID, err = src.Store.EscalationOpenCounts(ctx); err != nil {
+		return Summary{}, fmt.Errorf("peer: counting escalations: %w", err)
+	}
 
 	if sum.Scheduler, err = schedulerHealth(ctx, src, now); err != nil {
 		return Summary{}, err
@@ -407,6 +420,12 @@ func (s Summary) WriteText(w io.Writer) error {
 	fmt.Fprintf(&b, "repos:      %d\n", len(s.Repos))
 	for _, r := range s.Repos {
 		fmt.Fprintf(&b, "  %s  %s mode, %d free slots\n", r.Path, r.Mode, r.FreeSlots)
+	}
+
+	if e := s.Escalations; e.Open == 0 {
+		b.WriteString("escalations: none open\n")
+	} else {
+		fmt.Fprintf(&b, "escalations: %d open, highest open #%d (ttorch decisions lists them)\n", e.Open, e.HighestOpenID)
 	}
 
 	d := s.Decisions

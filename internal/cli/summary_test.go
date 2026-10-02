@@ -92,3 +92,33 @@ func TestCmdSummaryRefusesArguments(t *testing.T) {
 		t.Errorf("cmdSummary(extra) = %v, want the usage error", err)
 	}
 }
+
+// TestCmdSummaryCountsMirroredApprovals: the summary mirrors approval_required events before
+// it counts, so its escalation count agrees with `ttorch decisions` on a DB nobody has listed.
+func TestCmdSummaryCountsMirroredApprovals(t *testing.T) {
+	seedEscalationDB(t, map[string]string{"sum-ap": db.StatusDone, "sum-q": db.StatusNeedsInput}, func(ctx context.Context, s *db.Store) {
+		if _, err := s.AppendEvent(ctx, db.Event{
+			EntityType: db.EntityTypeTask, EntityID: "sum-ap", Type: db.EventApprovalRequired,
+			Actor: db.ActorSystem, Actionable: true, Payload: "approval-marker",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.OpenEscalation(ctx, "sum-q", db.EscalationQuestion, "question-marker"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	code, out := runCLI(t, "summary", "--json")
+	if code != 0 {
+		t.Fatalf("ttorch summary --json exit = %d, output %q", code, out)
+	}
+	var sum peer.Summary
+	if err := json.Unmarshal([]byte(out), &sum); err != nil {
+		t.Fatal(err)
+	}
+	if sum.Escalations.Open != 2 || sum.Escalations.HighestOpenID != 2 {
+		t.Errorf("escalations = %+v, want 2 open with highest id 2 (the question, then the mirrored approval)", sum.Escalations)
+	}
+	if strings.Contains(out, "marker") {
+		t.Errorf("the summary carries escalation text: %s", out)
+	}
+}

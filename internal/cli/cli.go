@@ -2419,8 +2419,9 @@ Team:
     --cmd "..."             run a raw command instead of the default harness
   status                  list active workers (live tmux state + DB status/stage/owner)
   summary [--json]        the coordinator's state in one read: task counts, live workers,
-                          decisions waiting on the lead, scheduler and manager health,
-                          each repo's mode and free slots (--json: versioned object)
+                          decisions waiting on the lead, open escalations, scheduler and
+                          manager health, each repo's mode and free slots (--json:
+                          versioned object)
   escalate --task <id> --kind approval|question -m "<text>"
                           put a decision to the lead (the manager's command; refused
                           from a worker context). Text is capped at 2 KiB

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -178,8 +179,8 @@ func TestBuildSummary(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if sum.SchemaVersion != 1 {
-		t.Errorf("schema_version = %d, want 1", sum.SchemaVersion)
+	if sum.SchemaVersion != 2 {
+		t.Errorf("schema_version = %d, want 2", sum.SchemaVersion)
 	}
 	if !sum.GeneratedAt.Equal(now) {
 		t.Errorf("generated_at = %v, want %v", sum.GeneratedAt, now)
@@ -383,7 +384,7 @@ func TestEscape(t *testing.T) {
 // TestSummarySchema pins the JSON schema: its version and every field name at every level.
 // A change here is a protocol change, and the version moves with it.
 func TestSummarySchema(t *testing.T) {
-	if SchemaVersion != 1 {
+	if SchemaVersion != 2 {
 		t.Fatalf("SchemaVersion = %d; a schema change must update this test", SchemaVersion)
 	}
 	f := newFixture(t)
@@ -408,11 +409,12 @@ func TestSummarySchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string][]string{
-		"":                  {"decisions", "generated_at", "manager", "repos", "scheduler", "schema_version", "tasks", "workers"},
+		"":                  {"decisions", "escalations", "generated_at", "manager", "repos", "scheduler", "schema_version", "tasks", "workers"},
 		"tasks":             {"by_status", "total"},
 		"workers":           {"by_state", "total"},
 		"decisions":         {"items", "newest_event_id", "pending"},
 		"decisions.items[]": {"age_seconds", "event_id", "kind", "project", "task_id"},
+		"escalations":       {"highest_open_id", "open"},
 		"scheduler":         {"daemon_running", "errors", "has_ticked", "last_error_age_seconds", "last_tick_age_seconds", "stalled", "tick_count"},
 		"manager":           {"awaiting_lead", "last_action_age_seconds", "registered", "window_present"},
 		"repos[]":           {"free_slots", "mode", "name", "path"},
@@ -428,7 +430,7 @@ func TestSummarySchema(t *testing.T) {
 			t.Errorf("%q fields = %v, want %v", path, got, fields)
 		}
 	}
-	if v, _ := doc["schema_version"].(float64); v != 1 {
+	if v, _ := doc["schema_version"].(float64); v != 2 {
 		t.Errorf("schema_version in JSON = %v", doc["schema_version"])
 	}
 	if _, err := time.Parse(time.RFC3339, doc["generated_at"].(string)); err != nil {
@@ -460,4 +462,50 @@ func lookup(t *testing.T, doc map[string]any, path string) map[string]any {
 		cur = obj
 	}
 	return cur
+}
+
+// TestSummaryEscalations: the summary reports how many escalations are open and the highest
+// open id, a parent's cursor for `decisions`, and never their text.
+func TestSummaryEscalations(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	sum, err := Build(ctx, f.sources(t), f.now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Escalations != (Escalations{}) {
+		t.Fatalf("escalations with none raised = %+v", sum.Escalations)
+	}
+	var ids []int64
+	for _, body := range []string{"escalation-marker-one", "escalation-marker-two", "escalation-marker-three"} {
+		e, err := f.store.OpenEscalation(ctx, "t-done", db.EscalationQuestion, body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, e.ID)
+	}
+	if _, err := f.store.AnswerEscalation(ctx, ids[2], "req-sum", "answer-marker", db.ActorManager); err != nil {
+		t.Fatal(err)
+	}
+	if sum, err = Build(ctx, f.sources(t), f.now); err != nil {
+		t.Fatal(err)
+	}
+	if want := (Escalations{Open: 2, HighestOpenID: ids[1]}); sum.Escalations != want {
+		t.Errorf("escalations = %+v, want %+v", sum.Escalations, want)
+	}
+	var js, text strings.Builder
+	if err := sum.WriteJSON(&js); err != nil {
+		t.Fatal(err)
+	}
+	if err := sum.WriteText(&text); err != nil {
+		t.Fatal(err)
+	}
+	if want := fmt.Sprintf("escalations: 2 open, highest open #%d (ttorch decisions lists them)", ids[1]); !strings.Contains(text.String(), want) {
+		t.Errorf("text lacks %q:\n%s", want, text.String())
+	}
+	for _, out := range []string{js.String(), text.String()} {
+		if strings.Contains(out, "marker") {
+			t.Errorf("the summary carries escalation text:\n%s", out)
+		}
+	}
 }
