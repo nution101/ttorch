@@ -122,6 +122,8 @@ func Main(args []string) int {
 		return run(cmdStatus())
 	case "tasks":
 		return run(cmdTasks(rest))
+	case "summary":
+		return run(cmdSummary(rest))
 	case "project":
 		return run(cmdProject(rest))
 	case "epic":
@@ -2410,6 +2412,9 @@ Team:
     --force-overlap         dispatch anyway when --touches overlaps a live worker
     --cmd "..."             run a raw command instead of the default harness
   status                  list active workers (live tmux state + DB status/stage/owner)
+  summary [--json]        the coordinator's state in one read: task counts, live workers,
+                          decisions waiting on the lead, scheduler and manager health,
+                          each repo's mode and free slots (--json: versioned object)
   check-overlap "<paths>" show which live workers a proposed footprint conflicts
     [--repo dir]            with, to plan disjoint parallel dispatch (scopes to the
                             cwd's repo, or --repo)

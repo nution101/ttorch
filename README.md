@@ -145,6 +145,7 @@ reference; this table covers the surface a lead and manager use day to day.
 | `ttorch cc [--isolated]` | Open a Claude session attached to the team |
 | `ttorch spawn <id> <repo>` | Start a worker on a task in an isolated worktree. Flags: `--scout`, `--touches "a,b"`, `--brief`/`--brief-file`, `--effort <level>`, `--init`, `--force-overlap`, `--cmd` |
 | `ttorch status` | List live workers (tmux state + each task's DB status/stage/owner + free dispatch capacity) |
+| `ttorch summary [--json]` | The coordinator's state in one read: task counts by status, live workers by state, decisions waiting on the lead, scheduler and manager health, and each repo's delivery mode and free slots. It carries counts, ids and ages only, never a worker's or reviewer's text. `--json` prints a versioned object (`schema_version`) for scripts |
 | `ttorch check-overlap "<paths>"` | Show which live workers a proposed footprint conflicts with |
 | `ttorch peek <id> [lines]` | Read recent output from a worker |
 | `ttorch send <id> <text>` | Type a message into a worker (delivered verbatim; also `-` for stdin, `--message-file`) |
