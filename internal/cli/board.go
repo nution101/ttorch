@@ -11,6 +11,7 @@ import (
 
 	"github.com/nution101/ttorch/internal/approval"
 	"github.com/nution101/ttorch/internal/board"
+	"github.com/nution101/ttorch/internal/orchestrator"
 	"github.com/nution101/ttorch/internal/projectinit"
 	"github.com/nution101/ttorch/internal/scheduler"
 )
@@ -31,16 +32,7 @@ func cmdBoard(args []string) error {
 		return err
 	}
 	defer m.Close()
-	s, err := board.New(board.Config{
-		Store: m.Store,
-		Fleet: m,
-		Mode:  projectinit.ReadMode,
-		// Read-only: the board lists a task as awaiting approval when it holds no valid
-		// approval. It never grants one.
-		ApprovalValid:    func(id string) bool { return approval.Valid(m.P.ApprovalFile(id)) },
-		SerializeOverlap: scheduler.SerializeOverlapFromEnv(),
-		Log:              os.Stderr,
-	})
+	s, err := board.New(boardConfig(m))
 	if err != nil {
 		return err
 	}
@@ -53,4 +45,19 @@ func cmdBoard(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return s.Serve(ctx, ln)
+}
+
+// boardConfig wires the board to the manager's store and fleet. Anything else that reads the
+// board's snapshot builds it from this same config, so it sees the decisions the page shows.
+func boardConfig(m *orchestrator.Manager) board.Config {
+	return board.Config{
+		Store: m.Store,
+		Fleet: m,
+		Mode:  projectinit.ReadMode,
+		// Read-only: the board lists a task as awaiting approval when it holds no valid
+		// approval. It never grants one.
+		ApprovalValid:    func(id string) bool { return approval.Valid(m.P.ApprovalFile(id)) },
+		SerializeOverlap: scheduler.SerializeOverlapFromEnv(),
+		Log:              os.Stderr,
+	}
 }
