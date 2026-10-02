@@ -124,6 +124,12 @@ func Main(args []string) int {
 		return run(cmdTasks(rest))
 	case "summary":
 		return run(cmdSummary(rest))
+	case "escalate":
+		return run(cmdEscalate(rest))
+	case "decisions":
+		return run(cmdDecisions(rest))
+	case "answer":
+		return run(cmdAnswer(rest))
 	case "project":
 		return run(cmdProject(rest))
 	case "epic":
@@ -2415,6 +2421,15 @@ Team:
   summary [--json]        the coordinator's state in one read: task counts, live workers,
                           decisions waiting on the lead, scheduler and manager health,
                           each repo's mode and free slots (--json: versioned object)
+  escalate --task <id> --kind approval|question -m "<text>"
+                          put a decision to the lead (the manager's command; refused
+                          from a worker context). Text is capped at 2 KiB
+  decisions [--json]      list the open escalations, escaped and capped (--json:
+                          versioned object); syncs approval escalations first
+  answer <escalation-id> -m "<text>" [--request-id <id>]
+                          record the lead's answer, relayed by the manager, and wake
+                          the manager with one event; a repeated --request-id
+                          changes nothing (refused from a worker context)
   check-overlap "<paths>" show which live workers a proposed footprint conflicts
     [--repo dir]            with, to plan disjoint parallel dispatch (scopes to the
                             cwd's repo, or --repo)

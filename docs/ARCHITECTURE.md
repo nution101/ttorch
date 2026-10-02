@@ -1076,6 +1076,20 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
 - **Delivery provenance.** When work lands, the task's summary columns (`gate_passed`,
   `approved_by`, `reviewed_sha`) and a `delivered`/`merged` event are written in one
   transaction, so the verdict row and the summary can never drift apart.
+- **Escalations.** The decisions waiting on the lead are rows in `escalations` (migration
+  0011), so the open list survives a restart. The manager raises one with `ttorch escalate`;
+  `ttorch decisions` and `ttorch summary` also open an approval escalation for each done task
+  whose `approval_required` event has had no human approval since, at most once per done
+  episode (keyed by the status event that put the task in `done`), and resolve approvals whose
+  task has left `done` or been approved. `ttorch answer` marks one answered and appends one
+  actionable `escalation_answered` event for the manager, once per request id. Stored and
+  printed text is capped at 2 KiB, and every print escapes it.
+  Both `escalate` and `answer` refuse a worker context, and that refusal is a guard against
+  accidents, not a security boundary: a process running as the lead's uid can unset
+  `$TTORCH_TASK_ID`, run outside its worktree, or write the database directly. So an answer's
+  origin is not verified. It is recorded as relayed by the manager (the event's actor and
+  `answered_by`), never as the lead, and it grants only text: it mints no approval token and
+  bypasses no gate. Approving still takes `ttorch approve` at the lead's own terminal.
 
 Migrations, in order: **0001** initial hierarchy + events + manager singleton; **0002**
 durable verdicts; **0003** task leases + the terminal `failed` status; **0004** the
