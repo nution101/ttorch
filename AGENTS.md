@@ -45,9 +45,9 @@ fast and CI keeps the coverage.
   explicitly includes (non-exhaustive): Claude, Claude Code, Anthropic, Codex, ChatGPT,
   OpenAI, Copilot, Cursor. (Functional references to the literal `claude` binary or the
   `CLAUDE.md` filename are fine — this is about authorship/attribution, not tooling.)
-- **No upstream source-author/project attribution.** ttorch is a clean-room
-  reimplementation — don't reference upstream authors/projects (e.g. kunchenguid,
-  firstmate, treehouse, no-mistakes) or add `THIRD_PARTY` / attribution files.
+- **No upstream source-author/project attribution.** ttorch is an independent
+  implementation. Commits, docs, and code name no upstream author or project, and
+  the repo adds no `THIRD_PARTY` / attribution files.
 
 ## Roadmap
 
