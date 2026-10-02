@@ -205,7 +205,7 @@ reference; this table covers the surface a lead and manager use day to day.
 | --- | --- |
 | `ttorch install` / `update [--content-only]` / `uninstall [--purge]` | Manage the installed binary + content |
 | `ttorch doctor [--yes]` | Detect and install missing dependencies; print the default branch, last landed commit and origin URL the trust gate reads for each trusted project |
-| `ttorch skills [install]` | List/force-install recommended agent skills (e.g. `axi`, `ponytail`); ttorch also installs any missing ones automatically before a team launches |
+| `ttorch skills [install]` | List/force-install recommended agent skills (e.g. `ponytail`); ttorch also installs any missing ones automatically before a team launches |
 | `ttorch init [--mode pr\|local\|validated\|trusted]` | Set up a repo's AGENTS.md + CLAUDE.md + delivery mode + profile |
 | `ttorch profile [dir]` | Derive the repo's stack/commands/conventions into AGENTS.md |
 | `ttorch version` / `help` | Version / full usage |

@@ -156,7 +156,7 @@ func Run(out io.Writer, in io.Reader, autoYes bool) error {
 		}
 	}
 
-	fmt.Fprintln(out, "  tip: 'ttorch skills' adds recommended agent skills (e.g. axi)")
+	fmt.Fprintln(out, "  tip: 'ttorch skills' adds recommended agent skills (e.g. ponytail)")
 
 	if len(installable) == 0 && !wantITerm {
 		fmt.Fprintln(out, "Nothing to auto-install.")

@@ -251,11 +251,11 @@ Workers get more effective when they start informed:
 
 - **Skills.** A worker is a normal Claude Code session, so it inherits every Agent Skill in
   `~/.claude/skills` — ttorch adds its own on top. ttorch installs its recommended skills
-  automatically before a team launches (e.g. the `axi` guidelines for agent-ergonomic CLIs
-  and `ponytail`, which keeps workers terse; needs `npx`/Node). `ttorch skills` lists them and
-  `ttorch skills install` forces the install now; `TTORCH_SKIP_SKILL_INSTALL=1` disables the
-  automatic step. A team can also ship its own skills through ttorch's managed content so
-  `ttorch update` distributes them to everyone.
+  automatically before a team launches (e.g. `ponytail`, which keeps workers terse; needs
+  `npx`/Node). `ttorch skills` lists them and `ttorch skills install` forces the install
+  now; `TTORCH_SKIP_SKILL_INSTALL=1` disables the automatic step. A team can also ship its
+  own skills through ttorch's managed content so `ttorch update` distributes them to
+  everyone.
 - **Memory.** A repo's committed `AGENTS.md` (with `CLAUDE.md` symlinked to it by
   `ttorch init`) is durable project memory — conventions, gotchas, where things live. Workers
   read it automatically. At delivery the manager records lessons with `ttorch learn` into

@@ -125,4 +125,4 @@ echo "Installed ttorch ${VERSION} -> ${BIN_PATH}"
 echo "Laying down managed content..."
 "$BIN_PATH" install
 echo "Done. Run 'ttorch doctor' to check dependencies (tmux, git, gh, claude)."
-echo "ttorch installs recommended agent skills (e.g. axi, ponytail) automatically before a team launches; 'ttorch skills install' forces it now (needs npx/Node)."
+echo "ttorch installs recommended agent skills (e.g. ponytail) automatically before a team launches; 'ttorch skills install' forces it now (needs npx/Node)."

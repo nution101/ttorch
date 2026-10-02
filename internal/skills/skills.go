@@ -27,7 +27,6 @@ type Skill struct {
 // Recommended returns the skills ttorch installs for any team.
 func Recommended() []Skill {
 	return []Skill{
-		{Ref: "kunchenguid/axi", Why: "guidelines for building token-efficient, agent-native CLI tools"},
 		{Ref: "DietrichGebert/ponytail", Why: "keeps workers terse — write the least code that works and flag over-engineering (workers apply it by default)"},
 	}
 }

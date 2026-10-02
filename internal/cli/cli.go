@@ -2580,7 +2580,7 @@ Setup:
   update [--content-only] self-update the binary, then re-apply content
   uninstall [--purge]     remove managed files (keeps files you edited)
   doctor [--yes]          check/install tmux, git, gh, claude (+ optional codegraph)
-  skills [install]        list / install recommended agent skills (e.g. axi, ponytail)
+  skills [install]        list / install recommended agent skills (e.g. ponytail)
   init [--mode m]         set up a repo's AGENTS.md + CLAUDE.md + delivery mode
                           (+ codegraph nav when TTORCH_CODEGRAPH=1; opt-in, default off)
   profile [dir]           derive the repo's stack/commands/conventions into AGENTS.md
