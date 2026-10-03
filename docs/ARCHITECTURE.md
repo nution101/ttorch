@@ -450,6 +450,7 @@ once if it touches any covered path.
 | `go.work` | 0 | +0 |
 | `go.work.sum` | 0 | +0 |
 | `internal/approval/` | 6 | +0 |
+| `internal/cli/peeradd.go` | 0 | +0 |
 | `internal/cli/peerinit.go` | 0 | +0 |
 | `internal/cli/peerserve.go` | 0 | +0 |
 | `internal/installer/` | 5 | +1 |
@@ -464,6 +465,8 @@ once if it touches any covered path.
 | `internal/orchestrator/validatecache.go` | 1 | +0 |
 | `internal/orchestrator/workdir.go` | 0 | +0 |
 | `internal/peer/authkeys.go` | 0 | +0 |
+| `internal/peer/client.go` | 0 | +0 |
+| `internal/peer/init.go` | 0 | +0 |
 | `internal/peer/serve.go` | 0 | +0 |
 | `internal/projectinit/` | 9 | +3 |
 | `internal/review/` | 7 | +4 |
@@ -1193,9 +1196,11 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   key with a `version` call over the control channel, which must answer as that peer with this
   coordinator as both its recorded parent and its key's. Only then is the peer `live`. A failure
   records why and leaves it `provisioning`, and running `peer add` again resumes with the same
-  key. `peer adopt --force`
-  is the same for a peer another parent provisioned, and removes the other control keys' lines,
-  so the parent it moved away from can no longer reach the peer at all.
+  key. `peer adopt --force` is the same for a peer another parent provisioned, and removes the
+  other control keys' lines, so the parent it moved away from can no longer reach the peer at
+  all. Both sides of provisioning are in the covered set: `internal/cli/peeradd.go`,
+  `internal/peer/init.go` (the init session's command line and envelope),
+  `internal/cli/peerinit.go` and `internal/peer/authkeys.go`.
 - **Peer client.** `ttorch peer status`, `decisions`, `answer`, `task-add`, `goal` and `repo
   add` refuse a worker context (an accident guard, like `ttorch answer`'s, not a boundary), then
   reach a `live` or `unreachable` peer through `internal/peer/client.go` alone: one ssh
@@ -1207,7 +1212,8 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   agent is asked, so the lead's own keys, which run anything, are never offered; a host key the
   lead's `known_hosts` does not hold fails the call, and the channel never writes that file.
   What comes back is decoded and every string in it escaped and capped before anything reads it,
-  and a different protocol major is refused unread. No request names a parent: the key does.
+  and a different protocol major is refused unread. `internal/peer/client.go` is in the covered
+  set, so loosening that command line is a gate change. No request names a parent: the key does.
   `task-add` and `goal` record a delegation (request id, peer,
   task, sha256 of the brief or goal) before the call, drop it when the peer refuses (a refusal
   means the peer acted on nothing), and keep it otherwise, printing the request id that makes a

@@ -168,10 +168,18 @@ var ttorchSourceFiles = []string{
 	// --allow-gate-change.
 	"internal/peer/serve.go",
 	// authkeys.go writes the authorized_keys line that pins that key to the channel: the
-	// forced command, restrict, and which binary the command names. A line without them would
-	// let the key run anything on the peer, so changing it is a gate change too. The rest of
-	// internal/peer (the summary, the client a parent calls with, init's envelope) is not.
+	// forced command with the parent it binds, restrict, and which binary the command names. A
+	// line without them would let the key run anything on the peer, or act for another parent,
+	// so changing it is a gate change too.
 	"internal/peer/authkeys.go",
+	// client.go is the only way a parent's commands reach a peer: the pinned ssh command line
+	// that reads no ssh_config, offers no agent key and accepts only a known host key. Loosening
+	// it would hand the lead's own keys, which run anything, or a ProxyCommand to the channel.
+	"internal/peer/client.go",
+	// init.go is the init session's command line and envelope: what runs on the peer over the
+	// lead's own ssh session, with the lead's authority there, and the request init acts on.
+	// The rest of internal/peer (the summary and decisions readers) is not covered.
+	"internal/peer/init.go",
 	// peerserve.go wires those verbs to what they act on (the store, the task add core,
 	// ensure-up's Resume and scheduler start) and builds the environment the channel and
 	// everything ensure-up starts run with. Covering only the verb names would let a change here
@@ -180,9 +188,13 @@ var ttorchSourceFiles = []string{
 	"internal/cli/peerserve.go",
 	// peerinit.go provisions a peer: it records the parent the channel checks requests against,
 	// writes the peer.env whose PATH and settings everything ensure-up starts inherits, and hands
-	// the key to authkeys.go. The rest of internal/cli, the parent's peer commands included,
-	// stays uncovered.
+	// the key to authkeys.go.
 	"internal/cli/peerinit.go",
+	// peeradd.go is the parent's side of that: it makes the control key, chooses which of the
+	// lead's settings cross to the peer, runs init over the lead's session and proves the key
+	// before the peer goes live. The rest of internal/cli, the parent's other peer commands
+	// included, stays uncovered.
+	"internal/cli/peeradd.go",
 	// The gate's own proofs. Without these, the backstop can be deleted in the same merge
 	// as the attack it would catch: TestTtorchRepoIsScopedIn goes red on a .gitattributes
 	// that un-scopes the repo, but a diff that adds the attribute AND deletes the test

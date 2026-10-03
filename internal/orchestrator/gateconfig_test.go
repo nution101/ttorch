@@ -2027,11 +2027,16 @@ func TestMatchesGateConfig(t *testing.T) {
 		{"the control channel's wiring", "internal/cli/peerserve.go", true},
 		{"the rest of the cli", "internal/cli/cli.go", false},
 		// The authorized_keys line is the bound on the control key, and init writes it and the
-		// environment the channel runs with. The client a parent calls with is not covered.
+		// environment the channel runs with. The client's pinned ssh command line and the init
+		// session are covered with them, as is the parent's side of provisioning; the parent's
+		// other peer commands are not.
 		{"the control key's authorized_keys line", "internal/peer/authkeys.go", true},
 		{"provisioning a peer", "internal/cli/peerinit.go", true},
-		{"the parent's peer client", "internal/peer/client.go", false},
+		{"the parent's peer client", "internal/peer/client.go", true},
+		{"the init session", "internal/peer/init.go", true},
+		{"the parent's side of provisioning", "internal/cli/peeradd.go", true},
 		{"the parent's peer commands", "internal/cli/peerclient.go", false},
+		{"the peer decisions reader", "internal/peer/decisions.go", false},
 		{"a project-level reviewer definition", ".claude/agents/ttorch-reviewer-security.md", true},
 		{"project-level MCP servers", ".mcp.json", true},
 		{"a nested instruction file", "internal/orchestrator/CLAUDE.md", true},
