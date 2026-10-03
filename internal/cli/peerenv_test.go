@@ -230,8 +230,13 @@ func TestPeerEnvRefusesWhatAnotherAccountCouldWrite(t *testing.T) {
 
 	// Another account's file. Making one needs root, so the owner the check expects is moved
 	// instead: openPeerEnv is what readPeerEnv opens peer.env with, after the home has passed.
-	_, path = good(t)
-	if f, err := openPeerEnv(path, other); err == nil {
+	dir, _ = good(t)
+	home, err := peer.OpenPrivateDir(dir, uid, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer home.Close()
+	if f, err := openPeerEnv(home, other); err == nil {
 		f.Close()
 		t.Error("a peer.env another account owns was opened")
 	} else if !strings.Contains(err.Error(), "owned by") {

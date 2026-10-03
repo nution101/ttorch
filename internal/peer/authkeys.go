@@ -28,6 +28,8 @@ import (
 	"strings"
 	"syscall"
 	"unicode"
+
+	"golang.org/x/sys/unix"
 )
 
 // ControlKeyType is the only key type a control key may be.
@@ -202,6 +204,65 @@ func CheckPrivate(path string, fi fs.FileInfo, uid int, dir bool) error {
 	return ownedBy(path, fi, uid, false)
 }
 
+// OpenPrivateDir opens dir without following a symlink in its last component, and checks the
+// directory it got, through the descriptor (fstat), with CheckPrivate: a directory uid owns with no
+// group or other write bit. With create set, a missing dir is first made 0700; without it, a
+// missing dir is (nil, nil). Files in it are then opened with OpenAt, relative to the descriptor,
+// so a rename of dir or of its parents after the check cannot point a read or a write somewhere
+// the check never saw.
+func OpenPrivateDir(dir string, uid int, create bool) (*os.File, error) {
+	if !filepath.IsAbs(dir) {
+		return nil, fmt.Errorf("the directory %q is not absolute", dir)
+	}
+	if create {
+		if err := os.Mkdir(dir, 0o700); err == nil {
+			if err := os.Chmod(dir, 0o700); err != nil {
+				return nil, err
+			}
+		} else if !errors.Is(err, fs.ErrExist) {
+			return nil, err
+		}
+	}
+	fd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	switch {
+	case errors.Is(err, unix.ENOENT):
+		return nil, nil
+	case errors.Is(err, unix.ELOOP), errors.Is(err, unix.ENOTDIR):
+		// Linux answers a symlink with ELOOP and darwin with ENOTDIR. The open has refused
+		// either way; the Lstat only names what was there.
+		if fi, lerr := os.Lstat(dir); lerr == nil && fi.Mode()&fs.ModeSymlink != 0 {
+			return nil, fmt.Errorf("%s is a symbolic link; it must be a directory this account owns that no one else can write", dir)
+		}
+		return nil, fmt.Errorf("%s is not a directory", dir)
+	case err != nil:
+		return nil, &fs.PathError{Op: "open", Path: dir, Err: err}
+	}
+	f := os.NewFile(uintptr(fd), dir)
+	fi, err := f.Stat()
+	if err == nil {
+		err = CheckPrivate(dir, fi, uid, true)
+	}
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+// OpenAt opens name, one path component, in the directory dir was opened as, never following a
+// symlink: a symlink there fails with ELOOP. flags are os.OpenFile's.
+func OpenAt(dir *os.File, name string, flags int, perm os.FileMode) (*os.File, error) {
+	path := filepath.Join(dir.Name(), name)
+	if name == "" || name == "." || name == ".." || strings.ContainsRune(name, '/') {
+		return nil, fmt.Errorf("%q is not one path component", name)
+	}
+	fd, err := unix.Openat(int(dir.Fd()), name, flags|unix.O_NOFOLLOW|unix.O_CLOEXEC, uint32(perm.Perm()))
+	if err != nil {
+		return nil, &fs.PathError{Op: "open", Path: path, Err: err}
+	}
+	return os.NewFile(uintptr(fd), path), nil
+}
+
 // InstallResult is what installControlKey did. Added is false when the line was already there.
 // StaleControlKeys counts other control keys' lines in the file, a previous parent's for
 // instance, which were left as they are.
@@ -213,11 +274,12 @@ type InstallResult struct {
 
 // installControlKey appends line, which admits the key blob, to <sshDir>/authorized_keys. It is
 // unexported so that outside this package the only way to admit a key is ProvisionControlKey,
-// whose line always carries the forced command and restrict. sshDir
-// is created 0700 and the file 0600 when missing. Both must then be owned by uid and writable by
-// no one else, and neither may be a symlink: the directory is checked with Lstat, and the file is
-// opened with O_NOFOLLOW and checked with fstat, so what is written is what was checked. sshd's
-// StrictModes refuses a looser file anyway, and a file someone else can write could admit any key.
+// whose line always carries the forced command and restrict. sshDir is created 0700 and the file
+// 0600 when missing. Both must then be owned by uid and writable by no one else, and neither may
+// be a symlink: the directory is opened once (OpenPrivateDir) and the file opened relative to it
+// with O_NOFOLLOW (OpenAt), each checked through its descriptor, so what is written is what was
+// checked. sshd's StrictModes refuses a looser file anyway, and a file someone else can write
+// could admit any key.
 //
 // The file is appended to, never rewritten, and a last line without a newline gets one first, so
 // no existing entry is touched. If the file already holds line, nothing is written. If it lists
@@ -232,25 +294,14 @@ func installControlKey(sshDir, line, blob string, uid int) (InstallResult, error
 		!containsField(line, blob) {
 		return InstallResult{}, errors.New("the authorized_keys line must be one printable line holding the key")
 	}
-	fi, err := os.Lstat(sshDir)
-	if errors.Is(err, fs.ErrNotExist) {
-		if err := os.Mkdir(sshDir, 0o700); err != nil {
-			return InstallResult{}, err
-		}
-		if err := os.Chmod(sshDir, 0o700); err != nil {
-			return InstallResult{}, err
-		}
-		fi, err = os.Lstat(sshDir)
-	}
+	dir, err := OpenPrivateDir(sshDir, uid, true)
 	if err != nil {
 		return InstallResult{}, err
 	}
-	if err := CheckPrivate(sshDir, fi, uid, true); err != nil {
-		return InstallResult{}, err
-	}
+	defer dir.Close()
 	path := filepath.Join(sshDir, "authorized_keys")
 	out := InstallResult{Path: path}
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
+	f, err := OpenAt(dir, "authorized_keys", os.O_RDWR|os.O_CREATE|os.O_APPEND|syscall.O_NONBLOCK, 0o600)
 	if errors.Is(err, syscall.ELOOP) {
 		return out, fmt.Errorf("%s is a symbolic link; it must be a regular file this account owns that no one else can write", path)
 	}
@@ -258,7 +309,8 @@ func installControlKey(sshDir, line, blob string, uid int) (InstallResult, error
 		return out, err
 	}
 	defer f.Close()
-	if fi, err = f.Stat(); err != nil {
+	fi, err := f.Stat()
+	if err != nil {
 		return out, err
 	}
 	if err := CheckPrivate(path, fi, uid, false); err != nil {

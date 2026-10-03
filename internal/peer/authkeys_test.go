@@ -282,3 +282,110 @@ func TestProvisionControlKey(t *testing.T) {
 		t.Error("an rsa key was provisioned")
 	}
 }
+
+// TestOpenPrivateDir: a directory is opened without following a symlink and checked through the
+// descriptor; with create, a missing one is made 0700.
+func TestOpenPrivateDir(t *testing.T) {
+	uid := os.Getuid()
+	base := t.TempDir()
+	made := filepath.Join(base, "made")
+	d, err := OpenPrivateDir(made, uid, true)
+	if err != nil || d == nil {
+		t.Fatalf("OpenPrivateDir(create) = %v, %v", d, err)
+	}
+	d.Close()
+	if fi, err := os.Lstat(made); err != nil || !fi.IsDir() || fi.Mode().Perm() != 0o700 {
+		t.Errorf("created %v (%v), want a 0700 directory", fi.Mode(), err)
+	}
+	if d, err := OpenPrivateDir(filepath.Join(base, "absent"), uid, false); d != nil || err != nil {
+		t.Errorf("a missing directory without create = %v, %v; want nil, nil", d, err)
+	}
+	if _, err := os.Lstat(filepath.Join(base, "absent")); !os.IsNotExist(err) {
+		t.Error("a missing directory was created without create")
+	}
+
+	refused := func(label, dir string, uid int, create bool, want string) {
+		t.Helper()
+		d, err := OpenPrivateDir(dir, uid, create)
+		if err == nil {
+			d.Close()
+			t.Errorf("%s: opened", label)
+		} else if !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: %v, want it to say %q", label, err, want)
+		}
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(made, link); err != nil {
+		t.Fatal(err)
+	}
+	refused("a symlink to a private directory", link, uid, false, "symbolic link")
+	refused("a symlink, with create", link, uid, true, "symbolic link")
+	file := filepath.Join(base, "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	refused("a file", file, uid, true, "not a directory")
+	loose := filepath.Join(base, "loose")
+	if err := os.Mkdir(loose, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(loose, 0o770); err != nil {
+		t.Fatal(err)
+	}
+	refused("a group-writable directory", loose, uid, false, "writable")
+	refused("another account's directory", made, uid+1, false, "owned by")
+	refused("a relative path", "made", uid, false, "absolute")
+}
+
+// TestOpenAtStaysInTheDirectoryItChecked: once a directory is open, a file opened through it is in
+// that directory, even if its path is renamed away and a symlink to somewhere else put in its
+// place, and a symlink inside it is never followed.
+func TestOpenAtStaysInTheDirectoryItChecked(t *testing.T) {
+	uid := os.Getuid()
+	base := t.TempDir()
+	dir := filepath.Join(base, ".ssh")
+	d, err := OpenPrivateDir(dir, uid, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	elsewhere := t.TempDir()
+	if err := os.Rename(dir, dir+".moved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, dir); err != nil {
+		t.Fatal(err)
+	}
+	f, err := OpenAt(d, "authorized_keys", os.O_WRONLY|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("x\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if _, err := os.Stat(filepath.Join(dir+".moved", "authorized_keys")); err != nil {
+		t.Errorf("the file is not in the directory that was checked: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(elsewhere, "authorized_keys")); !os.IsNotExist(err) {
+		t.Errorf("the write followed the swapped-in symlink to %s", elsewhere)
+	}
+
+	target := filepath.Join(t.TempDir(), "target")
+	if err := os.WriteFile(target, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir+".moved", "link")); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := OpenAt(d, "link", os.O_WRONLY|os.O_APPEND, 0); err == nil {
+		f.Close()
+		t.Error("OpenAt followed a symlink")
+	}
+	for _, bad := range []string{"", ".", "..", "a/b", "../x"} {
+		if f, err := OpenAt(d, bad, os.O_RDONLY, 0); err == nil {
+			f.Close()
+			t.Errorf("OpenAt(%q) opened something", bad)
+		}
+	}
+}

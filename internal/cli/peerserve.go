@@ -201,23 +201,20 @@ func defaultPeerPath(u peerUser) string {
 //
 // peer.env sets the PATH and TTORCH_* settings of everything ensure-up starts, so where it comes
 // from matters as much as what it says. The ttorch home must be a directory, not a symlink, owned
-// by uid and writable by no one else, and peer.env a regular file with the same owner and mode
-// (openPeerEnv). A file another account can write, or one a link points somewhere else, is
-// refused rather than read. uid is the account the channel runs as; tests pass another one.
+// by uid and writable by no one else, and peer.env a regular file with the same owner and mode.
+// The home is opened once and checked through its descriptor (peer.OpenPrivateDir), and peer.env
+// opened relative to it (openPeerEnv), so a rename between the check and the read cannot swap
+// either. A file another account can write, or one a link points somewhere else, is refused
+// rather than read. uid is the account the channel runs as; tests pass another one.
 func readPeerEnv(ttorchHome string, uid int) (map[string]string, error) {
 	out := map[string]string{}
-	fi, err := os.Lstat(ttorchHome)
-	if os.IsNotExist(err) {
-		return out, nil
+	dir, err := peer.OpenPrivateDir(ttorchHome, uid, false)
+	if err != nil || dir == nil {
+		return out, err
 	}
-	if err != nil {
-		return nil, err
-	}
-	if err := peer.CheckPrivate(ttorchHome, fi, uid, true); err != nil {
-		return nil, err
-	}
+	defer dir.Close()
 	path := filepath.Join(ttorchHome, peerEnvFile)
-	f, err := openPeerEnv(path, uid)
+	f, err := openPeerEnv(dir, uid)
 	if err != nil || f == nil {
 		return out, err
 	}
@@ -247,12 +244,13 @@ func readPeerEnv(ttorchHome string, uid int) (map[string]string, error) {
 	return out, nil
 }
 
-// openPeerEnv opens peer.env without following a symlink in its last component, and checks the
-// file it got (fstat, not a second lookup by name): a regular file uid owns that no one else can
-// write. It opens non-blocking, so a fifo is refused rather than waited on. A missing file is
-// (nil, nil).
-func openPeerEnv(path string, uid int) (*os.File, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+// openPeerEnv opens peer.env in the ttorch home dir was opened as, without following a symlink,
+// and checks the file it got (fstat, not a second lookup by name): a regular file uid owns that no
+// one else can write. It opens non-blocking, so a fifo is refused rather than waited on. A missing
+// file is (nil, nil).
+func openPeerEnv(dir *os.File, uid int) (*os.File, error) {
+	path := filepath.Join(dir.Name(), peerEnvFile)
+	f, err := peer.OpenAt(dir, peerEnvFile, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return nil, nil

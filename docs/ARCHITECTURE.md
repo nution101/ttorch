@@ -1138,8 +1138,10 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   `TTORCH_WORKER_TABS`, which is always 0), and PATH falls back to a fixed default. A test reads
   every `TTORCH_*` name in the code and the installed content and fails on one that is neither
   refused nor listed as a setting peer.env may hold. `peer.env` is read only from a regular
-  file the account owns and no one else can write, opened with `O_NOFOLLOW` and checked with
-  `fstat`, in a ttorch home that is not a symlink and has the same owner and mode. A malformed
+  file the account owns and no one else can write, in a ttorch home that is not a symlink and
+  has the same owner and mode. The home is opened once (`O_DIRECTORY|O_NOFOLLOW`) and checked
+  with `fstat`, and `peer.env` is opened relative to that descriptor with `O_NOFOLLOW` and
+  checked with `fstat` too, so a rename between the check and the read cannot swap either. A malformed
   or unsafe `peer.env` refuses every verb.
 - **Peer provisioning.** `ttorch peer init` makes a machine a peer. `ttorch peer add` on the
   parent runs it over the lead's own interactive ssh session, with one JSON request on stdin
@@ -1155,7 +1157,8 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   to `~/.ssh/authorized_keys`. The path is the running binary with symlinks resolved, and must
   be a plain word to the shell, owned by the account or root, and writable by no one else, nor
   its directory. `~/.ssh` and the file are created private if missing, must be private
-  otherwise, and are never written through a symlink; the file is only appended to, and a key
+  otherwise, and are never written through a symlink (the directory is opened once and the file
+  relative to it, each checked through its descriptor); the file is only appended to, and a key
   already listed another way is refused. Running it again changes nothing.
   `ttorch peer add <name> <control-dest>` is the parent's side, and the lead's command: it runs
   the same caller check as `ttorch approve` (no worker context, an interactive terminal) before

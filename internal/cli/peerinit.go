@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"unicode"
 	"unicode/utf8"
 
@@ -65,9 +64,11 @@ func peerInit(ctx context.Context, stdin io.Reader) (peer.InitResult, error) {
 	if err := ownedDir(u.home, false); err != nil {
 		return peer.InitResult{}, fmt.Errorf("home directory %s: %w", u.home, err)
 	}
-	if err := privateDir(u.ttorchHome, uid); err != nil {
+	home, err := peer.OpenPrivateDir(u.ttorchHome, uid, true)
+	if err != nil {
 		return peer.InitResult{}, peer.Refuse(peer.CodeUnavailable, "the ttorch home: %v", err)
 	}
+	defer home.Close()
 	conf, err := readPeerEnv(u.ttorchHome, uid)
 	if err != nil {
 		return peer.InitResult{}, peer.Refuse(peer.CodeUnavailable, "the control channel would refuse this peer.env: %v", err)
@@ -88,19 +89,17 @@ func peerInit(ctx context.Context, stdin io.Reader) (peer.InitResult, error) {
 
 	envPath := filepath.Join(u.ttorchHome, peerEnvFile)
 	envState := "kept"
-	if _, err := os.Lstat(envPath); errors.Is(err, fs.ErrNotExist) {
-		conf = map[string]string{"PATH": initPath(u, os.Getenv("PATH"))}
-		for k, v := range req.Settings {
-			conf[k] = v
-		}
-		if err := writePeerEnv(envPath, conf); err != nil {
-			return peer.InitResult{}, err
-		}
+	fresh := map[string]string{"PATH": initPath(u, os.Getenv("PATH"))}
+	for k, v := range req.Settings {
+		fresh[k] = v
+	}
+	switch err := writePeerEnv(home, fresh); {
+	case err == nil:
 		if conf, err = readPeerEnv(u.ttorchHome, uid); err != nil {
 			return peer.InitResult{}, fmt.Errorf("reading back the peer.env just written: %w", err)
 		}
 		envState = "written"
-	} else if err != nil {
+	case !errors.Is(err, fs.ErrExist):
 		return peer.InitResult{}, err
 	}
 	path := conf["PATH"]
@@ -149,22 +148,13 @@ func checkInitRequest(req peer.InitRequest) error {
 }
 
 // privateDir creates dir 0700 if it is missing, and otherwise requires it to be a directory, not
-// a symlink, that uid owns and no one else can write.
+// a symlink, that uid owns and no one else can write (peer.OpenPrivateDir).
 func privateDir(dir string, uid int) error {
-	fi, err := os.Lstat(dir)
-	if errors.Is(err, fs.ErrNotExist) {
-		if err := os.Mkdir(dir, 0o700); err != nil {
-			return err
-		}
-		if err := os.Chmod(dir, 0o700); err != nil {
-			return err
-		}
-		fi, err = os.Lstat(dir)
+	f, err := peer.OpenPrivateDir(dir, uid, true)
+	if f != nil {
+		f.Close()
 	}
-	if err != nil {
-		return err
-	}
-	return peer.CheckPrivate(dir, fi, uid, true)
+	return err
 }
 
 // initPath is the PATH a new peer.env gets: the control channel's default (defaultPeerPath),
@@ -187,10 +177,10 @@ func initPath(u peerUser, session string) string {
 	return strings.Join(dirs, string(os.PathListSeparator))
 }
 
-// writePeerEnv creates peer.env 0600 with conf, PATH first and the rest sorted. It never
-// replaces a file: O_EXCL refuses one that appeared since the caller looked, and O_NOFOLLOW a
-// symlink.
-func writePeerEnv(path string, conf map[string]string) error {
+// writePeerEnv creates peer.env 0600 in the ttorch home dir was opened as, with conf, PATH first
+// and the rest sorted. It never replaces a file: one that exists, a symlink included, fails with
+// fs.ErrExist (O_EXCL) and is left as it is.
+func writePeerEnv(dir *os.File, conf map[string]string) error {
 	var b strings.Builder
 	b.WriteString("# Written by ttorch peer init. The PATH and TTORCH_* settings of every process the\n")
 	b.WriteString("# control channel (ttorch peer serve) starts. Edit it here: nothing rewrites it.\n")
@@ -207,7 +197,7 @@ func writePeerEnv(path string, conf map[string]string) error {
 	for _, k := range keys {
 		fmt.Fprintf(&b, "%s=%s\n", k, conf[k])
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	f, err := peer.OpenAt(dir, peerEnvFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
