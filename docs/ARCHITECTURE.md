@@ -1293,11 +1293,16 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   peer's `consecutive_failures`; the third in a row marks it `unreachable` and appends one
   actionable `peer_unreachable`, and nothing more is appended until a poll succeeds, which sets
   it `live` and appends a non-actionable `peer_recovered`. A peer that answers but reports no
-  manager window, or a scheduler that is not running or is stalled, is down: each poll then
-  takes one step of the down episode in `down_attempts`, claimed in the store before the call
-  is made. The first 3 steps are an `ensure-up` call each, the fourth appends one actionable
-  `peer_down` (and leaves `down_attempts` at 4), and later steps do nothing until a poll finds
-  the peer healthy, which resets it to 0. `ttorch scheduler --once` runs no peer pass.
+  manager window, or a scheduler that is not running or is stalled, is down. Each poll that
+  finds it down makes one `ensure-up` call while fewer than 3 of its calls fall in the last hour.
+  The call is claimed first, as a non-actionable `peer_ensure_up` event at the scheduler's time,
+  so the bound holds across a crash and across two schedulers. Once 3 are in the hour, the poll
+  appends one actionable `peer_down` instead, and nothing more until a call leaves the hour and
+  the next is made. Being healthy in between does not give the peer more calls: ensure-up
+  restores a peer's manager and workers and starts its scheduler, and the peer judges its own
+  health, so a summary that flaps between healthy and down gets 3 calls an hour and one
+  `peer_down` each time it uses them up. `down_attempts` counts the calls since the peer was
+  last healthy, for display. `ttorch scheduler --once` runs no peer pass.
 
 Migrations, in order: **0001** initial hierarchy + events + manager singleton; **0002**
 durable verdicts; **0003** task leases + the terminal `failed` status; **0004** the

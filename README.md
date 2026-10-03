@@ -378,7 +378,7 @@ A coordinator with peers (`ttorch peer add`) also polls each of them on its own 
 delays a tick. Each escalation open on a peer becomes one actionable `peer_escalation` event
 here, its text escaped and capped. Three failed polls in a row raise one `peer_unreachable`;
 a peer that answers without a manager window or a running scheduler gets up to three
-`ensure-up` calls, then one `peer_down`.
+`ensure-up` calls an hour, then one `peer_down`.
 
 To feed the autonomy loop, give each backlog task a **file-granular `--touches` footprint**
 and a **stored brief** (`--brief-file`). Without both, the scheduler leaves the task for the

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 )
 
 // The root scheduler's poll of its peers (internal/scheduler/peerpass.go) keeps its state on the
@@ -26,9 +27,12 @@ const (
 	EventPeerUnreachable = "peer_unreachable"
 	// EventPeerRecovered is an unreachable peer answering a poll again. Not actionable.
 	EventPeerRecovered = "peer_recovered"
-	// EventPeerDown is a peer that still had no manager window or no running scheduler after
-	// PeerEnsureUpAttempts ensure-up calls. Actionable.
+	// EventPeerDown is a peer that still had no manager window or no running scheduler once the
+	// pass had spent its ensure-up calls for the window. Actionable.
 	EventPeerDown = "peer_down"
+	// EventPeerEnsureUp is one ensure-up call the pass made, recorded before it is made. Not
+	// actionable; the window counts them.
+	EventPeerEnsureUp = "peer_ensure_up"
 	// EventPeerCursorReset is a peer whose escalation ids went back (a recreated or restored
 	// store): the cursor was moved back to its current numbering. Actionable, once per episode.
 	EventPeerCursorReset = "peer_cursor_reset"
@@ -67,25 +71,26 @@ type PeerRecoveredPayload struct {
 	Peer string `json:"peer"`
 }
 
-// PeerDownPayload is a peer_down event's payload: how many ensure-up calls were made, and what
-// the peer's summary said when the pass gave up.
+// PeerDownPayload is a peer_down event's payload: how many ensure-up calls were made in what
+// window, and what the peer's summary said when the pass gave up.
 type PeerDownPayload struct {
 	Peer             string `json:"peer"`
 	EnsureUpCalls    int    `json:"ensure_up_calls"`
+	Window           string `json:"window"`
 	ManagerWindow    bool   `json:"manager_window"`
 	SchedulerRunning bool   `json:"scheduler_running"`
 	SchedulerStalled bool   `json:"scheduler_stalled"`
 }
 
+// PeerEnsureUpPayload is a peer_ensure_up event's payload: which call of the window it is.
+type PeerEnsureUpPayload struct {
+	Peer   string `json:"peer"`
+	Call   int    `json:"call"`
+	Window string `json:"window"`
+}
+
 // PeerUnreachableAfter is how many polls in a row must fail before a peer is marked unreachable.
 const PeerUnreachableAfter = 3
-
-// PeerEnsureUpAttempts is how many ensure-up calls one down episode gets before peer_down.
-const PeerEnsureUpAttempts = 3
-
-// peerDownRaised is down_attempts once an episode's peer_down event is raised: one step past the
-// last ensure-up call, so the episode stays spent until a healthy poll resets it to zero.
-const peerDownRaised = PeerEnsureUpAttempts + 1
 
 // ErrPeerNotPolled is a poll result for a peer that is neither live nor unreachable: retired, or
 // sent back to provisioning, while the poll ran. It is dropped.
@@ -437,9 +442,9 @@ func (s *Store) RecordPeerFailure(ctx context.Context, name, msg, unreachablePay
 	return out, nil
 }
 
-// PeerDownStep is the next step of a down episode: call ensure-up (EnsureUp, the episode's
-// Attempt-th call), or raise peer_down (Down, with its event), or neither, once the episode's
-// peer_down is raised.
+// PeerDownStep is the next step for a peer that answered but is down: call ensure-up (EnsureUp;
+// Attempt is how many calls the window now holds, this one included), or raise peer_down (Down,
+// with its event), or neither, once the window's calls are spent and its peer_down is raised.
 type PeerDownStep struct {
 	EnsureUp bool
 	Attempt  int
@@ -447,35 +452,88 @@ type PeerDownStep struct {
 	EventID  int64
 }
 
-// StepPeerDown takes the next step of the peer's down episode, in one transaction. The first
-// PeerEnsureUpAttempts steps each claim one ensure-up call. The step after them raises one
-// actionable peer_down event whose payload is downPayload. Every step after that does nothing,
-// until a healthy poll (RecordPeerPoll) ends the episode. Claiming the call before making it
-// keeps the bound across a crash and across two schedulers: a claimed call is spent whether or
-// not it ran.
-func (s *Store) StepPeerDown(ctx context.Context, name, downPayload string) (PeerDownStep, error) {
-	now := s.now()
+// PeerEnsureUpLimit bounds ensure-up calls to a peer: at most Calls whose time is within Window
+// before At, which is now by the scheduler's clock and the time the call is recorded at.
+type PeerEnsureUpLimit struct {
+	Calls  int
+	Window time.Duration
+	At     time.Time
+}
+
+// StepPeerDown takes the next step for a down peer, in one transaction. While fewer than
+// limit.Calls peer_ensure_up events of this peer are within limit.Window before limit.At, the
+// step claims one more ensure-up call: it appends a non-actionable peer_ensure_up event at
+// limit.At and counts it in down_attempts. Once the window is full, the step raises one actionable
+// peer_down event whose payload is downPayload, unless one was raised since the last call, in
+// which case it does nothing. A healthy poll resets down_attempts but not the window, so a peer
+// whose summary flaps between healthy and down gets no more calls than the window allows, and
+// one peer_down each time it uses them up. Claiming the call before it is made keeps the bound
+// across a crash and across two schedulers: a claimed call is spent whether or not it ran.
+func (s *Store) StepPeerDown(ctx context.Context, name, downPayload string, limit PeerEnsureUpLimit) (PeerDownStep, error) {
+	if limit.Calls <= 0 || limit.Window <= 0 {
+		return PeerDownStep{}, fmt.Errorf("an ensure-up limit needs calls and a window, got %d in %s", limit.Calls, limit.Window)
+	}
+	at := limit.At
+	if at.IsZero() {
+		at = s.now()
+	}
 	var out PeerDownStep
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
 		p, err := polledPeer(ctx, tx, name)
 		if err != nil {
 			return err
 		}
-		attempts := p.DownAttempts
-		switch {
-		case attempts < PeerEnsureUpAttempts:
-			attempts++
-			out.EnsureUp, out.Attempt = true, attempts
-		case attempts == PeerEnsureUpAttempts:
-			if out.EventID, err = appendEvent(ctx, tx, now, peerEvent(name, EventPeerDown, downPayload, true)); err != nil {
+		id := PeerEntityID(name)
+		rows, err := tx.QueryContext(ctx,
+			`SELECT ts FROM events WHERE entity_type = ? AND entity_id = ? AND type = ? ORDER BY id DESC LIMIT ?`,
+			EntityTypeSystem, id, EventPeerEnsureUp, limit.Calls)
+		if err != nil {
+			return err
+		}
+		inWindow := 0
+		for rows.Next() {
+			var ts string
+			if err := rows.Scan(&ts); err != nil {
+				rows.Close()
 				return err
 			}
-			attempts, out.Down = peerDownRaised, true
-		default:
+			t, err := parseTime(ts)
+			if err != nil {
+				rows.Close()
+				return err
+			}
+			if at.Sub(t) < limit.Window {
+				inWindow++
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if inWindow < limit.Calls {
+			if _, err := appendEvent(ctx, tx, at, Event{EntityType: EntityTypeSystem, EntityID: id, Type: EventPeerEnsureUp,
+				Actor: id, TS: at, Payload: payloadJSON(PeerEnsureUpPayload{Peer: name, Call: inWindow + 1, Window: limit.Window.String()})}); err != nil {
+				return err
+			}
+			out.EnsureUp, out.Attempt = true, inWindow+1
+			_, err = tx.ExecContext(ctx, `UPDATE peers SET down_attempts = ?, updated_at = ? WHERE name = ?`,
+				p.DownAttempts+1, formatTime(at), name)
+			return err
+		}
+		var last string
+		err = tx.QueryRowContext(ctx,
+			`SELECT type FROM events WHERE entity_type = ? AND entity_id = ? AND type IN (?, ?) ORDER BY id DESC LIMIT 1`,
+			EntityTypeSystem, id, EventPeerEnsureUp, EventPeerDown).Scan(&last)
+		if err != nil {
+			return err
+		}
+		if last == EventPeerDown {
 			return nil
 		}
-		_, err = tx.ExecContext(ctx, `UPDATE peers SET down_attempts = ?, updated_at = ? WHERE name = ?`,
-			attempts, formatTime(now), name)
+		ev := peerEvent(name, EventPeerDown, downPayload, true)
+		ev.TS = at
+		out.EventID, err = appendEvent(ctx, tx, at, ev)
+		out.Down = err == nil
 		return err
 	})
 	if err != nil {

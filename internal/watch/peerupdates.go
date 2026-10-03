@@ -80,8 +80,8 @@ func writePeerEntry(out io.Writer, e db.Event) {
 			bad()
 			return
 		}
-		fmt.Fprintf(out, "  #%d peer-down peer=%q ensure-up calls=%d manager window=%t scheduler running=%t stalled=%t (restart it at the peer's own terminal)\n",
-			e.ID, peer, p.EnsureUpCalls, p.ManagerWindow, p.SchedulerRunning, p.SchedulerStalled)
+		fmt.Fprintf(out, "  #%d peer-down peer=%q ensure-up calls=%d in %q manager window=%t scheduler running=%t stalled=%t (restart it at the peer's own terminal)\n",
+			e.ID, peer, p.EnsureUpCalls, p.Window, p.ManagerWindow, p.SchedulerRunning, p.SchedulerStalled)
 	case db.EventPeerCursorReset:
 		var p db.PeerCursorResetPayload
 		if json.Unmarshal([]byte(e.Payload), &p) != nil {

@@ -150,12 +150,12 @@ func TestPeerPassOverTheControlChannel(t *testing.T) {
 			ensureUps++
 		}
 	}
-	if ensureUps != db.PeerEnsureUpAttempts || len(verbs) != 4*2+db.PeerEnsureUpAttempts {
-		t.Errorf("four passes called %v; want summary and decisions each pass and %d ensure-up", verbs, db.PeerEnsureUpAttempts)
+	if ensureUps != 3 || len(verbs) != 4*2+3 {
+		t.Errorf("four passes called %v; want summary and decisions each pass and 3 ensure-up", verbs)
 	}
 	evs = peerEventsIn(t, parent, "build")
-	if countType(evs, db.EventPeerEscalation) != 1 || countType(evs, db.EventPeerDown) != 1 || len(evs) != 2 {
-		t.Errorf("events after four passes = %+v, want the one escalation and one peer_down", evs)
+	if countType(evs, db.EventPeerEscalation) != 1 || countType(evs, db.EventPeerDown) != 1 || countType(evs, db.EventPeerEnsureUp) != 3 || len(evs) != 5 {
+		t.Errorf("events after four passes = %+v, want the one escalation, three ensure-up records and one peer_down", evs)
 	}
 	if p, _, _ := parent.GetPeer(ctx, "build"); p.EscalationCursor != esc.ID {
 		t.Errorf("cursor = %d", p.EscalationCursor)
@@ -342,8 +342,14 @@ func TestPeerPassNoticesAPeerStoreThatWentBack(t *testing.T) {
 	if n := countType(evs, db.EventPeerEscalation); n != 4 {
 		t.Errorf("%d peer_escalation events, want 4: three from before and the new one", n)
 	}
-	if last := evs[len(evs)-1]; last.Type != db.EventPeerEscalation || !strings.Contains(last.Payload, "after the reset") {
-		t.Errorf("last event = %+v, want the new escalation", last)
+	var last db.Event
+	for _, e := range evs {
+		if e.Type == db.EventPeerEscalation {
+			last = e
+		}
+	}
+	if !strings.Contains(last.Payload, "after the reset") {
+		t.Errorf("last escalation event = %+v, want the new escalation", last)
 	}
 	if p, _, _ := parent.GetPeer(ctx, "build"); p.EscalationCursor != 1 {
 		t.Errorf("cursor after the re-sync = %d, want 1", p.EscalationCursor)

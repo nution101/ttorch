@@ -471,65 +471,121 @@ func TestRecordPeerFailureMarksUnreachableOnce(t *testing.T) {
 	}
 }
 
-// TestStepPeerDownBoundsEnsureUp: a down episode allows PeerEnsureUpAttempts ensure-up calls,
-// then one peer_down event, then nothing until a poll finds the peer healthy, which starts the
-// next episode over.
-func TestStepPeerDownBoundsEnsureUp(t *testing.T) {
+// hourly is the scheduler's ensure-up limit, three calls an hour, as of at.
+func hourly(at time.Time) PeerEnsureUpLimit {
+	return PeerEnsureUpLimit{Calls: 3, Window: time.Hour, At: at}
+}
+
+// TestStepPeerDownBoundsEnsureUpPerWindow: a down peer gets ensure-up calls until Calls of them
+// fall within the last Window, then one peer_down, then nothing until a call leaves the window.
+// A healthy poll ends the down episode (down_attempts) but not the window, so a peer that flaps
+// between healthy and down still gets no more calls than the window allows, and one peer_down
+// each time it uses them up. Each call is a non-actionable peer_ensure_up event.
+func TestStepPeerDownBoundsEnsureUpPerWindow(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
 	livePeer(t, s, "build")
-	episode := func(label string) {
+	t0 := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	step := func(at time.Time) PeerDownStep {
 		t.Helper()
-		ensureUps, downs := 0, 0
-		for i := 0; i < PeerEnsureUpAttempts+4; i++ {
-			step, err := s.StepPeerDown(ctx, "build", "no manager window")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if step.EnsureUp && step.Down {
-				t.Fatalf("%s: step %d both calls ensure-up and raises peer_down: %+v", label, i, step)
-			}
-			if step.EnsureUp {
-				ensureUps++
-				if step.Attempt != ensureUps {
-					t.Errorf("%s: attempt = %d, want %d", label, step.Attempt, ensureUps)
-				}
-				if downs > 0 {
-					t.Errorf("%s: ensure-up allowed after peer_down", label)
-				}
-			}
-			if step.Down {
-				downs++
-				if step.EventID == 0 {
-					t.Errorf("%s: peer_down step has no event", label)
-				}
-			}
+		st, err := s.StepPeerDown(ctx, "build", "no manager window", hourly(at))
+		if err != nil {
+			t.Fatal(err)
 		}
-		if ensureUps != PeerEnsureUpAttempts || downs != 1 {
-			t.Errorf("%s: %d ensure-up calls and %d peer_down, want %d and 1", label, ensureUps, downs, PeerEnsureUpAttempts)
+		if st.EnsureUp && st.Down {
+			t.Fatalf("a step both calls ensure-up and raises peer_down: %+v", st)
+		}
+		return st
+	}
+	for i := 0; i < 3; i++ {
+		if st := step(t0.Add(time.Duration(i) * time.Minute)); !st.EnsureUp || st.Attempt != i+1 {
+			t.Errorf("step %d = %+v, want ensure-up call %d", i, st, i+1)
 		}
 	}
-	episode("first episode")
+	if p := mustPeer(t, s, "build"); p.DownAttempts != 3 {
+		t.Errorf("down_attempts = %d, want 3", p.DownAttempts)
+	}
+	st := step(t0.Add(3 * time.Minute))
+	if !st.Down || st.EventID == 0 {
+		t.Fatalf("fourth step = %+v, want peer_down", st)
+	}
+	if st := step(t0.Add(4 * time.Minute)); st.EnsureUp || st.Down {
+		t.Errorf("a step after peer_down = %+v, want nothing", st)
+	}
 	evs := peerEvents(t, s, "build")
-	if len(evs) != 1 || evs[0].Type != EventPeerDown || !evs[0].Actionable || evs[0].Payload != "no manager window" || evs[0].Actor != "peer:build" {
-		t.Fatalf("events = %+v, want one actionable peer_down", evs)
+	downs, calls := eventsOfType(evs, EventPeerDown), eventsOfType(evs, EventPeerEnsureUp)
+	if len(downs) != 1 || !downs[0].Actionable || downs[0].Payload != "no manager window" || downs[0].Actor != "peer:build" {
+		t.Fatalf("peer_down events = %+v, want one actionable", downs)
 	}
-	// A poll that finds it still down changes nothing; a healthy one ends the episode.
-	if _, err := s.RecordPeerPoll(ctx, "build", PeerPoll{Healthy: false}); err != nil {
-		t.Fatal(err)
+	if len(calls) != 3 || calls[0].Actionable || !calls[0].TS.Equal(t0) {
+		t.Errorf("peer_ensure_up events = %+v, want three, not actionable, at the scheduler's time", calls)
 	}
-	if step, _ := s.StepPeerDown(ctx, "build", "x"); step.EnsureUp || step.Down {
-		t.Errorf("a poll that found the peer down started a new episode: %+v", step)
-	}
-	if _, err := s.RecordPeerPoll(ctx, "build", PeerPoll{Healthy: true}); err != nil {
+
+	// Healthy again: the episode ends, the window does not.
+	if _, err := s.RecordPeerPoll(ctx, "build", openPoll(true)); err != nil {
 		t.Fatal(err)
 	}
 	if p := mustPeer(t, s, "build"); p.DownAttempts != 0 {
 		t.Errorf("down_attempts after a healthy poll = %d", p.DownAttempts)
 	}
-	episode("second episode")
-	if evs := peerEvents(t, s, "build"); len(evs) != 2 {
-		t.Errorf("events after two episodes = %+v", evs)
+	if st := step(t0.Add(10 * time.Minute)); st.EnsureUp || st.Down {
+		t.Errorf("down again inside the window = %+v, want nothing: the calls are spent and peer_down raised", st)
+	}
+	// An hour after the first call it leaves the window, and the other two are still in it: one
+	// more call, then peer_down again.
+	if st := step(t0.Add(60*time.Minute + 30*time.Second)); !st.EnsureUp || st.Attempt != 3 {
+		t.Errorf("down an hour after the first call = %+v, want ensure-up call 3 of the window", st)
+	}
+	if st := step(t0.Add(60*time.Minute + 45*time.Second)); !st.Down {
+		t.Errorf("the window full again = %+v, want peer_down", st)
+	}
+	if n := len(eventsOfType(peerEvents(t, s, "build"), EventPeerDown)); n != 2 {
+		t.Errorf("%d peer_down events, want 2", n)
+	}
+}
+
+// TestStepPeerDownFlappingPeer: a peer that is down one poll and healthy the next, for six hours
+// of 30s polls, never gets more than three ensure-up calls in any hour, and gets one peer_down
+// per hour it uses them up.
+func TestStepPeerDownFlappingPeer(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	livePeer(t, s, "build")
+	t0 := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	var calls []time.Time
+	downs := 0
+	for i := 0; i < 6*120; i++ {
+		at := t0.Add(time.Duration(i) * 30 * time.Second)
+		if i%2 == 1 {
+			if _, err := s.RecordPeerPoll(ctx, "build", openPoll(true)); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		st, err := s.StepPeerDown(ctx, "build", "down", hourly(at))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.EnsureUp {
+			calls = append(calls, at)
+		}
+		if st.Down {
+			downs++
+		}
+	}
+	for i := range calls {
+		n := 0
+		for _, c := range calls {
+			if !c.Before(calls[i]) && c.Sub(calls[i]) < time.Hour {
+				n++
+			}
+		}
+		if n > 3 {
+			t.Fatalf("%d ensure-up calls in the hour from %s", n, calls[i].Format(time.TimeOnly))
+		}
+	}
+	if len(calls) < 6*3-3 || len(calls) > 6*3+3 || downs < 5 || downs > 7 {
+		t.Errorf("%d ensure-up calls and %d peer_down over six hours, want about 18 and 6", len(calls), downs)
 	}
 }
 
@@ -561,7 +617,7 @@ func TestPeerPollRefusesAPeerNotInUse(t *testing.T) {
 				t.Errorf("%s: failure = %v, want ErrPeerNotPolled", name, err)
 			}
 		}
-		if _, err := s.StepPeerDown(ctx, name, "p"); !errors.Is(err, ErrPeerNotPolled) {
+		if _, err := s.StepPeerDown(ctx, name, "p", hourly(time.Now())); !errors.Is(err, ErrPeerNotPolled) {
 			t.Errorf("%s: down step = %v, want ErrPeerNotPolled", name, err)
 		}
 		if after := mustPeer(t, s, name); after.EscalationCursor != before.EscalationCursor || after.Status != before.Status ||
@@ -617,8 +673,8 @@ func TestRegisterPeerStartsThePollOver(t *testing.T) {
 			if _, err := s.RecordPeerPoll(ctx, "build", openPoll(false, esc{1, "a1", "one"}, esc{7, "a7", "seven"})); err != nil {
 				t.Fatal(err)
 			}
-			for i := 0; i < PeerEnsureUpAttempts+1; i++ {
-				if _, err := s.StepPeerDown(ctx, "build", "down"); err != nil {
+			for i := 0; i < 4; i++ {
+				if _, err := s.StepPeerDown(ctx, "build", "down", hourly(time.Now())); err != nil {
 					t.Fatal(err)
 				}
 			}

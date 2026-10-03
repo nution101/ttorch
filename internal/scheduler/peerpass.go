@@ -15,7 +15,7 @@ package scheduler
 // caps every string it decodes; this pass escapes again anything that still holds a non-printing
 // rune and caps each event payload at 2 KiB as a whole, so a channel that skipped the first step
 // still cannot put raw text in front of the manager. The state the pass keeps (the escalation
-// cursor, the failure streak, the down episode) is on the peers row, and each change to it is one
+// cursor, the failure streak, the ensure-up calls) is in the store, and each change to it is one
 // transaction with the event it raises (db.RecordPeerPoll, RecordPeerFailure, StepPeerDown).
 
 import (
@@ -56,6 +56,16 @@ const maxPeerEscalationID = 1<<31 - 1
 // peer; the id is refused and a peer_protocol_error raised rather than the cursor moved. A peer
 // polled for the first time (cursor 0) has no bound but maxPeerEscalationID.
 const maxPeerEscalationJump = 10000
+
+// peerEnsureUpCalls and peerEnsureUpWindow bound the ensure-up calls to one peer: at most this
+// many in any window of this length, whatever its summary does in between. ensure-up restores a
+// peer's manager and workers and starts its scheduler, so a peer whose own health report flaps
+// between healthy and down must not be restarted every other poll. Once the calls are spent the
+// pass raises one peer_down (db.StepPeerDown).
+const (
+	peerEnsureUpCalls  = 3
+	peerEnsureUpWindow = time.Hour
+)
 
 // peerPollBounds are the limits each poll records against (db.PeerPollBounds).
 var peerPollBounds = db.PeerPollBounds{MaxID: maxPeerEscalationID, MaxJump: maxPeerEscalationJump, MaxRaise: maxPeerRaisesPerPoll}
@@ -224,10 +234,11 @@ func (sc *Scheduler) releasePeerPoll(name string) {
 // pollPeer polls one peer under its deadline: summary, then decisions for every open escalation.
 // A poll that reaches the peer is recorded with the escalations it raises (db.RecordPeerPoll
 // decides which, against what was already raised, and spots ids that went back or are out of
-// range); one that fails counts toward unreachable. A peer that answers but shows no manager window or no ticking scheduler then takes
-// the next step of its down episode: ensure-up, or once those are spent, peer_down. The store is
-// written under ctx, not the poll's deadline, so a poll cut off at its deadline is still
-// recorded; a poll cut off by shutdown is not, since that is no failure of the peer's.
+// range); one that fails counts toward unreachable. A peer that answers but shows no manager
+// window or no ticking scheduler then takes the next step for a down peer: ensure-up, or once the
+// window's calls are spent, peer_down. The store is written under ctx, not the poll's deadline,
+// so a poll cut off at its deadline is still recorded; a poll cut off by shutdown is not, since
+// that is no failure of the peer's.
 func (sc *Scheduler) pollPeer(ctx context.Context, p db.Peer) {
 	deadline := sc.PeerDeadline
 	if deadline <= 0 {
@@ -291,14 +302,14 @@ func (sc *Scheduler) pollPeer(ctx context.Context, p db.Peer) {
 		return
 	}
 	step, err := sc.Store.StepPeerDown(ctx, p.Name, fitPayload(db.PeerDownPayload{
-		Peer: p.Name, EnsureUpCalls: db.PeerEnsureUpAttempts, ManagerWindow: sum.ManagerWindow,
+		Peer: p.Name, EnsureUpCalls: peerEnsureUpCalls, Window: peerEnsureUpWindow.String(), ManagerWindow: sum.ManagerWindow,
 		SchedulerRunning: sum.SchedulerRunning, SchedulerStalled: sum.SchedulerStalled,
-	}, nil))
+	}, nil), db.PeerEnsureUpLimit{Calls: peerEnsureUpCalls, Window: peerEnsureUpWindow, At: sc.clock()})
 	switch {
 	case err != nil:
 		sc.logPeerStoreErr(p.Name, err)
 	case step.Down:
-		sc.logf("peer %s is down after %d ensure-up calls (event %d)", p.Name, db.PeerEnsureUpAttempts, step.EventID)
+		sc.logf("peer %s is down after %d ensure-up calls in %s (event %d)", p.Name, peerEnsureUpCalls, peerEnsureUpWindow, step.EventID)
 	case step.EnsureUp:
 		out, err := ch.EnsureUp(pctx)
 		if ctx.Err() != nil {
@@ -307,10 +318,10 @@ func (sc *Scheduler) pollPeer(ctx context.Context, p db.Peer) {
 		if err != nil {
 			msg := untrustedText(err.Error(), db.MaxEscalationText)
 			_ = sc.Store.RecordPeerError(ctx, p.Name, msg)
-			sc.logf("peer %s: ensure-up %d of %d failed: %s", p.Name, step.Attempt, db.PeerEnsureUpAttempts, msg)
+			sc.logf("peer %s: ensure-up %d of %d in %s failed: %s", p.Name, step.Attempt, peerEnsureUpCalls, peerEnsureUpWindow, msg)
 			return
 		}
-		sc.logf("peer %s: ensure-up %d of %d: %s", p.Name, step.Attempt, db.PeerEnsureUpAttempts, untrustedText(out, db.MaxEscalationText))
+		sc.logf("peer %s: ensure-up %d of %d in %s: %s", p.Name, step.Attempt, peerEnsureUpCalls, peerEnsureUpWindow, untrustedText(out, db.MaxEscalationText))
 	}
 }
 

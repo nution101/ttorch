@@ -340,8 +340,9 @@ func TestPeerPassUnreachableThenRecovered(t *testing.T) {
 }
 
 // TestPeerPassBoundsEnsureUp: a peer whose summary shows no manager window gets ensure-up on
-// each poll, at most three times, then one actionable peer_down event, and no more calls until a
-// poll finds it healthy. A scheduler that is not running, or stalled, counts as down too.
+// each poll, at most three in an hour, then one actionable peer_down event, and no more calls
+// until a call leaves the hour. Being healthy in between does not give it more calls. A scheduler
+// that is not running, or stalled, counts as down too.
 func TestPeerPassBoundsEnsureUp(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
@@ -349,46 +350,92 @@ func TestPeerPassBoundsEnsureUp(t *testing.T) {
 	fp := newFakePeer()
 	fp.summary.ManagerWindow = false
 	fp.ensureUpErr = errors.New("no_manager: no manager session is recorded here")
+	clock := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
 	sc := peerScheduler(s, fakePeers{"build": fp})
-	for i := 0; i < 6; i++ {
+	sc.now = func() time.Time { return clock }
+	pass := func() {
+		t.Helper()
 		if _, err := sc.RunPeerPassOnce(ctx); err != nil {
 			t.Fatal(err)
 		}
+		clock = clock.Add(30 * time.Second)
 	}
-	if n := fp.count("ensure-up"); n != db.PeerEnsureUpAttempts {
-		t.Errorf("ensure-up called %d times, want %d", n, db.PeerEnsureUpAttempts)
+	for i := 0; i < 6; i++ {
+		pass()
+	}
+	if n := fp.count("ensure-up"); n != peerEnsureUpCalls {
+		t.Errorf("ensure-up called %d times, want %d", n, peerEnsureUpCalls)
 	}
 	downs := eventsOfType(peerEventsOf(t, s, "build"), db.EventPeerDown)
 	if len(downs) != 1 || !downs[0].Actionable || downs[0].Actor != "peer:build" {
 		t.Fatalf("peer_down events = %+v, want one actionable", downs)
 	}
-	if !strings.Contains(downs[0].Payload, `"manager_window":false`) || !strings.Contains(downs[0].Payload, `"ensure_up_calls":3`) {
+	if !strings.Contains(downs[0].Payload, `"manager_window":false`) || !strings.Contains(downs[0].Payload, `"ensure_up_calls":3`) || !strings.Contains(downs[0].Payload, `"window":"1h0m0s"`) {
 		t.Errorf("peer_down payload = %q", downs[0].Payload)
 	}
 	if p := getPeer(t, s, "build"); p.Status != db.PeerLive {
 		t.Errorf("a down peer that answers is still live, got %s", p.Status)
 	}
 
-	// Healthy again ends the episode; a stalled scheduler starts a new one.
-	fp.set(func(f *fakePeer) { f.summary.ManagerWindow = true })
-	if _, err := sc.RunPeerPassOnce(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if n := fp.count("ensure-up"); n != db.PeerEnsureUpAttempts {
-		t.Errorf("a healthy peer was sent ensure-up (%d calls)", n)
-	}
+	// Healthy, then down in each of the other ways, all inside the hour: no more calls.
 	for _, mark := range []func(f *fakePeer){
+		func(f *fakePeer) { f.summary.ManagerWindow = true },
 		func(f *fakePeer) { f.summary.SchedulerStalled = true },
-		func(f *fakePeer) { f.summary.SchedulerStalled, f.summary.SchedulerRunning = false, false },
+		func(f *fakePeer) { f.summary.SchedulerStalled = false },
+		func(f *fakePeer) { f.summary.SchedulerRunning = false },
 	} {
 		fp.set(mark)
+		pass()
+	}
+	if n := fp.count("ensure-up"); n != peerEnsureUpCalls {
+		t.Errorf("flapping inside the hour got %d ensure-up calls, want still %d", n, peerEnsureUpCalls)
+	}
+	// An hour on, the first call has left the window: a peer down with a stalled or stopped
+	// scheduler gets a call again.
+	clock = clock.Add(time.Hour)
+	pass()
+	if n := fp.count("ensure-up"); n != peerEnsureUpCalls+1 {
+		t.Errorf("an hour later the down peer got %d ensure-up calls in all, want %d", n, peerEnsureUpCalls+1)
+	}
+}
+
+// TestPeerPassFlappingPeer: a peer that is down one poll and healthy the next for three hours
+// gets at most three ensure-up calls in any hour, and one peer_down per hour.
+func TestPeerPassFlappingPeer(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	registerLivePeer(t, s, "build")
+	fp := newFakePeer()
+	clock := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	sc := peerScheduler(s, fakePeers{"build": fp})
+	sc.now = func() time.Time { return clock }
+	var calls []time.Time
+	for i := 0; i < 3*120; i++ {
+		down := i%2 == 0
+		fp.set(func(f *fakePeer) { f.summary.ManagerWindow = !down })
 		before := fp.count("ensure-up")
 		if _, err := sc.RunPeerPassOnce(ctx); err != nil {
 			t.Fatal(err)
 		}
-		if fp.count("ensure-up") != before+1 {
-			t.Errorf("a peer with summary %+v was not sent ensure-up", fp.summary)
+		if fp.count("ensure-up") > before {
+			calls = append(calls, clock)
 		}
+		clock = clock.Add(30 * time.Second)
+	}
+	for i := range calls {
+		n := 0
+		for _, c := range calls[i:] {
+			if c.Sub(calls[i]) < time.Hour {
+				n++
+			}
+		}
+		if n > peerEnsureUpCalls {
+			t.Fatalf("%d ensure-up calls in the hour from %s", n, calls[i].Format(time.TimeOnly))
+		}
+	}
+	downs := len(eventsOfType(peerEventsOf(t, s, "build"), db.EventPeerDown))
+	if len(calls) != 9 || downs != 3 {
+		t.Errorf("%d ensure-up calls and %d peer_down over three hours, want 9 and 3", len(calls), downs)
 	}
 }
 
