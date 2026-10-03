@@ -1151,8 +1151,9 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   `peer serve` does, so it writes the store, `peer.env` and `authorized_keys` the channel will
   read whatever `TTORCH_HOME` or `TTORCH_DB` the session has. It records the parent on the
   coordinator row (another parent is refused unless forced), writes `peer.env` only if there is
-  none (the channel's default PATH plus the session's, and the parent's settings; an existing one
-  is kept, and refused here if the channel would refuse it), and only then appends
+  none (the channel's default PATH plus each session directory that exists and that neither its
+  group nor others can write, and the parent's settings; an existing one is kept, and refused
+  here if the channel would refuse it), and only then appends
   `command="<absolute path> peer serve",restrict ssh-ed25519 <key> ttorch-peer-control:<parent>`
   to `~/.ssh/authorized_keys`. The path is the running binary with symlinks resolved, and must
   be a plain word to the shell, owned by the account or root, and writable by no one else, nor

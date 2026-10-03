@@ -158,9 +158,11 @@ func privateDir(dir string, uid int) error {
 }
 
 // initPath is the PATH a new peer.env gets: the control channel's default (defaultPeerPath),
-// then each absolute directory of this session's PATH it does not already hold. A claude
-// installed under a version manager or a custom prefix is on the lead's PATH and on none of the
-// defaults.
+// then each directory of this session's PATH it does not already hold. A claude installed under a
+// version manager or a custom prefix is on the lead's PATH and on none of the defaults. A session
+// directory is kept only if it is an absolute, printable path to an existing directory with no
+// group or other write bit: anyone who can write a PATH directory chooses which tmux, claude and
+// git the fleet runs, and a directory that does not exist yet is one someone else may create.
 func initPath(u peerUser, session string) string {
 	dirs := filepath.SplitList(defaultPeerPath(u))
 	seen := map[string]bool{}
@@ -169,6 +171,9 @@ func initPath(u peerUser, session string) string {
 	}
 	for _, d := range filepath.SplitList(session) {
 		if !filepath.IsAbs(d) || seen[d] || !utf8.ValidString(d) || strings.IndexFunc(d, func(r rune) bool { return !unicode.IsGraphic(r) }) >= 0 {
+			continue
+		}
+		if fi, err := os.Stat(d); err != nil || !fi.IsDir() || fi.Mode().Perm()&0o022 != 0 {
 			continue
 		}
 		seen[d] = true

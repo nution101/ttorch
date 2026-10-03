@@ -195,7 +195,8 @@ func TestPeerInitProvisions(t *testing.T) {
 		t.Errorf("peer.env PATH = %q, want the default first", conf["PATH"])
 	}
 	for _, d := range filepath.SplitList(os.Getenv("PATH")) {
-		if filepath.IsAbs(d) && !strings.Contains(conf["PATH"], d) {
+		fi, err := os.Stat(d)
+		if filepath.IsAbs(d) && err == nil && fi.IsDir() && fi.Mode().Perm()&0o022 == 0 && !strings.Contains(conf["PATH"], d) {
 			t.Errorf("peer.env PATH %q lacks the session's %s", conf["PATH"], d)
 		}
 	}
@@ -316,5 +317,26 @@ func TestPeerInitRefusesBeforeWriting(t *testing.T) {
 
 	if r := initRun(t, newInitHome(t), "", "extra"); r.code != 2 || !strings.Contains(r.stderr, "takes no arguments") {
 		t.Errorf("peer init with an argument: exit %d, stderr %q", r.code, r.stderr)
+	}
+}
+
+// TestInitPath: a new peer.env's PATH is the channel's default, then the session's directories,
+// minus any that are relative, missing, already listed, or writable by someone else.
+func TestInitPath(t *testing.T) {
+	u := peerUser{home: t.TempDir(), name: "p", ttorchHome: t.TempDir()}
+	mk := func(mode os.FileMode) string {
+		d := t.TempDir()
+		if err := os.Chmod(d, mode); err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	tools, shared, group := mk(0o755), mk(0o777), mk(0o775)
+	session := strings.Join([]string{
+		filepath.Join(t.TempDir(), "absent"), shared, "relative/bin", tools, group, tools, "/usr/bin",
+	}, string(os.PathListSeparator))
+	want := defaultPeerPath(u) + string(os.PathListSeparator) + tools
+	if got := initPath(u, session); got != want {
+		t.Errorf("initPath =\n%s\nwant\n%s", got, want)
 	}
 }
