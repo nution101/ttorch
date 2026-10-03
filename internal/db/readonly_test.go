@@ -153,3 +153,39 @@ func TestOpenReadOnlyRefusesWhatItCannotRead(t *testing.T) {
 		t.Errorf("schema version after the refused open = %d, want %d (untouched)", version, latest-1)
 	}
 }
+
+// TestGetCoordinator reads the identity row migration 0011 mints, through a read-only open as
+// well as a writable one.
+func TestGetCoordinator(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state.db")
+	w, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := w.GetCoordinator(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.CoordID) != 32 || c.Role != CoordinatorRoot || c.Name != "" || c.ParentID != "" || c.CreatedAt.IsZero() {
+		t.Errorf("coordinator = %+v, want a 32-hex id, role root, no name or parent, a creation time", c)
+	}
+	if _, err := w.db.ExecContext(ctx, `UPDATE coordinator SET role = 'peer', name = 'b', parent_id = 'p1'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	r, err := OpenReadOnly(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	got, err := r.GetCoordinator(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CoordID != c.CoordID || got.Role != CoordinatorPeer || got.Name != "b" || got.ParentID != "p1" {
+		t.Errorf("coordinator after provisioning = %+v", got)
+	}
+}
