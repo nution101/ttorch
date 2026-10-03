@@ -45,6 +45,12 @@ func TestMain(m *testing.M) {
 	// guard then fails the run). Clear it so TTORCH_HOME and each test's own
 	// t.Setenv("TTORCH_HOME", ...) fully govern where state resolves.
 	os.Unsetenv("TTORCH_DB")
+	// Spawn pre-accepts Claude's folder-trust prompt by rewriting ~/.claude.json with the
+	// worktree's path. Under test every path is a temp dir, so the real file only grew: on
+	// the build host it reached 21.5 MB, 118,546 of its 118,552 project entries left by
+	// these tests, and each Spawn parsed and re-indented all of it. Point the write at a
+	// file of the package's own; the trust write still runs, against a small file.
+	os.Setenv("TTORCH_CLAUDE_JSON", filepath.Join(home, "claude.json"))
 	// Clear any inherited GIT_DIR and the like (git rebase --exec exports one), so the git
 	// that fixtures and the code under test run acts on the temp repository it names.
 	gittest.Scrub()

@@ -49,6 +49,10 @@ func TestMain(m *testing.M) {
 	// real ~/.ttorch/state.db); StateDB() prefers it over TTORCH_HOME, so leaving it set
 	// would resolve the DB back into the real home despite the pin above.
 	os.Unsetenv("TTORCH_DB")
+	// cmdSpawn pre-accepts Claude's folder-trust prompt by rewriting ~/.claude.json with the
+	// worktree's path, which under test is always a temp dir. Keep that write in this
+	// package's own file so a test run never adds entries to the real one.
+	os.Setenv("TTORCH_CLAUDE_JSON", filepath.Join(home, "claude.json"))
 	// Clear any inherited GIT_DIR and the like (git rebase --exec exports one), so the git
 	// that fixtures and the code under test run acts on the temp repository it names.
 	gittest.Scrub()
