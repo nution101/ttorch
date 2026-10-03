@@ -192,9 +192,20 @@ var ttorchSourceFiles = []string{
 	"internal/cli/peerinit.go",
 	// peeradd.go is the parent's side of that: it makes the control key, chooses which of the
 	// lead's settings cross to the peer, runs init over the lead's session and proves the key
-	// before the peer goes live. The rest of internal/cli, the parent's other peer commands
-	// included, stays uncovered.
+	// before the peer goes live.
 	"internal/cli/peeradd.go",
+	// peerpass.go is the scheduler's peer pass: on a timer, with nobody in the loop, it runs
+	// control verbs against every peer, ensure-up among them, which restores a peer's manager
+	// and workers and starts its scheduler. It decides which verbs, how often, and the limits on
+	// them (ensure-up calls per hour, escalation id bounds, raises per poll). A change that let it
+	// send goals or answers on its own, or loosened those limits, would act on peers with no
+	// human asking, so it is a gate change.
+	"internal/scheduler/peerpass.go",
+	// peerpoll.go hands that pass its channel: which client, which ssh program and which key
+	// each call runs with. Pointing it anywhere but the pinned client in client.go would take
+	// the automatic calls off that command line. The rest of internal/cli, the parent's other
+	// peer commands included, and the rest of the scheduler stay uncovered.
+	"internal/cli/peerpoll.go",
 	// The gate's own proofs. Without these, the backstop can be deleted in the same merge
 	// as the attack it would catch: TestTtorchRepoIsScopedIn goes red on a .gitattributes
 	// that un-scopes the repo, but a diff that adds the attribute AND deletes the test

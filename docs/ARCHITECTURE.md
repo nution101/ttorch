@@ -452,6 +452,7 @@ once if it touches any covered path.
 | `internal/approval/` | 6 | +0 |
 | `internal/cli/peeradd.go` | 0 | +0 |
 | `internal/cli/peerinit.go` | 0 | +0 |
+| `internal/cli/peerpoll.go` | 0 | +0 |
 | `internal/cli/peerserve.go` | 0 | +0 |
 | `internal/installer/` | 5 | +1 |
 | `internal/orchestrator/audit.go` | 1 | +0 |
@@ -470,6 +471,7 @@ once if it touches any covered path.
 | `internal/peer/serve.go` | 0 | +0 |
 | `internal/projectinit/` | 9 | +3 |
 | `internal/review/` | 7 | +4 |
+| `internal/scheduler/peerpass.go` | 0 | +0 |
 | `internal/skills/` | 3 | +0 |
 | `internal/validate/` | 6 | +2 |
 | `internal/worktree/` | 18 | +11 |
@@ -1302,7 +1304,10 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   restores a peer's manager and workers and starts its scheduler, and the peer judges its own
   health, so a summary that flaps between healthy and down gets 3 calls an hour and one
   `peer_down` each time it uses them up. `down_attempts` counts the calls since the peer was
-  last healthy, for display. `ttorch scheduler --once` runs no peer pass.
+  last healthy, for display. `ttorch scheduler --once` runs no peer pass. Both files are in the
+  covered set: the pass runs control verbs against peers on a timer with nobody asking, and the
+  adapter picks the client, ssh program and key for those calls. The store's side
+  (`internal/db/peerpoll.go`) and the rest of the scheduler are not.
 
 Migrations, in order: **0001** initial hierarchy + events + manager singleton; **0002**
 durable verdicts; **0003** task leases + the terminal `failed` status; **0004** the

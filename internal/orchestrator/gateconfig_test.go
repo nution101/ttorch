@@ -2037,6 +2037,14 @@ func TestMatchesGateConfig(t *testing.T) {
 		{"the parent's side of provisioning", "internal/cli/peeradd.go", true},
 		{"the parent's peer commands", "internal/cli/peerclient.go", false},
 		{"the peer decisions reader", "internal/peer/decisions.go", false},
+		// The scheduler's peer pass runs control verbs on every peer on a timer, ensure-up among
+		// them, with nobody in the loop, and sets the limits on it; its adapter decides which
+		// client and ssh program it runs them through. Both are covered. The rest of the
+		// scheduler, and the store's side of the poll, are not.
+		{"the scheduler's peer pass", "internal/scheduler/peerpass.go", true},
+		{"the peer pass's client adapter", "internal/cli/peerpoll.go", true},
+		{"the rest of the scheduler", "internal/scheduler/scheduler.go", false},
+		{"the store's side of the peer poll", "internal/db/peerpoll.go", false},
 		{"a project-level reviewer definition", ".claude/agents/ttorch-reviewer-security.md", true},
 		{"project-level MCP servers", ".mcp.json", true},
 		{"a nested instruction file", "internal/orchestrator/CLAUDE.md", true},
