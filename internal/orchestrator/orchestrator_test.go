@@ -51,10 +51,28 @@ func TestMain(m *testing.M) {
 	// these tests, and each Spawn parsed and re-indented all of it. Point the write at a
 	// file of the package's own; the trust write still runs, against a small file.
 	os.Setenv("TTORCH_CLAUDE_JSON", filepath.Join(home, "claude.json"))
+	// Run the package against a tmux server of its own. tmux finds its server through $TMUX
+	// and then $TMUX_TMPDIR, so without this the tests open windows on whatever server the
+	// caller is using, under fixed session names that two runs at once would share. The
+	// server takes its default shell from the $SHELL of the process that starts it: /bin/sh,
+	// so a window comes up without loading the caller's interactive zsh profile (about 0.5s
+	// a window on the build host). isShellCommand lists sh alongside zsh, so the launch
+	// detection under test does not change.
+	tmuxDir, err := os.MkdirTemp("", "ttx-")
+	if err != nil {
+		panic(err)
+	}
+	os.Unsetenv("TMUX")
+	os.Setenv("TMUX_TMPDIR", tmuxDir)
+	os.Setenv("SHELL", "/bin/sh")
 	// Clear any inherited GIT_DIR and the like (git rebase --exec exports one), so the git
 	// that fixtures and the code under test run acts on the temp repository it names.
 	gittest.Scrub()
 	code := m.Run()
+	if tmux.Available() {
+		_ = exec.Command("tmux", "kill-server").Run()
+	}
+	_ = os.RemoveAll(tmuxDir)
 	_ = os.RemoveAll(home)
 	os.Exit(code)
 }
