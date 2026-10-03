@@ -1139,6 +1139,22 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   file the account owns and no one else can write, opened with `O_NOFOLLOW` and checked with
   `fstat`, in a ttorch home that is not a symlink and has the same owner and mode. A malformed
   or unsafe `peer.env` refuses every verb.
+- **Peer provisioning.** `ttorch peer init` makes a machine a peer. `ttorch peer add` on the
+  parent runs it over the lead's own interactive ssh session, with one JSON request on stdin
+  (name, the parent's coordinator id, the control key's public half, and the parent's `TTORCH_*`
+  settings), and it answers one response in the control channel's envelope. It refuses a worker
+  context and checks the whole request before writing anything. It finds the account the way
+  `peer serve` does, so it writes the store, `peer.env` and `authorized_keys` the channel will
+  read whatever `TTORCH_HOME` or `TTORCH_DB` the session has. It records the parent on the
+  coordinator row (another parent is refused unless forced), writes `peer.env` only if there is
+  none (the channel's default PATH plus the session's, and the parent's settings; an existing one
+  is kept, and refused here if the channel would refuse it), and only then appends
+  `command="<absolute path> peer serve",restrict ssh-ed25519 <key> ttorch-peer-control:<parent>`
+  to `~/.ssh/authorized_keys`. The path is the running binary with symlinks resolved, and must
+  be a plain word to the shell, owned by the account or root, and writable by no one else, nor
+  its directory. `~/.ssh` and the file are created private if missing, must be private
+  otherwise, and are never written through a symlink; the file is only appended to, and a key
+  already listed another way is refused. Running it again changes nothing.
 
 Migrations, in order: **0001** initial hierarchy + events + manager singleton; **0002**
 durable verdicts; **0003** task leases + the terminal `failed` status; **0004** the

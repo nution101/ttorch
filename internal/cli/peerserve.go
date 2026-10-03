@@ -23,26 +23,37 @@ import (
 	"github.com/nution101/ttorch/internal/peer"
 )
 
-const peerUsage = `usage: ttorch peer serve
+const peerUsage = `usage: ttorch peer serve | init
   serve answers one control request from a parent coordinator. It runs as an ssh forced
-  command (command="ttorch peer serve",restrict in authorized_keys): the verb comes from
-  SSH_ORIGINAL_COMMAND and the request is one JSON object on stdin.`
+  command (command="<ttorch> peer serve",restrict in authorized_keys): the verb comes from
+  SSH_ORIGINAL_COMMAND and the request is one JSON object on stdin.
+  init provisions this machine as a peer. ttorch peer add on the parent runs it over the
+  lead's own ssh session, with one JSON request on stdin.`
 
-// cmdPeer dispatches `ttorch peer`. serve is its only subcommand so far. It returns the exit
-// status itself, because serve's status is part of its protocol: 0 for an answered request, 1
-// for a refusal, whose JSON is on stdout either way.
+// cmdPeer dispatches `ttorch peer`. It returns the exit status itself, because serve's and
+// init's are part of their protocol: 0 for an answered request, 1 for a refusal, whose JSON is on
+// stdout either way, and 2 for a command line that names no request.
 func cmdPeer(args []string) int {
-	if len(args) == 0 || args[0] != "serve" {
+	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, peerUsage)
 		return 2
 	}
-	if len(args) > 1 {
-		// The forced command is exactly `ttorch peer serve`. A verb typed here would be a second
-		// way in that the authorized_keys line does not describe.
-		fmt.Fprintf(os.Stderr, "ttorch peer serve takes no arguments: the verb comes from SSH_ORIGINAL_COMMAND\n%s\n", peerUsage)
-		return 2
+	switch args[0] {
+	case "serve", "init":
+		if len(args) > 1 {
+			// The forced command is exactly `ttorch peer serve`. A verb typed here would be a
+			// second way in that the authorized_keys line does not describe; init's request
+			// travels on stdin the same way.
+			fmt.Fprintf(os.Stderr, "ttorch peer %s takes no arguments: the request comes from SSH_ORIGINAL_COMMAND and stdin\n%s\n", args[0], peerUsage)
+			return 2
+		}
+		if args[0] == "init" {
+			return cmdPeerInit(os.Stdin, os.Stdout, os.Stderr)
+		}
+		return cmdPeerServe(os.Stdin, os.Stdout, os.Stderr)
 	}
-	return cmdPeerServe(os.Stdin, os.Stdout, os.Stderr)
+	fmt.Fprintln(os.Stderr, peerUsage)
+	return 2
 }
 
 // cmdPeerServe answers one request (internal/peer/serve.go) against this account's ttorch home.
