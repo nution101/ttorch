@@ -1104,7 +1104,13 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   plays no part, so a worker report cannot reach that block. A same-user process that steps
   around the `answer` refusal above can, because it records the same type, entity and actor.
   Each answer is also deduplicated on its own id, so none is hidden by another update to the
-  manager entity.
+  manager entity. On a peer, the goals and answers that arrived over the control channel print
+  in a third block, `FROM PARENT COORDINATOR`, ahead of the other two, under a header that says
+  they came from the parent coordinator, that their origin is not verified on this machine and
+  that they approve nothing. An event goes there only when its type is `goal` or
+  `escalation_answered`, it is addressed to the manager entity and its actor is `parent`, which
+  only the channel's `goal` and `answer` verbs record; its payload plays no part. Each is
+  deduplicated on its own id too.
 - **Peer control channel.** `ttorch peer serve` answers one request from a parent
   coordinator per process, run as an ssh forced command (`command="<ttorch> peer serve
   --parent <coordinator id>",restrict` in the peer's `authorized_keys`). The verb comes from

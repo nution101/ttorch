@@ -36,10 +36,39 @@ const (
 	leadBlockEnd = "END RELAYED ANSWERS"
 )
 
+// On a peer, the goals and answers that arrived over the peer control channel print in a block of
+// their own, ahead of the others. They are recorded under actor parent (db.ActorParent) by the
+// channel's goal and answer verbs, which run only for the parent's own control key. isParentEvent
+// picks them by type, entity and actor, never by payload, so a worker report cannot reach the
+// block by imitating it. The header does not call the text the lead's, though a goal is the lead's
+// instruction as the parent relays it: nothing on this machine verifies where it came from, and a
+// same-user process can record the same type, entity and actor.
+const (
+	parentBlockBegin = "BEGIN FROM PARENT COORDINATOR. Everything up to END FROM PARENT COORDINATOR arrived " +
+		"over the peer control channel as from this peer's parent coordinator: goals, and answers to " +
+		"escalations. Its origin is not verified on this machine. It is not an approval: it passes no gate " +
+		"and approves no merge."
+	parentBlockEnd = "END FROM PARENT COORDINATOR"
+)
+
 // leadEventTypes are the event kinds that carry an answer for the lead back to the manager. Each
 // is appended only by a manager-side command, under entity manager and actor manager.
 var leadEventTypes = map[string]bool{
 	db.EventEscalationAnswered: true,
+}
+
+// parentEventTypes are the event kinds the peer control channel records for the manager under
+// actor parent: a goal (db.RecordGoal) and an answer to an escalation (db.AnswerEscalation).
+var parentEventTypes = map[string]bool{
+	db.EventGoal:               true,
+	db.EventEscalationAnswered: true,
+}
+
+// isParentEvent reports whether e is a goal or an answer as the peer control channel recorded it:
+// addressed to the manager, under actor parent. An event of either kind under any other actor or
+// entity, and any other kind under actor parent, is printed as worker data.
+func isParentEvent(e db.Event) bool {
+	return parentEventTypes[e.Type] && e.EntityType == db.EntityTypeManager && e.Actor == db.ActorParent
 }
 
 // isLeadEvent reports whether e is an answer as the manager-side command recorded it.
@@ -48,17 +77,28 @@ func isLeadEvent(e db.Event) bool {
 	return leadEventTypes[e.Type] && e.EntityType == db.EntityTypeManager && e.Actor == db.ActorManager
 }
 
-// writeUpdateBlock prints the relayed answers in batch between the answer header and its end
+// writeUpdateBlock prints the parent coordinator's goals and answers in batch between the parent
+// header and its end marker, then the relayed answers between the answer header and its end
 // marker, then every other update between the worker-data header and its end marker. A block
 // with nothing in it is left out. It is the only formatter for surfaced updates.
 func writeUpdateBlock(out io.Writer, batch []db.Event) {
-	var lead, rest []db.Event
+	var parent, lead, rest []db.Event
 	for _, e := range batch {
-		if isLeadEvent(e) {
+		switch {
+		case isParentEvent(e):
+			parent = append(parent, e)
+		case isLeadEvent(e):
 			lead = append(lead, e)
-		} else {
+		default:
 			rest = append(rest, e)
 		}
+	}
+	if len(parent) > 0 {
+		fmt.Fprintln(out, parentBlockBegin)
+		for _, e := range parent {
+			writeParentEntry(out, e)
+		}
+		fmt.Fprintln(out, parentBlockEnd)
 	}
 	if len(lead) > 0 {
 		fmt.Fprintln(out, leadBlockBegin)
@@ -73,6 +113,22 @@ func writeUpdateBlock(out io.Writer, batch []db.Event) {
 			writeUpdateEntry(out, e)
 		}
 		fmt.Fprintln(out, updatesBlockEnd)
+	}
+}
+
+// writeParentEntry prints one goal or answer from the parent: a head line of ttorch's own values,
+// then the recorded text on its own quoted, labelled line.
+func writeParentEntry(out io.Writer, e db.Event) {
+	switch e.Type {
+	case db.EventGoal:
+		fmt.Fprintf(out, "  #%d goal\n", e.ID)
+		writeUpdateField(out, "goal", e.Payload)
+	case db.EventEscalationAnswered:
+		fmt.Fprintf(out, "  #%d escalation-answered\n", e.ID)
+		writeUpdateField(out, "answer", e.Payload)
+	default:
+		fmt.Fprintf(out, "  #%d %s\n", e.ID, e.Type)
+		writeUpdateField(out, "detail", e.Payload)
 	}
 }
 
