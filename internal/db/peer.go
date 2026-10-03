@@ -143,7 +143,8 @@ func printableField(what, v string) error {
 // gets a new row. An existing row is updated with p's destinations and key and set back to
 // provisioning when it is retired, when it is still provisioning (a retried `peer add`), or when
 // replace is set (`peer adopt`); otherwise the name is in use and the call fails with
-// ErrPeerExists. The row's creation time, its repositories and its delegations are kept.
+// ErrPeerExists. The row's creation time, its repositories and its delegations are kept. A
+// coordinator that is itself a peer registers none (ErrCoordinatorIsPeer).
 func (s *Store) RegisterPeer(ctx context.Context, p Peer, replace bool) (Peer, error) {
 	if err := ValidPeerName(p.Name); err != nil {
 		return Peer{}, err
@@ -163,6 +164,15 @@ func (s *Store) RegisterPeer(ctx context.Context, p Peer, replace bool) (Peer, e
 	now := formatTime(s.now())
 	var out Peer
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		// The other end of ProvisionAsPeer's ErrHasPeers, in the same kind of transaction, so a
+		// peer add and a peer init racing on one store cannot both pass.
+		var role string
+		if err := tx.QueryRowContext(ctx, `SELECT role FROM coordinator WHERE id = 1`).Scan(&role); err != nil {
+			return err
+		}
+		if role == CoordinatorPeer {
+			return ErrCoordinatorIsPeer
+		}
 		cur, ok, err := getPeer(ctx, tx, p.Name)
 		if err != nil {
 			return err

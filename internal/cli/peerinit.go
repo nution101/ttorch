@@ -39,7 +39,8 @@ func cmdPeerInit(stdin io.Reader, stdout, stderr io.Writer) int {
 //  3. Read an existing peer.env with the channel's own reader, so one the channel would refuse
 //     fails here, at the lead's terminal, and not on every later call.
 //  4. Record the parent on the coordinator row (db.ProvisionAsPeer). Another parent is refused
-//     unless the request forces it.
+//     unless the request forces it, and a coordinator with peers of its own that are not retired
+//     is refused either way: a peer has no peers, and those peers' control keys are here.
 //  5. Write peer.env if there is none: the default PATH plus this session's, and the parent's
 //     settings. An existing one is kept as it is.
 //  6. Install the control key's forced-command line in ~/.ssh/authorized_keys
@@ -84,6 +85,9 @@ func peerInit(ctx context.Context, stdin io.Reader) (peer.InitResult, error) {
 	store.Close()
 	if errors.Is(err, db.ErrOtherParent) {
 		return peer.InitResult{}, peer.Refuse(peer.CodeWrongParent, "%v", err)
+	}
+	if errors.Is(err, db.ErrHasPeers) {
+		return peer.InitResult{}, peer.Refuse(peer.CodeConflict, "%v", err)
 	}
 	if err != nil {
 		return peer.InitResult{}, err

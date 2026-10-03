@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -85,6 +86,13 @@ func ValidCoordID(id string) error {
 // ErrOtherParent is provisioning by a parent other than the one the coordinator row records.
 var ErrOtherParent = errors.New("this coordinator was provisioned by another parent")
 
+// ErrHasPeers is provisioning a coordinator that has peers of its own, and ErrCoordinatorIsPeer
+// is registering a peer on a coordinator that is one. Either would put a peer below a peer.
+var (
+	ErrHasPeers          = errors.New("this coordinator has peers of its own, and a peer has none")
+	ErrCoordinatorIsPeer = errors.New("this coordinator is a peer, and a peer has no peers of its own")
+)
+
 // Provisioned is the coordinator row after ProvisionAsPeer, and the parent it recorded before
 // ("" when none).
 type Provisioned struct {
@@ -99,6 +107,11 @@ type Provisioned struct {
 // A store a parent already provisioned keeps that parent: another one is refused with
 // ErrOtherParent and nothing changes, unless force is set, which is `ttorch peer adopt --force`
 // moving the peer. The same parent may provision it again, under the same name or another.
+//
+// A coordinator with a peer of its own that is not retired is refused with ErrHasPeers, forced or
+// not: a peer has no peers (design 3.3). Each such peer still has a control key in this
+// coordinator's ttorch home, and made a peer, this coordinator's unattended manager and its
+// same-user workers could use that key on a third machine. Retiring a peer deletes its key.
 //
 // The row identifies and authorizes nothing (see Coordinator): any process running as this
 // store's user can rewrite it. The refusal keeps two parents from relaying one peer's work by
@@ -119,6 +132,13 @@ func (s *Store) ProvisionAsPeer(ctx context.Context, name, parentID string, forc
 		if role == CoordinatorPeer && previous != "" && previous != parentID && !force {
 			return fmt.Errorf("%w %s; moving it to this one is ttorch peer adopt --force", ErrOtherParent, previous)
 		}
+		held, err := peersInUse(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if len(held) > 0 {
+			return fmt.Errorf("%w: %s; retire them here first (ttorch peer retire <name>)", ErrHasPeers, strings.Join(held, ", "))
+		}
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE coordinator SET role = ?, name = ?, parent_id = ? WHERE id = 1`,
 			CoordinatorPeer, name, parentID); err != nil {
@@ -134,4 +154,22 @@ func (s *Store) ProvisionAsPeer(ctx context.Context, name, parentID string, forc
 		return Provisioned{}, err
 	}
 	return out, nil
+}
+
+// peersInUse names the peers registered here that are not retired, by name.
+func peersInUse(ctx context.Context, q queryer) ([]string, error) {
+	rows, err := q.QueryContext(ctx, `SELECT name FROM peers WHERE status != ? ORDER BY name`, PeerRetired)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
 }

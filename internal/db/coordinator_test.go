@@ -70,3 +70,57 @@ func TestProvisionAsPeer(t *testing.T) {
 		t.Errorf("a refused provisioning changed the row: %+v", c)
 	}
 }
+
+// TestProvisionAsPeerRefusesACoordinatorWithPeers: depth one holds from both ends. A coordinator
+// with a peer of its own that is not retired (provisioning, live or unreachable all still hold a
+// control key for that machine) is not made a peer, forced or not, and the row is left a root.
+// Once every peer is retired it can be. The other end: a peer registers no peers.
+func TestProvisionAsPeerRefusesACoordinatorWithPeers(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	parent := strings.Repeat("a", 32)
+	for _, name := range []string{"child-a", "child-b"} {
+		if _, err := s.RegisterPeer(ctx, testPeer(name), false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.MarkPeerLive(ctx, "child-a", 1, "v-test"); err != nil {
+		t.Fatal(err)
+	}
+	refused := func(label string) {
+		t.Helper()
+		for _, force := range []bool{false, true} {
+			_, err := s.ProvisionAsPeer(ctx, "mid", parent, force)
+			if !errors.Is(err, ErrHasPeers) {
+				t.Errorf("%s (force %v): err = %v, want ErrHasPeers", label, force, err)
+			}
+		}
+		if c, _ := s.GetCoordinator(ctx); c.Role != CoordinatorRoot || c.ParentID != "" {
+			t.Errorf("%s: a refused provisioning changed the row: %+v", label, c)
+		}
+	}
+	refused("one live peer and one provisioning")
+	if _, err := s.ProvisionAsPeer(ctx, "mid", parent, false); err == nil || !strings.Contains(err.Error(), "child-a") || !strings.Contains(err.Error(), "child-b") {
+		t.Errorf("the refusal %v does not name the peers it holds", err)
+	}
+	if _, err := s.RetirePeer(ctx, "child-a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE peers SET status = 'unreachable' WHERE name = 'child-b'`); err != nil {
+		t.Fatal(err)
+	}
+	refused("one unreachable peer")
+	if _, err := s.RetirePeer(ctx, "child-b"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ProvisionAsPeer(ctx, "mid", parent, false); err != nil {
+		t.Fatalf("with every peer retired: %v", err)
+	}
+
+	if _, err := s.RegisterPeer(ctx, testPeer("grandchild"), false); !errors.Is(err, ErrCoordinatorIsPeer) {
+		t.Errorf("RegisterPeer on a peer: err = %v, want ErrCoordinatorIsPeer", err)
+	}
+	if _, ok, _ := s.GetPeer(ctx, "grandchild"); ok {
+		t.Error("a peer registered a peer")
+	}
+}

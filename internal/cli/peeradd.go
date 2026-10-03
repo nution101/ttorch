@@ -116,9 +116,11 @@ func cmdPeerProvision(args []string, adopt bool, stdin *os.File) error {
 	}
 	// Depth one (design 3.3): a peer starts no peers. Its manager's escalations reach the lead
 	// through its parent, and a peer below it would need every hop to relay them, and the
-	// approvals back. Any process running as this account can rewrite the row, so the check
-	// stops accidents; what keeps a peer from reaching further is that provisioning gives it no
-	// key for any other machine.
+	// approvals back. db.RegisterPeer refuses the same in its own transaction. The other end is
+	// db.ProvisionAsPeer, which will not make a coordinator with peers of its own a peer, since it
+	// holds their control keys. Any process running as this account can rewrite the row, or run
+	// ssh-keygen and ssh itself, so these checks stop accidents, not a same-user process working
+	// round them.
 	if self.Role == db.CoordinatorPeer {
 		return fmt.Errorf("peer %s: this coordinator is a peer (%s, provisioned by %s), and a peer starts no peers of its own; run ttorch peer %s on the root coordinator instead", verb, peer.SafeID(self.Name), peer.SafeID(self.ParentID), verb)
 	}

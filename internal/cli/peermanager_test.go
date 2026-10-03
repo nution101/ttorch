@@ -323,3 +323,59 @@ func TestPeerServeEnsureUpTwice(t *testing.T) {
 		t.Errorf("the manager launched with charter %.80q..., want the peer charter", got)
 	}
 }
+
+// TestPeerAddRefusesARootWithPeers: depth one from the other end. The machine being provisioned
+// is a root with a live peer of its own, so it holds a control key for a third machine. peer add
+// and peer adopt --force both reach its peer init, which refuses before it records a parent,
+// writes peer.env or admits a key; the version proof never runs, and the parent's row stays
+// provisioning with the reason.
+func TestPeerAddRefusesARootWithPeers(t *testing.T) {
+	ctx := context.Background()
+	f := newPeerFixture(t)
+	s, err := db.Open(f.peer.db())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RegisterPeer(ctx, db.Peer{Name: "child", ControlDest: "ttorch@child-host", ApproveDest: "lead@child-host",
+		ControlKey: filepath.Join(f.peer.home, "peers", "child", "control")}, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkPeerLive(ctx, "child", peer.ProtocolVersion, "v-test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, args := range [][]string{
+		{"peer", "add", "build", "ttorch@build-host"},
+		{"peer", "adopt", "build", "ttorch@build-host", "--force"},
+	} {
+		r := f.run(t, nil, args...)
+		if r.code == 0 || !strings.Contains(r.stderr, "peers of its own") || !strings.Contains(r.stderr, "child") {
+			t.Errorf("%v of a root with a live peer: exit %d, stderr %q; want it refused naming the peer", args, r.code, r.stderr)
+		}
+	}
+	for i, c := range f.calls(t) {
+		if len(c.Args) < 4 || c.Args[len(c.Args)-1] != ".ttorch/bin/ttorch peer init" {
+			t.Errorf("ssh call %d = %q; only the init session may run", i, c.Args)
+		}
+	}
+	c, err := f.peerStore(t).GetCoordinator(ctx)
+	if err != nil || c.Role != db.CoordinatorRoot || c.ParentID != "" {
+		t.Errorf("the provisioned machine's coordinator row = %+v, %v; want it left a root", c, err)
+	}
+	for _, p := range []string{f.peer.authorizedKeys(), filepath.Join(f.peer.home, peerEnvFile)} {
+		if _, err := os.Lstat(p); !os.IsNotExist(err) {
+			t.Errorf("a refused init wrote %s (%v)", p, err)
+		}
+	}
+	if p, ok, err := f.parentStore(t).GetPeer(ctx, "build"); err != nil || !ok || p.Status != db.PeerProvisioning || !strings.Contains(p.LastError, "peers of its own") {
+		t.Errorf("the parent's row = %+v (%v, %v), want provisioning with the reason", p, ok, err)
+	}
+
+	// The init session itself names the refusal, so the parent can tell it from a failure.
+	line, _ := newControlKey(t)
+	r := initRun(t, f.peer, initBody(t, peer.InitRequest{Name: "build", ParentID: servedParent, ControlKey: line, Force: true}))
+	r.refused(t, "init of a root with a live peer", peer.CodeConflict)
+}

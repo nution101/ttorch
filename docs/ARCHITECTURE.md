@@ -1165,7 +1165,8 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   worker context and checks the whole request before writing anything. It finds the account the way
   `peer serve` does, so it writes the store, `peer.env` and `authorized_keys` the channel will
   read whatever `TTORCH_HOME` or `TTORCH_DB` the session has. It records the parent on the
-  coordinator row (another parent is refused unless forced) and writes `peer.env` only if there
+  coordinator row (another parent is refused unless forced, and a coordinator with peers of its
+  own that are not retired is refused either way) and writes `peer.env` only if there
   is none. A new one gets the channel's default PATH plus each session directory that exists, is
   owned by the account or root, and that no one else can write, nor any directory on the way to
   it, and the parent's model and effort settings.
@@ -1196,8 +1197,11 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   the same caller check as `ttorch approve` (no worker context, an interactive terminal) before
   it parses a flag or starts a process. It is refused, before any key or row is made, on a
   coordinator whose own row says `peer`: a peer starts no peers, so the depth stays at one. The
-  row can be rewritten by any process running as that account, so this stops accidents; the
-  limit that holds is that provisioning hands a peer no key for any other machine. It generates the control key with `ssh-keygen` (ed25519,
+  other end holds too: `peer init`, and so `peer adopt`, refuses (`conflict`) a coordinator that
+  has a peer of its own that is not retired, since it holds that peer's control key.
+  `db.RegisterPeer` and `db.ProvisionAsPeer` each check in their own transaction, so an add and an
+  init racing on one store cannot both pass. The row can be rewritten by any process running as
+  that account, so these checks stop accidents, not a same-user process working round them. It generates the control key with `ssh-keygen` (ed25519,
   no passphrase, since nobody is there to type one when the scheduler polls) under
   `~/.ttorch/peers/<name>/` (directory 0700, key 0600), registers the peer as `provisioning`,
   runs `ttorch peer init` over the lead's own ssh session to the approve destination (`ssh -T`
