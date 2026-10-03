@@ -72,14 +72,7 @@ func New(p paths.Paths) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
-	m := &Manager{
-		P:       p,
-		Session: be.SessionName(),
-		Store:   store,
-		Pool:    worktree.Pool{Root: p.Worktrees(), Max: worktree.MaxFromEnv()},
-		Clones:  clonepool.ClonePool{Root: p.Clones(), Max: worktree.MaxFromEnv()},
-		Backend: be,
-	}
+	m := newManager(p, be, store)
 	// Migrate any pre-SQLite JSON state into the DB (one-shot, idempotent — §2.5).
 	// A task's tmux window decides its imported status (active vs torn_down). This is
 	// best-effort: the legacy source is preserved either way (state.migrated/), so a
@@ -99,6 +92,29 @@ func New(p paths.Paths) (*Manager, error) {
 		}
 	}
 	return m, nil
+}
+
+// NewWithStore builds a Manager over a store the caller opened, with the backend from
+// TTORCH_BACKEND. Unlike New it runs no legacy import and seeds no default branch, so building
+// it writes nothing; with a store from db.OpenReadOnly, nothing it reads through can write
+// either. The peer control channel's summary reads the fleet this way. Close closes the store.
+func NewWithStore(p paths.Paths, store *db.Store) (*Manager, error) {
+	be, err := backend.FromEnv()
+	if err != nil {
+		return nil, err
+	}
+	return newManager(p, be, store), nil
+}
+
+func newManager(p paths.Paths, be backend.Backend, store *db.Store) *Manager {
+	return &Manager{
+		P:       p,
+		Session: be.SessionName(),
+		Store:   store,
+		Pool:    worktree.Pool{Root: p.Worktrees(), Max: worktree.MaxFromEnv()},
+		Clones:  clonepool.ClonePool{Root: p.Clones(), Max: worktree.MaxFromEnv()},
+		Backend: be,
+	}
 }
 
 // Close releases the underlying state store. Short-lived CLI commands defer it.
