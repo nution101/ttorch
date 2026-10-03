@@ -342,13 +342,26 @@ func TestPeerAccountUnderTestIsNeverTheReal(t *testing.T) {
 	if u, err := peerAccount(); err == nil {
 		t.Fatalf("peerAccount() with no seam = %+v; want an error, never the real account", u)
 	}
+	tmuxDir := t.TempDir()
 	for _, half := range [][2]string{{"", t.TempDir()}, {t.TempDir(), ""}} {
-		if u, err := testPeerAccount(half[0], half[1])(); err == nil {
+		if u, err := testPeerAccount(half[0], half[1], tmuxDir)(); err == nil {
 			t.Errorf("half a seam %q gave %+v; want an error", half, u)
 		}
 	}
 	home, ttorch := t.TempDir(), t.TempDir()
-	if u, err := testPeerAccount(home, ttorch)(); err != nil || u.home != home || u.ttorchHome != ttorch {
+	// The seam restores the private tmux directory a served process's clear removed, and refuses
+	// a process that has none, or one that no longer exists, where tmux would fall back to the
+	// caller's default server.
+	t.Setenv("TMUX_TMPDIR", "")
+	for _, bad := range []string{"", filepath.Join(t.TempDir(), "gone")} {
+		if u, err := testPeerAccount(home, ttorch, bad)(); err == nil {
+			t.Errorf("tmux dir %q gave %+v; want an error", bad, u)
+		}
+	}
+	if u, err := testPeerAccount(home, ttorch, tmuxDir)(); err != nil || u.home != home || u.ttorchHome != ttorch {
 		t.Errorf("the seam = %+v, %v", u, err)
+	}
+	if got := os.Getenv("TMUX_TMPDIR"); got != tmuxDir {
+		t.Errorf("TMUX_TMPDIR after the seam = %q, want %q", got, tmuxDir)
 	}
 }

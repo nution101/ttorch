@@ -23,7 +23,7 @@ func TestMain(m *testing.M) {
 	// The peer commands take the account's home from the user database, never from the
 	// environment, and that answer is the real home with the real ~/.ssh and ~/.ttorch. Under
 	// test the account comes only from the seam, and a process without it fails instead.
-	peerAccount = testPeerAccount(os.Getenv(testPeerHomeEnv), os.Getenv(testPeerTtorchEnv))
+	peerAccount = testPeerAccount(os.Getenv(testPeerHomeEnv), os.Getenv(testPeerTtorchEnv), os.Getenv("TMUX_TMPDIR"))
 	// A stand-in for ssh (peerclient_test.go): the parent's peer commands run this binary in
 	// ssh's place, and it plays sshd and the peer's shell.
 	if cfg := os.Getenv(testSSHShimEnv); cfg != "" {
@@ -57,9 +57,12 @@ func TestMain(m *testing.M) {
 	// Clear any inherited GIT_DIR and the like (git rebase --exec exports one), so the git
 	// that fixtures and the code under test run acts on the temp repository it names.
 	gittest.Scrub()
-	// Run the package against a tmux server of its own, as internal/orchestrator's tests do:
-	// a test that reaches Spawn would otherwise open windows on the caller's server, and the
-	// cleanup kills that server through its pinned socket only.
+	// Run the package against a tmux server of its own: TMUX cleared and TMUX_TMPDIR private
+	// for this process and every child that inherits its environment, and the server killed
+	// through its pinned socket after the run (and by the reaper if the binary dies). A child
+	// started with an environment of its own does not inherit any of that, so the peer tests
+	// that re-run this binary pass TMUX_TMPDIR explicitly (testTmuxEnv), and a served child,
+	// which clears its environment, gets it back from testPeerAccount.
 	tmuxServer, err := tmuxtest.Isolate()
 	if err != nil {
 		panic(err)
@@ -74,14 +77,31 @@ func TestMain(m *testing.M) {
 // testPeerAccount is the peer account lookup a test process uses: the temp homes
 // testPeerHomeEnv and testPeerTtorchEnv named when the process started (the served process clears
 // its environment before it looks the account up), or an error when either was unset.
-func testPeerAccount(home, ttorchHome string) func() (peerUser, error) {
+//
+// It also puts back tmuxDir, the TMUX_TMPDIR the process started with. peerControlEnv clears the
+// environment and then looks the account up, so this is the one point in a served test process
+// after the clear, and without it the served process's tmux would act on the caller's default
+// server. A process started without a private tmux directory that exists is refused the same
+// way as one without the homes.
+func testPeerAccount(home, ttorchHome, tmuxDir string) func() (peerUser, error) {
 	return func() (peerUser, error) {
 		if home == "" || ttorchHome == "" {
 			return peerUser{}, errors.New("test process without " + testPeerHomeEnv + " and " + testPeerTtorchEnv + ": refusing to use the real account")
 		}
+		if fi, err := os.Stat(tmuxDir); tmuxDir == "" || err != nil || !fi.IsDir() {
+			return peerUser{}, errors.New("test process without a private TMUX_TMPDIR (testTmuxEnv): refusing to run tmux against the caller's server")
+		}
+		os.Unsetenv("TMUX")
+		if err := os.Setenv("TMUX_TMPDIR", tmuxDir); err != nil {
+			return peerUser{}, err
+		}
 		return peerUser{home: home, name: "peer-test", ttorchHome: ttorchHome}, nil
 	}
 }
+
+// testTmuxEnv is the environment entry that hands this process's private tmux directory to a
+// child started with an environment of its own (see TestMain).
+func testTmuxEnv() string { return "TMUX_TMPDIR=" + os.Getenv("TMUX_TMPDIR") }
 
 // runMainEnv, set to 1, makes the test binary run Main on its arguments instead of the tests.
 // testPeerHomeEnv and testPeerTtorchEnv then name the account home and ttorch home a served

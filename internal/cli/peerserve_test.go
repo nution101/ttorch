@@ -109,6 +109,7 @@ func serveRun(t *testing.T, h serveHome, command, body string, args ...string) s
 		"SSH_ORIGINAL_COMMAND=" + command,
 		"HOME=" + h.account,
 		"PATH=" + os.Getenv("PATH"),
+		testTmuxEnv(),
 	}, h.extraEnv...)
 	cmd.Stdin = strings.NewReader(body)
 	var out, errOut bytes.Buffer
@@ -537,7 +538,7 @@ func TestPeerServeTakesTheParentFromTheKey(t *testing.T) {
 	for _, argv := range [][]string{{"peer", "serve", "--parent"}, {"peer", "serve", "--other", servedParent}, {"peer", "serve", "--parent", servedParent, "summary"}} {
 		cmd := exec.Command(os.Args[0], argv...)
 		cmd.Dir = h.dir
-		cmd.Env = []string{runMainEnv + "=1", testPeerHomeEnv + "=" + h.account, testPeerTtorchEnv + "=" + h.home, "SSH_ORIGINAL_COMMAND=version", "HOME=" + h.account}
+		cmd.Env = []string{runMainEnv + "=1", testPeerHomeEnv + "=" + h.account, testPeerTtorchEnv + "=" + h.home, "SSH_ORIGINAL_COMMAND=version", "HOME=" + h.account, testTmuxEnv()}
 		err := cmd.Run()
 		var exit *exec.ExitError
 		if !errors.As(err, &exit) || exit.ExitCode() != 2 {

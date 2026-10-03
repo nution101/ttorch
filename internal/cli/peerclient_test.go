@@ -108,6 +108,7 @@ func runSSHShim(cfgPath string, args []string) int {
 		runMainEnv + "=1", testPeerHomeEnv + "=" + cfg.Account, testPeerTtorchEnv + "=" + cfg.Home,
 		"HOME=" + cfg.Account, "PATH=" + os.Getenv("PATH"),
 		"TTORCH_HOME=" + cfg.Home, "TTORCH_DB=" + filepath.Join(cfg.Home, "state.db"),
+		testTmuxEnv(),
 	}
 	command := remote
 	if key := valueAfter(args[:sep], "-i"); key != "" {
@@ -239,6 +240,7 @@ func (f *peerFixture) run(t *testing.T, stdin *strings.Reader, args ...string) r
 	cmd.Env = append([]string{
 		runMainEnv + "=1", testPeerSSHEnv + "=" + f.shim,
 		"TTORCH_HOME=" + f.parentHome, "HOME=" + f.parentAccount, "PATH=" + os.Getenv("PATH"),
+		testTmuxEnv(),
 	}, f.extraEnv...)
 	if stdin != nil {
 		cmd.Stdin = stdin

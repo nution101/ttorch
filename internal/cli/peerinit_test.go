@@ -48,6 +48,7 @@ func (h initHome) sessionEnv(decoy string) []string {
 		"PATH=" + os.Getenv("PATH"),
 		"TTORCH_HOME=" + decoy,
 		"TTORCH_DB=" + filepath.Join(decoy, "state.db"),
+		testTmuxEnv(),
 	}, h.extraEnv...)
 }
 
@@ -205,7 +206,7 @@ func TestPeerInitProvisions(t *testing.T) {
 	cmd := exec.Command("/bin/sh", "-c", forcedCommand(t, line))
 	cmd.Dir = h.account
 	cmd.Env = []string{runMainEnv + "=1", testPeerHomeEnv + "=" + h.account, testPeerTtorchEnv + "=" + h.home,
-		"HOME=" + h.account, "PATH=/usr/bin:/bin", "SSH_ORIGINAL_COMMAND=version"}
+		"HOME=" + h.account, "PATH=/usr/bin:/bin", "SSH_ORIGINAL_COMMAND=version", testTmuxEnv()}
 	cmd.Stdin = strings.NewReader("{}")
 	out, err := cmd.Output()
 	if err != nil {
