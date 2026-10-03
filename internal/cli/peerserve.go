@@ -95,12 +95,16 @@ var peerLang = func() string {
 	return "C.UTF-8"
 }()
 
-// peerEnvRefused are the TTORCH_* keys peer.env may not set: the store and the other paths come
-// from the account's home, a worker's identity is never the control channel's, and worker tabs
-// are always off for a process with no screen.
+// peerEnvRefused are the TTORCH_* keys peer.env may not set: every path override (the store and
+// the other paths come from the account's home; the validate cache holds the green results a
+// trusted merge reuses; TTORCH_CLAUDE_JSON names the claude config ttorch writes folder trust
+// into), a worker's identity, which is never the control channel's, and worker tabs, always off
+// for a process with no screen. TestPeerEnvClassifiesEveryVariable fails on any TTORCH_* name
+// ttorch reads that is neither here nor among the settings peer.env may hold.
 var peerEnvRefused = map[string]bool{
 	"TTORCH_HOME": true, "TTORCH_DB": true, "TTORCH_CLAUDE_DIR": true, "TTORCH_AGENTS_DIR": true,
-	"TTORCH_BIN_DIR": true, "TTORCH_TASK_ID": true, "TTORCH_TASK": true, "TTORCH_WORKER_TABS": true,
+	"TTORCH_BIN_DIR": true, "TTORCH_VALIDATE_CACHE_DIR": true, "TTORCH_CLAUDE_JSON": true,
+	"TTORCH_TASK_ID": true, "TTORCH_TASK": true, "TTORCH_WORKER_TABS": true,
 }
 
 // peerControlEnv replaces this process's environment with one built only from the account and

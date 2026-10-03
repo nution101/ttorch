@@ -1130,9 +1130,12 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   always `<home>/.ttorch`, LANG is fixed, no `LC_*`, `GIT_*`, `SSH_*` or other session variable
   survives, SHELL is kept only if `/etc/shells` lists it and TMPDIR only if the account owns it
   and no one else can write it. PATH and the `TTORCH_*` settings come from the peer's own
-  `~/.ttorch/peer.env` (`KEY=VALUE` lines; it may not set `TTORCH_HOME`, `TTORCH_DB`, the other
-  path overrides, a task identity or `TTORCH_WORKER_TABS`, which is always 0), and PATH falls
-  back to a fixed default. A malformed `peer.env` refuses every verb.
+  `~/.ttorch/peer.env` (`KEY=VALUE` lines; it may not set a path override, which is
+  `TTORCH_HOME`, `TTORCH_DB`, `TTORCH_CLAUDE_DIR`, `TTORCH_AGENTS_DIR`, `TTORCH_BIN_DIR`,
+  `TTORCH_VALIDATE_CACHE_DIR` and `TTORCH_CLAUDE_JSON`, nor a task identity or
+  `TTORCH_WORKER_TABS`, which is always 0), and PATH falls back to a fixed default. A test reads
+  every `TTORCH_*` name in the code and the installed content and fails on one that is neither
+  refused nor listed as a setting peer.env may hold. A malformed `peer.env` refuses every verb.
 
 Migrations, in order: **0001** initial hierarchy + events + manager singleton; **0002**
 durable verdicts; **0003** task leases + the terminal `failed` status; **0004** the
