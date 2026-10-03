@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/nution101/ttorch/internal/db"
-	"github.com/nution101/ttorch/internal/harness"
 	"github.com/nution101/ttorch/internal/orchestrator"
 	"github.com/nution101/ttorch/internal/projectinit"
 	"github.com/nution101/ttorch/internal/worktree"
@@ -814,7 +813,9 @@ func cmdTask(args []string) error {
 }
 
 // cmdTaskAdd creates a PENDING backlog task without spawning a worker (§3.3). It
-// sets no window/worktree — spawn later UpsertTasks this row to active (§3.4).
+// sets no window/worktree — spawn later UpsertTasks this row to active (§3.4). It parses its
+// flags and reads the brief, and leaves the rest to addBacklogTask, which the peer control channel's
+// task-add verb shares.
 func cmdTaskAdd(args []string) error {
 	if len(args) < 1 || strings.HasPrefix(args[0], "-") {
 		return errors.New(taskAddUsage)
@@ -842,127 +843,31 @@ func cmdTaskAdd(args []string) error {
 	if *project == 0 {
 		return errors.New("task add: --project <id> is required")
 	}
-	// Reject an unknown --effort/--model before any side effect, so a typo fails loudly. A
-	// value set here is persisted on the backlog row and ALWAYS wins over the scheduler's
-	// dispatch-time tier classifier (explicit-wins); leaving them unset defers to it.
-	if *effort != "" && !harness.ValidEffort(*effort) {
-		return fmt.Errorf("task add: invalid --effort %q (want one of: %s)", *effort, strings.Join(harness.EffortLevels, "|"))
-	}
-	if *model != "" && !harness.ValidModel(*model) {
-		return fmt.Errorf("task add: invalid --model %q (want an alias %s, or a full model id)", *model, strings.Join(harness.ModelAliases, "|"))
-	}
 	// Resolve the brief before any side effect so a bad --brief/--brief-file fails the add
-	// loudly. Storing it now (below, after the row is created) means the deterministic scheduler
-	// daemon — and a later manual `ttorch spawn` — launch the worker WITH the full brief as its
-	// initial prompt (equivalent to `spawn --brief-file`), instead of the stub that waits for a
-	// manager `ttorch send`. A task added without a brief still dispatches: it falls back to the
-	// stub, exactly as today.
+	// loudly. Storing it (addBacklogTask) means the deterministic scheduler daemon — and a later manual
+	// `ttorch spawn` — launch the worker WITH the full brief as its initial prompt (equivalent to
+	// `spawn --brief-file`), instead of the stub that waits for a manager `ttorch send`. A task
+	// added without a brief still dispatches: it falls back to the stub, exactly as today.
 	briefContent, err := resolveBrief("task add", *brief, *briefFile)
 	if err != nil {
 		return err
-	}
-	if *noLint && briefContent == "" {
-		return errNoBriefLintWithoutBrief
 	}
 	m, err := mgr()
 	if err != nil {
 		return err
 	}
 	defer m.Close()
-	ctx := context.Background()
-	proj, ok, err := m.Store.GetProject(ctx, *project)
-	if err != nil {
-		return err
-	} else if !ok {
-		return fmt.Errorf("task add: no such project %d (see 'ttorch project ls')", *project)
-	}
-	// Lint the brief before any side effect. The brief is a SNAPSHOT — it is copied into
-	// the task here, so editing the file afterwards reaches nobody and a defect is only
-	// discovered once a worker has acted on it. This is the last moment a fix is free. It
-	// runs against the project's own repository (its remote, its refs, its AGENTS.md
-	// configuration), and only when a brief was supplied: an add with no brief behaves
-	// exactly as before.
-	if !*noLint {
-		if err := lintBriefForAdd(briefContent, proj.RepoPath, *citationsRef, *offline); err != nil {
-			return err
-		}
-	}
-	// Resolve and cross-validate the hierarchy refs so the row is coherent: an
-	// --epic must live under --project, and a --phase must live under that epic
-	// (a phase always has a parent epic). When only --phase is given we adopt its
-	// parent epic, so a task can never end up with phase_id set and epic_id NULL —
-	// which would otherwise render under an epic in --tree yet be invisible to
-	// `tasks --epic` (the two read surfaces must agree).
-	var epicID, phaseID *int64
-	if *epic != 0 {
-		e, ok, err := m.Store.GetEpic(ctx, *epic)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return fmt.Errorf("task add: no such epic %d (see 'ttorch epic ls')", *epic)
-		}
-		if e.ProjectID != *project {
-			return fmt.Errorf("task add: epic %d belongs to project %d, not %d", *epic, e.ProjectID, *project)
-		}
-		ev := *epic
-		epicID = &ev
-	}
-	if *phase != 0 {
-		ph, ok, err := m.Store.GetPhase(ctx, *phase)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return fmt.Errorf("task add: no such phase %d (see 'ttorch phase ls')", *phase)
-		}
-		if epicID != nil && *epicID != ph.EpicID {
-			return fmt.Errorf("task add: phase %d belongs to epic %d, not the given epic %d", *phase, ph.EpicID, *epicID)
-		}
-		if epicID == nil {
-			// Adopt the phase's parent epic and verify it belongs to --project.
-			pe, ok, err := m.Store.GetEpic(ctx, ph.EpicID)
-			if err != nil {
-				return err
-			}
-			if !ok {
-				return fmt.Errorf("task add: phase %d references missing epic %d", *phase, ph.EpicID)
-			}
-			if pe.ProjectID != *project {
-				return fmt.Errorf("task add: phase %d belongs to project %d, not %d", *phase, pe.ProjectID, *project)
-			}
-			ev := ph.EpicID
-			epicID = &ev
-		}
-		pv := *phase
-		phaseID = &pv
-	}
-	if _, exists, err := m.Store.GetTask(ctx, id); err != nil {
-		return err
-	} else if exists {
-		return fmt.Errorf("task add: task %q already exists", id)
-	}
-	t, err := m.Store.CreateTask(ctx, db.Task{
-		ID: id, ProjectID: *project, EpicID: epicID, PhaseID: phaseID,
-		CreatedBy: db.ActorManager, Title: strings.TrimSpace(*title),
-		Kind: db.KindShip, Status: db.StatusPending, Footprint: parseTouches(*touches),
-		Effort: strings.ToLower(strings.TrimSpace(*effort)), Model: harness.NormalizeModel(*model),
-	}, db.ActorManager)
+	t, err := addBacklogTask(context.Background(), m.Store, m.P, taskAdd{
+		ID: id, ProjectID: *project, EpicID: *epic, PhaseID: *phase,
+		Title: *title, Touches: *touches, Brief: briefContent, Effort: *effort, Model: *model,
+		CitationsRef: *citationsRef, LintOffline: *offline, NoLint: *noLint,
+		Actor: db.ActorManager,
+	}, os.Stdout, os.Stderr)
 	if err != nil {
 		return err
 	}
-	// Persist the brief (keyed by task id) so dispatch — by the scheduler daemon or a manual
-	// spawn — launches the worker with it as the initial prompt. Done after the row exists, so a
-	// failed CreateTask never strands an orphan brief; a failure here is loud (the task is added
-	// but its brief is missing, which the lead should know to re-supply).
 	briefNote := ""
-	if briefContent != "" {
-		if err := m.WriteBrief(t.ID, briefContent); err != nil {
-			// The row exists but has no brief, so dispatch would fall back to the stub. Fail
-			// loudly with the recovery path rather than silently leave a brief-less task that the
-			// scheduler then dispatches on the stub.
-			return fmt.Errorf("task add: created %s but could not store its brief (%w); set it before dispatch with 'ttorch spawn %s <repo> --brief-file <path>', or remove the task with 'ttorch teardown %s'", t.ID, err, t.ID, t.ID)
-		}
+	if t.HasBrief {
 		briefNote = " with a stored brief"
 	}
 	fmt.Printf("added backlog task %s%s (project %d, status %s) — spawn it with: ttorch spawn %s <repo>\n", t.ID, briefNote, t.ProjectID, t.Status, t.ID)
@@ -970,7 +875,7 @@ func cmdTaskAdd(args []string) error {
 	// with no stored brief is left for the manager — it cannot be auto-dispatched without
 	// stranding the worker on the manager-send stub), so warn rather than let it silently
 	// sit undispatched.
-	if briefContent == "" {
+	if !t.HasBrief {
 		fmt.Fprintf(os.Stderr, "note: %s has no stored brief, so the scheduler will not auto-dispatch it (it is left for the manager). Add one with 'ttorch task add %s --brief-file <path>' / --brief, or dispatch it yourself with 'ttorch spawn %s <repo> --brief-file <path>'.\n", t.ID, t.ID, t.ID)
 	}
 	return nil

@@ -444,6 +444,11 @@ func (m *Manager) WriteBrief(taskID, content string) error {
 	return nil
 }
 
+// WriteBriefFile writes body to path as a task brief and records nothing in the store. It is
+// for a caller that sets has_brief itself, in the transaction that creates the task
+// (db.Store.AddTask); WriteBrief does both for a task that already exists.
+func WriteBriefFile(path, body string) error { return writeBrief(path, body) }
+
 // writeBrief writes body to path as a task brief, creating its parent directory.
 func writeBrief(path, body string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

@@ -191,6 +191,13 @@ func lintBriefForAdd(text, repo, citationsRef string, offline bool) error {
 // name the escape hatches. `task add` and `spawn` both store one, and for a while only the
 // first of them checked.
 func lintBriefBeforeStore(who, stored, text, repo, citationsRef string, offline bool) error {
+	return lintBriefTo(os.Stdout, os.Stderr, who, stored, text, repo, citationsRef, offline)
+}
+
+// lintBriefTo is lintBriefBeforeStore with the report written to out and the notes to errOut,
+// for a caller whose stdout is not a terminal's (the peer control channel answers in JSON on
+// stdout).
+func lintBriefTo(out, errOut io.Writer, who, stored, text, repo, citationsRef string, offline bool) error {
 	if strings.TrimSpace(text) == "" {
 		return nil
 	}
@@ -200,7 +207,7 @@ func lintBriefBeforeStore(who, stored, text, repo, citationsRef string, offline 
 		Offline:      offline,
 		Config:       brieflint.LoadConfig(repo),
 	})
-	printBriefLint(os.Stdout, "the supplied brief", rep)
+	printBriefLint(out, "the supplied brief", rep)
 	err := briefLintOutcome(rep, who)
 	var le lintError
 	if errors.As(err, &le) && le.code == exitLintPartial {
@@ -209,7 +216,7 @@ func lintBriefBeforeStore(who, stored, text, repo, citationsRef string, offline 
 		// coverage() names the real reason; this sentence must not re-assert a different
 		// one. It said "the rules the project disabled" even under --brief-lint-offline,
 		// which points the reader at an AGENTS.md that never mentions the rule.
-		fmt.Fprintf(os.Stderr, "note: %s. The %s proceeds; the rules that did not run were not checked.\n", coverage(rep), who)
+		fmt.Fprintf(errOut, "note: %s. The %s proceeds; the rules that did not run were not checked.\n", coverage(rep), who)
 		return nil
 	}
 	switch {
@@ -218,9 +225,9 @@ func lintBriefBeforeStore(who, stored, text, repo, citationsRef string, offline 
 		// Say plainly that this is not a verdict on the brief. The lint reaches the network
 		// for the target-branch check, so an unreachable remote lands here, and a worker
 		// whose add was refused should not go looking for a defect in the text.
-		fmt.Fprintf(os.Stderr, "note: nothing was %s, and this is NOT a verdict on the brief: the lint could not finish. An unreachable remote, a ref that does not resolve, or a citation it could not settle all land here. Resolve it, or re-run with --no-brief-lint to store the brief as written.\n", stored)
+		fmt.Fprintf(errOut, "note: nothing was %s, and this is NOT a verdict on the brief: the lint could not finish. An unreachable remote, a ref that does not resolve, or a citation it could not settle all land here. Resolve it, or re-run with --no-brief-lint to store the brief as written.\n", stored)
 	default:
-		fmt.Fprintf(os.Stderr, "note: nothing was %s. Fix the brief, or re-run with --no-brief-lint to store it as written.\n", stored)
+		fmt.Fprintf(errOut, "note: nothing was %s. Fix the brief, or re-run with --no-brief-lint to store it as written.\n", stored)
 	}
 	return err
 }
