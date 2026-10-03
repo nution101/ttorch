@@ -10,6 +10,7 @@ import (
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/gittest"
 	"github.com/nution101/ttorch/internal/orchestrator"
+	"github.com/nution101/ttorch/internal/tmuxtest"
 	"github.com/nution101/ttorch/internal/worktree"
 )
 
@@ -56,7 +57,16 @@ func TestMain(m *testing.M) {
 	// Clear any inherited GIT_DIR and the like (git rebase --exec exports one), so the git
 	// that fixtures and the code under test run acts on the temp repository it names.
 	gittest.Scrub()
+	// Run the package against a tmux server of its own, as internal/orchestrator's tests do:
+	// a test that reaches Spawn would otherwise open windows on the caller's server, and the
+	// cleanup kills that server through its pinned socket only.
+	tmuxServer, err := tmuxtest.Isolate()
+	if err != nil {
+		panic(err)
+	}
+	tmuxServer.StartReaper()
 	code := m.Run()
+	tmuxServer.Close()
 	_ = os.RemoveAll(home)
 	os.Exit(code)
 }

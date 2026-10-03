@@ -7,9 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -20,9 +18,14 @@ import (
 	"github.com/nution101/ttorch/internal/projectinit"
 	"github.com/nution101/ttorch/internal/review"
 	"github.com/nution101/ttorch/internal/tmux"
+	"github.com/nution101/ttorch/internal/tmuxtest"
 	"github.com/nution101/ttorch/internal/validate"
 	"github.com/nution101/ttorch/internal/worktree"
 )
+
+// testTmux is the package's private tmux server (TestMain). A test that runs tmux itself goes
+// through testTmux.Command, so it can reach no server but this one.
+var testTmux *tmuxtest.Server
 
 // TestMain disables native worker terminal views for the whole package. The
 // integration tests below exercise Spawn, which best-effort opens a terminal tab
@@ -63,14 +66,12 @@ func TestMain(m *testing.M) {
 	// so a window comes up without loading the caller's interactive zsh profile (about 0.5s
 	// a window on the build host). isShellCommand lists sh alongside zsh, so the launch
 	// detection under test does not change.
-	tmuxDir, err := os.MkdirTemp("", "ttx-")
+	testTmux, err = tmuxtest.Isolate()
 	if err != nil {
 		panic(err)
 	}
-	os.Unsetenv("TMUX")
-	os.Setenv("TMUX_TMPDIR", tmuxDir)
 	os.Setenv("SHELL", "/bin/sh")
-	startTmuxReaper(tmuxDir)
+	testTmux.StartReaper()
 	// The fixed pauses in a spawn and a teardown are sized for an agent's TUI and a real
 	// harness. Every test window runs a plain shell command, so they wait on nothing, and
 	// they add up to about 0.7s per spawn and teardown across some 200 spawns. Each one is a
@@ -83,34 +84,9 @@ func TestMain(m *testing.M) {
 	// that fixtures and the code under test run acts on the temp repository it names.
 	gittest.Scrub()
 	code := m.Run()
-	if tmux.Available() {
-		_ = exec.Command("tmux", "kill-server").Run()
-	}
-	_ = os.RemoveAll(tmuxDir)
+	testTmux.Close()
 	_ = os.RemoveAll(home)
 	os.Exit(code)
-}
-
-// startTmuxReaper starts a process that outlives this one to kill the package's private tmux
-// server once this test binary has exited, however it exits. TestMain kills the server itself
-// after m.Run, but a test that panics or hits -timeout ends the process from another goroutine,
-// where neither that code nor a defer in TestMain runs, and the server would be left running
-// with the windows of the test that died. The reaper polls for this pid once a second, so it
-// costs nothing while the tests run; it has no stdout or stderr, so go test does not wait on it,
-// and its own process group, so a signal to this one's does not reach it. Best-effort: if it
-// cannot start, the normal-exit kill-server below still runs.
-func startTmuxReaper(tmuxDir string) {
-	if !tmux.Available() {
-		return
-	}
-	reaper := exec.Command("/bin/sh", "-c",
-		`while kill -0 "$1" 2>/dev/null; do sleep 1; done; tmux kill-server 2>/dev/null; rm -rf "$2"`,
-		"tmux-reaper", strconv.Itoa(os.Getpid()), tmuxDir)
-	reaper.Env = append(os.Environ(), "TMUX_TMPDIR="+tmuxDir)
-	reaper.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := reaper.Start(); err == nil {
-		_ = reaper.Process.Release()
-	}
 }
 
 func TestDeriveState(t *testing.T) {
@@ -382,7 +358,7 @@ func TestSpawnPeekTeardown(t *testing.T) {
 	session := fmt.Sprintf("ttorch-test-%d", os.Getpid())
 	t.Setenv("TTORCH_HOME", t.TempDir())
 	t.Setenv("TTORCH_TMUX_SESSION", session)
-	t.Cleanup(func() { exec.Command("tmux", "kill-session", "-t", session).Run() })
+	t.Cleanup(func() { testTmux.Command("kill-session", "-t", session).Run() })
 
 	m, err := New(paths.Default())
 	if err != nil {
@@ -856,7 +832,7 @@ func TestTeardownRefusesDirtyWorktree(t *testing.T) {
 	session := fmt.Sprintf("ttorch-test-dirty-%d", os.Getpid())
 	t.Setenv("TTORCH_HOME", t.TempDir())
 	t.Setenv("TTORCH_TMUX_SESSION", session)
-	t.Cleanup(func() { exec.Command("tmux", "kill-session", "-t", session).Run() })
+	t.Cleanup(func() { testTmux.Command("kill-session", "-t", session).Run() })
 
 	m, err := New(paths.Default())
 	if err != nil {
@@ -918,7 +894,7 @@ func TestDeliveryLifecycle(t *testing.T) {
 	session := fmt.Sprintf("ttorch-deliver-%d", os.Getpid())
 	t.Setenv("TTORCH_HOME", t.TempDir())
 	t.Setenv("TTORCH_TMUX_SESSION", session)
-	t.Cleanup(func() { exec.Command("tmux", "kill-session", "-t", session).Run() })
+	t.Cleanup(func() { testTmux.Command("kill-session", "-t", session).Run() })
 
 	m, err := New(paths.Default())
 	if err != nil {
@@ -995,7 +971,7 @@ func TestMergeLocal_ApprovalBinding(t *testing.T) {
 	session := fmt.Sprintf("ttorch-bind-%d", os.Getpid())
 	t.Setenv("TTORCH_HOME", t.TempDir())
 	t.Setenv("TTORCH_TMUX_SESSION", session)
-	t.Cleanup(func() { exec.Command("tmux", "kill-session", "-t", session).Run() })
+	t.Cleanup(func() { testTmux.Command("kill-session", "-t", session).Run() })
 
 	m, err := New(paths.Default())
 	if err != nil {
@@ -1094,7 +1070,7 @@ func deliveryHarness(t *testing.T, tag string) (*Manager, string) {
 	session := fmt.Sprintf("ttorch-%s-%d", tag, os.Getpid())
 	t.Setenv("TTORCH_HOME", t.TempDir())
 	t.Setenv("TTORCH_TMUX_SESSION", session)
-	t.Cleanup(func() { exec.Command("tmux", "kill-session", "-t", session).Run() })
+	t.Cleanup(func() { testTmux.Command("kill-session", "-t", session).Run() })
 	m, err := New(paths.Default())
 	if err != nil {
 		t.Fatal(err)
@@ -2586,7 +2562,7 @@ func TestSpawnAutoInit_DoesNotBlockMergeLocal(t *testing.T) {
 	session := fmt.Sprintf("ttorch-aimerge-%d", os.Getpid())
 	t.Setenv("TTORCH_HOME", t.TempDir())
 	t.Setenv("TTORCH_TMUX_SESSION", session)
-	t.Cleanup(func() { exec.Command("tmux", "kill-session", "-t", session).Run() })
+	t.Cleanup(func() { testTmux.Command("kill-session", "-t", session).Run() })
 	m, err := New(paths.Default())
 	if err != nil {
 		t.Fatal(err)
@@ -2636,7 +2612,7 @@ func TestStopSession(t *testing.T) {
 	session := fmt.Sprintf("ttorch-stop-%d", os.Getpid())
 	t.Setenv("TTORCH_HOME", t.TempDir())
 	t.Setenv("TTORCH_TMUX_SESSION", session)
-	t.Cleanup(func() { exec.Command("tmux", "kill-session", "-t", session).Run() })
+	t.Cleanup(func() { testTmux.Command("kill-session", "-t", session).Run() })
 
 	m, err := New(paths.Default())
 	if err != nil {
@@ -2674,7 +2650,7 @@ func TestRestoreAndReset(t *testing.T) {
 	session := fmt.Sprintf("ttorch-restore-%d", os.Getpid())
 	t.Setenv("TTORCH_HOME", t.TempDir())
 	t.Setenv("TTORCH_TMUX_SESSION", session)
-	t.Cleanup(func() { exec.Command("tmux", "kill-session", "-t", session).Run() })
+	t.Cleanup(func() { testTmux.Command("kill-session", "-t", session).Run() })
 
 	m, err := New(paths.Default())
 	if err != nil {

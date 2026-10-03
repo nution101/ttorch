@@ -83,7 +83,7 @@ func TestTaskState_AgentExitedLeavesShell(t *testing.T) {
 	t.Setenv("TTORCH_DB", filepath.Join(t.TempDir(), "state.db"))
 	t.Setenv("TTORCH_TMUX_SESSION", session)
 	t.Setenv("TTORCH_NO_AUTOINIT", "1")
-	t.Cleanup(func() { exec.Command("tmux", "kill-session", "-t", session).Run() })
+	t.Cleanup(func() { testTmux.Command("kill-session", "-t", session).Run() })
 
 	m, err := New(paths.Default())
 	if err != nil {
