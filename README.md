@@ -373,6 +373,13 @@ in fixed order — **supervise → dispatch → gate → land**:
 > daemon runs all three passes. The scheduler **lands only already-gated work** — the
 > manager and the lead still own gating and (in non-trusted modes) approval.
 
+A coordinator with peers (`ttorch peer add`) also polls each of them on its own cadence,
+`TTORCH_PEER_POLL` (default 30s, `0` turns it off), in the background so a slow peer never
+delays a tick. Each escalation open on a peer becomes one actionable `peer_escalation` event
+here, its text escaped and capped. Three failed polls in a row raise one `peer_unreachable`;
+a peer that answers without a manager window or a running scheduler gets up to three
+`ensure-up` calls, then one `peer_down`.
+
 To feed the autonomy loop, give each backlog task a **file-granular `--touches` footprint**
 and a **stored brief** (`--brief-file`). Without both, the scheduler leaves the task for the
 manager to dispatch by hand.

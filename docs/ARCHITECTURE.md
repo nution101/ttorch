@@ -1253,6 +1253,30 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   only as a file: when it cannot be written, or the row cannot be read, the peer's manager is
   not launched and the restore says why, where a root's falls back to the inline manager
   charter.
+- **Peer pass.** The scheduler daemon polls each `live` or `unreachable` peer every
+  `TTORCH_PEER_POLL` (a Go duration, default 30s; zero or less turns it off), through the same
+  control client and key as the peer commands (`internal/cli/peerpoll.go` adapts the client to
+  `internal/scheduler/peerpass.go`). The tick only starts a pass when one is due and does not
+  wait for it. Each peer is polled in its own goroutine under a 90s deadline, on top of the
+  client's 30s per call, and a peer still being polled when the next pass is due is skipped by
+  that pass, so a peer that never answers delays neither the tick nor the other peers. A poll
+  calls `summary`, then `decisions` above the peer's `escalation_cursor`, caches the summary on
+  the peer's row, and raises each escalation above the cursor as one actionable event: entity
+  `system`, entity id and actor `peer:<name>`, type `peer_escalation`, with a JSON payload of the
+  escalation's id, kind, task and body and the peer's open count. At most 32 are raised per poll,
+  lowest id first, and the rest on the next polls. The events and the cursor move in one
+  transaction, which re-reads the cursor, so a crash or a restart neither loses nor repeats one
+  and two schedulers on one store raise each once. Peer text is escaped again if it still holds
+  a non-printing rune, and each payload is at most 2 KiB. A poll that fails (a timeout, a
+  transport error, a refusal, another protocol major or summary schema) counts toward the
+  peer's `consecutive_failures`; the third in a row marks it `unreachable` and appends one
+  actionable `peer_unreachable`, and nothing more is appended until a poll succeeds, which sets
+  it `live` and appends a non-actionable `peer_recovered`. A peer that answers but reports no
+  manager window, or a scheduler that is not running or is stalled, is down: each poll then
+  takes one step of the down episode in `down_attempts`, claimed in the store before the call
+  is made. The first 3 steps are an `ensure-up` call each, the fourth appends one actionable
+  `peer_down` (and leaves `down_attempts` at 4), and later steps do nothing until a poll finds
+  the peer healthy, which resets it to 0. `ttorch scheduler --once` runs no peer pass.
 
 Migrations, in order: **0001** initial hierarchy + events + manager singleton; **0002**
 durable verdicts; **0003** task leases + the terminal `failed` status; **0004** the
