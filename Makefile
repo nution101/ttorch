@@ -17,12 +17,20 @@ install:
 	ln -sf $(HOME)/.ttorch/bin/ttorch $(HOME)/.local/bin/ttorch
 	$(HOME)/.ttorch/bin/ttorch install
 
+# Every go test here runs under an explicit -timeout rather than go's 10m default, which the
+# full internal/orchestrator run used to exceed on its own (669s in one process on the build
+# host). Each value is several times the lane's measured run time there, so it fires on a hang,
+# not on a busy machine. Override one for a slower machine, e.g. TEST_TIMEOUT=40m.
+TEST_TIMEOUT      ?= 20m
+TEST_FAST_TIMEOUT ?= 10m
+TEST_GATE_TIMEOUT ?= 10m
+
 # Full test suite — every test, including the slow internal/orchestrator integration
-# (e2e) tests that drive real tmux/git/rebase/validate (~100s). This is the authoritative
-# gate: CI runs it on every push/PR (.github/workflows/ci.yml). TESTFLAGS lets CI add
-# -race without changing the default local invocation.
+# (e2e) tests that drive real tmux/git/rebase/validate. This is the authoritative gate: CI
+# runs it on every push/PR (.github/workflows/ci.yml). TESTFLAGS lets CI add -race without
+# changing the default local invocation.
 test:
-	go test $(TESTFLAGS) ./...
+	go test $(TESTFLAGS) -timeout $(TEST_TIMEOUT) ./...
 
 # The gate's own proofs. `.ttorch/validate.sh` runs this ON TOP of test-fast, because the
 # fast lane skips them: 16 of the 18 tests in gateattacks_test.go reach deliveryHarness,
@@ -45,8 +53,8 @@ GATE_TESTS = '^(TestApprovalPayloadScope|TestApprovalPayload_RoundTripsEveryGran
 # reads the repository through, and fails if one is missing here or is run behind a -run
 # selector that matches none of its tests and so exits 0 having run nothing.
 test-gate:
-	go test $(TESTFLAGS) -run $(GATE_TESTS) ./internal/orchestrator/
-	go test $(TESTFLAGS) ./internal/worktree/
+	go test $(TESTFLAGS) -timeout $(TEST_GATE_TIMEOUT) -run $(GATE_TESTS) ./internal/orchestrator/
+	go test $(TESTFLAGS) -timeout $(TEST_GATE_TIMEOUT) ./internal/worktree/
 
 # Fast lane — `-short` skips the slow internal/orchestrator integration tests, leaving the
 # unit coverage that finishes in seconds. Used by the local trusted gate
@@ -54,7 +62,7 @@ test-gate:
 # suite (incl. those e2e tests) still runs in CI before anything can land, so the gate is
 # not weakened.
 test-fast:
-	go test -short $(TESTFLAGS) ./...
+	go test -short $(TESTFLAGS) -timeout $(TEST_FAST_TIMEOUT) ./...
 
 vet:
 	go vet ./...
