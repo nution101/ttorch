@@ -509,3 +509,67 @@ func TestSummaryEscalations(t *testing.T) {
 		}
 	}
 }
+
+// TestLongTaskIDsAreCapped covers the one string in the summary and the decision list that a
+// worker chooses: a follow-on task's id, which nothing bounds at creation. Wherever an id is
+// printed it is cut to MaxIDText, and so is a repo path to MaxText, in both renderings.
+func TestLongTaskIDsAreCapped(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	proj, ok, err := f.store.GetProjectByRepo(ctx, repoPath)
+	if err != nil || !ok {
+		t.Fatal(err)
+	}
+	longID := "follow-on-" + strings.Repeat("x", 10_000)
+	if _, err := f.store.CreateTask(ctx, db.Task{ID: longID, ProjectID: proj.ID, Kind: db.KindShip, Window: "w-long"}, db.ActorManager); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.ReportStatus(ctx, longID, db.StatusNeedsInput, "worker:"+longID, "?"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.UpsertProject(ctx, "/repos/"+strings.Repeat("p", 3*MaxText), ""); err != nil {
+		t.Fatal(err)
+	}
+	sum, err := Build(ctx, f.sources(t), f.now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, it := range sum.Decisions.Items {
+		if strings.HasPrefix(it.TaskID, "follow-on-") {
+			found = true
+			if len(it.TaskID) > MaxIDText || !strings.HasSuffix(it.TaskID, truncated) {
+				t.Errorf("summary decision task id is %d bytes, want cut to %d", len(it.TaskID), MaxIDText)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("the long-id task is not among the decisions; the test asserts nothing")
+	}
+	for _, r := range sum.Repos {
+		if len(r.Path) > MaxText || len(r.Name) > MaxText {
+			t.Errorf("repo path %d / name %d bytes, want both capped at %d", len(r.Path), len(r.Name), MaxText)
+		}
+	}
+	var js, text strings.Builder
+	if err := sum.WriteJSON(&js); err != nil {
+		t.Fatal(err)
+	}
+	if err := sum.WriteText(&text); err != nil {
+		t.Fatal(err)
+	}
+	for _, out := range []string{js.String(), text.String()} {
+		if strings.Contains(out, strings.Repeat("x", MaxIDText)) {
+			t.Error("a rendering carries the uncapped id")
+		}
+	}
+
+	esc, err := f.store.OpenEscalation(ctx, longID, db.EscalationQuestion, "q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	list := NewDecisionList([]db.Escalation{esc}, f.now)
+	if got := list.Escalations[0].TaskID; len(got) > MaxIDText || !strings.HasSuffix(got, truncated) {
+		t.Errorf("decision list task id is %d bytes, want cut to %d", len(got), MaxIDText)
+	}
+}

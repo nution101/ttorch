@@ -34,6 +34,7 @@ const SchemaVersion = 2
 // GeneratedAt, floored at zero, and null when the thing it measures has never happened. The
 // strings it does carry (task ids, repo paths, statuses, modes) come from the DB or a repo and
 // are escaped (see escape), so the summary is safe to print to a terminal in either rendering.
+// Task ids are capped at MaxIDText and paths at MaxText, so no field grows without bound.
 type Summary struct {
 	SchemaVersion int          `json:"schema_version"`
 	GeneratedAt   time.Time    `json:"generated_at"`
@@ -213,7 +214,7 @@ func workers(snap board.Snapshot) WorkerCounts {
 func decisions(snap board.Snapshot, now time.Time) Decisions {
 	d := Decisions{Pending: snap.Pending(), Items: []Decision{}}
 	add := func(kind, task, project string, eventID int64, at *time.Time) {
-		it := Decision{Kind: kind, TaskID: escape(task), Project: escape(project), EventID: eventID}
+		it := Decision{Kind: kind, TaskID: SafeID(task), Project: SafeText(project), EventID: eventID}
 		if at != nil {
 			it.AgeSeconds = age(now, *at)
 		}
@@ -283,9 +284,9 @@ func repos(ctx context.Context, src Sources) ([]Repo, error) {
 		if p.Status == "archived" {
 			continue
 		}
-		r := Repo{Path: escape(p.RepoPath), Name: escape(filepath.Base(p.RepoPath)), Mode: "pr"}
+		r := Repo{Path: SafeText(p.RepoPath), Name: SafeText(filepath.Base(p.RepoPath)), Mode: "pr"}
 		if src.Mode != nil {
-			r.Mode = escape(src.Mode(p.RepoPath))
+			r.Mode = SafeText(src.Mode(p.RepoPath))
 		}
 		if src.FreeSlots != nil {
 			r.FreeSlots = src.FreeSlots(p.RepoPath)

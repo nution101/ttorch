@@ -70,13 +70,13 @@ func cmdEscalate(args []string) error {
 		return err
 	}
 	if !ok {
-		return fmt.Errorf("escalate: task %s not found", peer.SafeText(*task))
+		return fmt.Errorf("escalate: task %s not found", peer.SafeID(*task))
 	}
 	// An approval escalation stands for a done task waiting on the lead, and it is resolved
 	// once the task leaves done (db.SyncApprovalEscalations); raising one for any other task
 	// would be resolved on the next read.
 	if *kind == db.EscalationApproval && t.Status != db.StatusDone {
-		return fmt.Errorf("escalate: an approval escalation is for a done task; %s is %s", peer.SafeText(t.ID), t.Status)
+		return fmt.Errorf("escalate: an approval escalation is for a done task; %s is %s", peer.SafeID(t.ID), t.Status)
 	}
 	if _, cut := db.CapText(*msg, db.MaxEscalationText); cut {
 		fmt.Fprintf(os.Stderr, "ttorch: the message was cut to %d bytes\n", db.MaxEscalationText)
@@ -85,7 +85,7 @@ func cmdEscalate(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("escalation #%d opened: %s for task %s (the lead sees it in ttorch decisions)\n", esc.ID, esc.Kind, peer.SafeText(esc.TaskID))
+	fmt.Printf("escalation #%d opened: %s for task %s (the lead sees it in ttorch decisions)\n", esc.ID, esc.Kind, peer.SafeID(esc.TaskID))
 	return nil
 }
 

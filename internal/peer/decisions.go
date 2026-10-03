@@ -19,6 +19,10 @@ const DecisionsSchemaVersion = 1
 // several times over, so the printed form is capped again.
 const MaxText = db.MaxEscalationText
 
+// MaxIDText is the cap, after escaping, on a printed task id. A worker names its own follow-on
+// tasks and nothing bounds an id's length at creation, so an id is capped tighter than free text.
+const MaxIDText = 128
+
 // truncated marks a printed field the cap cut short.
 const truncated = "…"
 
@@ -52,7 +56,7 @@ func NewDecisionList(open []db.Escalation, now time.Time) DecisionList {
 		d.Escalations = append(d.Escalations, EscalationItem{
 			ID:            e.ID,
 			Kind:          SafeText(e.Kind),
-			TaskID:        SafeText(e.TaskID),
+			TaskID:        SafeID(e.TaskID),
 			Body:          SafeText(e.Body),
 			SourceEventID: e.SourceEventID,
 			CreatedAt:     e.CreatedAt.UTC(),
@@ -102,8 +106,11 @@ func (d DecisionList) WriteText(w io.Writer) error {
 }
 
 // SafeText is escalation text made safe to print: escaped (see escape) and capped at MaxText
-// bytes. Commands that echo an escalation's task id or text use it.
+// bytes. Commands that echo an escalation's text use it.
 func SafeText(s string) string { return escapeCap(s, MaxText) }
+
+// SafeID is a task id made safe to print: escaped and capped at MaxIDText bytes.
+func SafeID(s string) string { return escapeCap(s, MaxIDText) }
 
 // escapeCap escapes s and cuts the result to at most n bytes, never inside one rune's escape,
 // ending a cut value with truncated.
