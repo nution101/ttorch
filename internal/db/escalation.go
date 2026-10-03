@@ -19,8 +19,10 @@ import (
 //
 // Nothing here can tell who typed an answer. The CLI refuses a worker context, but a process
 // running as the lead's uid can step around that or write this database directly, so an
-// answer is recorded as relayed by the manager (answered_by, and the event's actor), never as
-// the lead. An answer only carries text: it mints no approval and passes no gate.
+// answer is recorded as relayed by whoever passed it on (answered_by, and the event's actor):
+// the manager for `ttorch answer`, the parent coordinator for one that arrives over the peer
+// control channel. Never as the lead. An answer only carries text: it mints no approval and
+// passes no gate.
 //
 // Body and answer text can come from a worker by way of the manager, and will come from
 // another machine once peers exist, so the store caps it (CapText) and keeps it otherwise as
@@ -60,6 +62,21 @@ const EventEscalationAnswered = "escalation_answered"
 
 // requestVerbAnswer is the peer_requests verb an answer is stored under.
 const requestVerbAnswer = "answer"
+
+// ErrEscalationNotFound and ErrEscalationNotOpen are an answer for an escalation that does not
+// exist, and for one that is no longer open.
+var (
+	ErrEscalationNotFound = errors.New("escalation not found")
+	ErrEscalationNotOpen  = errors.New("escalation is not open")
+)
+
+// answerRelayers are the actors an answer may be recorded under, and how the event names each.
+// It is a list of what is allowed rather than a refusal of the lead, so a new caller cannot
+// record an unverified answer under some other identity-sounding name either.
+var answerRelayers = map[string]string{
+	ActorManager: "the manager",
+	ActorParent:  "the parent coordinator",
+}
 
 // Escalation is one row of the escalations table. TaskID is "" when the escalation names no
 // task (its task was deleted); SourceEventID is 0 unless an approval_required event is behind
@@ -249,9 +266,14 @@ type AnswerResult struct {
 // never append a second event. A request id already used for another escalation, or a new
 // request id for an escalation that is no longer open, is refused.
 //
-// actor is who records the answer, stored as answered_by and as the event's actor. It may not
-// be the lead: the store cannot tell who typed the text, so it never claims the lead did. The
-// CLI passes the manager, which relays the lead's words.
+// actor is who records the answer, stored as answered_by and as the event's actor: the
+// manager (the CLI, which relays the lead's words) or the parent coordinator (the peer control
+// channel). Nothing else is accepted, the lead included: the store cannot tell who typed the
+// text, so it never claims the lead did.
+//
+// A request id stored for another verb, or for another escalation, is refused with
+// ErrRequestReused; an unknown escalation with ErrEscalationNotFound, and a new request id for
+// an escalation that is no longer open with ErrEscalationNotOpen.
 //
 // The answer is capped at MaxEscalationText, and so is the event's payload, which carries the
 // escalation id, its task, who relayed the answer, and the answer.
@@ -259,8 +281,9 @@ func (s *Store) AnswerEscalation(ctx context.Context, id int64, requestID, answe
 	if err := ValidRequestID(requestID); err != nil {
 		return AnswerResult{}, err
 	}
-	if actor == "" || actor == ActorLead {
-		return AnswerResult{}, fmt.Errorf("an answer is recorded as relayed by its caller, not as %q: nothing verifies who typed it", actor)
+	relayer, ok := answerRelayers[actor]
+	if !ok {
+		return AnswerResult{}, fmt.Errorf("an answer is recorded as relayed by the manager or the parent coordinator, not as %q: nothing verifies who typed it", actor)
 	}
 	if strings.TrimSpace(answer) == "" {
 		return AnswerResult{}, errors.New("answer is empty")
@@ -269,35 +292,33 @@ func (s *Store) AnswerEscalation(ctx context.Context, id int64, requestID, answe
 	now := s.now()
 	var out AnswerResult
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
-		var verb, stored string
-		err := tx.QueryRowContext(ctx,
-			`SELECT verb, result FROM peer_requests WHERE request_id = ?`, requestID).Scan(&verb, &stored)
-		switch {
-		case err == nil:
+		verb, stored, seen, err := storedRequest(ctx, tx, requestID)
+		if err != nil {
+			return err
+		}
+		if seen {
 			if verb != requestVerbAnswer {
-				return fmt.Errorf("request id %s was already used for %s", requestID, verb)
+				return fmt.Errorf("request id %s was already used for %s: %w", requestID, verb, ErrRequestReused)
 			}
 			if err := json.Unmarshal([]byte(stored), &out); err != nil {
 				return fmt.Errorf("request id %s: stored result unreadable: %w", requestID, err)
 			}
 			if out.Escalation.ID != id {
-				return fmt.Errorf("request id %s already answered escalation %d", requestID, out.Escalation.ID)
+				return fmt.Errorf("request id %s already answered escalation %d: %w", requestID, out.Escalation.ID, ErrRequestReused)
 			}
 			out.Replayed = true
 			return nil
-		case err != sql.ErrNoRows:
-			return err
 		}
 
 		esc, err := getEscalation(ctx, tx, id)
 		if err == sql.ErrNoRows {
-			return fmt.Errorf("escalation %d not found", id)
+			return fmt.Errorf("escalation %d: %w", id, ErrEscalationNotFound)
 		}
 		if err != nil {
 			return err
 		}
 		if esc.Status != EscalationOpen {
-			return fmt.Errorf("escalation %d is %s, not open", id, esc.Status)
+			return fmt.Errorf("escalation %d is %s, not open: %w", id, esc.Status, ErrEscalationNotOpen)
 		}
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE escalations SET status = 'answered', answer = ?, answered_by = ?, answer_request_id = ?, resolved_at = ?
@@ -308,10 +329,6 @@ func (s *Store) AnswerEscalation(ctx context.Context, id int64, requestID, answe
 		payload := fmt.Sprintf("escalation %d", id)
 		if esc.TaskID != "" {
 			payload += " (task " + esc.TaskID + ")"
-		}
-		relayer := actor
-		if actor == ActorManager {
-			relayer = "the manager"
 		}
 		payload, _ = CapText(payload+" answer relayed by "+relayer+": "+answer, MaxEscalationText)
 		eventID, err := appendEvent(ctx, tx, now, Event{
@@ -325,14 +342,7 @@ func (s *Store) AnswerEscalation(ctx context.Context, id int64, requestID, answe
 			return err
 		}
 		out = AnswerResult{Escalation: esc, EventID: eventID}
-		result, err := json.Marshal(out)
-		if err != nil {
-			return err
-		}
-		_, err = tx.ExecContext(ctx,
-			`INSERT INTO peer_requests (request_id, verb, result, created_at) VALUES (?, ?, ?, ?)`,
-			requestID, requestVerbAnswer, string(result), formatTime(now))
-		return err
+		return storeRequest(ctx, tx, now, requestID, requestVerbAnswer, out)
 	})
 	if err != nil {
 		return AnswerResult{}, err

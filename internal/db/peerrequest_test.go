@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -234,5 +235,106 @@ func TestAddTaskConcurrentRepeats(t *testing.T) {
 	wg.Wait()
 	if fresh != 1 || replayed != len(stores)-1 || writes != 1 {
 		t.Errorf("fresh %d, replayed %d, brief writes %d; want 1, %d, 1", fresh, replayed, writes, len(stores)-1)
+	}
+}
+
+// TestRecordGoalOncePerRequest proves a goal appends one actionable event addressed to the
+// manager, recorded as the parent coordinator's, and that a repeat of its request id returns
+// the first event and appends nothing.
+func TestRecordGoalOncePerRequest(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	res, err := s.RecordGoal(ctx, "goal-1", "split the importer into three tasks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Replayed || res.EventID == 0 {
+		t.Fatalf("goal = %+v", res)
+	}
+	evs := managerEvents(t, s)
+	if len(evs) != 1 {
+		t.Fatalf("manager events = %d, want 1", len(evs))
+	}
+	ev := evs[0]
+	if ev.ID != res.EventID || ev.Type != EventGoal || ev.Actor != ActorParent || ev.EntityID != "manager" ||
+		!ev.Actionable || ev.Payload != "split the importer into three tasks" {
+		t.Errorf("goal event = %+v", ev)
+	}
+
+	again, err := s.RecordGoal(ctx, "goal-1", "something else entirely")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !again.Replayed || again.EventID != res.EventID {
+		t.Errorf("repeat = %+v, want the first event replayed", again)
+	}
+	if n := len(managerEvents(t, s)); n != 1 {
+		t.Errorf("manager events after a repeat = %d, want 1", n)
+	}
+
+	big := strings.Repeat("g", MaxEscalationText+10)
+	capped, err := s.RecordGoal(ctx, "goal-big", big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evs := managerEvents(t, s); len(evs[len(evs)-1].Payload) != MaxEscalationText || evs[len(evs)-1].ID != capped.EventID {
+		t.Errorf("a goal's payload must be capped at %d bytes", MaxEscalationText)
+	}
+
+	if _, err := s.RecordGoal(ctx, "goal-2", "  \n"); err == nil {
+		t.Error("an empty goal was accepted")
+	}
+	if _, err := s.RecordGoal(ctx, "bad id", "x"); err == nil {
+		t.Error("an invalid request id was accepted")
+	}
+	mkPendingTask(t, s, "g1", nil)
+	esc, err := s.OpenEscalation(ctx, "g1", EscalationQuestion, "q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AnswerEscalation(ctx, esc.ID, "req-answer", "a", ActorManager); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecordGoal(ctx, "req-answer", "x"); !errors.Is(err, ErrRequestReused) {
+		t.Errorf("a goal under an answer's request id: want ErrRequestReused, got %v", err)
+	}
+	if _, err := s.AnswerEscalation(ctx, esc.ID, "goal-1", "a", ActorManager); !errors.Is(err, ErrRequestReused) {
+		t.Errorf("an answer under a goal's request id: want ErrRequestReused, got %v", err)
+	}
+}
+
+// TestAnswerEscalationFromTheParent proves an answer relayed by the parent coordinator is
+// recorded as the parent's, never as the lead or the local manager, and that the store accepts
+// only the two relaying actors it knows.
+func TestAnswerEscalationFromTheParent(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	mkPendingTask(t, s, "p1", nil)
+	esc, err := s.OpenEscalation(ctx, "p1", EscalationQuestion, "which schema?")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, actor := range []string{"human", "worker:p1", ActorSystem, "Parent"} {
+		if _, err := s.AnswerEscalation(ctx, esc.ID, "req-"+strings.ReplaceAll(actor, ":", "-"), "x", actor); err == nil {
+			t.Errorf("an answer recorded as %q was accepted", actor)
+		}
+	}
+	res, err := s.AnswerEscalation(ctx, esc.ID, "req-parent", "the second one", ActorParent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Escalation.AnsweredBy != ActorParent {
+		t.Errorf("answered_by = %q, want %q", res.Escalation.AnsweredBy, ActorParent)
+	}
+	evs := managerEvents(t, s)
+	if len(evs) != 1 || evs[0].Actor != ActorParent ||
+		evs[0].Payload != "escalation 1 (task p1) answer relayed by the parent coordinator: the second one" {
+		t.Errorf("answer events = %+v", evs)
+	}
+	if _, err := s.AnswerEscalation(ctx, 999, "req-none", "x", ActorParent); !errors.Is(err, ErrEscalationNotFound) {
+		t.Errorf("unknown escalation: want ErrEscalationNotFound, got %v", err)
+	}
+	if _, err := s.AnswerEscalation(ctx, esc.ID, "req-late", "x", ActorParent); !errors.Is(err, ErrEscalationNotOpen) {
+		t.Errorf("answered escalation: want ErrEscalationNotOpen, got %v", err)
 	}
 }

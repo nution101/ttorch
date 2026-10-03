@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -203,6 +204,66 @@ func (s *Store) AddTask(ctx context.Context, a TaskAdd) (TaskAddResult, error) {
 	})
 	if err != nil {
 		return TaskAddResult{}, err
+	}
+	return out, nil
+}
+
+// EventGoal is what a goal from the parent coordinator appends: entity manager, actor parent,
+// actionable, payload the goal's text, capped.
+const EventGoal = "goal"
+
+// GoalResult is what a goal appended: the manager event that carries it. Replayed is set when
+// the request id had already been used and this is the stored result.
+type GoalResult struct {
+	EventID  int64 `json:"event_id"`
+	Replayed bool  `json:"-"`
+}
+
+// RecordGoal hands the manager plain-language work from the parent coordinator, once per
+// request id. In one transaction it appends one actionable event addressed to the manager,
+// recorded as the parent's (ActorParent), and stores the result under requestID. A repeat of
+// requestID returns the stored event and appends nothing, whatever text it carries; an id
+// stored for another verb is refused with ErrRequestReused.
+//
+// The text is capped at MaxEscalationText, like an answer. The event is the only record of the
+// goal: the manager reads it and turns it into tasks.
+func (s *Store) RecordGoal(ctx context.Context, requestID, text string) (GoalResult, error) {
+	if err := ValidRequestID(requestID); err != nil {
+		return GoalResult{}, err
+	}
+	if strings.TrimSpace(text) == "" {
+		return GoalResult{}, errors.New("goal is empty")
+	}
+	text, _ = CapText(text, MaxEscalationText)
+	now := s.now()
+	var out GoalResult
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		verb, stored, seen, err := storedRequest(ctx, tx, requestID)
+		if err != nil {
+			return err
+		}
+		if seen {
+			if verb != RequestVerbGoal {
+				return fmt.Errorf("request id %s was already used for %s: %w", requestID, verb, ErrRequestReused)
+			}
+			if err := json.Unmarshal([]byte(stored), &out); err != nil {
+				return fmt.Errorf("request id %s: stored result unreadable: %w", requestID, err)
+			}
+			out.Replayed = true
+			return nil
+		}
+		id, err := appendEvent(ctx, tx, now, Event{
+			EntityType: EntityTypeManager, EntityID: "manager", Type: EventGoal,
+			Actor: ActorParent, Actionable: true, Payload: text,
+		})
+		if err != nil {
+			return err
+		}
+		out = GoalResult{EventID: id}
+		return storeRequest(ctx, tx, now, requestID, RequestVerbGoal, out)
+	})
+	if err != nil {
+		return GoalResult{}, err
 	}
 	return out, nil
 }

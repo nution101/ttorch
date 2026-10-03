@@ -75,11 +75,13 @@ const (
 	EntityTypeSystem  = "system"
 )
 
-// Common actors (events.actor / notes.author). worker:<id> is also valid.
+// Common actors (events.actor / notes.author). worker:<id> is also valid. ActorParent is the
+// parent coordinator, for what arrives over the peer control channel (`ttorch peer serve`).
 const (
 	ActorManager = "manager"
 	ActorLead    = "lead"
 	ActorSystem  = "system"
+	ActorParent  = "parent"
 )
 
 // EntityKind identifies a hierarchy table for SetEntityStatus. It maps to a fixed
