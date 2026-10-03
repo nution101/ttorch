@@ -1480,7 +1480,11 @@ func TestNoRuleReportsAnUnboundedNumberOfFindings(t *testing.T) {
 	if len(body) > MaxBriefBytes {
 		t.Fatalf("fixture is %d bytes, over the %d byte cap", len(body), MaxBriefBytes)
 	}
-	r := Lint(body, Options{})
+	// The caps are under test here, not the run budget, and this brief takes about 30s to lint
+	// under -race on the build host: within reach of the 45s default on a loaded machine, where
+	// a rule that runs out reports the budget finding instead of its capped list. The budget's
+	// own expiry is covered by TestTextRulesStopWhenTheBudgetIsSpent.
+	r := Lint(body, Options{Budget: 10 * time.Minute})
 
 	for _, id := range []RuleID{RuleHardCounts, RuleProhibition} {
 		fs := findingsFor(r, id)
