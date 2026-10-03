@@ -28,6 +28,10 @@ func TestMain(m *testing.M) {
 	if cfg := os.Getenv(testSSHShimEnv); cfg != "" {
 		os.Exit(runSSHShim(cfg, os.Args[1:]))
 	}
+	// A stand-in for the scheduler daemon that only holds its singleton lock (peermanager_test.go).
+	if lock := os.Getenv(testHoldSchedulerEnv); lock != "" {
+		os.Exit(holdScheduler(lock))
+	}
 	// A test that runs ttorch as its own process (peerserve_test.go) re-enters this binary with
 	// runMainEnv set, and it runs Main as cmd/ttorch's main does, with the environment the test
 	// gave it.

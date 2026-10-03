@@ -571,6 +571,10 @@ func (m *Manager) StartManager() error {
 	}
 
 	// Fresh start: no saved session.
+	charter, err := m.charterFile()
+	if err != nil {
+		return err
+	}
 	dir := cwd()
 	sid := harness.NewSessionID()
 	if err := m.Store.SetManager(context.Background(), db.Manager{Dir: dir, SessionID: sid}); err != nil {
@@ -580,19 +584,35 @@ func (m *Manager) StartManager() error {
 	if err := m.newWindow("manager", dir, "manager"); err != nil {
 		return err
 	}
-	_ = m.backend().SendLine(m.Session, "manager", harness.ManagerCommand(harness.Resolve(), sid, m.charterFile()))
+	_ = m.backend().SendLine(m.Session, "manager", harness.ManagerCommand(harness.Resolve(), sid, charter))
 	fmt.Fprintf(os.Stderr, "ttorch: manager started in %s — tell it the repo to work on; 'ttorch stop' to end.\n", dir)
 	return m.attachManager()
 }
 
-// charterFile ensures the manager charter file exists and returns its path; on a
-// write failure it returns "" so the launch falls back to an inline charter.
-func (m *Manager) charterFile() string {
-	p := m.P.ManagerCharterFile()
-	if err := harness.WriteManagerCharter(p); err != nil {
-		return ""
+// charterFile writes the charter this coordinator's manager launches with and returns its
+// path. Which charter is the coordinator row's to say. A root's manager gets the manager
+// charter, and when that cannot be written charterFile returns "" so the launch falls back to
+// the inline manager charter. A peer's manager gets the peer charter: nobody reads a peer's
+// manager tab, so it escalates what it would otherwise ask there. The peer charter is passed only
+// as a file, and the inline manager charter would have a peer's manager wait in its tab for a lead
+// who never reads it, so for a peer a failed write is an error and the manager is not launched.
+// So is a coordinator row that cannot be read, since then the role is unknown.
+func (m *Manager) charterFile() (string, error) {
+	c, err := m.Store.GetCoordinator(context.Background())
+	if err != nil {
+		return "", fmt.Errorf("reading the coordinator role, which picks the manager's charter: %w", err)
 	}
-	return p
+	p := m.P.ManagerCharterFile()
+	if c.Role == db.CoordinatorPeer {
+		if err := harness.WritePeerManagerCharter(p); err != nil {
+			return "", fmt.Errorf("could not write the peer manager charter: %w", err)
+		}
+		return p, nil
+	}
+	if err := harness.WriteManagerCharter(p); err != nil {
+		return "", nil
+	}
+	return p, nil
 }
 
 // attachManager opens the manager window for the lead: it prefers a native iTerm2
@@ -618,14 +638,18 @@ func (m *Manager) restore() []string {
 	// Manager window first, so there is always a manager to talk to.
 	if !m.backend().WindowExists(m.Session, "manager") {
 		mgr, ok, _ := m.Store.GetManager(context.Background())
-		if ok {
+		charter, err := m.charterFile()
+		switch {
+		case err != nil:
+			notes = append(notes, "skipped manager ("+err.Error()+")")
+		case ok:
 			if err := m.newWindow("manager", mgr.Dir, "manager"); err != nil {
 				notes = append(notes, "skipped manager ("+err.Error()+")")
 			} else {
-				_ = m.backend().SendLine(m.Session, "manager", harness.ManagerResumeOrFresh(h, mgr.SessionID, m.charterFile()))
+				_ = m.backend().SendLine(m.Session, "manager", harness.ManagerResumeOrFresh(h, mgr.SessionID, charter))
 				notes = append(notes, "restored manager")
 			}
-		} else {
+		default:
 			// No manager record (legacy state): start a fresh manager so the lead
 			// always has one, and persist it for next time.
 			dir := cwd()
@@ -636,7 +660,7 @@ func (m *Manager) restore() []string {
 			if err := m.newWindow("manager", dir, "manager"); err != nil {
 				notes = append(notes, "skipped manager ("+err.Error()+")")
 			} else {
-				_ = m.backend().SendLine(m.Session, "manager", harness.ManagerCommand(h, sid, m.charterFile()))
+				_ = m.backend().SendLine(m.Session, "manager", harness.ManagerCommand(h, sid, charter))
 				notes = append(notes, "started a fresh manager (no saved manager record)")
 			}
 		}

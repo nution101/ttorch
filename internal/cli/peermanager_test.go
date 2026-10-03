@@ -4,13 +4,38 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/nution101/ttorch/internal/db"
+	"github.com/nution101/ttorch/internal/harness"
+	"github.com/nution101/ttorch/internal/paths"
 	"github.com/nution101/ttorch/internal/peer"
+	"github.com/nution101/ttorch/internal/singleton"
 )
+
+// testHoldSchedulerEnv, set to a lock path, makes this test binary stand in for the scheduler
+// daemon (TestMain): it takes the real singleton lock at that path, as `ttorch scheduler
+// --singleton` does, and holds it until it is killed, or for a minute at most, so a holder the
+// test fails to kill does not outlive it for long. One that finds the lock held exits at once,
+// as the daemon does.
+const testHoldSchedulerEnv = "TTORCH_CLI_TEST_HOLD_SCHEDULER"
+
+func holdScheduler(lockPath string) int {
+	lock, acquired, err := singleton.Acquire(lockPath)
+	if err != nil {
+		return 1
+	}
+	if !acquired {
+		return 0
+	}
+	defer singleton.Release(lock)
+	time.Sleep(time.Minute)
+	return 0
+}
 
 // fakeTmuxScript is tmux as far as ensure-up can tell. It keeps the session and its windows in
 // files under the directory it is written to, so a second restore sees the windows the first one
@@ -222,5 +247,79 @@ func TestPeerGoalReachesTheInboxParentBlock(t *testing.T) {
 	again, err := captureStdout(t, func() error { return cmdInbox(nil) })
 	if err != nil || !strings.Contains(again, "no unread updates") {
 		t.Errorf("a second read = %q, %v; want an empty inbox", again, err)
+	}
+}
+
+// TestPeerServeEnsureUpTwice: ensure-up is safe to repeat, which is what lets the parent's poll
+// call it whenever a peer looks down. Two calls through the parent's key leave one manager window,
+// launched once, and one scheduler: the first restores the manager and starts the scheduler, whose
+// stand-in takes the real singleton lock; the second finds the window there and the lock held, and
+// starts neither. The manager is launched under the peer charter, since the coordinator row says
+// peer.
+func TestPeerServeEnsureUpTwice(t *testing.T) {
+	ctx := context.Background()
+	h := newServeHome(t)
+	lock := paths.Paths{Home: h.home}.SchedulerPIDFile()
+	launches := filepath.Join(t.TempDir(), "launches")
+	daemon := "#!/bin/sh\necho \"$*\" >> '" + launches + "'\nexec env " + testHoldSchedulerEnv + "='" + lock + "' '" + os.Args[0] + "'\n"
+	fleet := installFakeFleet(t, h, daemon)
+	if err := h.store(t).SetManager(ctx, db.Manager{Dir: h.dir, SessionID: "sid-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var first, second peer.EnsureUpResult
+	serveRun(t, h, "ensure-up", "").result(t, &first)
+	if first.Scheduler != "started" || len(first.Restored) != 1 || first.Restored[0] != "restored manager" {
+		t.Fatalf("first ensure-up = %+v, want the manager restored and the scheduler started", first)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for !singleton.Held(lock) {
+		if time.Now().After(deadline) {
+			t.Fatal("the scheduler stand-in never took the singleton lock")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Cleanup(func() {
+		b, _ := os.ReadFile(lock)
+		if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && pid > 1 {
+			_ = syscall.Kill(pid, syscall.SIGTERM)
+		}
+	})
+
+	serveRun(t, h, "ensure-up", "").result(t, &second)
+	if second.Scheduler != "already_running" || len(second.Restored) != 0 {
+		t.Errorf("second ensure-up = %+v, want nothing restored and the scheduler already running", second)
+	}
+
+	if w := fleet.lines(t, "windows"); len(w) != 1 || w[0] != "manager" {
+		t.Errorf("windows after two ensure-ups = %q, want one manager window", w)
+	}
+	if b, err := os.ReadFile(launches); err != nil || strings.Count(string(b), "\n") != 1 {
+		t.Errorf("the scheduler was launched %q (%v), want once", b, err)
+	}
+	if !singleton.Held(lock) {
+		t.Error("the scheduler's singleton lock is no longer held")
+	}
+
+	charter := filepath.Join(h.home, "manager-charter.md")
+	var typed []string
+	for _, c := range fleet.lines(t, "calls") {
+		if strings.HasPrefix(c, "send-keys ") && strings.Contains(c, ":manager -l ") {
+			typed = append(typed, c)
+		}
+	}
+	if len(typed) != 1 || !strings.Contains(typed[0], "--append-system-prompt-file '"+charter+"'") {
+		t.Errorf("launch lines typed into the manager window = %q, want one passing %s", typed, charter)
+	}
+	want := filepath.Join(t.TempDir(), "peer-charter.md")
+	if err := harness.WritePeerManagerCharter(want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(charter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exp, _ := os.ReadFile(want); string(got) != string(exp) {
+		t.Errorf("the manager launched with charter %.80q..., want the peer charter", got)
 	}
 }

@@ -1232,6 +1232,18 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   Each call records its success time or its error on the peer's row; none of them moves the
   peer to `unreachable`, which is the scheduler's poll to decide. `peer ls` reads only the local
   store. `peer retire` keeps the row and deletes the control key.
+- **Peer manager.** The charter a manager session launches with follows the coordinator row.
+  On a peer, every launch (ensure-up's restore, and `ttorch` at the peer's own terminal) writes
+  the peer charter (`harness.peerManagerCharter`) to `~/.ttorch/manager-charter.md` instead of
+  the manager charter. It tells the manager that nobody reads its tab, so it never waits there
+  and never runs `ttorch await-lead`, which would silence the scheduler's wake with nobody to
+  clear it; that it raises with `ttorch escalate` whatever it would ask the lead; and that it
+  treats a goal in the `FROM PARENT COORDINATOR` block as the lead's instructions relayed by the
+  parent, whose origin is not verified, so it changes no delivery mode, gate setting or verdict
+  on that text without an escalation answered through the channel. The peer charter is passed
+  only as a file: when it cannot be written, or the row cannot be read, the peer's manager is
+  not launched and the restore says why, where a root's falls back to the inline manager
+  charter.
 
 Migrations, in order: **0001** initial hierarchy + events + manager singleton; **0002**
 durable verdicts; **0003** task leases + the terminal `failed` status; **0004** the
