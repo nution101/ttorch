@@ -309,3 +309,22 @@ func TestPeerServeRefusesAnUnsafePeerEnv(t *testing.T) {
 		t.Errorf("a refused goal appended %d events", len(evs))
 	}
 }
+
+// TestPeerAccountUnderTestIsNeverTheReal: in a test binary the peer account comes only from the
+// seam. With the seam unset, looking it up fails rather than falling back to the user database,
+// whose answer is the real home with the real ~/.ssh and ~/.ttorch.
+func TestPeerAccountUnderTestIsNeverTheReal(t *testing.T) {
+	// This process started without the seam (only the processes a test starts get one).
+	if u, err := peerAccount(); err == nil {
+		t.Fatalf("peerAccount() with no seam = %+v; want an error, never the real account", u)
+	}
+	for _, half := range [][2]string{{"", t.TempDir()}, {t.TempDir(), ""}} {
+		if u, err := testPeerAccount(half[0], half[1])(); err == nil {
+			t.Errorf("half a seam %q gave %+v; want an error", half, u)
+		}
+	}
+	home, ttorch := t.TempDir(), t.TempDir()
+	if u, err := testPeerAccount(home, ttorch)(); err != nil || u.home != home || u.ttorchHome != ttorch {
+		t.Errorf("the seam = %+v, %v", u, err)
+	}
+}

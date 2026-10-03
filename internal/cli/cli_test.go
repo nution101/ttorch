@@ -19,6 +19,10 @@ import (
 // ImportLegacy would rename the live state/ dir away. The db.Open guard is the final
 // fail-closed backstop.
 func TestMain(m *testing.M) {
+	// The peer commands take the account's home from the user database, never from the
+	// environment, and that answer is the real home with the real ~/.ssh and ~/.ttorch. Under
+	// test the account comes only from the seam, and a process without it fails instead.
+	peerAccount = testPeerAccount(os.Getenv(testPeerHomeEnv), os.Getenv(testPeerTtorchEnv))
 	// A stand-in for ssh (peerclient_test.go): the parent's peer commands run this binary in
 	// ssh's place, and it plays sshd and the peer's shell.
 	if cfg := os.Getenv(testSSHShimEnv); cfg != "" {
@@ -29,14 +33,6 @@ func TestMain(m *testing.M) {
 	// gave it.
 	if os.Getenv(runMainEnv) == "1" {
 		applyPeerClientSeams()
-		// The peer control channel takes the account's home from the user database, never from
-		// the environment. A served test process gets a temp one through this seam instead.
-		if home := os.Getenv(testPeerHomeEnv); home != "" {
-			ttorchHome := os.Getenv(testPeerTtorchEnv)
-			peerAccount = func() (peerUser, error) {
-				return peerUser{home: home, name: "peer-test", ttorchHome: ttorchHome}, nil
-			}
-		}
 		os.Exit(Main(os.Args[1:]))
 	}
 	os.Setenv("TTORCH_WORKER_TABS", "off")
@@ -55,6 +51,18 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 	_ = os.RemoveAll(home)
 	os.Exit(code)
+}
+
+// testPeerAccount is the peer account lookup a test process uses: the temp homes
+// testPeerHomeEnv and testPeerTtorchEnv named when the process started (the served process clears
+// its environment before it looks the account up), or an error when either was unset.
+func testPeerAccount(home, ttorchHome string) func() (peerUser, error) {
+	return func() (peerUser, error) {
+		if home == "" || ttorchHome == "" {
+			return peerUser{}, errors.New("test process without " + testPeerHomeEnv + " and " + testPeerTtorchEnv + ": refusing to use the real account")
+		}
+		return peerUser{home: home, name: "peer-test", ttorchHome: ttorchHome}, nil
+	}
 }
 
 // runMainEnv, set to 1, makes the test binary run Main on its arguments instead of the tests.
