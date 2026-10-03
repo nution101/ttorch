@@ -80,7 +80,7 @@ func TestClientCall(t *testing.T) {
 	key := filepath.Join(t.TempDir(), "control")
 	c := Client{SSH: ssh, Dest: "ttorch@build-host", Key: key}
 	var got GoalResult
-	if err := c.Call(context.Background(), VerbGoal, GoalRequest{ParentID: testParent, RequestID: "r1", Text: "tidy"}, &got); err != nil {
+	if err := c.Call(context.Background(), VerbGoal, GoalRequest{RequestID: "r1", Text: "tidy"}, &got); err != nil {
 		t.Fatal(err)
 	}
 	if got.EventID != 7 {
@@ -94,7 +94,7 @@ func TestClientCall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal(b, &sent); err != nil || sent != (GoalRequest{ParentID: testParent, RequestID: "r1", Text: "tidy"}) {
+	if err := json.Unmarshal(b, &sent); err != nil || sent != (GoalRequest{RequestID: "r1", Text: "tidy"}) {
 		t.Errorf("stdin = %q (%v)", b, err)
 	}
 }

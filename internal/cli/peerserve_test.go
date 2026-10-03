@@ -35,20 +35,19 @@ import (
 type serveHome struct {
 	account, home, db, dir string
 	extraEnv               []string
+	// keyParent is the --parent the forced command passes, as sshd would from the key's line;
+	// "" runs `peer serve` with none.
+	keyParent string
 }
 
-// servedParent is the coordinator id of the parent a served home is provisioned under.
+// servedParent is the coordinator id of the parent a served home is provisioned under, and the
+// one its control key's forced command binds (`peer serve --parent`), unless a test changes it.
 const servedParent = "0123456789abcdef0123456789abcdef"
-
-// parentBody puts servedParent's id in a request body, as the parent's client does.
-func parentBody(body string) string {
-	return strings.Replace(body, "{", `{"parent_id":"`+servedParent+`",`, 1)
-}
 
 func newServeHome(t *testing.T) serveHome {
 	t.Helper()
 	account, home := t.TempDir(), t.TempDir()
-	h := serveHome{account: account, home: home, db: filepath.Join(home, "state.db"), dir: t.TempDir()}
+	h := serveHome{account: account, home: home, db: filepath.Join(home, "state.db"), dir: t.TempDir(), keyParent: servedParent}
 	s, err := db.Open(h.db)
 	if err != nil {
 		t.Fatal(err)
@@ -95,7 +94,11 @@ type served struct {
 // .ttorch/task would make the child a worker context.
 func serveRun(t *testing.T, h serveHome, command, body string, args ...string) served {
 	t.Helper()
-	cmd := exec.Command(os.Args[0], append([]string{"peer", "serve"}, args...)...)
+	argv := []string{"peer", "serve"}
+	if h.keyParent != "" {
+		argv = append(argv, "--parent", h.keyParent)
+	}
+	cmd := exec.Command(os.Args[0], append(argv, args...)...)
 	cmd.Dir = h.dir
 	// HOME and PATH are what sshd would set; the served process replaces both (see
 	// peerControlEnv), so the test's own values must not be what makes it work.
@@ -186,8 +189,9 @@ func TestPeerServeRefusesWhatIsNotAVerb(t *testing.T) {
 		t.Fatalf("a command string ran a shell: %s exists (%v)", marker, err)
 	}
 
-	// The forced command is exactly `ttorch peer serve`; a verb typed after it is refused.
-	if s := serveRun(t, h, "summary", "", "summary"); s.code != 2 || !strings.Contains(s.stderr, "takes no arguments") {
+	// The forced command is exactly `ttorch peer serve --parent <id>`; a verb typed after it is
+	// refused.
+	if s := serveRun(t, h, "summary", "", "summary"); s.code != 2 || !strings.Contains(s.stderr, "takes only --parent") {
 		t.Errorf("peer serve with an argument: exit %d, stderr %q", s.code, s.stderr)
 	}
 	// A worker context is refused, however the request looks.
@@ -255,7 +259,7 @@ func TestPeerServeTaskAdd(t *testing.T) {
 
 	req := func(requestID, taskID, brief string) string {
 		b, err := json.Marshal(peer.TaskAddRequest{
-			ParentID: servedParent, RequestID: requestID, TaskID: taskID, Repo: repo, Title: "from the parent",
+			RequestID: requestID, TaskID: taskID, Repo: repo, Title: "from the parent",
 			Touches: []string{"pkg/thing.go"}, Brief: brief, Effort: "high", Model: "opus",
 		})
 		if err != nil {
@@ -381,7 +385,8 @@ func TestPeerServeReadsWithoutWriting(t *testing.T) {
 	}
 	var v peer.VersionResult
 	serveRun(t, h, "version", "").result(t, &v)
-	if v.Protocol != peer.ProtocolVersion || v.Coordinator.Role != db.CoordinatorPeer || v.Coordinator.ParentID != servedParent || v.Version == "" {
+	if v.Protocol != peer.ProtocolVersion || v.Coordinator.Role != db.CoordinatorPeer || v.Coordinator.ParentID != servedParent ||
+		v.KeyParent != servedParent || v.Version == "" {
 		t.Errorf("version = %+v", v)
 	}
 	if after := stateOfFile(t, h.db); after != before {
@@ -444,15 +449,15 @@ func TestPeerServeGoalAnswerDecisions(t *testing.T) {
 	}
 
 	var g peer.GoalResult
-	serveRun(t, h, "goal", parentBody(`{"request_id":"goal-1","text":"tidy the importer"}`)).result(t, &g)
+	serveRun(t, h, "goal", `{"request_id":"goal-1","text":"tidy the importer"}`).result(t, &g)
 	var a peer.AnswerResult
-	answer := parentBody(`{"request_id":"ans-1","escalation_id":` + itoa(esc.ID) + `,"text":"the first one"}`)
+	answer := `{"request_id":"ans-1","escalation_id":` + itoa(esc.ID) + `,"text":"the first one"}`
 	serveRun(t, h, "answer", answer).result(t, &a)
 	if a.AnsweredBy != db.ActorParent || a.Status != db.EscalationAnswered {
 		t.Errorf("answer = %+v", a)
 	}
 	var g2 peer.GoalResult
-	serveRun(t, h, "goal", parentBody(`{"request_id":"goal-1","text":"tidy the importer"}`)).result(t, &g2)
+	serveRun(t, h, "goal", `{"request_id":"goal-1","text":"tidy the importer"}`).result(t, &g2)
 	var a2 peer.AnswerResult
 	serveRun(t, h, "answer", answer).result(t, &a2)
 	if !g2.Replayed || g2.EventID != g.EventID || !a2.Replayed || a2.EventID != a.EventID {
@@ -469,9 +474,12 @@ func TestPeerServeGoalAnswerDecisions(t *testing.T) {
 	}
 }
 
-// TestPeerServeRefusesAnotherParent: through the binary, a goal and an answer that name any
-// coordinator but the one the peer's row records are refused and append nothing.
-func TestPeerServeRefusesAnotherParent(t *testing.T) {
+// TestPeerServeTakesTheParentFromTheKey: the parent a state-changing request comes from is the
+// --parent the key's forced command passes, which sshd takes from the key's authorized_keys line,
+// not anything the client sends. A key bound to another parent, or to none, is refused; a request
+// that names a parent itself is refused as malformed, so a client cannot claim one; the read
+// verbs still answer, and version says which parent the key is bound to.
+func TestPeerServeTakesTheParentFromTheKey(t *testing.T) {
 	ctx := context.Background()
 	h := newServeHome(t)
 	s := h.store(t)
@@ -487,14 +495,54 @@ func TestPeerServeRefusesAnotherParent(t *testing.T) {
 		t.Fatal(err)
 	}
 	other := strings.Repeat("e", 32)
+	goal := `{"request_id":"goal-1","text":"tidy"}`
+	answer := `{"request_id":"ans-1","escalation_id":` + itoa(esc.ID) + `,"text":"x"}`
 	events := countIn(t, s, "events")
-	serveRun(t, h, "goal", `{"parent_id":"`+other+`","request_id":"goal-1","text":"tidy"}`).refused(t, "another parent's goal", peer.CodeWrongParent)
-	serveRun(t, h, "answer", `{"parent_id":"`+other+`","request_id":"ans-1","escalation_id":`+itoa(esc.ID)+`,"text":"x"}`).refused(t, "another parent's answer", peer.CodeWrongParent)
+
+	wrong := h
+	wrong.keyParent = other
+	serveRun(t, wrong, "goal", goal).refused(t, "a key bound to another parent: goal", peer.CodeWrongParent)
+	serveRun(t, wrong, "answer", answer).refused(t, "a key bound to another parent: answer", peer.CodeWrongParent)
+	claimed := `{"parent_id":"` + servedParent + `","request_id":"goal-2","text":"tidy"}`
+	serveRun(t, wrong, "goal", claimed).refused(t, "a request naming the parent itself", peer.CodeBadBody)
+	serveRun(t, h, "goal", claimed).refused(t, "a request naming the parent itself, through the right key", peer.CodeBadBody)
+	unbound := h
+	unbound.keyParent = ""
+	serveRun(t, unbound, "goal", goal).refused(t, "a key bound to no parent", peer.CodeWrongParent)
 	if n := countIn(t, s, "events"); n != events {
-		t.Errorf("another parent's requests appended %d events", n-events)
+		t.Errorf("refused requests appended %d events", n-events)
 	}
 	if e, _, _ := s.GetEscalation(ctx, esc.ID); e.Status != db.EscalationOpen {
-		t.Errorf("another parent's answer changed the escalation: %+v", e)
+		t.Errorf("a refused answer changed the escalation: %+v", e)
+	}
+
+	var v peer.VersionResult
+	serveRun(t, wrong, "version", "").result(t, &v)
+	if v.KeyParent != other || v.Coordinator.ParentID != servedParent {
+		t.Errorf("version through another parent's key = %+v", v)
+	}
+	serveRun(t, unbound, "version", "").result(t, &v)
+	if v.KeyParent != "" {
+		t.Errorf("version through an unbound key = %+v", v)
+	}
+	var g peer.GoalResult
+	serveRun(t, h, "goal", goal).result(t, &g)
+	if g.EventID == 0 {
+		t.Errorf("goal through the parent's key = %+v", g)
+	}
+
+	bad := h
+	bad.keyParent = "not-a-coordinator-id"
+	serveRun(t, bad, "version", "").refused(t, "a malformed --parent", peer.CodeUnavailable)
+	for _, argv := range [][]string{{"peer", "serve", "--parent"}, {"peer", "serve", "--other", servedParent}, {"peer", "serve", "--parent", servedParent, "summary"}} {
+		cmd := exec.Command(os.Args[0], argv...)
+		cmd.Dir = h.dir
+		cmd.Env = []string{runMainEnv + "=1", testPeerHomeEnv + "=" + h.account, testPeerTtorchEnv + "=" + h.home, "SSH_ORIGINAL_COMMAND=version", "HOME=" + h.account}
+		err := cmd.Run()
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) || exit.ExitCode() != 2 {
+			t.Errorf("%v: %v, want exit 2", argv, err)
+		}
 	}
 }
 

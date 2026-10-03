@@ -151,12 +151,22 @@ func cmdPeerProvision(args []string, adopt bool, stdin *os.File) error {
 	if v.Coordinator.Role != db.CoordinatorPeer || v.Coordinator.Name != name || v.Coordinator.ParentID != self.CoordID {
 		return fail(fmt.Errorf("the control channel at %s answers as %s %q with parent %s, not as peer %q of this coordinator; it reads another store than the one init wrote", controlDest, v.Coordinator.Role, v.Coordinator.Name, v.Coordinator.ParentID, name))
 	}
+	// The key's forced command must name this coordinator too, or the peer refuses every task,
+	// goal and answer sent through it. A peer binary older than the --parent binding writes a
+	// line without one.
+	if v.KeyParent != self.CoordID {
+		bound := "no parent"
+		if v.KeyParent != "" {
+			bound = "parent " + v.KeyParent
+		}
+		return fail(fmt.Errorf("the control key at %s is bound to %s, not to this coordinator (%s); the peer would refuse its tasks, goals and answers. Update ttorch on the peer, then run ttorch peer adopt --force", controlDest, bound, self.CoordID))
+	}
 	if err := store.MarkPeerLive(ctx, name, v.Protocol, v.Version); err != nil {
 		return err
 	}
 
 	fmt.Printf("peer %s is live: ttorch %s (protocol %d), control key %s\n", name, v.Version, v.Protocol, key)
-	fmt.Printf("  forced command: %s peer serve (restrict), authorized_keys %s\n", res.Binary, res.AuthorizedKeys)
+	fmt.Printf("  forced command: %s peer serve --parent %s (restrict), authorized_keys %s\n", res.Binary, self.CoordID, res.AuthorizedKeys)
 	if res.PreviousParent != "" && res.PreviousParent != self.CoordID {
 		fmt.Printf("  moved from parent %s\n", res.PreviousParent)
 	}

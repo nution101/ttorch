@@ -1103,21 +1103,24 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   Each answer is also deduplicated on its own id, so none is hidden by another update to the
   manager entity.
 - **Peer control channel.** `ttorch peer serve` answers one request from a parent
-  coordinator per process, run as an ssh forced command (`command="ttorch peer
-  serve",restrict` in the peer's `authorized_keys`). The verb comes from
+  coordinator per process, run as an ssh forced command (`command="<ttorch> peer serve
+  --parent <coordinator id>",restrict` in the peer's `authorized_keys`). The verb comes from
   `SSH_ORIGINAL_COMMAND`, which is split on whitespace and never given to a shell, and must be
   exactly one of `version`, `summary`, `decisions`, `task-add`, `goal`, `answer`, `ensure-up`.
   Anything else, including a verb followed by arguments, is refused with a named error code
-  before the body is read. The body is one JSON object on stdin, at most 1 MiB, with no field
+  before the body is read. `peer serve` itself takes `--parent <id>` and nothing else. The body is one JSON object on stdin, at most 1 MiB, with no field
   the verb does not define. `version` and `summary` open the store read-only: no migration,
   no legacy import, no default-branch seed, no row written, so unlike `ttorch summary` the
   served summary does not sync approval escalations first. `task-add`, `goal` and `answer`
   carry a request id stored in `peer_requests`, so a repeat returns the first result and
-  changes nothing. They also carry the sending coordinator's id, and are refused with
-  `wrong_parent`, before the ledger is read, unless it is the parent the coordinator row records
-  (`ttorch peer init` writes it); a coordinator no parent provisioned refuses all three, and
-  `version` reports the recorded parent. Like the rest of that row, this stops two parents
-  sharing a peer by accident and bounds nothing. `task-add` runs the `ttorch task add` core, brief lint included, and writes
+  changes nothing. They are refused with `wrong_parent`, before the ledger is read, unless the
+  key they came through is bound to the parent the coordinator row records (`ttorch peer init`
+  writes both). A key is bound by its forced command's `--parent`, which sshd sets from the key's
+  own line, so the request carries no parent id (one that names a parent is malformed) and a
+  client holding one parent's key cannot act as another. A key whose line has no `--parent`, and
+  a coordinator no parent provisioned, refuse all three; a malformed `--parent` refuses every
+  verb. `version` reports the recorded parent and the key's (`key_parent`). `task-add` runs the
+  `ttorch task add` core, brief lint included, and writes
   the brief in the transaction that creates the row. `goal` and `answer` are recorded as the
   parent coordinator's (actor `parent`), never the lead's or the local manager's. `ensure-up`
   restores the manager and workers without a terminal and starts the scheduler, and refuses
@@ -1154,8 +1157,8 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   none (the channel's default PATH plus each session directory that exists and that neither its
   group nor others can write, and the parent's settings; an existing one is kept, and refused
   here if the channel would refuse it), and only then appends
-  `command="<absolute path> peer serve",restrict ssh-ed25519 <key> ttorch-peer-control:<parent>`
-  to `~/.ssh/authorized_keys`. The path is the running binary with symlinks resolved, and must
+  `command="<absolute path> peer serve --parent <parent>",restrict ssh-ed25519 <key>
+  ttorch-peer-control:<parent>` to `~/.ssh/authorized_keys`. The path is the running binary with symlinks resolved, and must
   be a plain word to the shell, owned by the account or root, and writable by no one else, nor
   its directory. `~/.ssh` and the file are created private if missing, must be private
   otherwise, and are never written through a symlink (the directory is opened once and the file
@@ -1170,7 +1173,7 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   with the lead's config and agent, since that session is the lead's authority on the peer),
   passing the `TTORCH_*` settings of the lead's shell that `peer.env` may hold, then proves the
   key with a `version` call over the control channel, which must answer as that peer with this
-  coordinator as its parent. Only then is the peer `live`. A failure records why and leaves it
+  coordinator as both its recorded parent and its key's. Only then is the peer `live`. A failure records why and leaves it
   `provisioning`, and running `peer add` again resumes with the same key. `peer adopt --force`
   is the same for a peer another parent provisioned.
 - **Peer client.** `ttorch peer status`, `decisions`, `answer`, `task-add`, `goal` and `repo
@@ -1184,8 +1187,8 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   agent is asked, so the lead's own keys, which run anything, are never offered; a host key the
   lead's `known_hosts` does not hold fails the call, and the channel never writes that file.
   What comes back is decoded and every string in it escaped and capped before anything reads it,
-  and a different protocol major is refused unread. `task-add`, `goal` and `answer` send this
-  coordinator's id as `parent_id`. `task-add` and `goal` record a delegation (request id, peer,
+  and a different protocol major is refused unread. No request names a parent: the key does.
+  `task-add` and `goal` record a delegation (request id, peer,
   task, sha256 of the brief or goal) before the call, drop it when the peer refuses (a refusal
   means the peer acted on nothing), and keep it otherwise, printing the request id that makes a
   retry safe. `answer` is recorded on the peer as relayed by its parent, never as the lead.

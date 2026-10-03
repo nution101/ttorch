@@ -332,12 +332,8 @@ func cmdPeerAnswer(args []string) error {
 		return err
 	}
 	defer store.Close()
-	self, err := store.GetCoordinator(ctx)
-	if err != nil {
-		return err
-	}
 	var res peer.AnswerResult
-	err = peerCall(ctx, store, p, c, peer.VerbAnswer, peer.AnswerRequest{ParentID: self.CoordID, RequestID: *requestID, EscalationID: id, Text: *msg}, &res)
+	err = peerCall(ctx, store, p, c, peer.VerbAnswer, peer.AnswerRequest{RequestID: *requestID, EscalationID: id, Text: *msg}, &res)
 	if err != nil {
 		return retryHint(err, *requestID)
 	}
@@ -410,8 +406,8 @@ func cmdPeerTaskAdd(args []string) error {
 	req := peer.TaskAddRequest{RequestID: *requestID, TaskID: taskID, Repo: *repo, Title: *title, Touches: footprint, Brief: text, Effort: *effort, Model: *model}
 	var res peer.TaskAddResult
 	rid, err := delegate(name, db.Delegation{Kind: db.DelegationTask, RemoteTaskID: taskID, BriefSHA256: hex.EncodeToString(sum[:])}, *requestID,
-		func(ctx context.Context, store *db.Store, p db.Peer, c peer.Client, parentID, rid string) error {
-			req.ParentID, req.RequestID = parentID, rid
+		func(ctx context.Context, store *db.Store, p db.Peer, c peer.Client, rid string) error {
+			req.RequestID = rid
 			return peerCall(ctx, store, p, c, peer.VerbTaskAdd, req, &res)
 		})
 	if err != nil {
@@ -457,8 +453,8 @@ func cmdPeerGoal(args []string) error {
 	sum := sha256.Sum256([]byte(*msg))
 	var res peer.GoalResult
 	rid, err := delegate(args[0], db.Delegation{Kind: db.DelegationGoal, BriefSHA256: hex.EncodeToString(sum[:])}, *requestID,
-		func(ctx context.Context, store *db.Store, p db.Peer, c peer.Client, parentID, rid string) error {
-			return peerCall(ctx, store, p, c, peer.VerbGoal, peer.GoalRequest{ParentID: parentID, RequestID: rid, Text: *msg}, &res)
+		func(ctx context.Context, store *db.Store, p db.Peer, c peer.Client, rid string) error {
+			return peerCall(ctx, store, p, c, peer.VerbGoal, peer.GoalRequest{RequestID: rid, Text: *msg}, &res)
 		})
 	if err != nil {
 		return err
@@ -475,7 +471,7 @@ func cmdPeerGoal(args []string) error {
 // drops the record by the outcome: a refusal the peer answered with means it acted on nothing, so
 // the record goes; anything else (success, a timeout, a transport failure) may have reached the
 // peer, so it stays, and a failure says which request id makes a retry safe.
-func delegate(name string, d db.Delegation, requestID string, call func(ctx context.Context, store *db.Store, p db.Peer, c peer.Client, parentID, requestID string) error) (string, error) {
+func delegate(name string, d db.Delegation, requestID string, call func(ctx context.Context, store *db.Store, p db.Peer, c peer.Client, requestID string) error) (string, error) {
 	var err error
 	if requestID == "" {
 		if requestID, err = mintRequestID(); err != nil {
@@ -490,15 +486,11 @@ func delegate(name string, d db.Delegation, requestID string, call func(ctx cont
 		return "", err
 	}
 	defer store.Close()
-	self, err := store.GetCoordinator(ctx)
-	if err != nil {
-		return "", err
-	}
 	d.RequestID, d.Peer = requestID, p.Name
 	if _, _, err := store.RecordDelegation(ctx, d); err != nil {
 		return "", err
 	}
-	if err := call(ctx, store, p, c, self.CoordID, requestID); err != nil {
+	if err := call(ctx, store, p, c, requestID); err != nil {
 		var re *peer.RemoteError
 		if errors.As(err, &re) {
 			_ = store.ForgetDelegation(ctx, requestID)

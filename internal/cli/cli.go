@@ -2456,10 +2456,12 @@ Team:
                           record that the peer owns a repository
   peer retire <name>      stop using a peer and delete its control key (the lead's
                           command)
-  peer serve              answer one control request from a parent coordinator, as an
+  peer serve [--parent <id>]
+                          answer one control request from a parent coordinator, as an
                           ssh forced command: the verb comes from SSH_ORIGINAL_COMMAND
                           (version, summary, decisions, task-add, goal, answer,
-                          ensure-up), the request is one JSON object on stdin
+                          ensure-up), the request is one JSON object on stdin, and
+                          --parent is the parent the key's line binds
   peer init               provision this machine as a peer (peer add runs it)
   check-overlap "<paths>" show which live workers a proposed footprint conflicts
     [--repo dir]            with, to plan disjoint parallel dispatch (scopes to the

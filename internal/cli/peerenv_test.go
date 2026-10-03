@@ -304,7 +304,7 @@ func TestPeerServeRefusesAnUnsafePeerEnv(t *testing.T) {
 		t.Fatal(err)
 	}
 	serveRun(t, h, "summary", "").refused(t, "a symlinked peer.env", peer.CodeUnavailable)
-	serveRun(t, h, "goal", parentBody(`{"request_id":"g1","text":"x"}`)).refused(t, "a symlinked peer.env", peer.CodeUnavailable)
+	serveRun(t, h, "goal", `{"request_id":"g1","text":"x"}`).refused(t, "a symlinked peer.env", peer.CodeUnavailable)
 	if evs := managerEventsIn(t, h.store(t)); len(evs) != 0 {
 		t.Errorf("a refused goal appended %d events", len(evs))
 	}

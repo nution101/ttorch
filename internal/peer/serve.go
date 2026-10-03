@@ -3,7 +3,7 @@ package peer
 // The peer control channel: one request from a parent coordinator per process, run as an ssh
 // forced command. The peer's authorized_keys pins the parent's control key to it,
 //
-//	command="ttorch peer serve",restrict ssh-ed25519 AAAA... ttorch-peer-control:<parent>
+//	command="ttorch peer serve --parent <parent>",restrict ssh-ed25519 AAAA... ttorch-peer-control:<parent>
 //
 // so whatever the parent asks to run arrives in SSH_ORIGINAL_COMMAND and nothing else runs.
 // Serve reads that string itself, without a shell: it must be exactly one verb from the list
@@ -13,10 +13,11 @@ package peer
 //
 // What the channel can do is the verb list, and the list holds nothing that approves, merges,
 // lands, gates or touches a worker. A verb that changes state takes a request id, and the
-// peer_requests ledger makes a repeat of it return the first result and change nothing. It also
-// names the parent it comes from, and is refused unless that is the parent the coordinator row
-// records (`ttorch peer init` writes it), so a peer two parents registered by mistake takes work
-// and answers from one of them. The read verbs open the store read-only (db.OpenReadOnly), so a
+// peer_requests ledger makes a repeat of it return the first result and change nothing. It is
+// also refused unless the key it came through is bound to the parent the coordinator row records
+// (`ttorch peer init` writes both). The binding is the forced command's --parent, which sshd sets
+// from the key's own authorized_keys line, so a request cannot name a parent and a key installed
+// for one parent cannot act for another. The read verbs open the store read-only (db.OpenReadOnly), so a
 // poll runs no migration and writes no row.
 //
 // Every byte of a request is treated as hostile, and so is every string a response carries:
@@ -142,6 +143,11 @@ func Refuse(code, format string, args ...any) *Error {
 // Host is what the verbs act on. The CLI wires it (`ttorch peer serve`); a test wires fakes. A
 // nil field answers as an internal error, never as a silent success.
 type Host struct {
+	// KeyParent is the coordinator id the control key's forced command passes (`peer serve
+	// --parent <id>`), which sshd takes from the key's authorized_keys line: the parent the
+	// request comes from, as this account's own file says, never as the client says. "" is a
+	// key bound to no parent, which takes no state-changing request.
+	KeyParent string
 	// ReadStore opens the state store read-only, with no migration (db.OpenReadOnly). version
 	// and summary use it, so a poll never writes the peer's store.
 	ReadStore func() (*db.Store, error)
@@ -403,12 +409,15 @@ func writeStore(h Host) (*db.Store, error) {
 
 // --- version -----------------------------------------------------------------------------
 
-// VersionResult is what `version` answers: the protocol, this binary's version, and the
-// coordinator's name and role.
+// VersionResult is what `version` answers: the protocol, this binary's version, the
+// coordinator's name and role, and KeyParent, the parent the key that asked is bound to ("" for
+// none). A parent checks both parent ids after `peer init`: the row's says which parent the store
+// records, the key's that its own key is the one bound to it.
 type VersionResult struct {
 	Protocol    int             `json:"protocol"`
 	Version     string          `json:"version"`
 	Coordinator CoordinatorInfo `json:"coordinator"`
+	KeyParent   string          `json:"key_parent"`
 }
 
 // CoordinatorInfo is the coordinator row as a parent sees it. ParentID is the coordinator id of
@@ -437,6 +446,7 @@ func serveVersion(ctx context.Context, h Host, body []byte) (any, error) {
 		Protocol:    ProtocolVersion,
 		Version:     SafeText(h.Version),
 		Coordinator: CoordinatorInfo{Name: SafeText(c.Name), Role: SafeText(c.Role), ParentID: SafeID(c.ParentID)},
+		KeyParent:   SafeID(h.KeyParent),
 	}, nil
 }
 
@@ -516,11 +526,10 @@ func serveDecisions(ctx context.Context, h Host, body []byte) (any, error) {
 
 // --- task-add ----------------------------------------------------------------------------
 
-// TaskAddRequest is a briefed backlog task a parent hands the peer. ParentID is the sending
-// coordinator's id; Repo is the repository's path on the peer, as registered there; Touches is
-// its footprint.
+// TaskAddRequest is a briefed backlog task a parent hands the peer. Repo is the repository's path
+// on the peer, as registered there; Touches is its footprint. The parent it comes from is the
+// key's (Host.KeyParent), not a field: a request that names one is refused as malformed.
 type TaskAddRequest struct {
-	ParentID  string   `json:"parent_id"`
 	RequestID string   `json:"request_id"`
 	TaskID    string   `json:"task_id"`
 	Repo      string   `json:"repo"`
@@ -578,7 +587,7 @@ func serveTaskAdd(ctx context.Context, h Host, body []byte) (any, error) {
 		return nil, err
 	}
 	defer store.Close()
-	if err := checkParent(ctx, store, req.ParentID); err != nil {
+	if err := checkParent(ctx, store, h.KeyParent); err != nil {
 		return nil, err
 	}
 	// A repeat is answered before the lint runs again: the lint reaches the network, and a
@@ -616,9 +625,6 @@ func serveTaskAdd(ctx context.Context, h Host, body []byte) (any, error) {
 // checkTaskAdd refuses a task-add request whose fields are missing or out of bounds, before
 // anything is opened.
 func checkTaskAdd(req TaskAddRequest) error {
-	if err := checkParentID(req.ParentID); err != nil {
-		return err
-	}
 	if err := db.ValidRequestID(req.RequestID); err != nil {
 		return Refuse(CodeBadRequest, "%v", err)
 	}
@@ -675,21 +681,13 @@ func storeErr(err error) error {
 	return err
 }
 
-// checkParentID refuses a request that does not name the coordinator it comes from, before
-// anything is opened.
-func checkParentID(id string) error {
-	if err := db.ValidCoordID(id); err != nil {
-		return Refuse(CodeBadRequest, "parent_id: %v", err)
-	}
-	return nil
-}
-
-// checkParent refuses a state-changing request from any coordinator but this peer's parent, as
-// the coordinator row records it (design 5.7). It runs before the request ledger is read, so a
-// result stored for the parent is not replayed to another coordinator. A coordinator no parent
-// has provisioned takes no such request at all. The row is any same-user process's to rewrite,
-// so this keeps two parents from both handing one peer work by accident, and bounds nothing else.
-func checkParent(ctx context.Context, store *db.Store, parentID string) error {
+// checkParent refuses a state-changing request unless the key it came through is bound to this
+// peer's parent, as the coordinator row records it (design 5.7). keyParent is the --parent of the
+// key's forced command, so a client cannot claim another parent: it can only use a key, and each
+// key's line names the parent it was installed for. It runs before the request ledger is read, so
+// a result stored for the parent is not replayed through another parent's key. A coordinator no
+// parent has provisioned, or a key bound to none, takes no such request at all.
+func checkParent(ctx context.Context, store *db.Store, keyParent string) error {
 	c, err := store.GetCoordinator(ctx)
 	if err != nil {
 		return fmt.Errorf("reading the coordinator row: %w", err)
@@ -697,8 +695,11 @@ func checkParent(ctx context.Context, store *db.Store, parentID string) error {
 	if c.Role != db.CoordinatorPeer || c.ParentID == "" {
 		return Refuse(CodeWrongParent, "this coordinator was not provisioned by a parent, so it takes no work or answers over this channel (ttorch peer add runs ttorch peer init here)")
 	}
-	if c.ParentID != parentID {
-		return Refuse(CodeWrongParent, "the request comes from coordinator %s, and this peer's parent is %s; moving a peer to another parent is ttorch peer adopt --force", SafeID(parentID), SafeID(c.ParentID))
+	if keyParent == "" {
+		return Refuse(CodeWrongParent, "the key this request came through binds no parent (its forced command has no --parent), and this peer's parent is %s; ttorch peer adopt --force installs a key bound to it", SafeID(c.ParentID))
+	}
+	if c.ParentID != keyParent {
+		return Refuse(CodeWrongParent, "the key this request came through is bound to coordinator %s, and this peer's parent is %s; moving a peer to another parent is ttorch peer adopt --force", SafeID(keyParent), SafeID(c.ParentID))
 	}
 	return nil
 }
@@ -708,7 +709,6 @@ func checkParent(ctx context.Context, store *db.Store, parentID string) error {
 // GoalRequest is plain-language work for the peer's manager, the way the lead talks to a root
 // manager.
 type GoalRequest struct {
-	ParentID  string `json:"parent_id"`
 	RequestID string `json:"request_id"`
 	Text      string `json:"text"`
 }
@@ -724,9 +724,6 @@ func serveGoal(ctx context.Context, h Host, body []byte) (any, error) {
 	if err := decode(body, &req); err != nil {
 		return nil, err
 	}
-	if err := checkParentID(req.ParentID); err != nil {
-		return nil, err
-	}
 	if err := db.ValidRequestID(req.RequestID); err != nil {
 		return nil, Refuse(CodeBadRequest, "%v", err)
 	}
@@ -738,7 +735,7 @@ func serveGoal(ctx context.Context, h Host, body []byte) (any, error) {
 		return nil, err
 	}
 	defer store.Close()
-	if err := checkParent(ctx, store, req.ParentID); err != nil {
+	if err := checkParent(ctx, store, h.KeyParent); err != nil {
 		return nil, err
 	}
 	res, err := store.RecordGoal(ctx, req.RequestID, req.Text)
@@ -764,7 +761,6 @@ func checkText(text string) error {
 
 // AnswerRequest answers one open escalation.
 type AnswerRequest struct {
-	ParentID     string `json:"parent_id"`
 	RequestID    string `json:"request_id"`
 	EscalationID int64  `json:"escalation_id"`
 	Text         string `json:"text"`
@@ -788,9 +784,6 @@ func serveAnswer(ctx context.Context, h Host, body []byte) (any, error) {
 	if err := decode(body, &req); err != nil {
 		return nil, err
 	}
-	if err := checkParentID(req.ParentID); err != nil {
-		return nil, err
-	}
 	if err := db.ValidRequestID(req.RequestID); err != nil {
 		return nil, Refuse(CodeBadRequest, "%v", err)
 	}
@@ -805,7 +798,7 @@ func serveAnswer(ctx context.Context, h Host, body []byte) (any, error) {
 		return nil, err
 	}
 	defer store.Close()
-	if err := checkParent(ctx, store, req.ParentID); err != nil {
+	if err := checkParent(ctx, store, h.KeyParent); err != nil {
 		return nil, err
 	}
 	// Recorded as relayed by the parent coordinator: not the lead, whose words these may be but

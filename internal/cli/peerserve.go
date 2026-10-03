@@ -23,10 +23,11 @@ import (
 	"github.com/nution101/ttorch/internal/peer"
 )
 
-const peerUsage = `usage: ttorch peer serve | init
+const peerUsage = `usage: ttorch peer serve [--parent <coordinator id>] | init
   serve answers one control request from a parent coordinator. It runs as an ssh forced
-  command (command="<ttorch> peer serve",restrict in authorized_keys): the verb comes from
-  SSH_ORIGINAL_COMMAND and the request is one JSON object on stdin.
+  command (command="<ttorch> peer serve --parent <id>",restrict in authorized_keys): the verb
+  comes from SSH_ORIGINAL_COMMAND and the request is one JSON object on stdin. --parent is the
+  parent the key was installed for; without it, the key takes no task, goal or answer.
   init provisions this machine as a peer. ttorch peer add on the parent runs it over the
   lead's own ssh session, with one JSON request on stdin.`
 
@@ -40,18 +41,26 @@ func cmdPeer(args []string) int {
 		return 2
 	}
 	switch args[0] {
-	case "serve", "init":
+	case "init":
 		if len(args) > 1 {
-			// The forced command is exactly `ttorch peer serve`. A verb typed here would be a
-			// second way in that the authorized_keys line does not describe; init's request
-			// travels on stdin the same way.
-			fmt.Fprintf(os.Stderr, "ttorch peer %s takes no arguments: the request comes from SSH_ORIGINAL_COMMAND and stdin\n%s\n", args[0], peerUsage)
+			// init's request travels on stdin, like serve's.
+			fmt.Fprintf(os.Stderr, "ttorch peer init takes no arguments: the request comes from stdin\n%s\n", peerUsage)
 			return 2
 		}
-		if args[0] == "init" {
-			return cmdPeerInit(os.Stdin, os.Stdout, os.Stderr)
+		return cmdPeerInit(os.Stdin, os.Stdout, os.Stderr)
+	case "serve":
+		// The forced command is exactly `ttorch peer serve --parent <id>`. A verb typed here
+		// would be a second way in that the authorized_keys line does not describe.
+		var keyParent string
+		switch {
+		case len(args) == 1:
+		case len(args) == 3 && args[1] == "--parent":
+			keyParent = args[2]
+		default:
+			fmt.Fprintf(os.Stderr, "ttorch peer serve takes only --parent <coordinator id>: the request comes from SSH_ORIGINAL_COMMAND and stdin\n%s\n", peerUsage)
+			return 2
 		}
-		return cmdPeerServe(os.Stdin, os.Stdout, os.Stderr)
+		return cmdPeerServe(keyParent, os.Stdin, os.Stdout, os.Stderr)
 	}
 	// The parent's commands (peerclient.go) reach a peer only through the control key, or, for
 	// add and adopt, through the lead's own ssh session.
@@ -66,14 +75,21 @@ func cmdPeer(args []string) int {
 // in it. ensure-up starts the tmux server every restored window and worker inherits from, and the
 // scheduler daemon, so a variable left here would reach all of them, and TTORCH_HOME, TTORCH_DB,
 // TTORCH_TMUX_SESSION or TTORCH_BACKEND would choose which store and session this process acts on.
-func cmdPeerServe(stdin io.Reader, stdout, stderr io.Writer) int {
+//
+// keyParent is the forced command's --parent, the parent the key was installed for ("" when the
+// line has none). Only the account's authorized_keys sets it, so a malformed one is a broken
+// installation, answered as unavailable for every verb rather than read as no parent.
+func cmdPeerServe(keyParent string, stdin io.Reader, stdout, stderr io.Writer) int {
 	command := os.Getenv("SSH_ORIGINAL_COMMAND")
 	// The caller's context is judged on the environment it came with, before that is replaced.
 	signal := workerContextSignal()
 	p, err := peerControlEnv()
 	host := peerHost(p)
+	host.KeyParent = keyParent
 	if err != nil {
 		host = peer.Host{Unavailable: peer.Refuse(peer.CodeUnavailable, "the peer's control environment: %v", err)}
+	} else if keyParent != "" && db.ValidCoordID(keyParent) != nil {
+		host = peer.Host{Unavailable: peer.Refuse(peer.CodeUnavailable, "the control key's forced command passes a --parent that is not a coordinator id; ttorch peer adopt --force reinstalls the key")}
 	}
 	return peer.Serve(context.Background(), command, stdin, stdout, stderr, signal, host)
 }

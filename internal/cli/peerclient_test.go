@@ -53,12 +53,14 @@ func applyPeerClientSeams() {
 }
 
 // shimConfig is the stand-in ssh's world: where it logs, the peer account's home, the peer's
-// ttorch home, and, with Hang set, that it never answers.
+// ttorch home, and, with Hang set, that it never answers. With Unbound set, a control key's
+// forced command runs without its --parent, as a line an older init wrote would.
 type shimConfig struct {
 	Log     string `json:"log"`
 	Account string `json:"account"`
 	Home    string `json:"home"`
 	Hang    bool   `json:"hang"`
+	Unbound bool   `json:"unbound"`
 }
 
 type shimCall struct {
@@ -115,6 +117,9 @@ func runSSHShim(cfgPath string, args []string) int {
 			return 255
 		}
 		command = forced
+		if cfg.Unbound {
+			command = regexp.MustCompile(` --parent [0-9a-f]+$`).ReplaceAllString(command, "")
+		}
 		env = append(env, "SSH_ORIGINAL_COMMAND="+remote)
 	}
 	cmd := exec.Command("/bin/sh", "-c", command)
@@ -438,6 +443,23 @@ func TestPeerAddFailsClosed(t *testing.T) {
 		t.Errorf("ssh ran %d times; want only the init session", n)
 	}
 	firstKey, _ := os.ReadFile(p.ControlKey + ".pub")
+
+	if err := os.Remove(f.peer.authorizedKeys()); err != nil {
+		t.Fatal(err)
+	}
+	// The key is admitted, but its forced command binds no parent, so the peer would refuse
+	// every task, goal and answer the parent sends: the version proof says so, and add stops.
+	f.cfg.Unbound = true
+	f.writeConfig(t)
+	r = f.run(t, nil, "peer", "add", "build", "ttorch@build-host")
+	if r.code == 0 || !strings.Contains(r.stderr, "stays provisioning") || !strings.Contains(r.stderr, "bound to") {
+		t.Fatalf("peer add through a key bound to no parent: exit %d, stderr %q", r.code, r.stderr)
+	}
+	if p, _, _ = f.parentStore(t).GetPeer(ctx, "build"); p.Status != db.PeerProvisioning {
+		t.Errorf("after an unbound key: %+v", p)
+	}
+	f.cfg.Unbound = false
+	f.writeConfig(t)
 
 	if err := os.Remove(f.peer.authorizedKeys()); err != nil {
 		t.Fatal(err)

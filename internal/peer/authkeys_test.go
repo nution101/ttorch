@@ -34,7 +34,7 @@ func testControlKey(t *testing.T) (line, blob string) {
 func TestAuthorizedKeyLine(t *testing.T) {
 	_, blob := testControlKey(t)
 	got := AuthorizedKeyLine("/home/ttorch/.ttorch/bin/ttorch", blob, testParent)
-	want := `command="/home/ttorch/.ttorch/bin/ttorch peer serve",restrict ssh-ed25519 ` + blob + ` ttorch-peer-control:` + testParent
+	want := `command="/home/ttorch/.ttorch/bin/ttorch peer serve --parent ` + testParent + `",restrict ssh-ed25519 ` + blob + ` ttorch-peer-control:` + testParent
 	if got != want {
 		t.Errorf("AuthorizedKeyLine =\n%s\nwant\n%s", got, want)
 	}

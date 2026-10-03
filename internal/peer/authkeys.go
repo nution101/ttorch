@@ -6,12 +6,16 @@ package peer
 //
 // The line is the whole bound on what the control key can do:
 //
-//	command="<absolute path to ttorch> peer serve",restrict ssh-ed25519 <key> ttorch-peer-control:<parent>
+//	command="<absolute path to ttorch> peer serve --parent <parent>",restrict ssh-ed25519 <key> ttorch-peer-control:<parent>
 //
 // sshd runs the forced command for that key whatever the client asked for, and puts the client's
 // request in SSH_ORIGINAL_COMMAND, which Serve reads as one verb. restrict turns off forwarding of
 // every kind, pty allocation and ~/.ssh/rc. The path is absolute so the PATH sshd gives a forced
-// command, which may not reach ~/.ttorch/bin, does not decide which program runs. This file is in
+// command, which may not reach ~/.ttorch/bin, does not decide which program runs. --parent is the
+// coordinator id of the parent the key was installed for: serve takes the parent a request comes
+// from from its own argv, which only this line sets, so holding one parent's key does not let a
+// client speak as another. The comment carries the same id, for a person reading the file and for
+// adopt --force, which finds every control key's line by it. This file is in
 // the gate's covered set (orchestrator.ttorchSourceFiles) beside serve.go: a change to the line,
 // or to which binary it names, changes what a parent's key reaches.
 
@@ -30,6 +34,8 @@ import (
 	"unicode"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/nution101/ttorch/internal/db"
 )
 
 // ControlKeyType is the only key type a control key may be.
@@ -46,10 +52,10 @@ const maxAuthorizedKeys = 8 << 20
 func ControlKeyComment(parentID string) string { return controlKeyCommentPrefix + parentID }
 
 // AuthorizedKeyLine is the line that admits a parent's control key and runs nothing but
-// `<binary> peer serve` for it. binary must have passed resolveServeBinary and blob
-// ParseControlKey.
+// `<binary> peer serve --parent <parentID>` for it. binary must have passed resolveServeBinary,
+// blob ParseControlKey and parentID db.ValidCoordID.
 func AuthorizedKeyLine(binary, blob, parentID string) string {
-	return fmt.Sprintf(`command="%s peer serve",restrict %s %s %s`, binary, ControlKeyType, blob, ControlKeyComment(parentID))
+	return fmt.Sprintf(`command="%s peer serve --parent %s",restrict %s %s %s`, binary, parentID, ControlKeyType, blob, ControlKeyComment(parentID))
 }
 
 // ParseControlKey reads a public key as ssh-keygen writes it, "ssh-ed25519 <base64> [comment]",
@@ -108,6 +114,10 @@ func shellSafe(path string) bool {
 // (ServeBinary), and installs the line in <sshDir>/authorized_keys (installControlKey). Everything
 // that decides what the line says is in this file. It returns the binary path with the result.
 func ProvisionControlKey(sshDir, pubKey, parentID string, uid int) (string, InstallResult, error) {
+	// The id goes into the forced command, which sshd hands to a shell.
+	if err := db.ValidCoordID(parentID); err != nil {
+		return "", InstallResult{}, fmt.Errorf("the parent's coordinator id: %w", err)
+	}
 	blob, err := ParseControlKey(pubKey)
 	if err != nil {
 		return "", InstallResult{}, err

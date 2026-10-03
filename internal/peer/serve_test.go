@@ -203,24 +203,18 @@ func TestServeRequestFields(t *testing.T) {
 		{"decisions with a negative cursor", VerbDecisions, `{"since":-1}`},
 	}
 	for _, c := range cases {
-		body := c.body
-		if c.verb != VerbDecisions {
-			body = withParent(body)
-		}
-		code, r, stderr := serveCall(t, unwired(t), c.verb, body)
-		wantRefusal(t, c.label, code, r, stderr, CodeBadRequest)
-	}
-	// The parent's id is required, and must look like one: the fields above all carried one.
-	for _, c := range []struct{ label, verb, body string }{
-		{"task-add without a parent id", VerbTaskAdd, `{"request_id":"r1","task_id":"t1","repo":"/r",` + brief + `}`},
-		{"goal without a parent id", VerbGoal, `{"request_id":"r1","text":"do it"}`},
-		{"answer without a parent id", VerbAnswer, `{"request_id":"r1","escalation_id":1,"text":"yes"}`},
-		{"task-add with a short parent id", VerbTaskAdd, withParentID(`{"request_id":"r1","task_id":"t1","repo":"/r",`+brief+`}`, "abc")},
-		{"goal with an uppercase parent id", VerbGoal, withParentID(`{"request_id":"r1","text":"do it"}`, strings.ToUpper(testParent))},
-		{"answer with a parent id holding a quote", VerbAnswer, withParentID(`{"request_id":"r1","escalation_id":1,"text":"yes"}`, `0123456789abcdef0123456789abcde\"`)},
-	} {
 		code, r, stderr := serveCall(t, unwired(t), c.verb, c.body)
 		wantRefusal(t, c.label, code, r, stderr, CodeBadRequest)
+	}
+	// The parent comes from the key's forced command, never from the request: a request that
+	// names one is malformed, whatever it names.
+	for _, c := range []struct{ label, verb, body string }{
+		{"task-add naming a parent", VerbTaskAdd, withParentID(`{"request_id":"r1","task_id":"t1","repo":"/r",`+brief+`}`, testParent)},
+		{"goal naming a parent", VerbGoal, withParentID(`{"request_id":"r1","text":"do it"}`, testParent)},
+		{"answer naming a parent", VerbAnswer, withParentID(`{"request_id":"r1","escalation_id":1,"text":"yes"}`, otherParent)},
+	} {
+		code, r, stderr := serveCall(t, unwired(t), c.verb, c.body)
+		wantRefusal(t, c.label, code, r, stderr, CodeBadBody)
 	}
 }
 
@@ -298,9 +292,6 @@ const (
 	otherParent = "fedcba9876543210fedcba9876543210"
 )
 
-// withParent puts testParent's id in a request body, as the parent's client does.
-func withParent(body string) string { return withParentID(body, testParent) }
-
 func withParentID(body, id string) string {
 	return strings.Replace(body, "{", `{"parent_id":"`+id+`",`, 1)
 }
@@ -329,6 +320,7 @@ func newServedStore(t *testing.T, provision bool) (Host, string) {
 		t.Fatal(err)
 	}
 	return Host{
+		KeyParent: testParent,
 		ReadStore: func() (*db.Store, error) { return db.OpenReadOnly(path) },
 		Store:     func() (*db.Store, error) { return db.Open(path) },
 		Version:   "v-test",
@@ -374,7 +366,7 @@ func TestServeVersionDecisionsGoalAnswer(t *testing.T) {
 	var v VersionResult
 	resultOf(t, r, &v)
 	if code != 0 || v.Protocol != ProtocolVersion || v.Version != "v-test" ||
-		v.Coordinator != (CoordinatorInfo{Name: "build", Role: db.CoordinatorPeer, ParentID: testParent}) {
+		v.Coordinator != (CoordinatorInfo{Name: "build", Role: db.CoordinatorPeer, ParentID: testParent}) || v.KeyParent != testParent {
 		t.Errorf("version = %+v", v)
 	}
 
@@ -422,23 +414,23 @@ func TestServeVersionDecisionsGoalAnswer(t *testing.T) {
 		return out
 	}
 
-	_, r, _ = serveCall(t, h, VerbGoal, withParent(`{"request_id":"goal-1","text":"split the importer"}`))
+	_, r, _ = serveCall(t, h, VerbGoal, `{"request_id":"goal-1","text":"split the importer"}`)
 	var g GoalResult
 	resultOf(t, r, &g)
-	_, r, _ = serveCall(t, h, VerbGoal, withParent(`{"request_id":"goal-1","text":"something else"}`))
+	_, r, _ = serveCall(t, h, VerbGoal, `{"request_id":"goal-1","text":"something else"}`)
 	var g2 GoalResult
 	resultOf(t, r, &g2)
 	if g.Replayed || !g2.Replayed || g2.EventID != g.EventID {
 		t.Errorf("goal then repeat = %+v, %+v", g, g2)
 	}
 
-	_, r, _ = serveCall(t, h, VerbAnswer, withParent(`{"request_id":"ans-1","escalation_id":`+itoa(first.ID)+`,"text":"the first"}`))
+	_, r, _ = serveCall(t, h, VerbAnswer, `{"request_id":"ans-1","escalation_id":`+itoa(first.ID)+`,"text":"the first"}`)
 	var a AnswerResult
 	resultOf(t, r, &a)
 	if a.EscalationID != first.ID || a.Status != db.EscalationAnswered || a.AnsweredBy != db.ActorParent || a.TaskID != "t1" || a.Replayed {
 		t.Errorf("answer = %+v", a)
 	}
-	_, r, _ = serveCall(t, h, VerbAnswer, withParent(`{"request_id":"ans-1","escalation_id":`+itoa(first.ID)+`,"text":"changed my mind"}`))
+	_, r, _ = serveCall(t, h, VerbAnswer, `{"request_id":"ans-1","escalation_id":`+itoa(first.ID)+`,"text":"changed my mind"}`)
 	var a2 AnswerResult
 	resultOf(t, r, &a2)
 	if !a2.Replayed || a2.EventID != a.EventID {
@@ -455,20 +447,21 @@ func TestServeVersionDecisionsGoalAnswer(t *testing.T) {
 		}
 	}
 
-	code, r, stderr := serveCall(t, h, VerbAnswer, withParent(`{"request_id":"ans-2","escalation_id":`+itoa(first.ID)+`,"text":"again"}`))
+	code, r, stderr := serveCall(t, h, VerbAnswer, `{"request_id":"ans-2","escalation_id":`+itoa(first.ID)+`,"text":"again"}`)
 	wantRefusal(t, "answer to an answered escalation", code, r, stderr, CodeConflict)
-	code, r, stderr = serveCall(t, h, VerbAnswer, withParent(`{"request_id":"ans-3","escalation_id":999,"text":"x"}`))
+	code, r, stderr = serveCall(t, h, VerbAnswer, `{"request_id":"ans-3","escalation_id":999,"text":"x"}`)
 	wantRefusal(t, "answer to no escalation", code, r, stderr, CodeNotFound)
-	code, r, stderr = serveCall(t, h, VerbGoal, withParent(`{"request_id":"ans-1","text":"x"}`))
+	code, r, stderr = serveCall(t, h, VerbGoal, `{"request_id":"ans-1","text":"x"}`)
 	wantRefusal(t, "goal under an answer's request id", code, r, stderr, CodeConflict)
 }
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }
 
-// TestServeRefusesAnotherParent: task-add, goal and answer name the parent they come from, and a
-// peer refuses one from any coordinator but the parent that provisioned it, before the request
-// ledger is read, so not even a replay of a stored result reaches another parent. A coordinator no
-// parent provisioned refuses all three. Nothing is written either way. The read verbs do not check.
+// TestServeRefusesAnotherParent: task-add, goal and answer come from the parent the key's forced
+// command names (Host.KeyParent), and a peer refuses them through a key bound to any coordinator
+// but the parent that provisioned it, or to none, before the request ledger is read, so not even a
+// replay of a stored result reaches another parent. A coordinator no parent provisioned refuses
+// all three. Nothing is written either way. The read verbs do not check.
 func TestServeRefusesAnotherParent(t *testing.T) {
 	ctx := context.Background()
 	h, path := servedStore(t)
@@ -491,7 +484,7 @@ func TestServeRefusesAnotherParent(t *testing.T) {
 		return res, "", err
 	}
 	// One goal from the parent, so there is a stored result another parent could try to replay.
-	_, r, _ := serveCall(t, h, VerbGoal, withParent(`{"request_id":"goal-1","text":"tidy"}`))
+	_, r, _ := serveCall(t, h, VerbGoal, `{"request_id":"goal-1","text":"tidy"}`)
 	var g GoalResult
 	resultOf(t, r, &g)
 
@@ -509,8 +502,10 @@ func TestServeRefusesAnotherParent(t *testing.T) {
 		{"a replayed goal", VerbGoal, `{"request_id":"goal-1","text":"tidy"}`},
 		{"answer", VerbAnswer, `{"request_id":"ans-1","escalation_id":` + itoa(esc.ID) + `,"text":"the first"}`},
 	}
+	wrong := h
+	wrong.KeyParent = otherParent
 	for _, c := range mutating {
-		code, r, stderr := serveCall(t, h, c.verb, withParentID(c.body, otherParent))
+		code, r, stderr := serveCall(t, wrong, c.verb, c.body)
 		wantRefusal(t, "another parent's "+c.label, code, r, stderr, CodeWrongParent)
 		if r.Error != nil && (!strings.Contains(r.Error.Message, otherParent) || !strings.Contains(r.Error.Message, testParent)) {
 			t.Errorf("another parent's %s: the refusal %q does not name both coordinators", c.label, r.Error.Message)
@@ -526,9 +521,15 @@ func TestServeRefusesAnotherParent(t *testing.T) {
 		t.Errorf("another parent's answer changed the escalation: %+v", e)
 	}
 	for _, verb := range []string{VerbVersion, VerbDecisions} {
-		if _, r, _ := serveCall(t, h, verb, ``); !r.OK {
+		if _, r, _ := serveCall(t, wrong, verb, ``); !r.OK {
 			t.Errorf("%s is a read and does not check the parent; got %+v", verb, r.Error)
 		}
+	}
+	unbound := h
+	unbound.KeyParent = ""
+	for _, c := range mutating {
+		code, r, stderr := serveCall(t, unbound, c.verb, c.body)
+		wantRefusal(t, "a key bound to no parent: "+c.label, code, r, stderr, CodeWrongParent)
 	}
 
 	// A root coordinator, which no parent provisioned, has no parent to match.
@@ -539,7 +540,7 @@ func TestServeRefusesAnotherParent(t *testing.T) {
 	}
 	root.AddTask = h.AddTask
 	for _, c := range mutating {
-		code, r, stderr := serveCall(t, root, c.verb, withParent(c.body))
+		code, r, stderr := serveCall(t, root, c.verb, c.body)
 		wantRefusal(t, "a root's "+c.label, code, r, stderr, CodeWrongParent)
 	}
 }
@@ -567,23 +568,23 @@ func TestServeTaskAddReplaysBeforeTheLint(t *testing.T) {
 		return res, "5 of 5 rules ran: passed\x1b[0m", err
 	}
 	body := `{"request_id":"add-1","task_id":"p-1","repo":"/repo","touches":["a.go"],"brief":"# b"}`
-	_, r, _ := serveCall(t, h, VerbTaskAdd, withParent(body))
+	_, r, _ := serveCall(t, h, VerbTaskAdd, body)
 	var first TaskAddResult
 	resultOf(t, r, &first)
 	if first.TaskID != "p-1" || !first.HasBrief || first.Replayed || first.Lint != `5 of 5 rules ran: passed\x1b[0m` {
 		t.Errorf("task-add = %+v", first)
 	}
-	_, r, _ = serveCall(t, h, VerbTaskAdd, withParent(body))
+	_, r, _ = serveCall(t, h, VerbTaskAdd, body)
 	var again TaskAddResult
 	resultOf(t, r, &again)
 	if !again.Replayed || again.EventID != first.EventID || again.Lint != "" || adds != 1 {
 		t.Errorf("repeat = %+v after %d adds, want a replay with no second add", again, adds)
 	}
-	code, r, stderr := serveCall(t, h, VerbTaskAdd, withParent(`{"request_id":"add-1","task_id":"p-2","repo":"/repo","brief":"# b"}`))
+	code, r, stderr := serveCall(t, h, VerbTaskAdd, `{"request_id":"add-1","task_id":"p-2","repo":"/repo","brief":"# b"}`)
 	wantRefusal(t, "request id reused for another task", code, r, stderr, CodeConflict)
-	code, r, stderr = serveCall(t, h, VerbTaskAdd, withParent(`{"request_id":"add-2","task_id":"p-1","repo":"/repo","brief":"# b"}`))
+	code, r, stderr = serveCall(t, h, VerbTaskAdd, `{"request_id":"add-2","task_id":"p-1","repo":"/repo","brief":"# b"}`)
 	wantRefusal(t, "task id taken", code, r, stderr, CodeConflict)
-	code, r, stderr = serveCall(t, h, VerbTaskAdd, withParent(`{"request_id":"add-3","task_id":"p-3","repo":"/elsewhere","brief":"# b"}`))
+	code, r, stderr = serveCall(t, h, VerbTaskAdd, `{"request_id":"add-3","task_id":"p-3","repo":"/elsewhere","brief":"# b"}`)
 	wantRefusal(t, "unregistered repo", code, r, stderr, CodeNotFound)
 	if adds != 2 {
 		t.Errorf("adds = %d, want 2 (the first, and the taken id the store refused)", adds)
