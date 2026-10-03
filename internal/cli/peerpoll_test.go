@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -278,5 +279,73 @@ func TestControlChannelReadsTheSummary(t *testing.T) {
 	answer(`{"schema_version":99,"manager":{"window_present":true},"scheduler":{"daemon_running":true}}`)
 	if _, err := ch.Summary(ctx); err == nil || !strings.Contains(err.Error(), "schema 99") {
 		t.Errorf("a summary in schema 99: %v, want it refused", err)
+	}
+}
+
+// TestPeerPassNoticesAPeerStoreThatWentBack: the peer's escalations are emptied and its id
+// sequence reset, as a recreated store would leave them, so its next escalation is numbered 1
+// again, below the cursor. The pass raises one peer_cursor_reset and the new escalation, which the
+// old cursor would have hidden, and moves the cursor back to 1.
+func TestPeerPassNoticesAPeerStoreThatWentBack(t *testing.T) {
+	ctx := context.Background()
+	f := newPeerFixture(t)
+	f.add(t, "build")
+	usePeerShim(t, f, 30*time.Second)
+	ps := f.peerStore(t)
+	proj, err := ps.UpsertProject(ctx, "/srv/q", "q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ps.CreateTask(ctx, db.Task{ID: "t-q", ProjectID: proj.ID}, db.ActorManager); err != nil {
+		t.Fatal(err)
+	}
+	for _, body := range []string{"first", "second", "third"} {
+		if _, err := ps.OpenEscalation(ctx, "t-q", db.EscalationQuestion, body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	parent := f.parentStore(t)
+	sc := &scheduler.Scheduler{Store: parent, Peers: dialPeer}
+	if _, err := sc.RunPeerPassOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if p, _, _ := parent.GetPeer(ctx, "build"); p.EscalationCursor != 3 {
+		t.Fatalf("cursor = %d, want 3", p.EscalationCursor)
+	}
+
+	raw, err := sql.Open("sqlite", f.peer.db())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	for _, q := range []string{`DELETE FROM escalations`, `UPDATE sqlite_sequence SET seq = 0 WHERE name = 'escalations'`} {
+		if _, err := raw.ExecContext(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	again, err := ps.OpenEscalation(ctx, "t-q", db.EscalationQuestion, "after the reset")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.ID != 1 {
+		t.Fatalf("the peer numbered the new escalation %d, want 1", again.ID)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := sc.RunPeerPassOnce(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	evs := peerEventsIn(t, parent, "build")
+	if n := countType(evs, db.EventPeerCursorReset); n != 1 {
+		t.Errorf("%d peer_cursor_reset events, want 1", n)
+	}
+	if n := countType(evs, db.EventPeerEscalation); n != 4 {
+		t.Errorf("%d peer_escalation events, want 4: three from before and the new one", n)
+	}
+	if last := evs[len(evs)-1]; last.Type != db.EventPeerEscalation || !strings.Contains(last.Payload, "after the reset") {
+		t.Errorf("last event = %+v, want the new escalation", last)
+	}
+	if p, _, _ := parent.GetPeer(ctx, "build"); p.EscalationCursor != 1 {
+		t.Errorf("cursor after the re-sync = %d, want 1", p.EscalationCursor)
 	}
 }

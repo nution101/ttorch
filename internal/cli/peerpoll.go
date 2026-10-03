@@ -54,7 +54,7 @@ func (ch controlChannel) Decisions(ctx context.Context, since int64) (scheduler.
 	}
 	out := scheduler.PeerDecisions{Open: d.Open}
 	for _, e := range d.Escalations {
-		out.Escalations = append(out.Escalations, scheduler.PeerEscalation{ID: e.ID, Kind: e.Kind, TaskID: e.TaskID, Body: e.Body})
+		out.Escalations = append(out.Escalations, scheduler.PeerEscalation{ID: e.ID, Kind: e.Kind, TaskID: e.TaskID, Body: e.Body, CreatedAt: e.CreatedAt})
 	}
 	return out, nil
 }

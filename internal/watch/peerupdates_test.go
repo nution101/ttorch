@@ -202,3 +202,35 @@ func TestDedupeByEntity_PeerEventsKeptApart(t *testing.T) {
 		t.Errorf("deduped ids = %v, want [1 3 4 5]: every peer event, and alpha's latest", ids)
 	}
 }
+
+// TestReadInbox_PeerCursorResetAndProtocolErrorPrint: a peer whose ids went back and one that
+// listed ids out of range each print their own line in the peer block, saying what happened.
+func TestReadInbox_PeerCursorResetAndProtocolErrorPrint(t *testing.T) {
+	_, s, _, _ := newWatcher(t)
+	reset := appendPeerEvent(t, s, "build", db.EventPeerCursorReset, db.PeerCursorResetPayload{
+		Peer: "build", Cursor: 40, Resynced: 2, Unseen: 2, Lowest: 1})
+	bad := appendPeerEvent(t, s, "build", db.EventPeerProtocolError, db.PeerProtocolErrorPayload{
+		Peer: "build", Reason: "an id above 2147483647", Refused: 1, IDs: []int64{9223372036854775807}})
+	esc := appendPeerEvent(t, s, "build", db.EventPeerEscalation, db.PeerEscalationPayload{
+		Peer: "build", EscalationID: 1, Kind: "question", Open: 2, Body: "new store, first question"})
+	res, text := readInbox(t, s)
+	t.Logf("inbox output:\n%s", text)
+	if len(res.Batch) != 3 {
+		t.Fatalf("batch has %d updates, want 3", len(res.Batch))
+	}
+	assertOnlyInsidePeerBlock(t, text, map[string]string{
+		fmt.Sprintf("#%d peer-cursor-reset", reset.ID): fmt.Sprintf("#%d peer-cursor-reset", reset.ID),
+		fmt.Sprintf("#%d peer-protocol-error", bad.ID): fmt.Sprintf("#%d peer-protocol-error", bad.ID),
+		"an id above 2147483647":                       `reason: "`,
+		"new store, first question":                    `peer text: "`,
+		fmt.Sprintf("#%d peer-escalation", esc.ID):     fmt.Sprintf("#%d peer-escalation", esc.ID),
+	})
+	for _, want := range []string{
+		fmt.Sprintf(`#%d peer-cursor-reset peer="build" cursor=40 resynced=2 unseen=2 lowest=1`, reset.ID),
+		fmt.Sprintf(`#%d peer-protocol-error peer="build" refused=1 ids=[9223372036854775807]`, bad.ID),
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("inbox output missing %q", want)
+		}
+	}
+}

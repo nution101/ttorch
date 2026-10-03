@@ -27,10 +27,12 @@ const (
 // peerEventTypes are the event kinds the peer pass records, under entity system and entity id and
 // actor peer:<name>.
 var peerEventTypes = map[string]bool{
-	db.EventPeerEscalation:  true,
-	db.EventPeerUnreachable: true,
-	db.EventPeerRecovered:   true,
-	db.EventPeerDown:        true,
+	db.EventPeerEscalation:    true,
+	db.EventPeerUnreachable:   true,
+	db.EventPeerRecovered:     true,
+	db.EventPeerDown:          true,
+	db.EventPeerCursorReset:   true,
+	db.EventPeerProtocolError: true,
 }
 
 // isPeerEvent reports whether e is an event the peer pass recorded about a peer. Each one is its
@@ -80,6 +82,22 @@ func writePeerEntry(out io.Writer, e db.Event) {
 		}
 		fmt.Fprintf(out, "  #%d peer-down peer=%q ensure-up calls=%d manager window=%t scheduler running=%t stalled=%t (restart it at the peer's own terminal)\n",
 			e.ID, peer, p.EnsureUpCalls, p.ManagerWindow, p.SchedulerRunning, p.SchedulerStalled)
+	case db.EventPeerCursorReset:
+		var p db.PeerCursorResetPayload
+		if json.Unmarshal([]byte(e.Payload), &p) != nil {
+			bad()
+			return
+		}
+		fmt.Fprintf(out, "  #%d peer-cursor-reset peer=%q cursor=%d resynced=%d unseen=%d lowest=%d (its escalation ids went back: a recreated or restored store; ttorch peer decisions %s lists what is open)\n",
+			e.ID, peer, p.Cursor, p.Resynced, p.Unseen, p.Lowest, quoteArg(peer))
+	case db.EventPeerProtocolError:
+		var p db.PeerProtocolErrorPayload
+		if json.Unmarshal([]byte(e.Payload), &p) != nil {
+			bad()
+			return
+		}
+		fmt.Fprintf(out, "  #%d peer-protocol-error peer=%q refused=%d ids=%v (escalations with these ids were not raised)\n", e.ID, peer, p.Refused, p.IDs)
+		writeUpdateField(out, "reason", p.Reason)
 	default:
 		bad()
 	}

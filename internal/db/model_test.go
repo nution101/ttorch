@@ -122,8 +122,8 @@ func TestMigration0007TaskModel(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t) // Open() already migrated to the latest
 
-	if v, err := s.schemaVersion(ctx); err != nil || v != 12 {
-		t.Fatalf("fresh DB version = %d err=%v, want 12", v, err)
+	if v, err := s.schemaVersion(ctx); err != nil || v != 13 {
+		t.Fatalf("fresh DB version = %d err=%v, want 13", v, err)
 	}
 	if !taskColumns(t, s)["model"] {
 		t.Fatal("model column missing after up")

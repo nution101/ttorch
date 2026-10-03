@@ -61,11 +61,15 @@ type Peer struct {
 	LastError           string
 	CreatedAt           time.Time
 	UpdatedAt           time.Time
+	// CursorResetOpen and BadIDsOpen are the poll's episode flags (migration 0013): the peer's
+	// escalation ids went back, or it listed ids out of range, and the episode's event is raised.
+	CursorResetOpen bool
+	BadIDsOpen      bool
 }
 
 const peerColumns = `name, control_dest, approve_dest, control_key, status, protocol, version,
 	escalation_cursor, summary, consecutive_failures, down_attempts, last_ok_at, last_error,
-	created_at, updated_at`
+	created_at, updated_at, cursor_reset_open, bad_ids_open`
 
 func scanPeer(r rowScanner) (Peer, error) {
 	var (
@@ -75,7 +79,7 @@ func scanPeer(r rowScanner) (Peer, error) {
 	)
 	if err := r.Scan(&p.Name, &p.ControlDest, &p.ApproveDest, &p.ControlKey, &p.Status, &p.Protocol,
 		&p.Version, &p.EscalationCursor, &p.Summary, &p.ConsecutiveFailures, &p.DownAttempts, &lastOK,
-		&p.LastError, &created, &updated); err != nil {
+		&p.LastError, &created, &updated, &p.CursorResetOpen, &p.BadIDsOpen); err != nil {
 		return Peer{}, err
 	}
 	var err error
@@ -144,7 +148,8 @@ func printableField(what, v string) error {
 // provisioning when it is retired, when it is still provisioning (a retried `peer add`), or when
 // replace is set (`peer adopt`); otherwise the name is in use and the call fails with
 // ErrPeerExists. The row's creation time, its repositories and its delegations are kept; the
-// scheduler's poll state (escalation cursor, failure streak, down episode) starts over. A
+// scheduler's poll state (escalation cursor, the record of what it raised, failure streak, down
+// episode, episode flags) starts over. A
 // coordinator that is itself a peer registers none (ErrCoordinatorIsPeer).
 func (s *Store) RegisterPeer(ctx context.Context, p Peer, replace bool) (Peer, error) {
 	if err := ValidPeerName(p.Name); err != nil {
@@ -186,12 +191,16 @@ func (s *Store) RegisterPeer(ctx context.Context, p Peer, replace bool) (Peer, e
 				p.Name, p.ControlDest, p.ApproveDest, p.ControlKey, PeerProvisioning, now, now)
 		case cur.Status == PeerRetired, cur.Status == PeerProvisioning, replace:
 			// The name may now point at another machine, or at a fresh store whose escalation
-			// ids start at 1 again, so the poll's state starts over with the registration.
+			// ids start at 1 again, so the poll's state starts over with the registration,
+			// including the record of what it raised.
 			_, err = tx.ExecContext(ctx,
 				`UPDATE peers SET control_dest = ?, approve_dest = ?, control_key = ?, status = ?,
 				 escalation_cursor = 0, consecutive_failures = 0, down_attempts = 0,
-				 last_error = '', updated_at = ? WHERE name = ?`,
+				 cursor_reset_open = 0, bad_ids_open = 0, last_error = '', updated_at = ? WHERE name = ?`,
 				p.ControlDest, p.ApproveDest, p.ControlKey, PeerProvisioning, now, p.Name)
+			if err == nil {
+				_, err = tx.ExecContext(ctx, `DELETE FROM peer_open_escalations WHERE peer = ?`, p.Name)
+			}
 		default:
 			return fmt.Errorf("peer %s is %s: %w", p.Name, cur.Status, ErrPeerExists)
 		}

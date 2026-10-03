@@ -1268,13 +1268,26 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   wait for it. Each peer is polled in its own goroutine under a 90s deadline, on top of the
   client's 30s per call, and a peer still being polled when the next pass is due is skipped by
   that pass, so a peer that never answers delays neither the tick nor the other peers. A poll
-  calls `summary`, then `decisions` above the peer's `escalation_cursor`, caches the summary on
-  the peer's row, and raises each escalation above the cursor as one actionable event: entity
+  calls `summary`, then `decisions` for every open escalation, caches the summary on the peer's
+  row, and raises each open escalation it has not raised yet as one actionable event: entity
   `system`, entity id and actor `peer:<name>`, type `peer_escalation`, with a JSON payload of the
-  escalation's id, kind, task and body and the peer's open count. At most 32 are raised per poll,
-  lowest id first, and the rest on the next polls. The events and the cursor move in one
-  transaction, which re-reads the cursor, so a crash or a restart neither loses nor repeats one
-  and two schedulers on one store raise each once. Peer text is escaped again if it still holds
+  escalation's id, kind, task, body and the peer's own creation stamp for it, and the peer's open
+  count. Which ones are new is decided against `peer_open_escalations` (migration 0013), the
+  escalations raised here that are still open, each named by the peer's id and creation stamp
+  together; a row goes once the peer no longer lists it. At most 32 are raised per poll, lowest id
+  first, and the rest on the next polls. The events, the rows and the cursor (the highest id
+  raised) move in one transaction that reads them first, so a crash or a restart neither loses
+  nor repeats one and two schedulers on one store raise each once. A peer's ids only grow, so an
+  escalation never raised here at or below the cursor means its ids went back: a recreated or
+  restored store. That raises one actionable `peer_cursor_reset` per episode, the escalations are
+  raised as usual, and the cursor moves to the highest id raised that is still open. An open
+  escalation with nothing new above the cursor, or a highest open id below it because the newest
+  was answered, is the normal state and raises nothing. An id at or below zero, above 2^31-1,
+  listed twice, or more than 10000 above a cursor above zero is refused: not raised, and the
+  cursor does not move for it. Refusals raise one actionable `peer_protocol_error` per episode.
+  Re-registering a peer (a retried `peer add`, `peer adopt`, or `peer add` after `retire`) starts
+  its cursor, its rows, its failure streak, its down episode and both episode flags over, so
+  every escalation open on it is raised again once. Peer text is escaped again if it still holds
   a non-printing rune, and each payload is at most 2 KiB. A poll that fails (a timeout, a
   transport error, a refusal, another protocol major or summary schema) counts toward the
   peer's `consecutive_failures`; the third in a row marks it `unreachable` and appends one

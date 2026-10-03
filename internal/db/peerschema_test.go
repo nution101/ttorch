@@ -102,3 +102,48 @@ func TestMigration0012AddsPeerTables(t *testing.T) {
 		}
 	}
 }
+
+// TestMigration0013AddsTheRaisedLedger proves 0013 adds peer_open_escalations, keyed by peer and
+// escalation id and referencing peers, and the two episode flags on peers, defaulting to off;
+// and that its down half removes them and leaves 0012's tables.
+func TestMigration0013AddsTheRaisedLedger(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	if !tableExists(t, s, "peer_open_escalations") {
+		t.Fatal("0013 must create peer_open_escalations")
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO peers (name, control_dest, approve_dest, control_key, status, created_at, updated_at)
+		 VALUES ('p', 'b@host', 'b@host', '/k', 'live', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	var reset, bad int
+	if err := s.db.QueryRowContext(ctx, `SELECT cursor_reset_open, bad_ids_open FROM peers WHERE name = 'p'`).Scan(&reset, &bad); err != nil || reset != 0 || bad != 0 {
+		t.Errorf("episode flags = %d %d, %v; want 0 0", reset, bad, err)
+	}
+	row := func(peer string, id int64) error {
+		_, err := s.db.ExecContext(ctx, `INSERT INTO peer_open_escalations (peer, escalation_id, created_at, event_id) VALUES (?, ?, 't', 1)`, peer, id)
+		return err
+	}
+	if err := row("p", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := row("p", 1); err == nil {
+		t.Error("one escalation id twice for one peer was accepted")
+	}
+	if err := row("nobody", 1); err == nil {
+		t.Error("a ledger row for an unregistered peer was accepted")
+	}
+	if err := s.MigrateDown(ctx, 12); err != nil {
+		t.Fatalf("MigrateDown(12): %v", err)
+	}
+	if tableExists(t, s, "peer_open_escalations") || !tableExists(t, s, "peers") {
+		t.Error("0013 down must drop the ledger and keep peers")
+	}
+	if _, err := s.db.ExecContext(ctx, `SELECT cursor_reset_open FROM peers`); err == nil {
+		t.Error("0013 down left cursor_reset_open on peers")
+	}
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatalf("re-Migrate: %v", err)
+	}
+}

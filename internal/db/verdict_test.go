@@ -193,8 +193,8 @@ func TestMigration0002OnExisting0001(t *testing.T) {
 	if err := s.Migrate(ctx); err != nil {
 		t.Fatalf("re-Migrate: %v", err)
 	}
-	if v, err := s.schemaVersion(ctx); err != nil || v != 12 {
-		t.Fatalf("after re-up: version=%d err=%v, want 12", v, err)
+	if v, err := s.schemaVersion(ctx); err != nil || v != 13 {
+		t.Fatalf("after re-up: version=%d err=%v, want 13", v, err)
 	}
 	if !tableExists(t, s, "verdicts") {
 		t.Error("verdicts must be present again after re-migrate")

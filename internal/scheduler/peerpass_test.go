@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -74,6 +76,7 @@ func (f *fakePeer) Decisions(ctx context.Context, since int64) (PeerDecisions, e
 			out.Escalations = append(out.Escalations, e)
 		}
 	}
+	// A peer lists the open escalations above since; the pass asks for all of them.
 	return out, f.decisionsErr
 }
 
@@ -209,8 +212,8 @@ func TestPeerPassRaisesEachEscalationOnce(t *testing.T) {
 	if evs := peerEventsOf(t, s, "build"); len(evs) != 1 {
 		t.Errorf("after a second pass and a restart: events = %+v, want still one", evs)
 	}
-	if got := fp.sinces; len(got) != 3 || got[0] != 0 || got[1] != 4 || got[2] != 4 {
-		t.Errorf("decisions asked since %v, want [0 4 4]", got)
+	if got := fp.sinces; len(got) != 3 || got[0] != 0 || got[1] != 0 || got[2] != 0 {
+		t.Errorf("decisions asked since %v, want [0 0 0]: the whole open list each poll", got)
 	}
 
 	fp.set(func(f *fakePeer) {
@@ -542,5 +545,97 @@ func TestPeerPollFromEnv(t *testing.T) {
 	}
 	if DefaultPeerPoll != 30*time.Second {
 		t.Errorf("DefaultPeerPoll = %s, want 30s", DefaultPeerPoll)
+	}
+}
+
+// stamped is n escalations from id from, each created at its own time in a store identified by
+// epoch, as the peer reports them.
+func stamped(from int64, n int, epoch time.Time) []PeerEscalation {
+	var out []PeerEscalation
+	for id := from; id < from+int64(n); id++ {
+		out = append(out, PeerEscalation{ID: id, Kind: "question", TaskID: "t", Body: fmt.Sprintf("question %d", id),
+			CreatedAt: epoch.Add(time.Duration(id) * time.Minute)})
+	}
+	return out
+}
+
+// TestPeerPassDetectsAStoreThatWentBack: a peer whose store was recreated lists escalations
+// numbered from 1 again. The pass raises one peer_cursor_reset, raises the new escalations, which
+// the old cursor would have hidden, and later polls raise nothing twice. Each escalation's payload
+// carries the peer's creation stamp.
+func TestPeerPassDetectsAStoreThatWentBack(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	registerLivePeer(t, s, "build")
+	fp := newFakePeer()
+	old := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	fp.decisions = PeerDecisions{Open: 5, Escalations: stamped(1, 5, old)}
+	sc := peerScheduler(s, fakePeers{"build": fp})
+	if _, err := sc.RunPeerPassOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if p := getPeer(t, s, "build"); p.EscalationCursor != 5 {
+		t.Fatalf("cursor = %d, want 5", p.EscalationCursor)
+	}
+	fresh := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	fp.set(func(f *fakePeer) { f.decisions = PeerDecisions{Open: 2, Escalations: stamped(1, 2, fresh)} })
+	for i := 0; i < 3; i++ {
+		if _, err := sc.RunPeerPassOnce(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	evs := peerEventsOf(t, s, "build")
+	if n := len(eventsOfType(evs, db.EventPeerCursorReset)); n != 1 {
+		t.Errorf("%d peer_cursor_reset events, want 1", n)
+	}
+	escs := eventsOfType(evs, db.EventPeerEscalation)
+	if len(escs) != 7 {
+		t.Fatalf("%d peer_escalation events, want 7: five from the old store, two from the new", len(escs))
+	}
+	var last db.PeerEscalationPayload
+	if err := json.Unmarshal([]byte(escs[6].Payload), &last); err != nil || last.EscalationID != 2 || last.CreatedAt != fresh.Add(2*time.Minute).Format(time.RFC3339Nano) {
+		t.Errorf("last payload %q = %+v, %v", escs[6].Payload, last, err)
+	}
+	if p := getPeer(t, s, "build"); p.EscalationCursor != 2 {
+		t.Errorf("cursor after the re-sync = %d, want 2", p.EscalationCursor)
+	}
+}
+
+// TestPeerPassRefusesEscalationIDsOutOfRange: an escalation id of math.MaxInt64, or one far
+// above the cursor, is not raised and does not move the cursor; it raises one peer_protocol_error,
+// and an escalation in range after it is still raised.
+func TestPeerPassRefusesEscalationIDsOutOfRange(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	registerLivePeer(t, s, "build")
+	fp := newFakePeer()
+	epoch := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	fp.decisions = PeerDecisions{Open: 2, Escalations: append(stamped(1, 1, epoch), PeerEscalation{ID: math.MaxInt64, Kind: "question", Body: "hide the rest", CreatedAt: epoch})}
+	sc := peerScheduler(s, fakePeers{"build": fp})
+	for i := 0; i < 2; i++ {
+		if _, err := sc.RunPeerPassOnce(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if p := getPeer(t, s, "build"); p.EscalationCursor != 1 {
+		t.Errorf("cursor = %d, want 1: the MaxInt64 id must not move it", p.EscalationCursor)
+	}
+	fp.set(func(f *fakePeer) {
+		f.decisions.Escalations = append(f.decisions.Escalations, stamped(2, 1, epoch)[0],
+			PeerEscalation{ID: 1 + maxPeerEscalationJump + 1, Kind: "question", Body: "far", CreatedAt: epoch})
+	})
+	if _, err := sc.RunPeerPassOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	evs := peerEventsOf(t, s, "build")
+	if n := len(eventsOfType(evs, db.EventPeerProtocolError)); n != 1 {
+		t.Errorf("%d peer_protocol_error events, want 1 for the episode", n)
+	}
+	escs := eventsOfType(evs, db.EventPeerEscalation)
+	if len(escs) != 2 || !strings.Contains(escs[1].Payload, `"escalation_id":2`) {
+		t.Errorf("escalation events = %+v, want 1 and 2 only", escs)
+	}
+	if p := getPeer(t, s, "build"); p.EscalationCursor != 2 {
+		t.Errorf("cursor = %d, want 2", p.EscalationCursor)
 	}
 }

@@ -24,7 +24,6 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,6 +44,21 @@ const defaultPeerDeadline = 90 * time.Second
 // maxPeerRaisesPerPoll bounds how many escalations one poll of one peer raises. The cursor moves
 // only past what was raised, so the rest arrive on the next polls, none lost.
 const maxPeerRaisesPerPoll = 32
+
+// maxPeerEscalationID is the largest escalation id a poll accepts. A peer's ids count its
+// escalations from 1, so an id past this one, which is more than one a second for 68 years, is
+// a broken or hostile peer, and accepting it would put the cursor above every id the peer will
+// ever really use.
+const maxPeerEscalationID = 1<<31 - 1
+
+// maxPeerEscalationJump is how far above the cursor a new escalation id may be. Ids grow by one
+// per escalation and a poll runs every 30s, so a gap this wide since the last poll is not a busy
+// peer; the id is refused and a peer_protocol_error raised rather than the cursor moved. A peer
+// polled for the first time (cursor 0) has no bound but maxPeerEscalationID.
+const maxPeerEscalationJump = 10000
+
+// peerPollBounds are the limits each poll records against (db.PeerPollBounds).
+var peerPollBounds = db.PeerPollBounds{MaxID: maxPeerEscalationID, MaxJump: maxPeerEscalationJump, MaxRaise: maxPeerRaisesPerPoll}
 
 // Caps on the peer's strings in an event payload, after escaping.
 const (
@@ -71,16 +85,18 @@ func (s PeerSummary) healthy() bool {
 }
 
 // PeerEscalation is one escalation open on a peer, as its decisions verb lists it. Every string
-// in it came from the peer.
+// in it came from the peer. CreatedAt is the peer's own stamp for it, which with ID names it:
+// the pass never compares it with this machine's clock.
 type PeerEscalation struct {
-	ID     int64
-	Kind   string
-	TaskID string
-	Body   string
+	ID        int64
+	Kind      string
+	TaskID    string
+	Body      string
+	CreatedAt time.Time
 }
 
 // PeerDecisions is a peer's answer to decisions: how many escalations it has open, and the open
-// ones above the id the pass asked from.
+// ones above the id the pass asked from (the pass asks for all of them).
 type PeerDecisions struct {
 	Open        int
 	Escalations []PeerEscalation
@@ -205,9 +221,10 @@ func (sc *Scheduler) releasePeerPoll(name string) {
 	delete(st.inFlight, name)
 }
 
-// pollPeer polls one peer under its deadline: summary, then decisions above the cursor. A poll
-// that reaches the peer is recorded with the escalations it raises; one that fails counts toward
-// unreachable. A peer that answers but shows no manager window or no ticking scheduler then takes
+// pollPeer polls one peer under its deadline: summary, then decisions for every open escalation.
+// A poll that reaches the peer is recorded with the escalations it raises (db.RecordPeerPoll
+// decides which, against what was already raised, and spots ids that went back or are out of
+// range); one that fails counts toward unreachable. A peer that answers but shows no manager window or no ticking scheduler then takes
 // the next step of its down episode: ensure-up, or once those are spent, peer_down. The store is
 // written under ctx, not the poll's deadline, so a poll cut off at its deadline is still
 // recorded; a poll cut off by shutdown is not, since that is no failure of the peer's.
@@ -225,7 +242,9 @@ func (sc *Scheduler) pollPeer(ctx context.Context, p db.Peer) {
 	sum, err := ch.Summary(pctx)
 	var dec PeerDecisions
 	if err == nil {
-		dec, err = ch.Decisions(pctx, p.EscalationCursor)
+		// The whole open list, not just what is above the cursor: an escalation at or below
+		// it that was never raised here is how a store that went back shows.
+		dec, err = ch.Decisions(pctx, 0)
 	}
 	if ctx.Err() != nil {
 		return
@@ -243,9 +262,13 @@ func (sc *Scheduler) pollPeer(ctx context.Context, p db.Peer) {
 		return
 	}
 
-	poll := db.PeerPoll{Summary: sum.JSON, Healthy: sum.healthy(), RecoveredPayload: fitPayload(db.PeerRecoveredPayload{Peer: p.Name}, nil)}
-	for _, e := range raisable(dec.Escalations, p.EscalationCursor) {
-		poll.Raise = append(poll.Raise, db.PeerRaise{ID: e.ID, Payload: escalationPayload(p.Name, e, dec.Open)})
+	poll := db.PeerPoll{
+		Summary: sum.JSON, Healthy: sum.healthy(), Bounds: peerPollBounds,
+		RecoveredPayload: fitPayload(db.PeerRecoveredPayload{Peer: p.Name}, nil),
+		PayloadFor:       func(i int) string { return escalationPayload(p.Name, dec.Escalations[i], dec.Open) },
+	}
+	for _, e := range dec.Escalations {
+		poll.Open = append(poll.Open, db.PeerOpenEscalation{ID: e.ID, CreatedAt: stamp(e.CreatedAt)})
 	}
 	res, err := sc.Store.RecordPeerPoll(ctx, p.Name, poll)
 	if err != nil {
@@ -254,6 +277,12 @@ func (sc *Scheduler) pollPeer(ctx context.Context, p db.Peer) {
 	}
 	if res.Recovered {
 		sc.logf("peer %s answered again (event %d)", p.Name, res.RecoveredEventID)
+	}
+	if res.CursorReset {
+		sc.logf("peer %s: its escalation ids went back (a recreated or restored store); cursor re-synced to %d (event %d)", p.Name, res.Cursor, res.ResetEventID)
+	}
+	if res.ProtocolEventID != 0 {
+		sc.logf("peer %s: refused %d escalation id(s) out of range (event %d)", p.Name, len(res.Refused), res.ProtocolEventID)
 	}
 	if len(res.Raised) > 0 {
 		sc.logf("peer %s: raised %d escalation(s), cursor now %d", p.Name, len(res.Raised), res.Cursor)
@@ -292,27 +321,23 @@ func (sc *Scheduler) logPeerStoreErr(name string, err error) {
 	sc.logf("peer %s: recording the poll: %v", name, err)
 }
 
-// raisable is the escalations above cursor, lowest id first, at most maxPeerRaisesPerPoll.
-func raisable(list []PeerEscalation, cursor int64) []PeerEscalation {
-	var out []PeerEscalation
-	for _, e := range list {
-		if e.ID > cursor {
-			out = append(out, e)
-		}
+// stamp is the peer's creation stamp for an escalation as the ledger keeps it. A zero time (a
+// peer that sent none) is "", so such escalations are told apart by id alone.
+func stamp(t time.Time) string {
+	if t.IsZero() {
+		return ""
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	if len(out) > maxPeerRaisesPerPoll {
-		out = out[:maxPeerRaisesPerPoll]
-	}
-	return out
+	return t.UTC().Format(time.RFC3339Nano)
 }
 
 // escalationPayload is the payload of e's peer_escalation event: the peer, the escalation's id,
-// kind and task, how many the peer has open, and its body, all escaped and capped.
+// kind and task, the peer's creation stamp, how many the peer has open, and its body, all
+// escaped and capped.
 func escalationPayload(peer string, e PeerEscalation, open int) string {
 	p := db.PeerEscalationPayload{
 		Peer: peer, EscalationID: e.ID, Kind: untrustedText(e.Kind, maxPeerKind),
-		TaskID: untrustedText(e.TaskID, maxPeerTaskID), Open: open, Body: untrustedText(e.Body, maxPeerPayload),
+		TaskID: untrustedText(e.TaskID, maxPeerTaskID), CreatedAt: stamp(e.CreatedAt), Open: open,
+		Body: untrustedText(e.Body, maxPeerPayload),
 	}
 	return fitPayload(&p, &p.Body)
 }
