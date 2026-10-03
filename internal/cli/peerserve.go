@@ -30,12 +30,13 @@ const peerUsage = `usage: ttorch peer serve | init
   init provisions this machine as a peer. ttorch peer add on the parent runs it over the
   lead's own ssh session, with one JSON request on stdin.`
 
-// cmdPeer dispatches `ttorch peer`. It returns the exit status itself, because serve's and
-// init's are part of their protocol: 0 for an answered request, 1 for a refusal, whose JSON is on
-// stdout either way, and 2 for a command line that names no request.
+// cmdPeer dispatches `ttorch peer`. serve and init are this machine answering a parent; every
+// other subcommand is this machine acting as one (cmdPeerClient). It returns the exit status
+// itself, because serve's and init's are part of their protocol: 0 for an answered request, 1 for
+// a refusal, whose JSON is on stdout either way, and 2 for a command line that names no request.
 func cmdPeer(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, peerUsage)
+		fmt.Fprintf(os.Stderr, "%s\n%s\n", peerClientUsage, peerUsage)
 		return 2
 	}
 	switch args[0] {
@@ -52,8 +53,9 @@ func cmdPeer(args []string) int {
 		}
 		return cmdPeerServe(os.Stdin, os.Stdout, os.Stderr)
 	}
-	fmt.Fprintln(os.Stderr, peerUsage)
-	return 2
+	// The parent's commands (peerclient.go) reach a peer only through the control key, or, for
+	// add and adopt, through the lead's own ssh session.
+	return run(cmdPeerClient(args))
 }
 
 // cmdPeerServe answers one request (internal/peer/serve.go) against this account's ttorch home.

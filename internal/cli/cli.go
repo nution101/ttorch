@@ -2433,10 +2433,17 @@ Team:
                           record the lead's answer, relayed by the manager, and wake
                           the manager with one event; a repeated --request-id
                           changes nothing (refused from a worker context)
+  peer add <name> <control-dest> [--approve-dest <dest>]
+                          provision a peer: make its control key, run peer init on it
+                          over your own ssh session, prove the key (the lead's command:
+                          refused from a worker context or without a terminal)
+  peer adopt <name> <control-dest> --force
+                          peer add for a peer another parent provisioned
   peer serve              answer one control request from a parent coordinator, as an
                           ssh forced command: the verb comes from SSH_ORIGINAL_COMMAND
                           (version, summary, decisions, task-add, goal, answer,
                           ensure-up), the request is one JSON object on stdin
+  peer init               provision this machine as a peer (peer add runs it)
   check-overlap "<paths>" show which live workers a proposed footprint conflicts
     [--repo dir]            with, to plan disjoint parallel dispatch (scopes to the
                             cwd's repo, or --repo)

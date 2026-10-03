@@ -1155,6 +1155,18 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   its directory. `~/.ssh` and the file are created private if missing, must be private
   otherwise, and are never written through a symlink; the file is only appended to, and a key
   already listed another way is refused. Running it again changes nothing.
+  `ttorch peer add <name> <control-dest>` is the parent's side, and the lead's command: it runs
+  the same caller check as `ttorch approve` (no worker context, an interactive terminal) before
+  it parses a flag or starts a process. It generates the control key with `ssh-keygen` (ed25519,
+  no passphrase, since nobody is there to type one when the scheduler polls) under
+  `~/.ttorch/peers/<name>/` (directory 0700, key 0600), registers the peer as `provisioning`,
+  runs `ttorch peer init` over the lead's own ssh session to the approve destination (`ssh -T`
+  with the lead's config and agent, since that session is the lead's authority on the peer),
+  passing the `TTORCH_*` settings of the lead's shell that `peer.env` may hold, then proves the
+  key with a `version` call over the control channel, which must answer as that peer with this
+  coordinator as its parent. Only then is the peer `live`. A failure records why and leaves it
+  `provisioning`, and running `peer add` again resumes with the same key. `peer adopt --force`
+  is the same for a peer another parent provisioned.
 
 Migrations, in order: **0001** initial hierarchy + events + manager singleton; **0002**
 durable verdicts; **0003** task leases + the terminal `failed` status; **0004** the

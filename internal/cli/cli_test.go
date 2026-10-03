@@ -19,10 +19,16 @@ import (
 // ImportLegacy would rename the live state/ dir away. The db.Open guard is the final
 // fail-closed backstop.
 func TestMain(m *testing.M) {
+	// A stand-in for ssh (peerclient_test.go): the parent's peer commands run this binary in
+	// ssh's place, and it plays sshd and the peer's shell.
+	if cfg := os.Getenv(testSSHShimEnv); cfg != "" {
+		os.Exit(runSSHShim(cfg, os.Args[1:]))
+	}
 	// A test that runs ttorch as its own process (peerserve_test.go) re-enters this binary with
 	// runMainEnv set, and it runs Main as cmd/ttorch's main does, with the environment the test
 	// gave it.
 	if os.Getenv(runMainEnv) == "1" {
+		applyPeerClientSeams()
 		// The peer control channel takes the account's home from the user database, never from
 		// the environment. A served test process gets a temp one through this seam instead.
 		if home := os.Getenv(testPeerHomeEnv); home != "" {

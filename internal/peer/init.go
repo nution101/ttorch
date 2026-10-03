@@ -7,12 +7,28 @@ package peer
 // stdout, in the same envelope the control channel uses.
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"os/exec"
+	"strings"
+	"time"
+
+	"github.com/nution101/ttorch/internal/proc"
 )
 
 // VerbInit names init's response. It is not a control verb: the control key cannot reach it.
 const VerbInit = "init"
+
+// DefaultRemoteTtorch is the ttorch the init session runs, relative to the home directory sshd
+// starts a session in: the standard install.
+const DefaultRemoteTtorch = ".ttorch/bin/ttorch"
+
+// InitTimeout bounds the init session. The lead may have to type a passphrase or touch a key.
+const InitTimeout = 10 * time.Minute
 
 // InitRequest is what the parent asks init to do. Name is the peer's name on the parent; ParentID
 // is the parent's coordinator id; ControlKey is the control key's public half as ssh-keygen wrote
@@ -43,6 +59,80 @@ type InitResult struct {
 	PeerEnv          string   `json:"peer_env"`
 	PeerEnvPath      string   `json:"peer_env_path"`
 	Missing          []string `json:"missing"`
+}
+
+// ValidRemoteTtorch refuses a path for the remote ttorch that the remote shell would not read as
+// one plain word: letters, digits and / . _ + @ -, with an optional leading ~/.
+func ValidRemoteTtorch(path string) error {
+	if !shellSafe(strings.TrimPrefix(path, "~/")) || len(path) > 1024 || strings.HasPrefix(path, "-") {
+		return fmt.Errorf("%q is not a path the remote shell reads as one word; use letters, digits and / . _ + @ -", path)
+	}
+	return nil
+}
+
+// InitArgs is the ssh command line of the init session, after the program name. Unlike a
+// control call it uses the lead's own ssh setup, which is what authenticates it. -T asks for no
+// pty, since stdin carries the request; ssh still prompts on the terminal if it has to.
+func InitArgs(dest, remoteTtorch string) []string {
+	return []string{"-T", "--", dest, remoteTtorch + " peer init"}
+}
+
+// RunInit runs init on dest over the lead's session and returns what it did. ssh's own messages
+// and anything init writes to stderr go to stderr, the lead's terminal. A refusal comes back as a
+// *RemoteError, and a session with no response to read as a *TransportError.
+func RunInit(ctx context.Context, ssh, dest, remoteTtorch string, timeout time.Duration, req InitRequest, stderr io.Writer) (InitResult, error) {
+	if err := ValidDest(dest); err != nil {
+		return InitResult{}, err
+	}
+	if err := ValidRemoteTtorch(remoteTtorch); err != nil {
+		return InitResult{}, err
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return InitResult{}, err
+	}
+	if timeout <= 0 {
+		timeout = InitTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cmd := proc.Command(ctx, ssh, InitArgs(dest, remoteTtorch)...)
+	cmd.Stdin = bytes.NewReader(body)
+	stdout := &cappedBuffer{max: MaxResponse}
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	runErr := proc.Run(cmd)
+	if ctx.Err() == context.DeadlineExceeded {
+		return InitResult{}, fmt.Errorf("peer init on %s: %w after %s; ssh and everything it started were killed", dest, ErrTimeout, timeout)
+	}
+	exit := 0
+	var ee *exec.ExitError
+	if errors.As(runErr, &ee) {
+		exit = ee.ExitCode()
+	} else if runErr != nil {
+		return InitResult{}, fmt.Errorf("peer init on %s: running ssh: %w", dest, runErr)
+	}
+	if stdout.over {
+		return InitResult{}, fmt.Errorf("peer init on %s: the answer is over the %d byte limit", dest, MaxResponse)
+	}
+	resp, err := readResponse(stdout.Bytes())
+	if err != nil {
+		return InitResult{}, &TransportError{ExitCode: exit, Reason: fmt.Sprintf("peer init on %s: no response (%v); is ttorch installed at %s on the peer?", dest, err, remoteTtorch)}
+	}
+	if resp.Protocol != ProtocolVersion {
+		return InitResult{}, &ProtocolError{Got: resp.Protocol}
+	}
+	if !resp.OK {
+		e := &RemoteError{Verb: VerbInit, Code: CodeInternal, Message: "peer init refused without saying why"}
+		if resp.Error != nil {
+			e.Code, e.Message, e.Detail = resp.Error.Code, resp.Error.Message, resp.Error.Detail
+		}
+		return InitResult{}, e
+	}
+	var out InitResult
+	if err := json.Unmarshal(resp.Result, &out); err != nil {
+		return InitResult{}, fmt.Errorf("peer init on %s: the result does not decode: %w", dest, err)
+	}
+	return out, nil
 }
 
 // ReadInitRequest reads init's request: one JSON object of at most MaxBody bytes with no field
