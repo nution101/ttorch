@@ -137,7 +137,7 @@ func TestInstallControlKey(t *testing.T) {
 
 	home := t.TempDir()
 	sshDir := filepath.Join(home, ".ssh")
-	res, err := installControlKey(sshDir, line, blob, uid)
+	res, err := installControlKey(sshDir, line, blob, uid, false)
 	if err != nil || res.Added != true || res.StaleControlKeys != 0 {
 		t.Fatalf("first install = %+v, %v", res, err)
 	}
@@ -151,7 +151,7 @@ func TestInstallControlKey(t *testing.T) {
 	if b, _ := os.ReadFile(keys); string(b) != line+"\n" {
 		t.Errorf("authorized_keys = %q", b)
 	}
-	res, err = installControlKey(sshDir, line, blob, uid)
+	res, err = installControlKey(sshDir, line, blob, uid, false)
 	if err != nil || res.Added {
 		t.Errorf("second install = %+v, %v; want present, nothing added", res, err)
 	}
@@ -171,7 +171,7 @@ func TestInstallControlKey(t *testing.T) {
 	if err := os.WriteFile(keys, []byte(existing), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	res, err = installControlKey(sshDir, line, blob, uid)
+	res, err = installControlKey(sshDir, line, blob, uid, false)
 	if err != nil || !res.Added || res.StaleControlKeys != 1 {
 		t.Fatalf("install after a line with no newline = %+v, %v; want added, one other parent's key", res, err)
 	}
@@ -190,7 +190,7 @@ func TestInstallControlKey(t *testing.T) {
 	if err := os.WriteFile(keys, []byte(bare), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := installControlKey(sshDir, line, blob, uid); err == nil || !strings.Contains(err.Error(), "already lists") {
+	if _, err := installControlKey(sshDir, line, blob, uid, false); err == nil || !strings.Contains(err.Error(), "already lists") {
 		t.Errorf("the key listed without the forced command: %v, want refused", err)
 	}
 	if b, _ := os.ReadFile(keys); string(b) != bare {
@@ -199,7 +199,7 @@ func TestInstallControlKey(t *testing.T) {
 
 	refused := func(label, sshDir string, uid int, want string) {
 		t.Helper()
-		if _, err := installControlKey(sshDir, line, blob, uid); err == nil {
+		if _, err := installControlKey(sshDir, line, blob, uid, false); err == nil {
 			t.Errorf("%s: accepted", label)
 		} else if !strings.Contains(err.Error(), want) {
 			t.Errorf("%s: %v, want it to say %q", label, err, want)
@@ -253,7 +253,7 @@ func TestInstallControlKey(t *testing.T) {
 	}
 	refused(".ssh a symlink", linkDir, uid, "symbolic link")
 	refused("a relative .ssh", ".ssh", uid, "absolute")
-	if _, err := installControlKey(filepath.Join(t.TempDir(), ".ssh"), line+"\nssh-ed25519 "+blob, blob, uid); err == nil {
+	if _, err := installControlKey(filepath.Join(t.TempDir(), ".ssh"), line+"\nssh-ed25519 "+blob, blob, uid, false); err == nil {
 		t.Error("a line holding a newline was installed")
 	}
 }
@@ -263,7 +263,7 @@ func TestInstallControlKey(t *testing.T) {
 func TestProvisionControlKey(t *testing.T) {
 	pub, blob := testControlKey(t)
 	sshDir := filepath.Join(t.TempDir(), ".ssh")
-	bin, res, err := ProvisionControlKey(sshDir, pub, testParent, os.Getuid())
+	bin, res, err := ProvisionControlKey(sshDir, pub, testParent, os.Getuid(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +278,7 @@ func TestProvisionControlKey(t *testing.T) {
 	if want := AuthorizedKeyLine(bin, blob, testParent) + "\n"; string(b) != want {
 		t.Errorf("authorized_keys = %q, want %q", b, want)
 	}
-	if _, _, err := ProvisionControlKey(filepath.Join(t.TempDir(), ".ssh"), "ssh-rsa AAAA", testParent, os.Getuid()); err == nil {
+	if _, _, err := ProvisionControlKey(filepath.Join(t.TempDir(), ".ssh"), "ssh-rsa AAAA", testParent, os.Getuid(), false); err == nil {
 		t.Error("an rsa key was provisioned")
 	}
 }
@@ -388,4 +388,129 @@ func TestOpenAtStaysInTheDirectoryItChecked(t *testing.T) {
 			t.Errorf("OpenAt(%q) opened something", bad)
 		}
 	}
+}
+
+// TestInstallControlKeyReplacing: with replace (adopt --force), every other control key's line
+// goes, an older line for this same key included, and every other line stays as it was. The file
+// is rewritten through a new file renamed over it in the directory that was checked, reports the
+// parent each removed line named, and leaves no temporary file behind. A line that lists this key
+// without a control key's comment is still refused, and a file that changes between the read and
+// the rename is refused with the change kept.
+func TestInstallControlKeyReplacing(t *testing.T) {
+	uid := os.Getuid()
+	_, blob := testControlKey(t)
+	line := AuthorizedKeyLine("/home/ttorch/.ttorch/bin/ttorch", blob, testParent)
+	_, otherBlob := testControlKey(t)
+	other := strings.Repeat("e", 32)
+	own := "ssh-ed25519 AAAAexisting lead@laptop"
+	oldOther := AuthorizedKeyLine("/x/ttorch", otherBlob, other)
+	oldSame := `command="/x/ttorch peer serve",restrict ssh-ed25519 ` + blob + " " + ControlKeyComment(testParent)
+	setup := func(t *testing.T, content string) (string, string) {
+		t.Helper()
+		sshDir := filepath.Join(t.TempDir(), ".ssh")
+		if err := os.Mkdir(sshDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		keys := filepath.Join(sshDir, "authorized_keys")
+		if err := os.WriteFile(keys, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return sshDir, keys
+	}
+	onlyKeys := func(t *testing.T, sshDir string) {
+		t.Helper()
+		ents, _ := os.ReadDir(sshDir)
+		if len(ents) != 1 || ents[0].Name() != "authorized_keys" {
+			var names []string
+			for _, e := range ents {
+				names = append(names, e.Name())
+			}
+			t.Errorf(".ssh holds %v; want only authorized_keys", names)
+		}
+	}
+
+	sshDir, keys := setup(t, own+"\n"+oldOther+"\n# a note\n"+oldSame)
+	res, err := installControlKey(sshDir, line, blob, uid, true)
+	if err != nil || !res.Added || res.StaleControlKeys != 0 || strings.Join(res.Removed, ",") != other+","+testParent {
+		t.Fatalf("replacing install = %+v, %v; want added, removing %s and %s", res, err, other, testParent)
+	}
+	if b, _ := os.ReadFile(keys); string(b) != own+"\n# a note\n"+line+"\n" {
+		t.Errorf("authorized_keys = %q", b)
+	}
+	if fi, err := os.Lstat(keys); err != nil || !fi.Mode().IsRegular() || fi.Mode().Perm() != 0o600 {
+		t.Errorf("authorized_keys after the rewrite = %v, %v; want a 0600 regular file", fi.Mode(), err)
+	}
+	onlyKeys(t, sshDir)
+
+	// Nothing to remove and the line present: nothing is written at all.
+	before, _ := os.Lstat(keys)
+	if res, err := installControlKey(sshDir, line, blob, uid, true); err != nil || res.Added || len(res.Removed) != 0 {
+		t.Errorf("a repeat = %+v, %v; want present, nothing removed", res, err)
+	}
+	if after, _ := os.Lstat(keys); !os.SameFile(before, after) || !after.ModTime().Equal(before.ModTime()) {
+		t.Error("a repeat with nothing to remove rewrote authorized_keys")
+	}
+
+	// The line already there and another parent's beside it: that one goes, the line stays once.
+	sshDir, keys = setup(t, line+"\n"+oldOther+"\n")
+	if res, err := installControlKey(sshDir, line, blob, uid, true); err != nil || res.Added || strings.Join(res.Removed, ",") != other {
+		t.Errorf("replacing with the line present = %+v, %v", res, err)
+	}
+	if b, _ := os.ReadFile(keys); string(b) != line+"\n" {
+		t.Errorf("authorized_keys = %q", b)
+	}
+
+	// This key listed as a plain key, with no forced command, is someone's own entry: refused.
+	plain := "ssh-ed25519 " + blob + " lead@laptop"
+	sshDir, keys = setup(t, plain+"\n"+oldOther+"\n")
+	if _, err := installControlKey(sshDir, line, blob, uid, true); err == nil || !strings.Contains(err.Error(), "another way") {
+		t.Errorf("replacing over a plain listing of the key: %v", err)
+	}
+	if b, _ := os.ReadFile(keys); string(b) != plain+"\n"+oldOther+"\n" {
+		t.Errorf("a refused replace changed authorized_keys: %q", b)
+	}
+
+	// authorized_keys a symlink: refused, the target untouched.
+	sshDir, keys = setup(t, "")
+	target := filepath.Join(t.TempDir(), "elsewhere")
+	if err := os.WriteFile(target, []byte(oldOther+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(keys); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, keys); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := installControlKey(sshDir, line, blob, uid, true); err == nil || !strings.Contains(err.Error(), "symbolic link") {
+		t.Errorf("replacing through a symlinked authorized_keys: %v", err)
+	}
+	if b, _ := os.ReadFile(target); string(b) != oldOther+"\n" {
+		t.Errorf("the symlink's target changed: %q", b)
+	}
+	if fi, _ := os.Lstat(keys); fi.Mode()&os.ModeSymlink == 0 {
+		t.Error("the symlink was replaced")
+	}
+
+	// Someone appends between the read and the rename: refused, and their line survives.
+	sshDir, keys = setup(t, own+"\n"+oldOther+"\n")
+	late := "ssh-ed25519 AAAAlate someone@else"
+	afterAuthorizedKeysRead = func() {
+		f, err := os.OpenFile(keys, os.O_WRONLY|os.O_APPEND, 0)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		f.WriteString(late + "\n")
+		f.Close()
+	}
+	t.Cleanup(func() { afterAuthorizedKeysRead = nil })
+	if _, err := installControlKey(sshDir, line, blob, uid, true); err == nil || !strings.Contains(err.Error(), "changed") {
+		t.Errorf("a file that changed during the rewrite: %v", err)
+	}
+	afterAuthorizedKeysRead = nil
+	if b, _ := os.ReadFile(keys); string(b) != own+"\n"+oldOther+"\n"+late+"\n" {
+		t.Errorf("the change made during the rewrite was lost: %q", b)
+	}
+	onlyKeys(t, sshDir)
 }

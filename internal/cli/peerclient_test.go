@@ -473,7 +473,8 @@ func TestPeerAddFailsClosed(t *testing.T) {
 
 // TestPeerAdopt: a second parent cannot add a peer another one provisioned, and adopt needs
 // --force; with it, the peer moves to the second parent, which reports the parent it replaced and
-// the first parent's control key left in authorized_keys.
+// the first parent's control key line it removed. The first parent's key is then not admitted at
+// all: a request through it is refused by sshd before anything on the peer runs.
 func TestPeerAdopt(t *testing.T) {
 	ctx := context.Background()
 	f := newPeerFixture(t)
@@ -487,13 +488,33 @@ func TestPeerAdopt(t *testing.T) {
 	if r := second.run(t, nil, "peer", "adopt", "build", "ttorch@build-host"); r.code == 0 || !strings.Contains(r.stderr, "--force") {
 		t.Errorf("adopt without --force: exit %d, stderr %q", r.code, r.stderr)
 	}
+	firstSelf, _ := f.parentStore(t).GetCoordinator(ctx)
+	first, _, _ := f.parentStore(t).GetPeer(ctx, "build")
+	firstPub, _ := os.ReadFile(first.ControlKey + ".pub")
 	r := second.run(t, nil, "peer", "adopt", "build", "ttorch@build-host", "--force")
-	if r.code != 0 || !strings.Contains(r.stdout, "moved from parent") || !strings.Contains(r.stdout, "1 other control key") {
+	if r.code != 0 || !strings.Contains(r.stdout, "moved from parent") || !strings.Contains(r.stdout, "removed 1 other control key line(s): parent "+firstSelf.CoordID) {
 		t.Fatalf("adopt --force: exit %d\nstdout: %s\nstderr: %s", r.code, r.stdout, r.stderr)
 	}
 	secondSelf, _ := second.parentStore(t).GetCoordinator(ctx)
 	if c, _ := f.peerStore(t).GetCoordinator(ctx); c.ParentID != secondSelf.CoordID {
 		t.Errorf("after adopt the peer's parent is %s, want %s", c.ParentID, secondSelf.CoordID)
+	}
+	keys, _ := os.ReadFile(f.peer.authorizedKeys())
+	if blob := strings.Fields(string(firstPub))[1]; strings.Contains(string(keys), blob) || strings.Contains(string(keys), firstSelf.CoordID) {
+		t.Errorf("after adopt --force, authorized_keys still admits the first parent's key:\n%s", keys)
+	}
+	if n := strings.Count(string(keys), "\n"); n != 1 || !strings.Contains(string(keys), "--parent "+secondSelf.CoordID) {
+		t.Errorf("after adopt --force, authorized_keys = %q; want only the second parent's line", keys)
+	}
+	before := len(f.calls(t))
+	if r := f.run(t, nil, "peer", "status", "build"); r.code == 0 || !strings.Contains(r.stderr, "Permission denied") {
+		t.Errorf("the first parent's status after adopt --force: exit %d, stderr %q; want its key refused", r.code, r.stderr)
+	}
+	if n := len(f.calls(t)); n != before+1 {
+		t.Errorf("ssh ran %d times for one status", n-before)
+	}
+	if r := second.run(t, nil, "peer", "status", "build"); r.code != 0 {
+		t.Errorf("the second parent's status: exit %d, stderr %q", r.code, r.stderr)
 	}
 }
 
@@ -650,7 +671,8 @@ func TestPeerDecisionsAndAnswer(t *testing.T) {
 
 // TestPeerGoal: a goal reaches the peer's manager as one actionable event recorded as the
 // parent's, and the parent records it as a delegation. After the peer is adopted by another
-// parent, this one's goal is refused and appends nothing, and its record is dropped.
+// parent, this one's key is no longer admitted, so its goal fails and appends nothing; the record
+// stays, since a transport failure cannot say the peer acted on nothing.
 func TestPeerGoal(t *testing.T) {
 	ctx := context.Background()
 	f := newPeerFixture(t)
@@ -675,14 +697,14 @@ func TestPeerGoal(t *testing.T) {
 		t.Fatalf("adopt: %s", r.stderr)
 	}
 	r = f.run(t, nil, "peer", "goal", "build", "-m", "something else", "--request-id", "pg-2")
-	if r.code == 0 || !strings.Contains(r.stderr, peer.CodeWrongParent) {
-		t.Errorf("the old parent's goal: exit %d, stderr %q; want wrong_parent", r.code, r.stderr)
+	if r.code == 0 || !strings.Contains(r.stderr, "Permission denied") || !strings.Contains(r.stderr, "pg-2") {
+		t.Errorf("the old parent's goal: exit %d, stderr %q; want its key refused and the request id to retry", r.code, r.stderr)
 	}
 	if evs := managerEventsIn(t, f.peerStore(t)); len(evs) != 1 {
 		t.Errorf("the old parent's goal appended an event: %+v", evs)
 	}
-	if ds, _ := f.parentStore(t).ListDelegations(ctx, "build"); len(ds) != 1 {
-		t.Errorf("a refused goal left its record: %+v", ds)
+	if ds, _ := f.parentStore(t).ListDelegations(ctx, "build"); len(ds) != 2 {
+		t.Errorf("a goal that failed in transport dropped its record: %+v", ds)
 	}
 }
 

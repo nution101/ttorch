@@ -2438,7 +2438,8 @@ Team:
                           over your own ssh session, prove the key (the lead's command:
                           refused from a worker context or without a terminal)
   peer adopt <name> <control-dest> --force
-                          peer add for a peer another parent provisioned
+                          peer add for a peer another parent provisioned; removes every
+                          other control key from the peer's authorized_keys
   peer ls                 list the registered peers, what was delegated to each and the
                           repositories each owns (no network)
   peer status <name> [--json]

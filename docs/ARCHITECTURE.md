@@ -1108,8 +1108,9 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   `SSH_ORIGINAL_COMMAND`, which is split on whitespace and never given to a shell, and must be
   exactly one of `version`, `summary`, `decisions`, `task-add`, `goal`, `answer`, `ensure-up`.
   Anything else, including a verb followed by arguments, is refused with a named error code
-  before the body is read. `peer serve` itself takes `--parent <id>` and nothing else. The body is one JSON object on stdin, at most 1 MiB, with no field
-  the verb does not define. `version` and `summary` open the store read-only: no migration,
+  before the body is read. `peer serve` itself takes `--parent <id>` and nothing else. The body
+  is one JSON object on stdin, at most 1 MiB, with no field the verb does not define. `version`
+  and `summary` open the store read-only: no migration,
   no legacy import, no default-branch seed, no row written, so unlike `ttorch summary` the
   served summary does not sync approval escalations first. `task-add`, `goal` and `answer`
   carry a request id stored in `peer_requests`, so a repeat returns the first result and
@@ -1144,8 +1145,8 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   file the account owns and no one else can write, in a ttorch home that is not a symlink and
   has the same owner and mode. The home is opened once (`O_DIRECTORY|O_NOFOLLOW`) and checked
   with `fstat`, and `peer.env` is opened relative to that descriptor with `O_NOFOLLOW` and
-  checked with `fstat` too, so a rename between the check and the read cannot swap either. A malformed
-  or unsafe `peer.env` refuses every verb.
+  checked with `fstat` too, so a rename between the check and the read cannot swap either. A
+  malformed or unsafe `peer.env` refuses every verb.
 - **Peer provisioning.** `ttorch peer init` makes a machine a peer. `ttorch peer add` on the
   parent runs it over the lead's own interactive ssh session, with one JSON request on stdin
   (name, the parent's coordinator id, the control key's public half, and the parent's `TTORCH_*`
@@ -1158,12 +1159,19 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   group nor others can write, and the parent's settings; an existing one is kept, and refused
   here if the channel would refuse it), and only then appends
   `command="<absolute path> peer serve --parent <parent>",restrict ssh-ed25519 <key>
-  ttorch-peer-control:<parent>` to `~/.ssh/authorized_keys`. The path is the running binary with symlinks resolved, and must
-  be a plain word to the shell, owned by the account or root, and writable by no one else, nor
+  ttorch-peer-control:<parent>` to `~/.ssh/authorized_keys`. The path is the running binary with
+  symlinks resolved, and must be a plain word to the shell, owned by the account or root, and
+  writable by no one else, nor
   its directory. `~/.ssh` and the file are created private if missing, must be private
   otherwise, and are never written through a symlink (the directory is opened once and the file
   relative to it, each checked through its descriptor); the file is only appended to, and a key
-  already listed another way is refused. Running it again changes nothing.
+  already listed another way is refused. Running it again changes nothing. A forced init (adopt)
+  instead removes every other line that ends in a control key's comment, this key's older lines
+  included, keeping every other line byte for byte: the new contents go to a new 0600 file in
+  the same directory, which is synced and renamed over `authorized_keys` relative to the checked
+  descriptor, after checking the file is still the one read, unchanged (same file, size and
+  modification time). If something wrote it in between, the rewrite is dropped and refused, so
+  that write is not lost. The result names the parent each removed line was for.
   `ttorch peer add <name> <control-dest>` is the parent's side, and the lead's command: it runs
   the same caller check as `ttorch approve` (no worker context, an interactive terminal) before
   it parses a flag or starts a process. It generates the control key with `ssh-keygen` (ed25519,
@@ -1173,9 +1181,11 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   with the lead's config and agent, since that session is the lead's authority on the peer),
   passing the `TTORCH_*` settings of the lead's shell that `peer.env` may hold, then proves the
   key with a `version` call over the control channel, which must answer as that peer with this
-  coordinator as both its recorded parent and its key's. Only then is the peer `live`. A failure records why and leaves it
-  `provisioning`, and running `peer add` again resumes with the same key. `peer adopt --force`
-  is the same for a peer another parent provisioned.
+  coordinator as both its recorded parent and its key's. Only then is the peer `live`. A failure
+  records why and leaves it `provisioning`, and running `peer add` again resumes with the same
+  key. `peer adopt --force`
+  is the same for a peer another parent provisioned, and removes the other control keys' lines,
+  so the parent it moved away from can no longer reach the peer at all.
 - **Peer client.** `ttorch peer status`, `decisions`, `answer`, `task-add`, `goal` and `repo
   add` refuse a worker context (an accident guard, like `ttorch answer`'s, not a boundary), then
   reach a `live` or `unreachable` peer through `internal/peer/client.go` alone: one ssh

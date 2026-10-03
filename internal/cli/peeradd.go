@@ -170,8 +170,11 @@ func cmdPeerProvision(args []string, adopt bool, stdin *os.File) error {
 	if res.PreviousParent != "" && res.PreviousParent != self.CoordID {
 		fmt.Printf("  moved from parent %s\n", res.PreviousParent)
 	}
+	if len(res.RemovedControlKeys) > 0 {
+		fmt.Printf("  removed %d other control key line(s): parent %s\n", len(res.RemovedControlKeys), strings.Join(res.RemovedControlKeys, ", parent "))
+	}
 	if res.StaleControlKeys > 0 {
-		fmt.Printf("  authorized_keys still holds %d other control key line(s) (comment ttorch-peer-control:...); remove any you no longer use\n", res.StaleControlKeys)
+		fmt.Printf("  authorized_keys still holds %d other control key line(s) (comment ttorch-peer-control:...); remove any you no longer use, or run ttorch peer adopt --force, which removes them\n", res.StaleControlKeys)
 	}
 	switch res.PeerEnv {
 	case "written":

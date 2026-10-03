@@ -21,8 +21,10 @@ package peer
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -31,6 +33,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 	"unicode"
 
 	"golang.org/x/sys/unix"
@@ -113,7 +116,8 @@ func shellSafe(path string) bool {
 // (ParseControlKey), resolves the running ttorch to the path the forced command will name
 // (ServeBinary), and installs the line in <sshDir>/authorized_keys (installControlKey). Everything
 // that decides what the line says is in this file. It returns the binary path with the result.
-func ProvisionControlKey(sshDir, pubKey, parentID string, uid int) (string, InstallResult, error) {
+// With replace (adopt --force), every other control key's line is removed in the same step.
+func ProvisionControlKey(sshDir, pubKey, parentID string, uid int, replace bool) (string, InstallResult, error) {
 	// The id goes into the forced command, which sshd hands to a shell.
 	if err := db.ValidCoordID(parentID); err != nil {
 		return "", InstallResult{}, fmt.Errorf("the parent's coordinator id: %w", err)
@@ -126,7 +130,7 @@ func ProvisionControlKey(sshDir, pubKey, parentID string, uid int) (string, Inst
 	if err != nil {
 		return "", InstallResult{}, err
 	}
-	res, err := installControlKey(sshDir, AuthorizedKeyLine(bin, blob, parentID), blob, uid)
+	res, err := installControlKey(sshDir, AuthorizedKeyLine(bin, blob, parentID), blob, uid, replace)
 	return bin, res, err
 }
 
@@ -274,15 +278,21 @@ func OpenAt(dir *os.File, name string, flags int, perm os.FileMode) (*os.File, e
 }
 
 // InstallResult is what installControlKey did. Added is false when the line was already there.
-// StaleControlKeys counts other control keys' lines in the file, a previous parent's for
-// instance, which were left as they are.
+// StaleControlKeys counts other control keys' lines left in the file, a previous parent's for
+// instance. Removed is the parent each removed control key's line named (its comment), in file
+// order, when replace removed any.
 type InstallResult struct {
 	Path             string
 	Added            bool
 	StaleControlKeys int
+	Removed          []string
 }
 
-// installControlKey appends line, which admits the key blob, to <sshDir>/authorized_keys. It is
+// afterAuthorizedKeysRead, when set, runs once authorized_keys has been read, before anything is
+// written: a test's way to change the file at that point. It is nil outside tests.
+var afterAuthorizedKeysRead func()
+
+// installControlKey puts line, which admits the key blob, in <sshDir>/authorized_keys. It is
 // unexported so that outside this package the only way to admit a key is ProvisionControlKey,
 // whose line always carries the forced command and restrict. sshDir is created 0700 and the file
 // 0600 when missing. Both must then be owned by uid and writable by no one else, and neither may
@@ -291,12 +301,22 @@ type InstallResult struct {
 // checked. sshd's StrictModes refuses a looser file anyway, and a file someone else can write
 // could admit any key.
 //
-// The file is appended to, never rewritten, and a last line without a newline gets one first, so
-// no existing entry is touched. If the file already holds line, nothing is written. If it lists
-// the same key any other way (without the forced command, say), that is refused and nothing is
-// written: the key would then have two meanings. Other control keys' lines are counted, not
-// removed.
-func installControlKey(sshDir, line, blob string, uid int) (InstallResult, error) {
+// Without replace the file is appended to, never rewritten, and a last line without a newline
+// gets one first, so no existing entry is touched. If the file already holds line, nothing is
+// written. If it lists the same key any other way (without the forced command, say), that is
+// refused and nothing is written: the key would then have two meanings. Other control keys'
+// lines are counted, not removed.
+//
+// With replace, every line that ends in a control key's comment and is not line is removed,
+// this key's own older lines included, and every other line is kept byte for byte. A line that
+// lists this key without that comment is still refused: it is someone's own entry, and could
+// give the key more than the forced command. The new contents go to a new 0600 file in the same
+// directory, which is synced and then renamed over authorized_keys relative to the directory's
+// descriptor, so sshd sees the old file or the new one, never a partial one, and no symlink is
+// followed. Just before the rename the file is checked against what was read (same file, size
+// and modification time); if anything wrote it meanwhile, the new file is discarded and the
+// install refused, so that write is not lost.
+func installControlKey(sshDir, line, blob string, uid int, replace bool) (InstallResult, error) {
 	if !filepath.IsAbs(sshDir) {
 		return InstallResult{}, fmt.Errorf("the ssh directory %q is not absolute", sshDir)
 	}
@@ -333,17 +353,47 @@ func installControlKey(sshDir, line, blob string, uid int) (InstallResult, error
 	if len(have) > maxAuthorizedKeys {
 		return out, fmt.Errorf("%s is over %d bytes", path, maxAuthorizedKeys)
 	}
+	read, err := f.Stat()
+	if err != nil {
+		return out, err
+	}
+	if read.Size() != int64(len(have)) {
+		return out, fmt.Errorf("%s changed while it was being read; nothing was written, run it again", path)
+	}
+	if afterAuthorizedKeysRead != nil {
+		afterAuthorizedKeysRead()
+	}
 	present := false
-	for i, l := range strings.Split(string(have), "\n") {
-		l = strings.TrimSpace(strings.TrimSuffix(l, "\r"))
+	var kept bytes.Buffer
+	raw := strings.SplitAfter(string(have), "\n")
+	for i, r := range raw {
+		l := strings.TrimSpace(strings.TrimSuffix(strings.TrimSuffix(r, "\n"), "\r"))
 		switch {
 		case l == line:
 			present = true
+		case replace && isControlKeyLine(l):
+			fields := strings.Fields(l)
+			out.Removed = append(out.Removed, removedParent(fields[len(fields)-1]))
+			continue
 		case containsField(l, blob):
-			return out, fmt.Errorf("%s line %d already lists this control key another way; remove that line and provision again", path, i+1)
+			return InstallResult{Path: path}, fmt.Errorf("%s line %d already lists this control key another way; remove that line and provision again", path, i+1)
 		case isControlKeyLine(l):
 			out.StaleControlKeys++
 		}
+		kept.WriteString(r)
+	}
+	if len(out.Removed) > 0 {
+		if kept.Len() > 0 && !bytes.HasSuffix(kept.Bytes(), []byte("\n")) {
+			kept.WriteByte('\n')
+		}
+		if !present {
+			kept.WriteString(line + "\n")
+			out.Added = true
+		}
+		if err := replaceAt(dir, "authorized_keys", read, kept.Bytes()); err != nil {
+			return InstallResult{Path: path}, err
+		}
+		return out, nil
 	}
 	if present {
 		return out, nil
@@ -362,6 +412,71 @@ func installControlKey(sshDir, line, blob string, uid int) (InstallResult, error
 	}
 	out.Added = true
 	return out, nil
+}
+
+// removedParent is what a removed line's comment says about the parent it was for: the
+// coordinator id, or a placeholder when the comment holds something else.
+func removedParent(comment string) string {
+	id := strings.TrimPrefix(comment, controlKeyCommentPrefix)
+	if db.ValidCoordID(id) != nil {
+		return "(not a coordinator id)"
+	}
+	return id
+}
+
+// replaceAt replaces the file name in dir with content, atomically, if it is still the file read
+// describes, unchanged: same file, size and modification time. The content goes to a new 0600
+// file beside it (O_EXCL, never through a symlink), which is synced, checked private, and renamed
+// over name relative to dir's descriptor; dir is then synced so the rename survives a crash. On a
+// failure the new file is removed and name is left as it was.
+func replaceAt(dir *os.File, name string, read os.FileInfo, content []byte) (err error) {
+	path := filepath.Join(dir.Name(), name)
+	var suffix [8]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		return err
+	}
+	tmpName := "." + name + ".ttorch-" + hex.EncodeToString(suffix[:])
+	tmp, err := OpenAt(dir, tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	renamed := false
+	defer func() {
+		tmp.Close()
+		if !renamed {
+			_ = unix.Unlinkat(int(dir.Fd()), tmpName, 0)
+		}
+	}()
+	if _, err := tmp.Write(content); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	tfi, err := tmp.Stat()
+	if err != nil {
+		return err
+	}
+	st, ok := read.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("%s: no file identity to check", path)
+	}
+	if err := CheckPrivate(filepath.Join(dir.Name(), tmpName), tfi, int(st.Uid), false); err != nil {
+		return err
+	}
+	var now unix.Stat_t
+	if err := unix.Fstatat(int(dir.Fd()), name, &now, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return &fs.PathError{Op: "stat", Path: path, Err: err}
+	}
+	if uint64(now.Dev) != uint64(st.Dev) || uint64(now.Ino) != uint64(st.Ino) || now.Size != read.Size() ||
+		time.Unix(now.Mtim.Unix()).UnixNano() != read.ModTime().UnixNano() {
+		return fmt.Errorf("%s changed while it was being rewritten; nothing was written, run it again", path)
+	}
+	if err := unix.Renameat(int(dir.Fd()), tmpName, int(dir.Fd()), name); err != nil {
+		return &fs.PathError{Op: "rename", Path: path, Err: err}
+	}
+	renamed = true
+	return dir.Sync()
 }
 
 func containsField(line, field string) bool {

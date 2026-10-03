@@ -45,20 +45,22 @@ type InitRequest struct {
 
 // InitResult is what init did. AuthorizedKeys is "added" or "present"; PeerEnv is "written" or
 // "kept". Binary is the absolute path the forced command names. StaleControlKeys counts other
-// control keys' lines left in authorized_keys. Missing names the programs a fleet needs that
-// peer.env's PATH does not reach.
+// control keys' lines left in authorized_keys; RemovedControlKeys is the parent each removed one
+// named, when a forced init removed them. Missing names the programs a fleet needs that peer.env's
+// PATH does not reach.
 type InitResult struct {
-	CoordID          string   `json:"coord_id"`
-	Name             string   `json:"name"`
-	Role             string   `json:"role"`
-	ParentID         string   `json:"parent_id"`
-	PreviousParent   string   `json:"previous_parent"`
-	Binary           string   `json:"binary"`
-	AuthorizedKeys   string   `json:"authorized_keys"`
-	StaleControlKeys int      `json:"stale_control_keys"`
-	PeerEnv          string   `json:"peer_env"`
-	PeerEnvPath      string   `json:"peer_env_path"`
-	Missing          []string `json:"missing"`
+	CoordID            string   `json:"coord_id"`
+	Name               string   `json:"name"`
+	Role               string   `json:"role"`
+	ParentID           string   `json:"parent_id"`
+	PreviousParent     string   `json:"previous_parent"`
+	Binary             string   `json:"binary"`
+	AuthorizedKeys     string   `json:"authorized_keys"`
+	StaleControlKeys   int      `json:"stale_control_keys"`
+	RemovedControlKeys []string `json:"removed_control_keys"`
+	PeerEnv            string   `json:"peer_env"`
+	PeerEnvPath        string   `json:"peer_env_path"`
+	Missing            []string `json:"missing"`
 }
 
 // ValidRemoteTtorch refuses a path for the remote ttorch that the remote shell would not read as

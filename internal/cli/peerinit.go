@@ -42,7 +42,8 @@ func cmdPeerInit(stdin io.Reader, stdout, stderr io.Writer) int {
 //  5. Write peer.env if there is none: the default PATH plus this session's, and the parent's
 //     settings. An existing one is kept as it is.
 //  6. Install the control key's forced-command line in ~/.ssh/authorized_keys
-//     (peer.ProvisionControlKey).
+//     (peer.ProvisionControlKey). A forced init also removes every other control key's line,
+//     so a parent the peer was moved away from can no longer reach it.
 //
 // Every step can run again: a retried add finds the row, peer.env and the line already there.
 func peerInit(ctx context.Context, stdin io.Reader) (peer.InitResult, error) {
@@ -107,7 +108,7 @@ func peerInit(ctx context.Context, stdin io.Reader) (peer.InitResult, error) {
 		path = defaultPeerPath(u)
 	}
 
-	bin, inst, err := peer.ProvisionControlKey(filepath.Join(u.home, ".ssh"), req.ControlKey, req.ParentID, uid)
+	bin, inst, err := peer.ProvisionControlKey(filepath.Join(u.home, ".ssh"), req.ControlKey, req.ParentID, uid, req.Force)
 	if err != nil {
 		return peer.InitResult{}, err
 	}
@@ -118,7 +119,7 @@ func peerInit(ctx context.Context, stdin io.Reader) (peer.InitResult, error) {
 	c := prov.Coordinator
 	return peer.InitResult{
 		CoordID: c.CoordID, Name: c.Name, Role: c.Role, ParentID: c.ParentID, PreviousParent: prov.PreviousParent,
-		Binary: bin, AuthorizedKeys: keys, StaleControlKeys: inst.StaleControlKeys,
+		Binary: bin, AuthorizedKeys: keys, StaleControlKeys: inst.StaleControlKeys, RemovedControlKeys: inst.Removed,
 		PeerEnv: envState, PeerEnvPath: envPath, Missing: missingPrograms(path),
 	}, nil
 }

@@ -237,7 +237,7 @@ func TestPeerInitProvisions(t *testing.T) {
 }
 
 // TestPeerInitKeepsItsParent: another parent is refused and changes nothing unless it forces the
-// move, which reports the parent it replaced and leaves that parent's line counted, not removed.
+// move, which reports the parent it replaced and removes that parent's control key line.
 func TestPeerInitKeepsItsParent(t *testing.T) {
 	ctx := context.Background()
 	h := newInitHome(t)
@@ -261,11 +261,13 @@ func TestPeerInitKeepsItsParent(t *testing.T) {
 	}
 
 	r = initRun(t, h, initBody(t, peer.InitRequest{Name: "build", ParentID: other, ControlKey: otherKey, Force: true}))
-	if r.code != 0 || r.result.ParentID != other || r.result.PreviousParent != servedParent || r.result.StaleControlKeys != 1 || r.result.AuthorizedKeys != "added" {
+	if r.code != 0 || r.result.ParentID != other || r.result.PreviousParent != servedParent || r.result.StaleControlKeys != 0 ||
+		strings.Join(r.result.RemovedControlKeys, ",") != servedParent || r.result.AuthorizedKeys != "added" {
 		t.Fatalf("a forced init = exit %d, %+v (%s)", r.code, r.result, r.raw)
 	}
+	// The first parent's line is gone; only the new parent's key is admitted.
 	b, _ := os.ReadFile(h.authorizedKeys())
-	if lines := strings.Split(strings.TrimSuffix(string(b), "\n"), "\n"); len(lines) != 2 || lines[0] != strings.TrimSuffix(string(before), "\n") || !strings.Contains(lines[1], otherBlob) {
+	if lines := strings.Split(strings.TrimSuffix(string(b), "\n"), "\n"); len(lines) != 1 || !strings.Contains(lines[0], otherBlob) || !strings.Contains(lines[0], "--parent "+other) {
 		t.Errorf("after a forced init, authorized_keys = %q", b)
 	}
 }
