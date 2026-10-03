@@ -571,6 +571,37 @@ func TestCmdTaskAddLintsTheBrief(t *testing.T) {
 	}
 }
 
+// A brief that cannot be stored stops the add with nothing created: the brief is written in the
+// transaction that inserts the row, so there is never a task the scheduler would skip for want
+// of the brief it was added with.
+func TestCmdTaskAddUnwritableBriefAddsNothing(t *testing.T) {
+	var projID int64
+	dbPath := withSeedDB(t, func(ctx context.Context, s *db.Store) {
+		p, _ := s.UpsertProject(ctx, "/r", "r")
+		projID = p.ID
+	})
+	// A file where the task's data directory would go makes the brief unwritable.
+	dir := filepath.Dir(paths.Default().BriefPath("brief-blocked"))
+	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir, []byte("in the way"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := captureStdout(t, func() error {
+		return cmdTaskAdd([]string{"brief-blocked", "--project", itoa(projID), "--brief", "# b\n", "--no-brief-lint"})
+	})
+	if err == nil {
+		t.Fatal("an add whose brief cannot be stored must fail")
+	}
+	store := reopen(t, dbPath)
+	if _, exists, qErr := store.GetTask(context.Background(), "brief-blocked"); qErr != nil {
+		t.Fatal(qErr)
+	} else if exists {
+		t.Fatalf("an add whose brief could not be stored left its row behind (%v)", err)
+	}
+}
+
 // The most ordinary citation a brief makes is file:line, and `task add` supplies no
 // citations ref of its own. A brief citing a REAL line of existing code must therefore be
 // added and stored, with no flag: requiring one here blocked essentially every brief that

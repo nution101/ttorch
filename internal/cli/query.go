@@ -870,13 +870,13 @@ func cmdTaskAdd(args []string) error {
 	if t.HasBrief {
 		briefNote = " with a stored brief"
 	}
-	fmt.Printf("added backlog task %s%s (project %d, status %s) — spawn it with: ttorch spawn %s <repo>\n", t.ID, briefNote, t.ProjectID, t.Status, t.ID)
+	fmt.Printf("added backlog task %s%s (project %d, status %s) — spawn it with: ttorch spawn %s <repo>\n", t.TaskID, briefNote, t.ProjectID, t.Status, t.TaskID)
 	// Make a briefless task an explicit choice: the scheduler daemon will SKIP it (a task
 	// with no stored brief is left for the manager — it cannot be auto-dispatched without
 	// stranding the worker on the manager-send stub), so warn rather than let it silently
 	// sit undispatched.
 	if !t.HasBrief {
-		fmt.Fprintf(os.Stderr, "note: %s has no stored brief, so the scheduler will not auto-dispatch it (it is left for the manager). Add one with 'ttorch task add %s --brief-file <path>' / --brief, or dispatch it yourself with 'ttorch spawn %s <repo> --brief-file <path>'.\n", t.ID, t.ID, t.ID)
+		fmt.Fprintf(os.Stderr, "note: %s has no stored brief, so the scheduler will not auto-dispatch it (it is left for the manager). Add one with 'ttorch task add %s --brief-file <path>' / --brief, or dispatch it yourself with 'ttorch spawn %s <repo> --brief-file <path>'.\n", t.TaskID, t.TaskID, t.TaskID)
 	}
 	return nil
 }
