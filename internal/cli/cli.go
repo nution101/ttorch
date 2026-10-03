@@ -2439,6 +2439,23 @@ Team:
                           refused from a worker context or without a terminal)
   peer adopt <name> <control-dest> --force
                           peer add for a peer another parent provisioned
+  peer ls                 list the registered peers, what was delegated to each and the
+                          repositories each owns (no network)
+  peer status <name> [--json]
+                          the peer's coordinator summary, over its control channel
+  peer decisions <name> [--since <id>] [--json]
+                          the peer's open escalations, escaped and capped
+  peer answer <name> <escalation-id> -m "<text>" [--request-id <id>]
+                          answer one; recorded on the peer as relayed by its parent
+  peer task-add <name> <task-id> --repo <path on the peer> --brief-file <f>
+                          hand the peer a briefed backlog task (also --title, --touches,
+                          --effort, --model, --request-id)
+  peer goal <name> -m "<text>" [--request-id <id>]
+                          hand the peer's manager plain-language work
+  peer repo add <name> <path on the peer> --origin <url>
+                          record that the peer owns a repository
+  peer retire <name>      stop using a peer and delete its control key (the lead's
+                          command)
   peer serve              answer one control request from a parent coordinator, as an
                           ssh forced command: the verb comes from SSH_ORIGINAL_COMMAND
                           (version, summary, decisions, task-add, goal, answer,

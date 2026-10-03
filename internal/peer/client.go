@@ -246,6 +246,11 @@ func readResponse(raw []byte) (wireResponse, error) {
 	return resp, nil
 }
 
+// Untrusted makes text that came from a peer, or was stored from one, safe to print on the
+// parent: escaped if it still holds a non-printing rune or invalid UTF-8, and capped at MaxText.
+// Text already escaped is left as it is, so it is not escaped twice.
+func Untrusted(s string) string { return safeString(s) }
+
 func servesVerb(verb string) bool {
 	for _, v := range verbs {
 		if v.name == verb {

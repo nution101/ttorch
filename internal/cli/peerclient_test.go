@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,10 +15,12 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/nution101/ttorch/internal/db"
+	"github.com/nution101/ttorch/internal/paths"
 	"github.com/nution101/ttorch/internal/peer"
 )
 
@@ -58,8 +62,9 @@ type shimConfig struct {
 }
 
 type shimCall struct {
-	Args []string `json:"args"`
-	PID  int      `json:"pid"`
+	Args  []string `json:"args"`
+	PID   int      `json:"pid"`
+	Child int      `json:"child,omitempty"`
 }
 
 // runSSHShim is ssh, as far as the parent can tell.
@@ -79,8 +84,10 @@ func runSSHShim(cfgPath string, args []string) int {
 		if err := child.Start(); err != nil {
 			return 255
 		}
-		writeShimLog(cfg, shimCall{Args: args, PID: child.Process.Pid})
-		select {}
+		writeShimLog(cfg, shimCall{Args: args, PID: os.Getpid(), Child: child.Process.Pid})
+		for {
+			time.Sleep(time.Hour)
+		}
 	}
 	writeShimLog(cfg, shimCall{Args: args, PID: os.Getpid()})
 	sep := -1
@@ -465,5 +472,359 @@ func TestPeerAdopt(t *testing.T) {
 	secondSelf, _ := second.parentStore(t).GetCoordinator(ctx)
 	if c, _ := f.peerStore(t).GetCoordinator(ctx); c.ParentID != secondSelf.CoordID {
 		t.Errorf("after adopt the peer's parent is %s, want %s", c.ParentID, secondSelf.CoordID)
+	}
+}
+
+// lastCall is the most recent ssh invocation, which must be a control call for verb with exactly
+// the pinned options.
+func (f *peerFixture) lastCall(t *testing.T, ctx context.Context, verb string) shimCall {
+	t.Helper()
+	calls := f.calls(t)
+	if len(calls) == 0 {
+		t.Fatalf("no ssh call for %s", verb)
+	}
+	p, _, _ := f.parentStore(t).GetPeer(ctx, "build")
+	last := calls[len(calls)-1]
+	if want := controlArgs(p.ControlKey, "ttorch@build-host", verb); !reflect.DeepEqual(last.Args, want) {
+		t.Errorf("ssh ran %q\nwant    %q", last.Args, want)
+	}
+	return last
+}
+
+// TestPeerTaskAdd: task-add puts a briefed backlog row in the peer's store, created by the
+// parent, after the peer's own brief lint passed, and records the delegation in the parent's
+// store, which holds no row for the task. A repeat of the request id changes nothing; a brief the
+// lint refuses creates nothing on either side.
+func TestPeerTaskAdd(t *testing.T) {
+	ctx := context.Background()
+	f := newPeerFixture(t)
+	f.add(t, "build")
+	repo := lintRepo(t)
+	if _, err := f.peerStore(t).UpsertProject(ctx, repo, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	briefPath := filepath.Join(t.TempDir(), "brief.md")
+	if err := os.WriteFile(briefPath, []byte(cleanBrief), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	add := []string{"peer", "task-add", "build", "p-1", "--repo", repo, "--brief-file", briefPath,
+		"--title", "from the parent", "--touches", "pkg/thing.go", "--effort", "high", "--request-id", "pt-1"}
+	r := f.run(t, nil, add...)
+	if r.code != 0 || !strings.Contains(r.stdout, "task p-1 added") {
+		t.Fatalf("peer task-add: exit %d\nstdout: %s\nstderr: %s", r.code, r.stdout, r.stderr)
+	}
+	f.lastCall(t, ctx, "task-add")
+
+	task := mustTask(t, f.peerStore(t), "p-1")
+	if task.Status != db.StatusPending || !task.HasBrief || task.CreatedBy != db.ActorParent || task.Title != "from the parent" ||
+		task.Effort != "high" || strings.Join(task.Footprint, ",") != "pkg/thing.go" {
+		t.Errorf("the peer's task = %+v", task)
+	}
+	if b, err := os.ReadFile(paths.Paths{Home: f.peer.home}.BriefPath("p-1")); err != nil || string(b) != cleanBrief {
+		t.Errorf("the peer's stored brief = %q, %v", b, err)
+	}
+	ps := f.parentStore(t)
+	if _, ok, _ := ps.GetTask(ctx, "p-1"); ok {
+		t.Error("the parent holds a row for the peer's task")
+	}
+	ds, err := ps.ListDelegations(ctx, "build")
+	sum := sha256Hex(cleanBrief)
+	if err != nil || len(ds) != 1 || ds[0].RequestID != "pt-1" || ds[0].Kind != db.DelegationTask || ds[0].RemoteTaskID != "p-1" || ds[0].BriefSHA256 != sum {
+		t.Errorf("the parent's delegations = %+v, %v", ds, err)
+	}
+
+	r = f.run(t, nil, add...)
+	if r.code != 0 || !strings.Contains(r.stdout, "already added") {
+		t.Errorf("a repeat: exit %d, stdout %q", r.code, r.stdout)
+	}
+	if n := countIn(t, f.peerStore(t), "tasks"); n != 1 {
+		t.Errorf("a repeat left %d tasks on the peer", n)
+	}
+
+	bad := filepath.Join(t.TempDir(), "bad.md")
+	if err := os.WriteFile(bad, []byte(defectiveBrief), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r = f.run(t, nil, "peer", "task-add", "build", "p-bad", "--repo", repo, "--brief-file", bad)
+	if r.code == 0 || !strings.Contains(r.stderr, "brief_lint") || !strings.Contains(r.stderr, "violation") {
+		t.Errorf("a defective brief: exit %d, stderr %q; want the peer's lint refusal and report", r.code, r.stderr)
+	}
+	if _, ok, _ := f.peerStore(t).GetTask(ctx, "p-bad"); ok {
+		t.Error("a refused brief created a task on the peer")
+	}
+	if ds, _ := ps.ListDelegations(ctx, "build"); len(ds) != 1 {
+		t.Errorf("a refused add left a delegation record: %+v", ds)
+	}
+}
+
+func sha256Hex(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+// TestPeerDecisionsAndAnswer: decisions reads an escalation raised on the peer, its text escaped
+// on arrival; answer records it on the peer as relayed by the parent, wakes the peer's manager,
+// and says so without claiming the lead.
+func TestPeerDecisionsAndAnswer(t *testing.T) {
+	ctx := context.Background()
+	f := newPeerFixture(t)
+	f.add(t, "build")
+	ps := f.peerStore(t)
+	proj, err := ps.UpsertProject(ctx, "/srv/q", "q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ps.CreateTask(ctx, db.Task{ID: "t-q", ProjectID: proj.ID}, db.ActorManager); err != nil {
+		t.Fatal(err)
+	}
+	esc, err := ps.OpenEscalation(ctx, "t-q", db.EscalationQuestion, "which one?\x1b]0;pwned\x07\nsecond line")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r := f.run(t, nil, "peer", "decisions", "build")
+	if r.code != 0 {
+		t.Fatalf("peer decisions: exit %d, %s", r.code, r.stderr)
+	}
+	f.lastCall(t, ctx, "decisions")
+	if !strings.Contains(r.stdout, fmt.Sprintf("#%d  question  task t-q", esc.ID)) || !strings.Contains(r.stdout, `which one?\x1b]0;pwned\x07\nsecond line`) {
+		t.Errorf("peer decisions = %q", r.stdout)
+	}
+	if strings.ContainsAny(r.stdout, "\x1b\x07") {
+		t.Errorf("peer decisions printed a raw control character: %q", r.stdout)
+	}
+	if r := f.run(t, nil, "peer", "decisions", "build", "--since", fmt.Sprint(esc.ID)); r.code != 0 || strings.Contains(r.stdout, "which one") {
+		t.Errorf("decisions above the only escalation = %q", r.stdout)
+	}
+
+	r = f.run(t, nil, "peer", "answer", "build", fmt.Sprint(esc.ID), "-m", "the first one", "--request-id", "pa-1")
+	if r.code != 0 {
+		t.Fatalf("peer answer: exit %d, %s", r.code, r.stderr)
+	}
+	f.lastCall(t, ctx, "answer")
+	if !strings.Contains(r.stdout, "relayed by this coordinator") || strings.Contains(strings.ToLower(r.stdout), "lead") {
+		t.Errorf("peer answer printed %q; it must say the parent relayed it and must not claim the lead", r.stdout)
+	}
+	e, _, _ := ps.GetEscalation(ctx, esc.ID)
+	if e.Status != db.EscalationAnswered || e.AnsweredBy != db.ActorParent || e.Answer != "the first one" {
+		t.Errorf("the peer's escalation = %+v", e)
+	}
+	evs := managerEventsIn(t, ps)
+	if len(evs) != 1 || evs[0].Actor != db.ActorParent || !evs[0].Actionable {
+		t.Errorf("the peer's manager events = %+v, want one actionable event recorded as the parent's", evs)
+	}
+	if r := f.run(t, nil, "peer", "answer", "build", fmt.Sprint(esc.ID), "-m", "again", "--request-id", "pa-1"); r.code != 0 || !strings.Contains(r.stdout, "nothing changed") {
+		t.Errorf("a repeated answer: exit %d, %q", r.code, r.stdout)
+	}
+	f.extraEnv = append(f.extraEnv, "TTORCH_TASK_ID=t1")
+	before := len(f.calls(t))
+	if r := f.run(t, nil, "peer", "answer", "build", fmt.Sprint(esc.ID), "-m", "x"); r.code == 0 || !strings.Contains(r.stderr, "worker context") {
+		t.Errorf("an answer from a worker context: exit %d, %q", r.code, r.stderr)
+	}
+	if n := len(f.calls(t)); n != before {
+		t.Error("an answer from a worker context ran ssh")
+	}
+}
+
+// TestPeerGoal: a goal reaches the peer's manager as one actionable event recorded as the
+// parent's, and the parent records it as a delegation. After the peer is adopted by another
+// parent, this one's goal is refused and appends nothing, and its record is dropped.
+func TestPeerGoal(t *testing.T) {
+	ctx := context.Background()
+	f := newPeerFixture(t)
+	f.add(t, "build")
+	r := f.run(t, nil, "peer", "goal", "build", "-m", "split the importer", "--request-id", "pg-1")
+	if r.code != 0 || !strings.Contains(r.stdout, "goal handed to its manager") {
+		t.Fatalf("peer goal: exit %d\nstdout: %s\nstderr: %s", r.code, r.stdout, r.stderr)
+	}
+	f.lastCall(t, ctx, "goal")
+	evs := managerEventsIn(t, f.peerStore(t))
+	if len(evs) != 1 || evs[0].Type != db.EventGoal || evs[0].Actor != db.ActorParent || evs[0].Payload != "split the importer" {
+		t.Errorf("the peer's manager events = %+v", evs)
+	}
+	ds, _ := f.parentStore(t).ListDelegations(ctx, "build")
+	if len(ds) != 1 || ds[0].Kind != db.DelegationGoal || ds[0].BriefSHA256 != sha256Hex("split the importer") {
+		t.Errorf("the parent's delegations = %+v", ds)
+	}
+
+	second := *f
+	second.parentHome, second.parentAccount = t.TempDir(), t.TempDir()
+	if r := second.run(t, nil, "peer", "adopt", "build", "ttorch@build-host", "--force"); r.code != 0 {
+		t.Fatalf("adopt: %s", r.stderr)
+	}
+	r = f.run(t, nil, "peer", "goal", "build", "-m", "something else", "--request-id", "pg-2")
+	if r.code == 0 || !strings.Contains(r.stderr, peer.CodeWrongParent) {
+		t.Errorf("the old parent's goal: exit %d, stderr %q; want wrong_parent", r.code, r.stderr)
+	}
+	if evs := managerEventsIn(t, f.peerStore(t)); len(evs) != 1 {
+		t.Errorf("the old parent's goal appended an event: %+v", evs)
+	}
+	if ds, _ := f.parentStore(t).ListDelegations(ctx, "build"); len(ds) != 1 {
+		t.Errorf("a refused goal left its record: %+v", ds)
+	}
+}
+
+// TestPeerStatusAndLs: status prints the peer's summary and caches it; ls shows the registry,
+// with what was delegated, from this coordinator's store alone.
+func TestPeerStatusAndLs(t *testing.T) {
+	ctx := context.Background()
+	f := newPeerFixture(t)
+	f.add(t, "build")
+	if r := f.run(t, nil, "peer", "goal", "build", "-m", "tidy"); r.code != 0 {
+		t.Fatal(r.stderr)
+	}
+	r := f.run(t, nil, "peer", "status", "build")
+	if r.code != 0 || !strings.Contains(r.stdout, "peer build (live") || !strings.Contains(r.stdout, "tasks:") {
+		t.Fatalf("peer status: exit %d\nstdout: %s\nstderr: %s", r.code, r.stdout, r.stderr)
+	}
+	f.lastCall(t, ctx, "summary")
+	p, _, _ := f.parentStore(t).GetPeer(ctx, "build")
+	var cached peer.Summary
+	if err := json.Unmarshal([]byte(p.Summary), &cached); err != nil || cached.SchemaVersion != peer.SchemaVersion {
+		t.Errorf("cached summary %q: %v", p.Summary, err)
+	}
+	if r := f.run(t, nil, "peer", "status", "build", "--json"); r.code != 0 || !strings.Contains(r.stdout, `"schema_version"`) {
+		t.Errorf("peer status --json: %q", r.stdout)
+	}
+
+	before := len(f.calls(t))
+	r = f.run(t, nil, "peer", "ls")
+	if r.code != 0 || !strings.Contains(r.stdout, "build  live  control ttorch@build-host") || !strings.Contains(r.stdout, "0 task(s), 1 goal(s)") {
+		t.Errorf("peer ls = %q", r.stdout)
+	}
+	if n := len(f.calls(t)); n != before {
+		t.Error("peer ls ran ssh")
+	}
+}
+
+// TestPeerRepoAdd: a repo is recorded only when the peer has a project at that path, and not
+// when this coordinator already has a project with the same origin.
+func TestPeerRepoAdd(t *testing.T) {
+	ctx := context.Background()
+	f := newPeerFixture(t)
+	f.add(t, "build")
+	if _, err := f.peerStore(t).UpsertProject(ctx, "/srv/app", "app"); err != nil {
+		t.Fatal(err)
+	}
+	if r := f.run(t, nil, "peer", "repo", "add", "build", "/srv/elsewhere", "--origin", "git@example.com:org/x.git"); r.code == 0 || !strings.Contains(r.stderr, "no project at") {
+		t.Errorf("a path the peer has no project at: exit %d, %q", r.code, r.stderr)
+	}
+	ps := f.parentStore(t)
+	proj, err := ps.UpsertProject(ctx, "/local/app", "app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ps.SetProjectDefaultBranch(ctx, proj.ID, "main", "https://example.com/org/app"); err != nil {
+		t.Fatal(err)
+	}
+	if r := f.run(t, nil, "peer", "repo", "add", "build", "/srv/app", "--origin", "git@example.com:org/app.git"); r.code == 0 || !strings.Contains(r.stderr, "already belongs") {
+		t.Errorf("an origin this coordinator has: exit %d, %q", r.code, r.stderr)
+	}
+	if r := f.run(t, nil, "peer", "repo", "add", "build", "/srv/app", "--origin", "git@example.com:org/other.git"); r.code != 0 {
+		t.Fatalf("peer repo add: exit %d, %s", r.code, r.stderr)
+	}
+	if repos, _ := ps.ListPeerRepos(ctx, "build"); len(repos) != 1 || repos[0].RemotePath != "/srv/app" {
+		t.Errorf("the peer's repos = %+v", repos)
+	}
+}
+
+// TestPeerRetire: retire is the lead's (refused from a pipe), keeps the row, deletes the control
+// key, and a retired peer is never called again.
+func TestPeerRetire(t *testing.T) {
+	ctx := context.Background()
+	f := newPeerFixture(t)
+	f.add(t, "build")
+	p, _, _ := f.parentStore(t).GetPeer(ctx, "build")
+	if r := f.run(t, strings.NewReader(""), "peer", "retire", "build"); r.code == 0 || !strings.Contains(r.stderr, "interactive terminal") {
+		t.Errorf("retire from a pipe: exit %d, %q", r.code, r.stderr)
+	}
+	if _, err := os.Stat(p.ControlKey); err != nil {
+		t.Fatalf("a refused retire touched the key: %v", err)
+	}
+	if r := f.run(t, nil, "peer", "retire", "build"); r.code != 0 {
+		t.Fatalf("peer retire: exit %d, %s", r.code, r.stderr)
+	}
+	for _, k := range []string{p.ControlKey, p.ControlKey + ".pub"} {
+		if _, err := os.Lstat(k); !os.IsNotExist(err) {
+			t.Errorf("retire left %s", k)
+		}
+	}
+	if p, _, _ = f.parentStore(t).GetPeer(ctx, "build"); p.Status != db.PeerRetired {
+		t.Errorf("after retire: %+v", p)
+	}
+	before := len(f.calls(t))
+	for _, args := range [][]string{{"peer", "status", "build"}, {"peer", "goal", "build", "-m", "x"}, {"peer", "decisions", "build"}} {
+		if r := f.run(t, nil, args...); r.code == 0 || !strings.Contains(r.stderr, "retired") {
+			t.Errorf("%v on a retired peer: exit %d, %q", args, r.code, r.stderr)
+		}
+	}
+	if n := len(f.calls(t)); n != before {
+		t.Error("a retired peer was called")
+	}
+}
+
+// TestPeerCallDeadline: a control call to an ssh that never answers is killed at the client's
+// deadline, together with the child it started, and the failure is recorded on the peer's row.
+func TestPeerCallDeadline(t *testing.T) {
+	ctx := context.Background()
+	f := newPeerFixture(t)
+	f.add(t, "build")
+	f.cfg.Hang = true
+	f.writeConfig(t)
+	f.extraEnv = append(f.extraEnv, testPeerTimeoutEnv+"=1s")
+	start := time.Now()
+	r := f.run(t, nil, "peer", "status", "build")
+	if r.code == 0 || !strings.Contains(r.stderr, "did not answer in time") {
+		t.Fatalf("peer status against a hung ssh: exit %d, stderr %q", r.code, r.stderr)
+	}
+	if took := time.Since(start); took > 15*time.Second {
+		t.Errorf("peer status took %s past a 1s deadline", took)
+	}
+	calls := f.calls(t)
+	hung := calls[len(calls)-1]
+	if hung.Child == 0 {
+		t.Fatalf("the hung shim logged no child: %+v", hung)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for (alive(hung.PID) || alive(hung.Child)) && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if alive(hung.PID) {
+		t.Errorf("the ssh process %d outlived the deadline", hung.PID)
+	}
+	if alive(hung.Child) {
+		_ = syscall.Kill(hung.Child, syscall.SIGKILL)
+		t.Errorf("the child %d of the ssh process outlived the deadline", hung.Child)
+	}
+	if p, _, _ := f.parentStore(t).GetPeer(ctx, "build"); !strings.Contains(p.LastError, "did not answer in time") || p.Status != db.PeerLive {
+		t.Errorf("after a timeout: status %s, last error %q; want the error recorded and the status left to the poll", p.Status, p.LastError)
+	}
+}
+
+func alive(pid int) bool { return pid > 0 && syscall.Kill(pid, 0) == nil }
+
+// TestPeerCommandsNeedAUsablePeer: an unknown or still-provisioning peer is refused before ssh
+// runs.
+func TestPeerCommandsNeedAUsablePeer(t *testing.T) {
+	ctx := context.Background()
+	f := newPeerFixture(t)
+	ps := f.parentStore(t)
+	if _, err := ps.RegisterPeer(ctx, db.Peer{Name: "half", ControlDest: "ttorch@build-host", ApproveDest: "ttorch@build-host", ControlKey: "/nowhere/control"}, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"peer", "status", "nobody"}, "no peer is registered"},
+		{[]string{"peer", "status", "half"}, "still provisioning"},
+		{[]string{"peer", "goal", "half", "-m", "x"}, "still provisioning"},
+	} {
+		if r := f.run(t, nil, c.args...); r.code == 0 || !strings.Contains(r.stderr, c.want) {
+			t.Errorf("%v: exit %d, %q; want %q", c.args, r.code, r.stderr, c.want)
+		}
+	}
+	if n := len(f.calls(t)); n != 0 {
+		t.Errorf("ssh ran %d time(s) for peers that cannot be called", n)
 	}
 }

@@ -1167,6 +1167,24 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   coordinator as its parent. Only then is the peer `live`. A failure records why and leaves it
   `provisioning`, and running `peer add` again resumes with the same key. `peer adopt --force`
   is the same for a peer another parent provisioned.
+- **Peer client.** `ttorch peer status`, `decisions`, `answer`, `task-add`, `goal` and `repo
+  add` reach a `live` or `unreachable` peer through `internal/peer/client.go` alone: one ssh
+  process per call, run through `proc.Command` with a 30s deadline, so a hung connection dies
+  with everything it started, and the fixed command line `ssh -F none -o BatchMode=yes -o
+  IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -i
+  <control key> -- <control-dest> <verb>`. No ssh_config is read, so no Host block can add a
+  ProxyCommand, a shared ControlMaster connection, another identity or agent forwarding; no
+  agent is asked, so the lead's own keys, which run anything, are never offered; a host key the
+  lead's `known_hosts` does not hold fails the call, and the channel never writes that file.
+  What comes back is decoded and every string in it escaped and capped before anything reads it,
+  and a different protocol major is refused unread. `task-add`, `goal` and `answer` send this
+  coordinator's id as `parent_id`. `task-add` and `goal` record a delegation (request id, peer,
+  task, sha256 of the brief or goal) before the call, drop it when the peer refuses (a refusal
+  means the peer acted on nothing), and keep it otherwise, printing the request id that makes a
+  retry safe. `answer` is recorded on the peer as relayed by its parent, never as the lead.
+  Each call records its success time or its error on the peer's row; none of them moves the
+  peer to `unreachable`, which is the scheduler's poll to decide. `peer ls` reads only the local
+  store. `peer retire` keeps the row and deletes the control key.
 
 Migrations, in order: **0001** initial hierarchy + events + manager singleton; **0002**
 durable verdicts; **0003** task leases + the terminal `failed` status; **0004** the
