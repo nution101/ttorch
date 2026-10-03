@@ -189,14 +189,15 @@ func TestPeerPassMarksAnUnreachablePeer(t *testing.T) {
 		t.Fatal(err)
 	}
 	sc := &scheduler.Scheduler{Store: parent, Peers: dialPeer}
-	for i := 0; i < db.PeerUnreachableAfter+1; i++ {
+	const unreachableAfter = 3 // the pass's limit (scheduler.peerUnreachableAfter)
+	for i := 0; i < unreachableAfter+1; i++ {
 		if _, err := sc.RunPeerPassOnce(ctx); err != nil {
 			t.Fatal(err)
 		}
 	}
 	p, _, _ = parent.GetPeer(ctx, "build")
-	if p.Status != db.PeerUnreachable || p.ConsecutiveFailures != db.PeerUnreachableAfter+1 || !strings.Contains(p.LastError, "Permission denied") {
-		t.Errorf("after %d refused polls: %+v", db.PeerUnreachableAfter+1, p)
+	if p.Status != db.PeerUnreachable || p.ConsecutiveFailures != unreachableAfter+1 || !strings.Contains(p.LastError, "Permission denied") {
+		t.Errorf("after %d refused polls: %+v", unreachableAfter+1, p)
 	}
 	evs := peerEventsIn(t, parent, "build")
 	if len(evs) != 1 || evs[0].Type != db.EventPeerUnreachable || !evs[0].Actionable || !strings.Contains(evs[0].Payload, "Permission denied") {

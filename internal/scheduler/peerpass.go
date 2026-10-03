@@ -57,6 +57,11 @@ const maxPeerEscalationID = 1<<31 - 1
 // polled for the first time (cursor 0) has no bound but maxPeerEscalationID.
 const maxPeerEscalationJump = 10000
 
+// peerUnreachableAfter is how many polls in a row must fail before the pass marks a peer
+// unreachable and raises peer_unreachable. One failed poll is a dropped connection; three, a
+// minute and a half at the default cadence, is a peer to tell the lead about.
+const peerUnreachableAfter = 3
+
 // peerEnsureUpCalls and peerEnsureUpWindow bound the ensure-up calls to one peer: at most this
 // many in any window of this length, whatever its summary does in between. ensure-up restores a
 // peer's manager and workers and starts its scheduler, so a peer whose own health report flaps
@@ -262,8 +267,8 @@ func (sc *Scheduler) pollPeer(ctx context.Context, p db.Peer) {
 	}
 	if err != nil {
 		msg := untrustedText(err.Error(), db.MaxEscalationText)
-		payload := db.PeerUnreachablePayload{Peer: p.Name, FailedPolls: db.PeerUnreachableAfter, Error: msg}
-		res, rerr := sc.Store.RecordPeerFailure(ctx, p.Name, msg, fitPayload(&payload, &payload.Error))
+		payload := db.PeerUnreachablePayload{Peer: p.Name, FailedPolls: peerUnreachableAfter, Error: msg}
+		res, rerr := sc.Store.RecordPeerFailure(ctx, p.Name, msg, fitPayload(&payload, &payload.Error), peerUnreachableAfter)
 		switch {
 		case rerr != nil:
 			sc.logPeerStoreErr(p.Name, rerr)

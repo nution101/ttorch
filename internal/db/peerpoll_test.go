@@ -70,6 +70,9 @@ type esc struct {
 	stamp, payload string
 }
 
+// unreachableAfter is the scheduler's limit of failed polls in a row, written out here.
+const unreachableAfter = 3
+
 // testBounds are the scheduler's bounds, written out here.
 var testBounds = PeerPollBounds{MaxID: 1<<31 - 1, MaxJump: 10000, MaxRaise: 32}
 
@@ -410,23 +413,23 @@ func TestRecordPeerPollConcurrent(t *testing.T) {
 }
 
 // TestRecordPeerFailureMarksUnreachableOnce: failed polls count up and record the error; the
-// one that reaches PeerUnreachableAfter marks the peer unreachable and raises one actionable
+// one that reaches unreachableAfter marks the peer unreachable and raises one actionable
 // event. Failures after that raise nothing. A successful poll then sets it live again, clears the
 // streak and raises one peer_recovered event, which is not actionable.
 func TestRecordPeerFailureMarksUnreachableOnce(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
 	livePeer(t, s, "build")
-	for i := 1; i <= PeerUnreachableAfter+2; i++ {
-		res, err := s.RecordPeerFailure(ctx, "build", "ssh: connect: refused", "down payload")
+	for i := 1; i <= unreachableAfter+2; i++ {
+		res, err := s.RecordPeerFailure(ctx, "build", "ssh: connect: refused", "down payload", unreachableAfter)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res.Failures != i || res.Unreachable != (i == PeerUnreachableAfter) || (res.EventID != 0) != (i == PeerUnreachableAfter) {
+		if res.Failures != i || res.Unreachable != (i == unreachableAfter) || (res.EventID != 0) != (i == unreachableAfter) {
 			t.Errorf("failure %d = %+v", i, res)
 		}
 		want := PeerLive
-		if i >= PeerUnreachableAfter {
+		if i >= unreachableAfter {
 			want = PeerUnreachable
 		}
 		if p := mustPeer(t, s, "build"); p.Status != want || p.ConsecutiveFailures != i || p.LastError != "ssh: connect: refused" {
@@ -455,15 +458,15 @@ func TestRecordPeerFailureMarksUnreachableOnce(t *testing.T) {
 	}
 
 	// A failure streak shorter than the threshold, broken by a good poll, starts over.
-	for i := 0; i < PeerUnreachableAfter-1; i++ {
-		if _, err := s.RecordPeerFailure(ctx, "build", "x", "p"); err != nil {
+	for i := 0; i < unreachableAfter-1; i++ {
+		if _, err := s.RecordPeerFailure(ctx, "build", "x", "p", unreachableAfter); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if _, err := s.RecordPeerPoll(ctx, "build", PeerPoll{Healthy: true}); err != nil {
 		t.Fatal(err)
 	}
-	if res, _ := s.RecordPeerFailure(ctx, "build", "x", "p"); res.Failures != 1 || res.Unreachable {
+	if res, _ := s.RecordPeerFailure(ctx, "build", "x", "p", unreachableAfter); res.Failures != 1 || res.Unreachable {
 		t.Errorf("first failure after a good poll = %+v", res)
 	}
 	if evs := peerEvents(t, s, "build"); len(evs) != 2 {
@@ -612,8 +615,8 @@ func TestPeerPollRefusesAPeerNotInUse(t *testing.T) {
 		if _, err := s.RecordPeerPoll(ctx, name, poll); !errors.Is(err, ErrPeerNotPolled) {
 			t.Errorf("%s: poll = %v, want ErrPeerNotPolled", name, err)
 		}
-		for i := 0; i < PeerUnreachableAfter; i++ {
-			if _, err := s.RecordPeerFailure(ctx, name, "x", "p"); !errors.Is(err, ErrPeerNotPolled) {
+		for i := 0; i < unreachableAfter; i++ {
+			if _, err := s.RecordPeerFailure(ctx, name, "x", "p", unreachableAfter); !errors.Is(err, ErrPeerNotPolled) {
 				t.Errorf("%s: failure = %v, want ErrPeerNotPolled", name, err)
 			}
 		}
@@ -634,7 +637,7 @@ func TestPeerPollRefusesAPeerNotInUse(t *testing.T) {
 func TestRecordPeerFailureCapsTheError(t *testing.T) {
 	s := newTestStore(t)
 	livePeer(t, s, "build")
-	if _, err := s.RecordPeerFailure(context.Background(), "build", strings.Repeat("e", 3*MaxEscalationText), "p"); err != nil {
+	if _, err := s.RecordPeerFailure(context.Background(), "build", strings.Repeat("e", 3*MaxEscalationText), "p", unreachableAfter); err != nil {
 		t.Fatal(err)
 	}
 	if p := mustPeer(t, s, "build"); len(p.LastError) > MaxEscalationText {
@@ -660,8 +663,8 @@ func TestRegisterPeerStartsThePollOver(t *testing.T) {
 			}
 		}, false},
 		{"adopted while unreachable", func(t *testing.T, s *Store) {
-			for i := 0; i < PeerUnreachableAfter; i++ {
-				if _, err := s.RecordPeerFailure(ctx, "build", "x", "p"); err != nil {
+			for i := 0; i < unreachableAfter; i++ {
+				if _, err := s.RecordPeerFailure(ctx, "build", "x", "p", unreachableAfter); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -678,7 +681,7 @@ func TestRegisterPeerStartsThePollOver(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if _, err := s.RecordPeerFailure(ctx, "build", "x", "p"); err != nil {
+			if _, err := s.RecordPeerFailure(ctx, "build", "x", "p", unreachableAfter); err != nil {
 				t.Fatal(err)
 			}
 			c.prepare(t, s)

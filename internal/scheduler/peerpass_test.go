@@ -289,12 +289,12 @@ func TestPeerPassUnreachableThenRecovered(t *testing.T) {
 	fp := newFakePeer()
 	fp.summaryErr = errors.New("ssh: connect to host build port 22: refused\x1b[31m")
 	sc := peerScheduler(s, fakePeers{"build": fp})
-	for i := 0; i < db.PeerUnreachableAfter+2; i++ {
+	for i := 0; i < peerUnreachableAfter+2; i++ {
 		if _, err := sc.RunPeerPassOnce(ctx); err != nil {
 			t.Fatal(err)
 		}
 		want := db.PeerLive
-		if i+1 >= db.PeerUnreachableAfter {
+		if i+1 >= peerUnreachableAfter {
 			want = db.PeerUnreachable
 		}
 		if p := getPeer(t, s, "build"); p.Status != want || p.ConsecutiveFailures != i+1 {

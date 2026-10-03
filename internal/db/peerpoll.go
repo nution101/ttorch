@@ -23,7 +23,7 @@ import (
 const (
 	// EventPeerEscalation is one escalation open on the peer, raised once. Actionable.
 	EventPeerEscalation = "peer_escalation"
-	// EventPeerUnreachable is the poll failing PeerUnreachableAfter times in a row. Actionable.
+	// EventPeerUnreachable is the poll failing the scheduler's limit of times in a row. Actionable.
 	EventPeerUnreachable = "peer_unreachable"
 	// EventPeerRecovered is an unreachable peer answering a poll again. Not actionable.
 	EventPeerRecovered = "peer_recovered"
@@ -88,9 +88,6 @@ type PeerEnsureUpPayload struct {
 	Call   int    `json:"call"`
 	Window string `json:"window"`
 }
-
-// PeerUnreachableAfter is how many polls in a row must fail before a peer is marked unreachable.
-const PeerUnreachableAfter = 3
 
 // ErrPeerNotPolled is a poll result for a peer that is neither live nor unreachable: retired, or
 // sent back to provisioning, while the poll ran. It is dropped.
@@ -410,11 +407,11 @@ type PeerFailureResult struct {
 }
 
 // RecordPeerFailure records a poll that failed, with why (escaped by the caller, capped here at
-// MaxEscalationText), in one transaction. The failure that brings a live peer's streak to
-// PeerUnreachableAfter marks it unreachable and raises one actionable peer_unreachable event
-// whose payload is unreachablePayload. A peer already unreachable stays so, and raises nothing
+// MaxEscalationText), in one transaction. The failure that brings a live peer's streak to after
+// marks it unreachable and raises one actionable peer_unreachable event whose payload is
+// unreachablePayload. A peer already unreachable stays so, and raises nothing
 // more until a poll succeeds.
-func (s *Store) RecordPeerFailure(ctx context.Context, name, msg, unreachablePayload string) (PeerFailureResult, error) {
+func (s *Store) RecordPeerFailure(ctx context.Context, name, msg, unreachablePayload string, after int) (PeerFailureResult, error) {
 	msg, _ = CapText(msg, MaxEscalationText)
 	now := s.now()
 	var out PeerFailureResult
@@ -425,7 +422,7 @@ func (s *Store) RecordPeerFailure(ctx context.Context, name, msg, unreachablePay
 		}
 		out.Failures = p.ConsecutiveFailures + 1
 		status := p.Status
-		if status == PeerLive && out.Failures >= PeerUnreachableAfter {
+		if status == PeerLive && out.Failures >= after {
 			if out.EventID, err = appendEvent(ctx, tx, now, peerEvent(name, EventPeerUnreachable, unreachablePayload, true)); err != nil {
 				return err
 			}
