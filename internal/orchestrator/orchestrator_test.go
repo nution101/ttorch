@@ -68,6 +68,14 @@ func TestMain(m *testing.M) {
 	os.Unsetenv("TMUX")
 	os.Setenv("TMUX_TMPDIR", tmuxDir)
 	os.Setenv("SHELL", "/bin/sh")
+	// The fixed pauses in a spawn and a teardown are sized for an agent's TUI and a real
+	// harness. Every test window runs a plain shell command, so they wait on nothing, and
+	// they add up to about 0.7s per spawn and teardown across some 200 spawns. Each one is a
+	// package var or a test seam that exists for this, and the code paths are unchanged.
+	spawnReadyInterval = 20 * time.Millisecond
+	fingerprintSettle = 20 * time.Millisecond
+	paneKillGrace = 20 * time.Millisecond
+	tmux.SetSendSettleForTest(10 * time.Millisecond)
 	// Clear any inherited GIT_DIR and the like (git rebase --exec exports one), so the git
 	// that fixtures and the code under test run acts on the temp repository it names.
 	gittest.Scrub()

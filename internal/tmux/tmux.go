@@ -503,12 +503,28 @@ func SendLine(session, window, text string) error {
 	if err := sendKeys("-t", t, "-l", text); err != nil {
 		return err
 	}
-	delay := 300 * time.Millisecond
+	delay := sendSettle
 	if strings.HasPrefix(strings.TrimSpace(text), "/") {
-		delay = 1200 * time.Millisecond
+		delay = slashSendSettle
 	}
 	time.Sleep(delay)
 	return sendKeys("-t", t, "Enter")
+}
+
+// sendSettle and slashSendSettle are SendLine's pauses before Enter, for ordinary text and
+// for a slash-command. Vars so a test can shorten them; nothing changes them at runtime.
+var (
+	sendSettle      = 300 * time.Millisecond
+	slashSendSettle = 1200 * time.Millisecond
+)
+
+// SetSendSettleForTest shortens both of SendLine's pauses to d and returns a restore func,
+// for a package above this one whose tests type into a plain shell, which needs no time to
+// render its input. Nothing in production calls it.
+func SetSendSettleForTest(d time.Duration) func() {
+	prev, prevSlash := sendSettle, slashSendSettle
+	sendSettle, slashSendSettle = d, d
+	return func() { sendSettle, slashSendSettle = prev, prevSlash }
 }
 
 // TypeLine types text into a window WITHOUT pressing Enter, refusing a pane in copy-mode for

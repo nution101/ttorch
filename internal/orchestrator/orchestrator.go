@@ -184,6 +184,10 @@ func (m *Manager) releaseWorkdir(repo, wt string) error {
 	return m.Pool.Release(repo, wt)
 }
 
+// paneKillGrace is how long killPaneProcesses waits between SIGTERM and SIGKILL. A var so
+// tests can shrink it.
+var paneKillGrace = 150 * time.Millisecond
+
 // killPaneProcesses reaps a window's pane process group so a returned worktree is
 // not held by lingering children.
 func (m *Manager) killPaneProcesses(window string) {
@@ -192,7 +196,7 @@ func (m *Manager) killPaneProcesses(window string) {
 		return
 	}
 	_ = syscall.Kill(-pid, syscall.SIGTERM)
-	time.Sleep(150 * time.Millisecond)
+	time.Sleep(paneKillGrace)
 	_ = syscall.Kill(-pid, syscall.SIGKILL)
 }
 
