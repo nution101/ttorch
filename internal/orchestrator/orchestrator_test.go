@@ -51,6 +51,9 @@ func TestMain(m *testing.M) {
 	// these tests, and each Spawn parsed and re-indented all of it. Point the write at a
 	// file of the package's own; the trust write still runs, against a small file.
 	os.Setenv("TTORCH_CLAUDE_JSON", filepath.Join(home, "claude.json"))
+	// An inherited TTORCH_VALIDATE_CACHE_DIR is used verbatim ahead of TTORCH_HOME, so a test
+	// that sets no cache dir of its own would read and write the caller's real validate cache.
+	os.Unsetenv("TTORCH_VALIDATE_CACHE_DIR")
 	// Run the package against a tmux server of its own. tmux finds its server through $TMUX
 	// and then $TMUX_TMPDIR, so without this the tests open windows on whatever server the
 	// caller is using, under fixed session names that two runs at once would share. The
