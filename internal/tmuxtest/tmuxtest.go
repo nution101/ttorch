@@ -8,15 +8,22 @@
 // when TMUX_TMPDIR names a directory that no longer exists, tmux skips it and falls back to
 // /tmp, which is the caller's default server, so a bare `tmux kill-server` issued after the
 // directory is gone (or by a process that outlives it) kills the caller's server and every
-// window on it.
+// window on it. For the same reason the directory stays until the test binary has exited:
+// Close kills the server and leaves it, and the reaper removes it once the process is gone.
+//
+// Every package whose tests can reach tmux, directly or through a package that runs it, runs
+// its tests through Run or Isolate in its TestMain. TestEveryTmuxReachingPackageIsIsolated
+// holds that.
 package tmuxtest
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"syscall"
+	"testing"
 )
 
 // Server is a test binary's private tmux server: the TMUX_TMPDIR the process runs under and
@@ -57,18 +64,35 @@ func (s *Server) Command(args ...string) *exec.Cmd {
 	return exec.Command("tmux", append([]string{"-S", s.Socket}, args...)...)
 }
 
-// Close kills the private server and removes its directory. Kill before remove: the other
-// order is the one that leaves tmux free to fall back to the default socket.
+// Close kills the private server. It leaves the directory: while this process lives, a tmux
+// that runs after Close (a test's leftover goroutine, a child it started) must still find
+// TMUX_TMPDIR, because with the directory gone tmux falls back to the default socket. The
+// reaper removes the directory once the process has exited.
 func (s *Server) Close() {
 	if _, err := exec.LookPath("tmux"); err == nil {
 		_ = s.Command("kill-server").Run()
 	}
-	_ = os.RemoveAll(s.Dir)
+}
+
+// Run is a TestMain body for a package whose tests can reach tmux: it isolates the process
+// on a private server, starts the reaper, runs the tests, kills the server, and returns the
+// exit code for os.Exit.
+func Run(m *testing.M) int {
+	s, err := Isolate()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "tmuxtest: cannot make a private tmux server: %v\n", err)
+		return 1
+	}
+	s.StartReaper()
+	code := m.Run()
+	s.Close()
+	return code
 }
 
 // reaperScript waits for pid $1 to exit, then kills the server on socket $3 only if that
-// socket still exists, and removes $2. A normal exit has already run Close, so the socket is
-// gone and tmux is not run at all.
+// socket exists, and removes $2. tmux leaves its socket file behind when the server exits, so
+// after a normal exit, with the server already killed by Close, this kill-server finds no
+// server and does nothing. It can only ever reach the private socket.
 const reaperScript = `while kill -0 "$1" 2>/dev/null; do sleep 1; done
 if [ -S "$3" ]; then tmux -S "$3" kill-server 2>/dev/null; fi
 rm -rf "$2"`
@@ -82,14 +106,12 @@ func (s *Server) reaper(pid int) *exec.Cmd {
 // test binary has exited, however it exits. Close runs after m.Run, but a test that panics or
 // hits -timeout ends the process from another goroutine, where neither that code nor a defer
 // in TestMain runs, and the server would be left running with the windows of the test that
-// died. The reaper polls for this pid once a second, so it costs nothing while the tests run;
-// it has no stdout or stderr, so go test does not wait on it, and its own process group, so a
-// signal to this one's does not reach it. Best-effort: if it cannot start, Close still runs on
-// a normal exit.
+// died. It is also what removes the directory, so it starts whether or not tmux is installed.
+// The reaper polls for this pid once a second, so it costs nothing while the tests run; it
+// has no stdout or stderr, so go test does not wait on it, and its own process group, so a
+// signal to this one's does not reach it. Best-effort: if it cannot start, Close still kills
+// the server on a normal exit, and the directory is left in the temp dir.
 func (s *Server) StartReaper() {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		return
-	}
 	reaper := s.reaper(os.Getpid())
 	reaper.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := reaper.Start(); err == nil {

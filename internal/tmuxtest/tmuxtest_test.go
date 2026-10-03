@@ -2,11 +2,16 @@ package tmuxtest
 
 import (
 	"bufio"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -97,13 +102,15 @@ func requirePinned(t *testing.T, got [][]string, socket string) {
 	}
 }
 
-func TestClose_KillsOnlyThePrivateSocket(t *testing.T) {
+// Close kills through the pinned socket and leaves the directory in place: a tmux that runs
+// after it in this process must still find TMUX_TMPDIR, or it falls back to the default socket.
+func TestClose_KillsOnlyThePrivateSocketAndKeepsTheDirectory(t *testing.T) {
 	log, _ := fakeTmux(t)
 	s := testServer(t)
 	s.Close()
 	requirePinned(t, calls(t, log), s.Socket)
-	if _, err := os.Stat(s.Dir); !os.IsNotExist(err) {
-		t.Errorf("Close left %s behind (stat err %v)", s.Dir, err)
+	if fi, err := os.Stat(s.Dir); err != nil || !fi.IsDir() {
+		t.Errorf("Close removed %s while the process lives (stat err %v)", s.Dir, err)
 	}
 }
 
@@ -153,43 +160,291 @@ func TestCommand_PinsTheSocket(t *testing.T) {
 	}
 }
 
-// bareTmux matches a test that runs tmux itself instead of through Server.Command, which is
-// the only way test code can reach a server without -S.
-var bareTmux = regexp.MustCompile(`exec\.Command(Context)?\([^)]*"tmux"`)
+// repoRoot is the module root, two directories up from this package.
+const repoRoot = "../.."
 
-// TestNoBareTmuxInTests keeps every tmux a test runs on a pinned socket: a test that builds its
-// own exec.Command("tmux", ...) reaches whatever server the environment names when it runs.
-func TestNoBareTmuxInTests(t *testing.T) {
-	root := filepath.Join("..", "..")
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+// goFile is one parsed Go file of the repository.
+type goFile struct {
+	path string
+	dir  string // relative to repoRoot, slash-separated
+	test bool
+	ast  *ast.File
+	fset *token.FileSet
+}
+
+// repoFiles parses every Go file in the repository, skipping hidden directories, vendor and
+// testdata.
+func repoFiles(t *testing.T) []goFile {
+	t.Helper()
+	var out []goFile
+	err := filepath.WalkDir(repoRoot, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.IsDir() {
-			if name := d.Name(); path != root && (strings.HasPrefix(name, ".") || name == "vendor" || name == "testdata") {
+			if name := d.Name(); path != repoRoot && (strings.HasPrefix(name, ".") || name == "vendor" || name == "testdata") {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if !strings.HasSuffix(path, "_test.go") {
+		if !strings.HasSuffix(path, ".go") {
 			return nil
 		}
-		b, err := os.ReadFile(path)
+		fset := token.NewFileSet()
+		f, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
 		if err != nil {
 			return err
 		}
-		for i, line := range strings.Split(string(b), "\n") {
-			if strings.HasPrefix(strings.TrimSpace(line), "//") {
-				continue
-			}
-			if bareTmux.MatchString(line) {
-				t.Errorf("%s:%d runs tmux without the private socket; use tmuxtest.Server.Command: %s", path, i+1, strings.TrimSpace(line))
-			}
+		rel, err := filepath.Rel(repoRoot, filepath.Dir(path))
+		if err != nil {
+			return err
 		}
+		out = append(out, goFile{path: path, dir: filepath.ToSlash(rel), test: strings.HasSuffix(path, "_test.go"), ast: f, fset: fset})
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	return out
+}
+
+// strLit is the value of a string literal expression, or ok=false for anything else.
+func strLit(e ast.Expr) (string, bool) {
+	lit, ok := e.(*ast.BasicLit)
+	if !ok || lit.Kind != token.STRING {
+		return "", false
+	}
+	v, err := strconv.Unquote(lit.Value)
+	return v, err == nil
+}
+
+// pkgCall reports whether call is pkg.name(...) for one of names.
+func pkgCall(call *ast.CallExpr, pkg string, names ...string) bool {
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	x, ok := sel.X.(*ast.Ident)
+	if !ok || x.Name != pkg {
+		return false
+	}
+	for _, n := range names {
+		if sel.Sel.Name == n {
+			return true
+		}
+	}
+	return false
+}
+
+var (
+	tmuxWord = regexp.MustCompile(`\btmux\b`)
+	shells   = map[string]bool{"sh": true, "bash": true, "zsh": true, "/bin/sh": true, "/bin/bash": true, "/bin/zsh": true, "/usr/bin/env": true, "env": true}
+)
+
+// runsTmux reports whether call runs tmux by name: exec.Command or exec.CommandContext with
+// tmux as the program, or with a shell as the program and a literal argument that runs tmux;
+// exec.LookPath("tmux"); or syscall.Exec of tmux. It reads the call's syntax, so a call split
+// over several lines is the same call.
+func runsTmux(call *ast.CallExpr) bool {
+	isTmux := func(s string) bool { return s == "tmux" || strings.HasSuffix(s, "/tmux") }
+	switch {
+	case pkgCall(call, "exec", "Command", "CommandContext"):
+		args := call.Args
+		if pkgCall(call, "exec", "CommandContext") {
+			if len(args) == 0 {
+				return false
+			}
+			args = args[1:]
+		}
+		if len(args) == 0 {
+			return false
+		}
+		prog, ok := strLit(args[0])
+		if !ok {
+			return false
+		}
+		if isTmux(prog) {
+			return true
+		}
+		if shells[prog] {
+			for _, a := range args[1:] {
+				if v, ok := strLit(a); ok && tmuxWord.MatchString(v) {
+					return true
+				}
+			}
+		}
+	case pkgCall(call, "exec", "LookPath"), pkgCall(call, "syscall", "Exec"):
+		if len(call.Args) > 0 {
+			if v, ok := strLit(call.Args[0]); ok && isTmux(v) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TestNoBareTmuxInTests keeps every tmux a test runs itself on a pinned socket: a test that
+// builds its own exec.Command("tmux", ...), on one line or several, or hands tmux to a shell,
+// reaches whatever server the environment names when it runs. Tests run tmux through
+// Server.Command. A fake tmux written to a file and put on PATH is not a call and is not
+// flagged.
+func TestNoBareTmuxInTests(t *testing.T) {
+	for _, f := range repoFiles(t) {
+		if !f.test {
+			continue
+		}
+		ast.Inspect(f.ast, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok && pkgCall(call, "exec", "Command", "CommandContext") && runsTmux(call) {
+				t.Errorf("%s runs tmux without the private socket; use tmuxtest.Server.Command", f.fset.Position(call.Pos()))
+			}
+			return true
+		})
+	}
+}
+
+// TestNoBareTmuxInTests_SeesThroughLineBreaksAndShells is the negative control for the check
+// above: the shapes it exists to catch, as source, each flagged.
+func TestNoBareTmuxInTests_SeesThroughLineBreaksAndShells(t *testing.T) {
+	src := `package p
+func f() {
+	exec.Command(
+		"tmux",
+		"kill-server",
+	).Run()
+	exec.CommandContext(ctx, "/opt/homebrew/bin/tmux", "kill-session", "-t", "s")
+	exec.Command("/bin/sh", "-c", "sleep 1; tmux kill-server")
+	exec.Command("tmux", "-S", sock, "kill-server") // pinned, but not through Server.Command
+	exec.Command("git", "status")
+	exec.Command("/bin/sh", "-c", "echo tmuxinator")
+}`
+	f, err := parser.ParseFile(token.NewFileSet(), "p.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var flagged int
+	ast.Inspect(f, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok && runsTmux(call) {
+			flagged++
+		}
+		return true
+	})
+	if flagged != 4 {
+		t.Errorf("flagged %d calls, want the 4 that run tmux", flagged)
+	}
+}
+
+// TestEveryTmuxReachingPackageIsIsolated holds that a test binary which can reach tmux at all
+// runs on a private server. A package's tests reach tmux when the package, its test files'
+// imports, or anything those import in this module runs tmux by name (internal/tmux does, for
+// every caller of the production tmux package). Each such package with tests must call
+// tmuxtest.Run or tmuxtest.Isolate from its TestMain; without that, a test calling
+// tmux.NewWindow or tmux.KillSession acts on the caller's own server.
+//
+// tmuxtest itself is the exception: it is what isolates, and its tests run only a fake tmux.
+func TestEveryTmuxReachingPackageIsIsolated(t *testing.T) {
+	modBytes, err := os.ReadFile(filepath.Join(repoRoot, "go.mod"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var module string
+	for _, l := range strings.Split(string(modBytes), "\n") {
+		if m, ok := strings.CutPrefix(strings.TrimSpace(l), "module "); ok {
+			module = strings.TrimSpace(m)
+		}
+	}
+	if module == "" {
+		t.Fatal("no module line in go.mod")
+	}
+	const self = "internal/tmuxtest"
+
+	deps := map[string]map[string]bool{}     // dir -> module dirs its non-test files import
+	testDeps := map[string]map[string]bool{} // dir -> module dirs its test files import
+	roots := map[string]bool{}               // dirs whose non-test code runs tmux by name
+	hasTests := map[string]bool{}
+	isolated := map[string]bool{} // dirs whose TestMain calls tmuxtest.Run or tmuxtest.Isolate
+	add := func(m map[string]map[string]bool, dir, dep string) {
+		if m[dir] == nil {
+			m[dir] = map[string]bool{}
+		}
+		m[dir][dep] = true
+	}
+	for _, f := range repoFiles(t) {
+		for _, imp := range f.ast.Imports {
+			p, _ := strconv.Unquote(imp.Path.Value)
+			rel, ok := strings.CutPrefix(p, module+"/")
+			if !ok {
+				continue
+			}
+			if f.test {
+				add(testDeps, f.dir, rel)
+			} else {
+				add(deps, f.dir, rel)
+			}
+		}
+		if f.test {
+			hasTests[f.dir] = true
+			for _, d := range f.ast.Decls {
+				fn, ok := d.(*ast.FuncDecl)
+				if !ok || fn.Recv != nil || fn.Name.Name != "TestMain" || fn.Body == nil {
+					continue
+				}
+				ast.Inspect(fn.Body, func(n ast.Node) bool {
+					if call, ok := n.(*ast.CallExpr); ok && pkgCall(call, "tmuxtest", "Run", "Isolate") {
+						isolated[f.dir] = true
+					}
+					return true
+				})
+			}
+			continue
+		}
+		ast.Inspect(f.ast, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok && runsTmux(call) {
+				roots[f.dir] = true
+			}
+			return true
+		})
+	}
+	delete(roots, self)
+	if !roots["internal/tmux"] {
+		t.Fatalf("internal/tmux was not found to run tmux (roots %v); the check is reading nothing", roots)
+	}
+
+	reaches := func(dir string) bool {
+		seen := map[string]bool{}
+		queue := []string{dir}
+		for d := range testDeps[dir] {
+			queue = append(queue, d)
+		}
+		for len(queue) > 0 {
+			d := queue[0]
+			queue = queue[1:]
+			if seen[d] || d == self {
+				continue
+			}
+			seen[d] = true
+			if roots[d] {
+				return true
+			}
+			for next := range deps[d] {
+				queue = append(queue, next)
+			}
+		}
+		return false
+	}
+	var reaching []string
+	for dir := range hasTests {
+		if dir == self || !reaches(dir) {
+			continue
+		}
+		reaching = append(reaching, dir)
+		if !isolated[dir] {
+			t.Errorf("%s: its tests can reach tmux, and no TestMain in it calls tmuxtest.Run or tmuxtest.Isolate, so they run against the caller's own tmux server", dir)
+		}
+	}
+	for _, must := range []string{"internal/tmux", "internal/orchestrator", "internal/cli"} {
+		if !slices.Contains(reaching, must) {
+			t.Errorf("%s was not found to reach tmux (found %v); the import walk is wrong", must, reaching)
+		}
 	}
 }
 

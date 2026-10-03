@@ -16,6 +16,7 @@ import (
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/gittest"
 	"github.com/nution101/ttorch/internal/paths"
+	"github.com/nution101/ttorch/internal/tmuxtest"
 )
 
 // TestMain isolates the whole package from the caller's environment so a test that
@@ -41,11 +42,13 @@ func TestMain(m *testing.M) {
 			panic(err)
 		}
 		os.Setenv("TTORCH_HOME", home)
-		code := m.Run()
+		code := tmuxtest.Run(m)
 		_ = os.RemoveAll(home)
 		os.Exit(code)
 	}
-	os.Exit(m.Run())
+	// tmuxtest.Run puts the tests on a tmux server of their own: the watch loop reads panes
+	// through the production tmux package.
+	os.Exit(tmuxtest.Run(m))
 }
 
 // fakeClock is a deterministic, manually-advanced clock for the watch loop.
