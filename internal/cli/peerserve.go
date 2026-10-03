@@ -200,7 +200,7 @@ func readPeerEnv(ttorchHome string, uid int) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := privateEntry(ttorchHome, fi, uid, true); err != nil {
+	if err := peer.CheckPrivate(ttorchHome, fi, uid, true); err != nil {
 		return nil, err
 	}
 	path := filepath.Join(ttorchHome, peerEnvFile)
@@ -250,40 +250,13 @@ func openPeerEnv(path string, uid int) (*os.File, error) {
 	}
 	fi, err := f.Stat()
 	if err == nil {
-		err = privateEntry(path, fi, uid, false)
+		err = peer.CheckPrivate(path, fi, uid, false)
 	}
 	if err != nil {
 		f.Close()
 		return nil, err
 	}
 	return f, nil
-}
-
-// privateEntry reports why fi, the entry at path, is not a directory (dir set) or a regular file
-// (dir unset) owned by uid with no group or other write bit. fi comes from Lstat or fstat, so a
-// symlink is seen as one.
-func privateEntry(path string, fi fs.FileInfo, uid int, dir bool) error {
-	kind := "a regular file"
-	if dir {
-		kind = "a directory"
-	}
-	switch {
-	case fi.Mode()&fs.ModeSymlink != 0:
-		return fmt.Errorf("%s is a symbolic link; it must be %s this account owns that no one else can write", path, kind)
-	case dir && !fi.IsDir(), !dir && !fi.Mode().IsRegular():
-		return fmt.Errorf("%s is not %s", path, kind)
-	}
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
-		return fmt.Errorf("%s: its owner cannot be read", path)
-	}
-	if int(st.Uid) != uid {
-		return fmt.Errorf("%s is owned by uid %d, not by this account (uid %d)", path, st.Uid, uid)
-	}
-	if fi.Mode().Perm()&0o022 != 0 {
-		return fmt.Errorf("%s is writable by its group or by others (mode %s); it must be writable only by this account", path, fi.Mode().Perm())
-	}
-	return nil
 }
 
 func peerEnvKey(k string) bool {

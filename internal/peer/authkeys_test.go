@@ -1,0 +1,284 @@
+package peer
+
+import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/binary"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// wireString is one SSH wire-format string: a big-endian length and the bytes.
+func wireString(b []byte) []byte {
+	out := binary.BigEndian.AppendUint32(nil, uint32(len(b)))
+	return append(out, b...)
+}
+
+// testControlKey returns a fresh ed25519 public key as an authorized_keys-style line and its
+// base64 blob.
+func testControlKey(t *testing.T) (line, blob string) {
+	t.Helper()
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob = base64.StdEncoding.EncodeToString(append(wireString([]byte("ssh-ed25519")), wireString(pub)...))
+	return "ssh-ed25519 " + blob + " ttorch-peer-control:" + testParent, blob
+}
+
+// TestAuthorizedKeyLine pins the line: the forced command is the absolute path of the binary
+// and `peer serve`, quoted, with restrict, then the key, then a comment naming the parent.
+func TestAuthorizedKeyLine(t *testing.T) {
+	_, blob := testControlKey(t)
+	got := AuthorizedKeyLine("/home/ttorch/.ttorch/bin/ttorch", blob, testParent)
+	want := `command="/home/ttorch/.ttorch/bin/ttorch peer serve",restrict ssh-ed25519 ` + blob + ` ttorch-peer-control:` + testParent
+	if got != want {
+		t.Errorf("AuthorizedKeyLine =\n%s\nwant\n%s", got, want)
+	}
+}
+
+// TestParseControlKey takes one ed25519 public key and nothing else: no other type, no options,
+// no second line, and a blob that really is an ed25519 key.
+func TestParseControlKey(t *testing.T) {
+	line, blob := testControlKey(t)
+	for _, ok := range []string{line, "ssh-ed25519 " + blob, "ssh-ed25519 " + blob + "\n", "  ssh-ed25519 " + blob + " any comment "} {
+		if got, err := ParseControlKey(ok); err != nil || got != blob {
+			t.Errorf("ParseControlKey(%q) = %q, %v; want the blob", ok, got, err)
+		}
+	}
+	raw, _ := base64.StdEncoding.DecodeString(blob)
+	rsa := base64.StdEncoding.EncodeToString(append(wireString([]byte("ssh-rsa")), wireString(make([]byte, 32))...))
+	short := base64.StdEncoding.EncodeToString(append(wireString([]byte("ssh-ed25519")), wireString(make([]byte, 31))...))
+	trailing := base64.StdEncoding.EncodeToString(append(raw, 0))
+	for _, bad := range []string{
+		"", "ssh-ed25519", "ssh-rsa " + blob, "ssh-ed25519 " + rsa, "ssh-ed25519 " + short, "ssh-ed25519 " + trailing,
+		"ssh-ed25519 !!!!", `command="sh" ssh-ed25519 ` + blob, "ssh-ed25519 " + blob + "\ncommand=\"sh\" ssh-ed25519 " + blob,
+		"ssh-ed25519 " + blob + " comment\x1b[2J", "ssh-ed25519\t" + blob + "\rx",
+	} {
+		if _, err := ParseControlKey(bad); err == nil {
+			t.Errorf("ParseControlKey(%q) accepted", bad)
+		}
+	}
+}
+
+// TestServeBinary: the forced command runs the binary named in authorized_keys, so it must be an
+// absolute path a shell reads as one word, to an executable regular file that only its owner (this
+// account or root) can replace, in a directory no one else can write.
+func TestServeBinary(t *testing.T) {
+	uid := os.Getuid()
+	mk := func(t *testing.T, name string, mode os.FileMode) string {
+		t.Helper()
+		dir := t.TempDir()
+		if err := os.Chmod(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("#!/bin/sh\n"), mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	good := mk(t, "ttorch", 0o755)
+	got, err := resolveServeBinary(good, uid)
+	if err != nil {
+		t.Fatalf("resolveServeBinary(%s) = %v", good, err)
+	}
+	if want, _ := filepath.EvalSymlinks(good); got != want {
+		t.Errorf("resolveServeBinary = %q, want the resolved path %q", got, want)
+	}
+	link := filepath.Join(t.TempDir(), "ttorch-link")
+	if err := os.Symlink(good, link); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := resolveServeBinary(link, uid); err != nil || filepath.Base(got) != "ttorch" {
+		t.Errorf("resolveServeBinary(symlink) = %q, %v; want the file it points at", got, err)
+	}
+
+	refused := func(label, path string, uid int, want string) {
+		t.Helper()
+		_, err := resolveServeBinary(path, uid)
+		if err == nil {
+			t.Errorf("%s: accepted", label)
+		} else if !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: %v, want it to say %q", label, err, want)
+		}
+	}
+	refused("relative", "ttorch", uid, "absolute")
+	refused("group-writable", mk(t, "ttorch", 0o775), uid, "writable")
+	refused("world-writable", mk(t, "ttorch", 0o757), uid, "writable")
+	refused("not executable", mk(t, "ttorch", 0o644), uid, "executable")
+	refused("another account's", good, uid+1, "owned by")
+	refused("a space in the path", mk(t, "tt orch", 0o755), uid, "shell")
+	refused("a quote in the path", mk(t, `tt"orch`, 0o755), uid, "shell")
+	refused("a dollar in the path", mk(t, "tt$orch", 0o755), uid, "shell")
+	refused("missing", filepath.Join(t.TempDir(), "nothing"), uid, "")
+	loose := mk(t, "ttorch", 0o755)
+	if err := os.Chmod(filepath.Dir(loose), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	refused("in a world-writable directory", loose, uid, "writable")
+	dir := t.TempDir()
+	refused("a directory", dir, uid, "regular file")
+}
+
+// TestInstallControlKey appends the line once, creating ~/.ssh and authorized_keys private if
+// they are missing, never splicing onto a last line with no newline, and refuses to touch a file
+// or directory someone else could have written, or a file that lists this key another way.
+func TestInstallControlKey(t *testing.T) {
+	uid := os.Getuid()
+	_, blob := testControlKey(t)
+	line := AuthorizedKeyLine("/home/ttorch/.ttorch/bin/ttorch", blob, testParent)
+
+	home := t.TempDir()
+	sshDir := filepath.Join(home, ".ssh")
+	res, err := installControlKey(sshDir, line, blob, uid)
+	if err != nil || res.Added != true || res.StaleControlKeys != 0 {
+		t.Fatalf("first install = %+v, %v", res, err)
+	}
+	keys := filepath.Join(sshDir, "authorized_keys")
+	if fi, err := os.Stat(sshDir); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Errorf(".ssh = %v, %v; want created 0700", fi.Mode(), err)
+	}
+	if fi, err := os.Stat(keys); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Errorf("authorized_keys = %v, %v; want created 0600", fi.Mode(), err)
+	}
+	if b, _ := os.ReadFile(keys); string(b) != line+"\n" {
+		t.Errorf("authorized_keys = %q", b)
+	}
+	res, err = installControlKey(sshDir, line, blob, uid)
+	if err != nil || res.Added {
+		t.Errorf("second install = %+v, %v; want present, nothing added", res, err)
+	}
+	if b, _ := os.ReadFile(keys); string(b) != line+"\n" {
+		t.Errorf("a second install changed authorized_keys: %q", b)
+	}
+
+	// An existing file whose last line has no newline keeps that line whole.
+	home = t.TempDir()
+	sshDir = filepath.Join(home, ".ssh")
+	if err := os.Mkdir(sshDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	keys = filepath.Join(sshDir, "authorized_keys")
+	_, otherBlob := testControlKey(t)
+	existing := "ssh-ed25519 AAAAexisting lead@laptop\ncommand=\"/x/ttorch peer serve\",restrict ssh-ed25519 " + otherBlob + " ttorch-peer-control:" + strings.Repeat("f", 32)
+	if err := os.WriteFile(keys, []byte(existing), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res, err = installControlKey(sshDir, line, blob, uid)
+	if err != nil || !res.Added || res.StaleControlKeys != 1 {
+		t.Fatalf("install after a line with no newline = %+v, %v; want added, one other parent's key", res, err)
+	}
+	if b, _ := os.ReadFile(keys); string(b) != existing+"\n"+line+"\n" {
+		t.Errorf("authorized_keys = %q", b)
+	}
+
+	// The same key already listed another way, say without the forced command, is refused.
+	home = t.TempDir()
+	sshDir = filepath.Join(home, ".ssh")
+	if err := os.Mkdir(sshDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	keys = filepath.Join(sshDir, "authorized_keys")
+	bare := "ssh-ed25519 " + blob + " no-forced-command\n"
+	if err := os.WriteFile(keys, []byte(bare), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := installControlKey(sshDir, line, blob, uid); err == nil || !strings.Contains(err.Error(), "already lists") {
+		t.Errorf("the key listed without the forced command: %v, want refused", err)
+	}
+	if b, _ := os.ReadFile(keys); string(b) != bare {
+		t.Errorf("a refused install changed authorized_keys: %q", b)
+	}
+
+	refused := func(label, sshDir string, uid int, want string) {
+		t.Helper()
+		if _, err := installControlKey(sshDir, line, blob, uid); err == nil {
+			t.Errorf("%s: accepted", label)
+		} else if !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: %v, want it to say %q", label, err, want)
+		}
+	}
+	mkSSH := func(t *testing.T, dirMode, fileMode os.FileMode) (string, string) {
+		t.Helper()
+		sshDir := filepath.Join(t.TempDir(), ".ssh")
+		if err := os.Mkdir(sshDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		keys := filepath.Join(sshDir, "authorized_keys")
+		if err := os.WriteFile(keys, []byte("ssh-ed25519 AAAAexisting lead@laptop\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(keys, fileMode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(sshDir, dirMode); err != nil {
+			t.Fatal(err)
+		}
+		return sshDir, keys
+	}
+	d, _ := mkSSH(t, 0o770, 0o600)
+	refused(".ssh group-writable", d, uid, "writable")
+	d, _ = mkSSH(t, 0o700, 0o620)
+	refused("authorized_keys group-writable", d, uid, "writable")
+	d, _ = mkSSH(t, 0o700, 0o606)
+	refused("authorized_keys world-writable", d, uid, "writable")
+	d, _ = mkSSH(t, 0o700, 0o600)
+	refused("another account's .ssh", d, uid+1, "owned by")
+	d, k := mkSSH(t, 0o700, 0o600)
+	target := filepath.Join(t.TempDir(), "elsewhere")
+	if err := os.WriteFile(target, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(k); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, k); err != nil {
+		t.Fatal(err)
+	}
+	refused("authorized_keys a symlink", d, uid, "symbolic link")
+	if b, _ := os.ReadFile(target); len(b) != 0 {
+		t.Errorf("an install wrote through a symlinked authorized_keys: %q", b)
+	}
+	d, _ = mkSSH(t, 0o700, 0o600)
+	linkDir := filepath.Join(t.TempDir(), ".ssh")
+	if err := os.Symlink(d, linkDir); err != nil {
+		t.Fatal(err)
+	}
+	refused(".ssh a symlink", linkDir, uid, "symbolic link")
+	refused("a relative .ssh", ".ssh", uid, "absolute")
+	if _, err := installControlKey(filepath.Join(t.TempDir(), ".ssh"), line+"\nssh-ed25519 "+blob, blob, uid); err == nil {
+		t.Error("a line holding a newline was installed")
+	}
+}
+
+// TestProvisionControlKey installs the line for the running binary: the test binary stands in for
+// ttorch, so the forced command names its resolved absolute path.
+func TestProvisionControlKey(t *testing.T) {
+	pub, blob := testControlKey(t)
+	sshDir := filepath.Join(t.TempDir(), ".ssh")
+	bin, res, err := ProvisionControlKey(sshDir, pub, testParent, os.Getuid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	exe, _ := os.Executable()
+	if want, _ := filepath.EvalSymlinks(exe); bin != want || !res.Added {
+		t.Errorf("ProvisionControlKey = %q, %+v; want %q, added", bin, res, want)
+	}
+	b, err := os.ReadFile(filepath.Join(sshDir, "authorized_keys"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := AuthorizedKeyLine(bin, blob, testParent) + "\n"; string(b) != want {
+		t.Errorf("authorized_keys = %q, want %q", b, want)
+	}
+	if _, _, err := ProvisionControlKey(filepath.Join(t.TempDir(), ".ssh"), "ssh-rsa AAAA", testParent, os.Getuid()); err == nil {
+		t.Error("an rsa key was provisioned")
+	}
+}
