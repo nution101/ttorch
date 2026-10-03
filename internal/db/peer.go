@@ -143,7 +143,8 @@ func printableField(what, v string) error {
 // gets a new row. An existing row is updated with p's destinations and key and set back to
 // provisioning when it is retired, when it is still provisioning (a retried `peer add`), or when
 // replace is set (`peer adopt`); otherwise the name is in use and the call fails with
-// ErrPeerExists. The row's creation time, its repositories and its delegations are kept. A
+// ErrPeerExists. The row's creation time, its repositories and its delegations are kept; the
+// scheduler's poll state (escalation cursor, failure streak, down episode) starts over. A
 // coordinator that is itself a peer registers none (ErrCoordinatorIsPeer).
 func (s *Store) RegisterPeer(ctx context.Context, p Peer, replace bool) (Peer, error) {
 	if err := ValidPeerName(p.Name); err != nil {
@@ -184,8 +185,11 @@ func (s *Store) RegisterPeer(ctx context.Context, p Peer, replace bool) (Peer, e
 				 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 				p.Name, p.ControlDest, p.ApproveDest, p.ControlKey, PeerProvisioning, now, now)
 		case cur.Status == PeerRetired, cur.Status == PeerProvisioning, replace:
+			// The name may now point at another machine, or at a fresh store whose escalation
+			// ids start at 1 again, so the poll's state starts over with the registration.
 			_, err = tx.ExecContext(ctx,
 				`UPDATE peers SET control_dest = ?, approve_dest = ?, control_key = ?, status = ?,
+				 escalation_cursor = 0, consecutive_failures = 0, down_attempts = 0,
 				 last_error = '', updated_at = ? WHERE name = ?`,
 				p.ControlDest, p.ApproveDest, p.ControlKey, PeerProvisioning, now, p.Name)
 		default:

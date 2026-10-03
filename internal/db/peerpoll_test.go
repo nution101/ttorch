@@ -331,3 +331,65 @@ func TestRecordPeerFailureCapsTheError(t *testing.T) {
 		t.Errorf("last error is %d bytes", len(p.LastError))
 	}
 }
+
+// TestRegisterPeerStartsThePollOver: registering a name again (a retried add, an adopt, or an add
+// after retire) may point it at another machine or a fresh store whose escalation ids start at 1
+// again, so the poll's state on the row starts over: the escalation cursor, the failure streak
+// and the down episode all go back to zero.
+func TestRegisterPeerStartsThePollOver(t *testing.T) {
+	ctx := context.Background()
+	for _, c := range []struct {
+		label   string
+		prepare func(t *testing.T, s *Store)
+		replace bool
+	}{
+		{"adopted while live", func(t *testing.T, s *Store) {}, true},
+		{"re-added after retire", func(t *testing.T, s *Store) {
+			if _, err := s.RetirePeer(ctx, "build"); err != nil {
+				t.Fatal(err)
+			}
+		}, false},
+		{"adopted while unreachable", func(t *testing.T, s *Store) {
+			for i := 0; i < PeerUnreachableAfter; i++ {
+				if _, err := s.RecordPeerFailure(ctx, "build", "x", "p"); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}, true},
+	} {
+		t.Run(c.label, func(t *testing.T) {
+			s := newTestStore(t)
+			livePeer(t, s, "build")
+			if _, err := s.RecordPeerPoll(ctx, "build", PeerPoll{Raise: []PeerRaise{{ID: 7, Payload: "seven"}}}); err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i < PeerEnsureUpAttempts+1; i++ {
+				if _, err := s.StepPeerDown(ctx, "build", "down"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := s.RecordPeerFailure(ctx, "build", "x", "p"); err != nil {
+				t.Fatal(err)
+			}
+			c.prepare(t, s)
+			if p := mustPeer(t, s, "build"); p.EscalationCursor != 7 || p.DownAttempts == 0 || p.ConsecutiveFailures == 0 {
+				t.Fatalf("before registering again: %+v", p)
+			}
+			if _, err := s.RegisterPeer(ctx, testPeer("build"), c.replace); err != nil {
+				t.Fatal(err)
+			}
+			p := mustPeer(t, s, "build")
+			if p.EscalationCursor != 0 || p.ConsecutiveFailures != 0 || p.DownAttempts != 0 || p.Status != PeerProvisioning {
+				t.Errorf("after registering again: cursor %d, failures %d, down %d, status %s; want all zero and provisioning",
+					p.EscalationCursor, p.ConsecutiveFailures, p.DownAttempts, p.Status)
+			}
+			// Once live again, an escalation the new store numbers 1 is raised.
+			if err := s.MarkPeerLive(ctx, "build", 1, "v2"); err != nil {
+				t.Fatal(err)
+			}
+			if res, err := s.RecordPeerPoll(ctx, "build", PeerPoll{Raise: []PeerRaise{{ID: 1, Payload: "one"}}}); err != nil || len(res.Raised) != 1 {
+				t.Errorf("escalation 1 after registering again: %+v, %v", res, err)
+			}
+		})
+	}
+}
