@@ -1090,11 +1090,14 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   origin is not verified. It is recorded as relayed by the manager (the event's actor and
   `answered_by`), never as the lead, and it grants only text: it mints no approval token and
   bypasses no gate. Approving still takes `ttorch approve` at the lead's own terminal.
-  `ttorch inbox` and `ttorch watch` print an answer event in its own `LEAD ANSWERS` block,
-  ahead of the `WORKER UPDATES` block, quoted the same way. An event goes there only when its
-  type is a lead kind (`escalation_answered`) and it was recorded under entity and actor
-  `manager`; its payload plays no part, so worker text cannot reach that block. Each answer
-  is also deduplicated on its own id, so none is hidden by another update to the manager entity.
+  `ttorch inbox` and `ttorch watch` print an answer event in its own `RELAYED ANSWERS` block,
+  ahead of the `WORKER UPDATES` block, quoted the same way, under a header that says its origin
+  is not verified. An event goes there only when its type is an answer kind
+  (`escalation_answered`) and it was recorded under entity and actor `manager`; its payload
+  plays no part, so a worker report cannot reach that block. A same-user process that steps
+  around the `answer` refusal above can, because it records the same type, entity and actor.
+  Each answer is also deduplicated on its own id, so none is hidden by another update to the
+  manager entity.
 
 Migrations, in order: **0001** initial hierarchy + events + manager singleton; **0002**
 durable verdicts; **0003** task leases + the terminal `failed` status; **0004** the
