@@ -130,6 +130,8 @@ func Main(args []string) int {
 		return run(cmdDecisions(rest))
 	case "answer":
 		return run(cmdAnswer(rest))
+	case "peer":
+		return cmdPeer(rest)
 	case "project":
 		return run(cmdProject(rest))
 	case "epic":
@@ -2431,6 +2433,10 @@ Team:
                           record the lead's answer, relayed by the manager, and wake
                           the manager with one event; a repeated --request-id
                           changes nothing (refused from a worker context)
+  peer serve              answer one control request from a parent coordinator, as an
+                          ssh forced command: the verb comes from SSH_ORIGINAL_COMMAND
+                          (version, summary, decisions, task-add, goal, answer,
+                          ensure-up), the request is one JSON object on stdin
   check-overlap "<paths>" show which live workers a proposed footprint conflicts
     [--repo dir]            with, to plan disjoint parallel dispatch (scopes to the
                             cwd's repo, or --repo)

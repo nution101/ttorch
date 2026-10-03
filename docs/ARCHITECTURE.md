@@ -1098,6 +1098,26 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   around the `answer` refusal above can, because it records the same type, entity and actor.
   Each answer is also deduplicated on its own id, so none is hidden by another update to the
   manager entity.
+- **Peer control channel.** `ttorch peer serve` answers one request from a parent
+  coordinator per process, run as an ssh forced command (`command="ttorch peer
+  serve",restrict` in the peer's `authorized_keys`). The verb comes from
+  `SSH_ORIGINAL_COMMAND`, which is split on whitespace and never given to a shell, and must be
+  exactly one of `version`, `summary`, `decisions`, `task-add`, `goal`, `answer`, `ensure-up`.
+  Anything else, including a verb followed by arguments, is refused with a named error code
+  before the body is read. The body is one JSON object on stdin, at most 1 MiB, with no field
+  the verb does not define. `version` and `summary` open the store read-only: no migration,
+  no legacy import, no default-branch seed, no row written, so unlike `ttorch summary` the
+  served summary does not sync approval escalations first. `task-add`, `goal` and `answer`
+  carry a request id stored in `peer_requests`, so a repeat returns the first result and
+  changes nothing. `task-add` runs the `ttorch task add` core, brief lint included, and writes
+  the brief in the transaction that creates the row. `goal` and `answer` are recorded as the
+  parent coordinator's (actor `parent`), never the lead's or the local manager's. `ensure-up`
+  restores the manager and workers without a terminal and starts the scheduler, and refuses
+  when no manager is recorded. Every string in a response is escaped and capped at 2 KiB, task
+  ids at 128 bytes, and every response carries `protocol`. No verb approves, merges, lands,
+  gates or reaches a worker, and `internal/peer/serve.go` is in the covered set, so adding one
+  is a gate change. A worker context is refused; like the escalation commands' refusal, that
+  guards against accidents and is not a boundary.
 
 Migrations, in order: **0001** initial hierarchy + events + manager singleton; **0002**
 durable verdicts; **0003** task leases + the terminal `failed` status; **0004** the

@@ -19,6 +19,12 @@ import (
 // ImportLegacy would rename the live state/ dir away. The db.Open guard is the final
 // fail-closed backstop.
 func TestMain(m *testing.M) {
+	// A test that runs ttorch as its own process (peerserve_test.go) re-enters this binary with
+	// runMainEnv set, and it runs Main as cmd/ttorch's main does, with the environment the test
+	// gave it.
+	if os.Getenv(runMainEnv) == "1" {
+		os.Exit(Main(os.Args[1:]))
+	}
 	os.Setenv("TTORCH_WORKER_TABS", "off")
 	home, err := os.MkdirTemp("", "ttorch-cli-test-home-*")
 	if err != nil {
@@ -36,6 +42,9 @@ func TestMain(m *testing.M) {
 	_ = os.RemoveAll(home)
 	os.Exit(code)
 }
+
+// runMainEnv, set to 1, makes the test binary run Main on its arguments instead of the tests.
+const runMainEnv = "TTORCH_CLI_TEST_RUN_MAIN"
 
 // nasty is a message body packed with the characters a shell would re-interpret:
 // command substitution (backticks and $(...)), variable expansion, both quote
