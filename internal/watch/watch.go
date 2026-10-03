@@ -661,7 +661,9 @@ func (w *Watcher) setLiveness(ctx context.Context, t db.Task, paneHash string, s
 // them. Each relayed answer is its own decision, so it is keyed on its own id: two
 // answers in one batch both surface, and an answer and the watchdog's re-poke, which share the
 // manager entity, never hide each other. A goal or an answer from the parent coordinator is keyed
-// on its own id for the same reason. The result is ordered by id ascending for a stable batch.
+// on its own id for the same reason, and so is every event the peer pass records about a peer:
+// they share the peer's entity id, and each escalation is a decision of its own. The result is
+// ordered by id ascending for a stable batch.
 func dedupeByEntity(rows []db.Event) []db.Event {
 	best := make(map[string]db.Event, len(rows))
 	for _, e := range rows {
@@ -673,6 +675,8 @@ func dedupeByEntity(rows []db.Event) []db.Event {
 			key += "\x00lead\x00" + strconv.FormatInt(e.ID, 10)
 		case isParentEvent(e):
 			key += "\x00parent\x00" + strconv.FormatInt(e.ID, 10)
+		case isPeerEvent(e):
+			key += "\x00peer\x00" + strconv.FormatInt(e.ID, 10)
 		}
 		if cur, ok := best[key]; !ok || e.ID > cur.ID {
 			best[key] = e

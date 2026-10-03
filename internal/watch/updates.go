@@ -79,16 +79,19 @@ func isLeadEvent(e db.Event) bool {
 
 // writeUpdateBlock prints the parent coordinator's goals and answers in batch between the parent
 // header and its end marker, then the relayed answers between the answer header and its end
-// marker, then every other update between the worker-data header and its end marker. A block
-// with nothing in it is left out. It is the only formatter for surfaced updates.
+// marker, then the peer pass's events between the peer header and its end marker
+// (peerupdates.go), then every other update between the worker-data header and its end marker. A
+// block with nothing in it is left out. It is the only formatter for surfaced updates.
 func writeUpdateBlock(out io.Writer, batch []db.Event) {
-	var parent, lead, rest []db.Event
+	var parent, lead, peers, rest []db.Event
 	for _, e := range batch {
 		switch {
 		case isParentEvent(e):
 			parent = append(parent, e)
 		case isLeadEvent(e):
 			lead = append(lead, e)
+		case isPeerEvent(e):
+			peers = append(peers, e)
 		default:
 			rest = append(rest, e)
 		}
@@ -107,6 +110,7 @@ func writeUpdateBlock(out io.Writer, batch []db.Event) {
 		}
 		fmt.Fprintln(out, leadBlockEnd)
 	}
+	writePeerBlock(out, peers)
 	if len(rest) > 0 {
 		fmt.Fprintln(out, updatesBlockBegin)
 		for _, e := range rest {

@@ -29,6 +29,45 @@ const (
 	EventPeerDown = "peer_down"
 )
 
+// The payloads of the peer events, as JSON. The peer pass builds them and the watcher decodes
+// them to print each event's own line, so the format is defined once, here. Every string field
+// came from the peer, or is an error about reaching it, and was escaped and capped by the pass;
+// a reader still prints each one quoted.
+
+// PeerEscalationPayload is a peer_escalation event's payload: the escalation as the peer listed
+// it, and how many the peer had open.
+type PeerEscalationPayload struct {
+	Peer         string `json:"peer"`
+	EscalationID int64  `json:"escalation_id"`
+	Kind         string `json:"kind"`
+	TaskID       string `json:"task_id"`
+	Open         int    `json:"open"`
+	Body         string `json:"body"`
+}
+
+// PeerUnreachablePayload is a peer_unreachable event's payload: how many polls failed in a row,
+// and the last one's error.
+type PeerUnreachablePayload struct {
+	Peer        string `json:"peer"`
+	FailedPolls int    `json:"failed_polls"`
+	Error       string `json:"error"`
+}
+
+// PeerRecoveredPayload is a peer_recovered event's payload.
+type PeerRecoveredPayload struct {
+	Peer string `json:"peer"`
+}
+
+// PeerDownPayload is a peer_down event's payload: how many ensure-up calls were made, and what
+// the peer's summary said when the pass gave up.
+type PeerDownPayload struct {
+	Peer             string `json:"peer"`
+	EnsureUpCalls    int    `json:"ensure_up_calls"`
+	ManagerWindow    bool   `json:"manager_window"`
+	SchedulerRunning bool   `json:"scheduler_running"`
+	SchedulerStalled bool   `json:"scheduler_stalled"`
+}
+
 // PeerUnreachableAfter is how many polls in a row must fail before a peer is marked unreachable.
 const PeerUnreachableAfter = 3
 

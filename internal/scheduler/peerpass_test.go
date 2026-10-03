@@ -359,7 +359,7 @@ func TestPeerPassBoundsEnsureUp(t *testing.T) {
 	if len(downs) != 1 || !downs[0].Actionable || downs[0].Actor != "peer:build" {
 		t.Fatalf("peer_down events = %+v, want one actionable", downs)
 	}
-	if !strings.Contains(downs[0].Payload, `"manager_window":false`) || !strings.Contains(downs[0].Payload, `"ensure_up_attempts":3`) {
+	if !strings.Contains(downs[0].Payload, `"manager_window":false`) || !strings.Contains(downs[0].Payload, `"ensure_up_calls":3`) {
 		t.Errorf("peer_down payload = %q", downs[0].Payload)
 	}
 	if p := getPeer(t, s, "build"); p.Status != db.PeerLive {

@@ -232,9 +232,8 @@ func (sc *Scheduler) pollPeer(ctx context.Context, p db.Peer) {
 	}
 	if err != nil {
 		msg := untrustedText(err.Error(), db.MaxEscalationText)
-		res, rerr := sc.Store.RecordPeerFailure(ctx, p.Name, msg, peerPayload(map[string]any{
-			"peer": p.Name, "failed_polls": db.PeerUnreachableAfter, "error": msg,
-		}, "error"))
+		payload := db.PeerUnreachablePayload{Peer: p.Name, FailedPolls: db.PeerUnreachableAfter, Error: msg}
+		res, rerr := sc.Store.RecordPeerFailure(ctx, p.Name, msg, fitPayload(&payload, &payload.Error))
 		switch {
 		case rerr != nil:
 			sc.logPeerStoreErr(p.Name, rerr)
@@ -244,7 +243,7 @@ func (sc *Scheduler) pollPeer(ctx context.Context, p db.Peer) {
 		return
 	}
 
-	poll := db.PeerPoll{Summary: sum.JSON, Healthy: sum.healthy(), RecoveredPayload: peerPayload(map[string]any{"peer": p.Name}, "")}
+	poll := db.PeerPoll{Summary: sum.JSON, Healthy: sum.healthy(), RecoveredPayload: fitPayload(db.PeerRecoveredPayload{Peer: p.Name}, nil)}
 	for _, e := range raisable(dec.Escalations, p.EscalationCursor) {
 		poll.Raise = append(poll.Raise, db.PeerRaise{ID: e.ID, Payload: escalationPayload(p.Name, e, dec.Open)})
 	}
@@ -262,10 +261,10 @@ func (sc *Scheduler) pollPeer(ctx context.Context, p db.Peer) {
 	if poll.Healthy {
 		return
 	}
-	step, err := sc.Store.StepPeerDown(ctx, p.Name, peerPayload(map[string]any{
-		"peer": p.Name, "ensure_up_attempts": db.PeerEnsureUpAttempts, "manager_window": sum.ManagerWindow,
-		"scheduler_running": sum.SchedulerRunning, "scheduler_stalled": sum.SchedulerStalled,
-	}, ""))
+	step, err := sc.Store.StepPeerDown(ctx, p.Name, fitPayload(db.PeerDownPayload{
+		Peer: p.Name, EnsureUpCalls: db.PeerEnsureUpAttempts, ManagerWindow: sum.ManagerWindow,
+		SchedulerRunning: sum.SchedulerRunning, SchedulerStalled: sum.SchedulerStalled,
+	}, nil))
 	switch {
 	case err != nil:
 		sc.logPeerStoreErr(p.Name, err)
@@ -311,34 +310,35 @@ func raisable(list []PeerEscalation, cursor int64) []PeerEscalation {
 // escalationPayload is the payload of e's peer_escalation event: the peer, the escalation's id,
 // kind and task, how many the peer has open, and its body, all escaped and capped.
 func escalationPayload(peer string, e PeerEscalation, open int) string {
-	return peerPayload(map[string]any{
-		"peer": peer, "escalation_id": e.ID, "kind": untrustedText(e.Kind, maxPeerKind),
-		"task_id": untrustedText(e.TaskID, maxPeerTaskID), "open": open, "body": untrustedText(e.Body, maxPeerPayload),
-	}, "body")
+	p := db.PeerEscalationPayload{
+		Peer: peer, EscalationID: e.ID, Kind: untrustedText(e.Kind, maxPeerKind),
+		TaskID: untrustedText(e.TaskID, maxPeerTaskID), Open: open, Body: untrustedText(e.Body, maxPeerPayload),
+	}
+	return fitPayload(&p, &p.Body)
 }
 
-// peerPayload encodes fields as one JSON object of at most maxPeerPayload bytes. When it is over,
-// the string field named cut is shortened until it fits; the other fields are small and capped
-// where they were built. HTML is not escaped, so the cap is spent on the text.
-func peerPayload(fields map[string]any, cut string) string {
+// fitPayload encodes v, one of the db.Peer*Payload types, as one JSON object of at most
+// maxPeerPayload bytes. When it is over, the string cut points at (a field of v) is shortened
+// until it fits; the other fields are small and capped where they were built. cut nil means v
+// has no free text. HTML is not escaped, so the cap is spent on the text.
+func fitPayload(v any, cut *string) string {
 	for {
 		var b bytes.Buffer
 		enc := json.NewEncoder(&b)
 		enc.SetEscapeHTML(false)
-		if err := enc.Encode(fields); err != nil {
+		if err := enc.Encode(v); err != nil {
 			return ""
 		}
 		out := strings.TrimSuffix(b.String(), "\n")
-		s, _ := fields[cut].(string)
 		over := len(out) - maxPeerPayload
-		if over <= 0 {
+		if over <= 0 || cut == nil {
 			return out
 		}
-		shorter := capWithMarker(s, len(s)-over)
-		if len(shorter) >= len(s) {
+		shorter := capWithMarker(*cut, len(*cut)-over)
+		if len(shorter) >= len(*cut) {
 			return out // nothing left to cut; the other fields are capped where they were built
 		}
-		fields[cut] = shorter
+		*cut = shorter
 	}
 }
 

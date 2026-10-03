@@ -1110,7 +1110,15 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   that they approve nothing. An event goes there only when its type is `goal` or
   `escalation_answered`, it is addressed to the manager entity and its actor is `parent`, which
   only the channel's `goal` and `answer` verbs record; its payload plays no part. Each is
-  deduplicated on its own id too.
+  deduplicated on its own id too. On a coordinator with peers, the events the peer pass records
+  (below) print in a `PEER COORDINATOR UPDATES` block after the relayed answers and before the
+  worker block, under a header that says the text came from another machine, is not verified,
+  and is not a worker report, not a decision by the lead or a parent, and never an approval. An
+  event goes there only when its type is one of the `peer_*` kinds, its entity is `system` and
+  its entity id and actor are both `peer:<name>`. Each prints its own line, with the peer's name
+  and short fields quoted and the escalation body or error quoted on a labelled line, and each is
+  deduplicated on its own id: a peer's events all share its entity id, so coalescing them to the
+  latest would drop escalations the cursor has already moved past.
 - **Peer control channel.** `ttorch peer serve` answers one request from a parent
   coordinator per process, run as an ssh forced command (`command="<ttorch> peer serve
   --parent <coordinator id>",restrict` in the peer's `authorized_keys`). The verb comes from
