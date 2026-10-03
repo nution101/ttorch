@@ -7,7 +7,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -68,6 +70,7 @@ func TestMain(m *testing.M) {
 	os.Unsetenv("TMUX")
 	os.Setenv("TMUX_TMPDIR", tmuxDir)
 	os.Setenv("SHELL", "/bin/sh")
+	startTmuxReaper(tmuxDir)
 	// The fixed pauses in a spawn and a teardown are sized for an agent's TUI and a real
 	// harness. Every test window runs a plain shell command, so they wait on nothing, and
 	// they add up to about 0.7s per spawn and teardown across some 200 spawns. Each one is a
@@ -86,6 +89,28 @@ func TestMain(m *testing.M) {
 	_ = os.RemoveAll(tmuxDir)
 	_ = os.RemoveAll(home)
 	os.Exit(code)
+}
+
+// startTmuxReaper starts a process that outlives this one to kill the package's private tmux
+// server once this test binary has exited, however it exits. TestMain kills the server itself
+// after m.Run, but a test that panics or hits -timeout ends the process from another goroutine,
+// where neither that code nor a defer in TestMain runs, and the server would be left running
+// with the windows of the test that died. The reaper polls for this pid once a second, so it
+// costs nothing while the tests run; it has no stdout or stderr, so go test does not wait on it,
+// and its own process group, so a signal to this one's does not reach it. Best-effort: if it
+// cannot start, the normal-exit kill-server below still runs.
+func startTmuxReaper(tmuxDir string) {
+	if !tmux.Available() {
+		return
+	}
+	reaper := exec.Command("/bin/sh", "-c",
+		`while kill -0 "$1" 2>/dev/null; do sleep 1; done; tmux kill-server 2>/dev/null; rm -rf "$2"`,
+		"tmux-reaper", strconv.Itoa(os.Getpid()), tmuxDir)
+	reaper.Env = append(os.Environ(), "TMUX_TMPDIR="+tmuxDir)
+	reaper.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := reaper.Start(); err == nil {
+		_ = reaper.Process.Release()
+	}
 }
 
 func TestDeriveState(t *testing.T) {
