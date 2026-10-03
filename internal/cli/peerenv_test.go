@@ -4,6 +4,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -29,6 +30,29 @@ var peerEnvSettings = []string{
 	"TTORCH_STALL_RERAISES", "TTORCH_TERMINAL", "TTORCH_TMUX_SESSION",
 	"TTORCH_VALIDATE_INFRA_RETRIES", "TTORCH_VALIDATE_RETRY_BACKOFF", "TTORCH_VALIDATE_TIMEOUT",
 	"TTORCH_WORKER_CLONES",
+}
+
+// TestLeadSettings: peer add hands the peer only the lead's policy settings (parentSettings),
+// whatever else the lead's shell sets, and nothing empty or unprintable.
+func TestLeadSettings(t *testing.T) {
+	for _, k := range parentSettings {
+		t.Setenv(k, "")
+	}
+	t.Setenv("TTORCH_MODEL", "opus")
+	t.Setenv("TTORCH_MANAGER_EFFORT", "medium")
+	t.Setenv("TTORCH_EFFORT", "high\x1b[2J")
+	for _, k := range []string{"TTORCH_TMUX_SESSION", "TTORCH_BACKEND", "TTORCH_NO_GLOBAL_HOOKS", "TTORCH_NO_AUTOTRUST", "TTORCH_SCHEDULER_AUTOSTART", "TTORCH_HOME", "TTORCH_TASK_ID"} {
+		t.Setenv(k, "x")
+	}
+	got := leadSettings()
+	if want := map[string]string{"TTORCH_MODEL": "opus", "TTORCH_MANAGER_EFFORT": "medium"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("leadSettings = %v, want %v", got, want)
+	}
+	for _, k := range parentSettings {
+		if !peerEnvKey(k) || k == "PATH" {
+			t.Errorf("parentSettings lists %s, which peer.env may not hold", k)
+		}
+	}
 }
 
 // TestPeerEnvRefusesEveryPathOverride: peer.env may not move anything ttorch reads or writes.

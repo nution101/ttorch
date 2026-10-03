@@ -289,6 +289,9 @@ func TestPeerInitRefusesBeforeWriting(t *testing.T) {
 		{"key with options", initBody(t, peer.InitRequest{Name: "build", ParentID: servedParent, ControlKey: `command="sh" ` + pub}), peer.CodeBadRequest, nil},
 		{"a path setting", initBody(t, peer.InitRequest{Name: "build", ParentID: servedParent, ControlKey: pub, Settings: map[string]string{"TTORCH_HOME": "/x"}}), peer.CodeBadRequest, nil},
 		{"PATH from the parent", initBody(t, peer.InitRequest{Name: "build", ParentID: servedParent, ControlKey: pub, Settings: map[string]string{"PATH": "/x"}}), peer.CodeBadRequest, nil},
+		// peer.env may hold these, but they are the peer's own to choose, not the parent's.
+		{"the tmux session from the parent", initBody(t, peer.InitRequest{Name: "build", ParentID: servedParent, ControlKey: pub, Settings: map[string]string{"TTORCH_TMUX_SESSION": "x"}}), peer.CodeBadRequest, nil},
+		{"hooks turned off by the parent", initBody(t, peer.InitRequest{Name: "build", ParentID: servedParent, ControlKey: pub, Settings: map[string]string{"TTORCH_NO_GLOBAL_HOOKS": "1"}}), peer.CodeBadRequest, nil},
 		{"a value with ESC", initBody(t, peer.InitRequest{Name: "build", ParentID: servedParent, ControlKey: pub, Settings: map[string]string{"TTORCH_MODEL": "a\x1bb"}}), peer.CodeBadRequest, nil},
 		{"an unknown field", `{"name":"build","parent_id":"` + servedParent + `","control_key":"x","command":"sh"}`, peer.CodeBadBody, nil},
 		{"two objects", initBody(t, good) + initBody(t, good), peer.CodeBadBody, nil},

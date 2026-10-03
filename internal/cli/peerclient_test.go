@@ -209,9 +209,10 @@ func newPeerFixture(t *testing.T) *peerFixture {
 	if err := os.WriteFile(f.shim, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	// A tmux session name of its own, handed to the peer's peer.env as one of the lead's
-	// settings, so nothing the served process does reads a real fleet's session.
-	f.extraEnv = []string{"TTORCH_TMUX_SESSION=ttorch-peer-test-" + filepath.Base(f.dir), "TTORCH_SCHEDULER_AUTOSTART=0", "TTORCH_MODEL=opus"}
+	// The lead's shell: a model setting add hands to the peer, and two settings it must not.
+	// isolatePeer puts the two in the peer's own peer.env, so nothing the served process does
+	// reads a real fleet's tmux session or starts a scheduler.
+	f.extraEnv = []string{"TTORCH_TMUX_SESSION=" + f.tmuxSession(), "TTORCH_SCHEDULER_AUTOSTART=0", "TTORCH_MODEL=opus"}
 	return f
 }
 
@@ -295,11 +296,34 @@ func (f *peerFixture) peerStore(t *testing.T) *db.Store {
 	return reopen(t, f.peer.db())
 }
 
-// add provisions the fixture's peer as name and fails the test unless it went live.
+// tmuxSession is a tmux session name of the fixture's own.
+func (f *peerFixture) tmuxSession() string { return "ttorch-peer-test-" + filepath.Base(f.dir) }
+
+// add provisions the fixture's peer as name, fails the test unless it went live, and then
+// isolates it (isolatePeer).
 func (f *peerFixture) add(t *testing.T, name string) {
 	t.Helper()
 	if r := f.run(t, nil, "peer", "add", name, "ttorch@build-host"); r.code != 0 {
 		t.Fatalf("peer add %s: exit %d\nstdout: %s\nstderr: %s", name, r.code, r.stdout, r.stderr)
+	}
+	f.isolatePeer(t)
+}
+
+// isolatePeer adds the fixture's tmux session and a scheduler that never starts to the peer's
+// peer.env, as the peer's operator would. add does not hand either over from the lead's shell.
+func (f *peerFixture) isolatePeer(t *testing.T) {
+	t.Helper()
+	path := filepath.Join(f.peer.home, peerEnvFile)
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "TTORCH_TMUX_SESSION=") {
+		return
+	}
+	extra := "TTORCH_TMUX_SESSION=" + f.tmuxSession() + "\nTTORCH_SCHEDULER_AUTOSTART=0\n"
+	if err := os.WriteFile(path, append(b, extra...), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -393,10 +417,13 @@ func TestPeerAddProvisions(t *testing.T) {
 	if want := peer.AuthorizedKeyLine(exe, blob, self.CoordID) + "\n"; string(keys) != want {
 		t.Errorf("the peer's authorized_keys = %q\nwant %q", keys, want)
 	}
+	// The lead's model setting is handed over; the tmux session and the scheduler switch, which
+	// the lead's shell also set, are the peer's own to choose and are not.
 	conf, err := readPeerEnv(f.peer.home, os.Getuid())
-	if err != nil || conf["TTORCH_MODEL"] != "opus" || !strings.HasPrefix(conf["TTORCH_TMUX_SESSION"], "ttorch-peer-test-") {
-		t.Errorf("the peer's peer.env = %v, %v; want the lead's settings", conf, err)
+	if err != nil || conf["TTORCH_MODEL"] != "opus" || conf["TTORCH_TMUX_SESSION"] != "" || conf["TTORCH_SCHEDULER_AUTOSTART"] != "" {
+		t.Errorf("the peer's peer.env = %v, %v; want only the lead's policy settings", conf, err)
 	}
+	f.isolatePeer(t)
 
 	calls := f.calls(t)
 	want := [][]string{

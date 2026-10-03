@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"unicode"
@@ -124,9 +125,17 @@ func peerInit(ctx context.Context, stdin io.Reader) (peer.InitResult, error) {
 	}, nil
 }
 
+// parentSettings are the TTORCH_* settings a parent hands a new peer: the lead's model and effort
+// policy for the manager and the workers, which should be the same on every machine the lead's
+// work runs on. Nothing else crosses: the tmux session, the backend and terminal, the scheduler
+// and limits, and every switch that turns a safeguard off (hooks, folder trust, prompt reminders)
+// describe one machine, and are the peer's operator's to set in peer.env. checkInitRequest
+// refuses any other key, and leadSettings sends no other.
+var parentSettings = []string{"TTORCH_MODEL", "TTORCH_EFFORT", "TTORCH_MANAGER_MODEL", "TTORCH_MANAGER_EFFORT"}
+
 // checkInitRequest refuses a request with a field out of bounds, before anything is opened. A
-// setting must be one peer.env may hold: a TTORCH_* key that is not a path or an identity, with a
-// printable value. PATH is the peer's own and never comes from the parent.
+// setting must be one parentSettings names, with a printable value. PATH and everything else
+// peer.env may hold are the peer's own and never come from the parent.
 func checkInitRequest(req peer.InitRequest) error {
 	if err := db.ValidPeerName(req.Name); err != nil {
 		return peer.Refuse(peer.CodeBadRequest, "name: %v", err)
@@ -138,8 +147,8 @@ func checkInitRequest(req peer.InitRequest) error {
 		return peer.Refuse(peer.CodeBadRequest, "control_key: %v", err)
 	}
 	for k, v := range req.Settings {
-		if k == "PATH" || !peerEnvKey(k) {
-			return peer.Refuse(peer.CodeBadRequest, "settings: %q is not a setting peer.env may hold from the parent", k)
+		if !slices.Contains(parentSettings, k) {
+			return peer.Refuse(peer.CodeBadRequest, "settings: %q is not a setting a parent hands a peer (%s); the peer's own peer.env sets the rest", k, strings.Join(parentSettings, ", "))
 		}
 		if !utf8.ValidString(v) || strings.IndexFunc(v, func(r rune) bool { return !unicode.IsGraphic(r) }) >= 0 {
 			return peer.Refuse(peer.CodeBadRequest, "settings: the value of %s holds a non-printing character", k)

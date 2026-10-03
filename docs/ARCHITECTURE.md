@@ -1149,15 +1149,17 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   malformed or unsafe `peer.env` refuses every verb.
 - **Peer provisioning.** `ttorch peer init` makes a machine a peer. `ttorch peer add` on the
   parent runs it over the lead's own interactive ssh session, with one JSON request on stdin
-  (name, the parent's coordinator id, the control key's public half, and the parent's `TTORCH_*`
-  settings), and it answers one response in the control channel's envelope. It refuses a worker
-  context and checks the whole request before writing anything. It finds the account the way
+  (name, the parent's coordinator id, the control key's public half, and the parent's model and
+  effort settings), and it answers one response in the control channel's envelope. It refuses a
+  worker context and checks the whole request before writing anything. It finds the account the way
   `peer serve` does, so it writes the store, `peer.env` and `authorized_keys` the channel will
   read whatever `TTORCH_HOME` or `TTORCH_DB` the session has. It records the parent on the
-  coordinator row (another parent is refused unless forced), writes `peer.env` only if there is
-  none (the channel's default PATH plus each session directory that exists and that neither its
-  group nor others can write, and the parent's settings; an existing one is kept, and refused
-  here if the channel would refuse it), and only then appends
+  coordinator row (another parent is refused unless forced) and writes `peer.env` only if there
+  is none. A new one gets the channel's default PATH plus each session directory that exists and
+  that neither its group nor others can write, and the parent's model and effort settings.
+  Everything else `peer.env` may hold (the tmux session, the backend, limits, the switches that
+  turn a safeguard off) describes one machine, so it is the peer operator's to add. An existing
+  `peer.env` is kept, and refused here if the channel would refuse it. Only then does init append
   `command="<absolute path> peer serve --parent <parent>",restrict ssh-ed25519 <key>
   ttorch-peer-control:<parent>` to `~/.ssh/authorized_keys`. The path is the running binary with
   symlinks resolved, and must be a plain word to the shell, owned by the account or root, and
@@ -1182,7 +1184,8 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   `~/.ttorch/peers/<name>/` (directory 0700, key 0600), registers the peer as `provisioning`,
   runs `ttorch peer init` over the lead's own ssh session to the approve destination (`ssh -T`
   with the lead's config and agent, since that session is the lead's authority on the peer),
-  passing the `TTORCH_*` settings of the lead's shell that `peer.env` may hold, then proves the
+  passing the lead's model and effort policy from its shell (`TTORCH_MODEL`, `TTORCH_EFFORT`,
+  `TTORCH_MANAGER_MODEL`, `TTORCH_MANAGER_EFFORT`; init refuses any other key), then proves the
   key with a `version` call over the control channel, which must answer as that peer with this
   coordinator as both its recorded parent and its key's. Only then is the peer `live`. A failure
   records why and leaves it `provisioning`, and running `peer add` again resumes with the same

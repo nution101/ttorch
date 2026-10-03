@@ -193,15 +193,14 @@ func cmdPeerProvision(args []string, adopt bool, stdin *os.File) error {
 	return nil
 }
 
-// leadSettings are the TTORCH_* settings of the shell running `peer add` that peer.env may hold:
-// the lead's policy (models, efforts, limits), handed to a new peer.env. Paths, identities and
-// worker tabs are left out (peerEnvKey), and so is anything not printable.
+// leadSettings are the settings of the shell running `peer add` that a new peer.env gets: those
+// parentSettings names (the lead's model and effort policy) that are set, non-empty and
+// printable. Every other TTORCH_* variable of the lead's shell stays on this machine.
 func leadSettings() map[string]string {
 	out := map[string]string{}
-	for _, kv := range os.Environ() {
-		k, v, ok := strings.Cut(kv, "=")
-		if !ok || k == "PATH" || !peerEnvKey(k) || v == "" || !utf8.ValidString(v) ||
-			strings.IndexFunc(v, func(r rune) bool { return !unicode.IsGraphic(r) }) >= 0 {
+	for _, k := range parentSettings {
+		v := os.Getenv(k)
+		if v == "" || !utf8.ValidString(v) || strings.IndexFunc(v, func(r rune) bool { return !unicode.IsGraphic(r) }) >= 0 {
 			continue
 		}
 		out[k] = v
