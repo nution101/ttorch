@@ -27,7 +27,7 @@ const peerUsage = `usage: ttorch peer serve [--parent <coordinator id>] | init
   serve answers one control request from a parent coordinator. It runs as an ssh forced
   command (command="<ttorch> peer serve --parent <id>",restrict in authorized_keys): the verb
   comes from SSH_ORIGINAL_COMMAND and the request is one JSON object on stdin. --parent is the
-  parent the key was installed for; without it, the key takes no task, goal or answer.
+  parent the key was installed for; without it, the key takes no task, goal, answer or ensure-up.
   init provisions this machine as a peer. ttorch peer add on the parent runs it over the
   lead's own ssh session, with one JSON request on stdin.`
 

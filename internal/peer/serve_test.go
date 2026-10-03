@@ -594,9 +594,10 @@ func TestServeTaskAddReplaysBeforeTheLint(t *testing.T) {
 // TestServeEnsureUpEscapesWhatItReports: the restore notes carry error text from tmux and the
 // filesystem, so they are escaped like everything else.
 func TestServeEnsureUpEscapesWhatItReports(t *testing.T) {
-	h := Host{EnsureUp: func(context.Context) (EnsureUpResult, error) {
+	h, _ := servedStore(t)
+	h.EnsureUp = func(context.Context) (EnsureUpResult, error) {
 		return EnsureUpResult{Restored: []string{"restored manager", "skipped t\x1b[1m (gone)"}, Scheduler: "started"}, nil
-	}}
+	}
 	_, r, _ := serveCall(t, h, VerbEnsureUp, `{}`)
 	var e EnsureUpResult
 	resultOf(t, r, &e)
@@ -608,4 +609,45 @@ func TestServeEnsureUpEscapesWhatItReports(t *testing.T) {
 	}
 	code, r, stderr := serveCall(t, h, VerbEnsureUp, `{}`)
 	wantRefusal(t, "no manager", code, r, stderr, CodeNoManager)
+}
+
+// TestServeEnsureUpChecksTheParent: ensure-up restarts the peer's manager, workers and
+// scheduler, so it takes the same parent check as task-add, goal and answer. Through a key bound
+// to another coordinator, a key bound to none, or on a coordinator no parent provisioned, it is
+// refused with wrong_parent and nothing is restored or started. Through the parent's own key it
+// runs.
+func TestServeEnsureUpChecksTheParent(t *testing.T) {
+	h, _ := servedStore(t)
+	calls := 0
+	h.EnsureUp = func(context.Context) (EnsureUpResult, error) {
+		calls++
+		return EnsureUpResult{Restored: []string{"restored manager"}, Scheduler: "started"}, nil
+	}
+
+	wrong := h
+	wrong.KeyParent = otherParent
+	code, r, stderr := serveCall(t, wrong, VerbEnsureUp, `{}`)
+	wantRefusal(t, "another parent's ensure-up", code, r, stderr, CodeWrongParent)
+	if r.Error != nil && (!strings.Contains(r.Error.Message, otherParent) || !strings.Contains(r.Error.Message, testParent)) {
+		t.Errorf("another parent's ensure-up: the refusal %q does not name both coordinators", r.Error.Message)
+	}
+	unbound := h
+	unbound.KeyParent = ""
+	code, r, stderr = serveCall(t, unbound, VerbEnsureUp, `{}`)
+	wantRefusal(t, "ensure-up through a key bound to no parent", code, r, stderr, CodeWrongParent)
+
+	root, _ := newServedStore(t, false)
+	root.EnsureUp = h.EnsureUp
+	code, r, stderr = serveCall(t, root, VerbEnsureUp, `{}`)
+	wantRefusal(t, "ensure-up on a root", code, r, stderr, CodeWrongParent)
+	if calls != 0 {
+		t.Fatalf("a refused ensure-up restored the fleet %d time(s)", calls)
+	}
+
+	code, r, _ = serveCall(t, h, VerbEnsureUp, `{}`)
+	var e EnsureUpResult
+	resultOf(t, r, &e)
+	if code != 0 || calls != 1 || e.Scheduler != "started" {
+		t.Errorf("the parent's ensure-up = exit %d, %+v after %d call(s); want it run once", code, e, calls)
+	}
 }

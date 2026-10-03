@@ -12,13 +12,14 @@ package peer
 // stdout that always carries the protocol version.
 //
 // What the channel can do is the verb list, and the list holds nothing that approves, merges,
-// lands, gates or touches a worker. A verb that changes state takes a request id, and the
-// peer_requests ledger makes a repeat of it return the first result and change nothing. It is
-// also refused unless the key it came through is bound to the parent the coordinator row records
-// (`ttorch peer init` writes both). The binding is the forced command's --parent, which sshd sets
-// from the key's own authorized_keys line, so a request cannot name a parent and a key installed
-// for one parent cannot act for another. The read verbs open the store read-only (db.OpenReadOnly), so a
-// poll runs no migration and writes no row.
+// lands, gates or touches a worker. task-add, goal and answer take a request id, and the
+// peer_requests ledger makes a repeat of one return the first result and change nothing;
+// ensure-up needs none, since restoring what is already up starts nothing. Every verb that
+// changes state, ensure-up included, is refused unless the key it came through is bound to the
+// parent the coordinator row records (`ttorch peer init` writes both). The binding is the forced
+// command's --parent, which sshd sets from the key's own authorized_keys line, so a request
+// cannot name a parent and a key installed for one parent cannot act for another. The read verbs
+// open the store read-only (db.OpenReadOnly), so a poll runs no migration and writes no row.
 //
 // Every byte of a request is treated as hostile, and so is every string a response carries:
 // task ids a worker chose, repo paths, escalation text that may quote a worker. Each is escaped
@@ -693,7 +694,7 @@ func checkParent(ctx context.Context, store *db.Store, keyParent string) error {
 		return fmt.Errorf("reading the coordinator row: %w", err)
 	}
 	if c.Role != db.CoordinatorPeer || c.ParentID == "" {
-		return Refuse(CodeWrongParent, "this coordinator was not provisioned by a parent, so it takes no work or answers over this channel (ttorch peer add runs ttorch peer init here)")
+		return Refuse(CodeWrongParent, "this coordinator was not provisioned by a parent, so it takes no work, answer or ensure-up over this channel (ttorch peer add runs ttorch peer init here)")
 	}
 	if keyParent == "" {
 		return Refuse(CodeWrongParent, "the key this request came through binds no parent (its forced command has no --parent), and this peer's parent is %s; ttorch peer adopt --force installs a key bound to it", SafeID(c.ParentID))
@@ -823,12 +824,25 @@ type EnsureUpResult struct {
 	Scheduler string   `json:"scheduler"`
 }
 
+// serveEnsureUp restarts the peer's manager, its workers and its scheduler, so it takes the
+// parent check the other state-changing verbs take: a key bound to no parent, or to a parent
+// this peer no longer has, starts nothing. The store is closed again before EnsureUp, which
+// opens its own.
 func serveEnsureUp(ctx context.Context, h Host, body []byte) (any, error) {
 	if err := decode(body, &struct{}{}); err != nil {
 		return nil, err
 	}
 	if h.EnsureUp == nil {
 		return nil, Refuse(CodeInternal, "no ensure-up is wired")
+	}
+	store, err := writeStore(h)
+	if err != nil {
+		return nil, err
+	}
+	err = checkParent(ctx, store, h.KeyParent)
+	store.Close()
+	if err != nil {
+		return nil, err
 	}
 	res, err := h.EnsureUp(ctx)
 	if err != nil {

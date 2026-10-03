@@ -1121,9 +1121,11 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   key they came through is bound to the parent the coordinator row records (`ttorch peer init`
   writes both). A key is bound by its forced command's `--parent`, which sshd sets from the key's
   own line, so the request carries no parent id (one that names a parent is malformed) and a
-  client holding one parent's key cannot act as another. A key whose line has no `--parent`, and
-  a coordinator no parent provisioned, refuse all three; a malformed `--parent` refuses every
-  verb. `version` reports the recorded parent and the key's (`key_parent`). `task-add` runs the
+  client holding one parent's key cannot act as another. `ensure-up` takes no request id, since
+  restoring what is already up starts nothing, but it takes the same parent check before it
+  restores or starts anything, because it restarts the peer's manager, workers and scheduler. A
+  key whose line has no `--parent`, and a coordinator no parent provisioned, refuse all four; a
+  malformed `--parent` refuses every verb. `version` reports the recorded parent and the key's (`key_parent`). `task-add` runs the
   `ttorch task add` core, brief lint included, and writes
   the brief in the transaction that creates the row. `goal` and `answer` are recorded as the
   parent coordinator's (actor `parent`), never the lead's or the local manager's. `ensure-up`
