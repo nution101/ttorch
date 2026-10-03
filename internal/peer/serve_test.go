@@ -203,6 +203,22 @@ func TestServeRequestFields(t *testing.T) {
 		{"decisions with a negative cursor", VerbDecisions, `{"since":-1}`},
 	}
 	for _, c := range cases {
+		body := c.body
+		if c.verb != VerbDecisions {
+			body = withParent(body)
+		}
+		code, r, stderr := serveCall(t, unwired(t), c.verb, body)
+		wantRefusal(t, c.label, code, r, stderr, CodeBadRequest)
+	}
+	// The parent's id is required, and must look like one: the fields above all carried one.
+	for _, c := range []struct{ label, verb, body string }{
+		{"task-add without a parent id", VerbTaskAdd, `{"request_id":"r1","task_id":"t1","repo":"/r",` + brief + `}`},
+		{"goal without a parent id", VerbGoal, `{"request_id":"r1","text":"do it"}`},
+		{"answer without a parent id", VerbAnswer, `{"request_id":"r1","escalation_id":1,"text":"yes"}`},
+		{"task-add with a short parent id", VerbTaskAdd, withParentID(`{"request_id":"r1","task_id":"t1","repo":"/r",`+brief+`}`, "abc")},
+		{"goal with an uppercase parent id", VerbGoal, withParentID(`{"request_id":"r1","text":"do it"}`, strings.ToUpper(testParent))},
+		{"answer with a parent id holding a quote", VerbAnswer, withParentID(`{"request_id":"r1","escalation_id":1,"text":"yes"}`, `0123456789abcdef0123456789abcde\"`)},
+	} {
 		code, r, stderr := serveCall(t, unwired(t), c.verb, c.body)
 		wantRefusal(t, c.label, code, r, stderr, CodeBadRequest)
 	}
@@ -275,13 +291,39 @@ func TestSanitizeCapsAndEscapesEveryString(t *testing.T) {
 	}
 }
 
+// testParent is the coordinator id of the parent the served stores are provisioned under, and
+// otherParent one that did not provision them.
+const (
+	testParent  = "0123456789abcdef0123456789abcdef"
+	otherParent = "fedcba9876543210fedcba9876543210"
+)
+
+// withParent puts testParent's id in a request body, as the parent's client does.
+func withParent(body string) string { return withParentID(body, testParent) }
+
+func withParentID(body, id string) string {
+	return strings.Replace(body, "{", `{"parent_id":"`+id+`",`, 1)
+}
+
 // servedStore is a Host over a real store in a temp dir, with the read-only open the CLI uses.
+// The store is provisioned as a peer of testParent, named build.
 func servedStore(t *testing.T) (Host, string) {
+	t.Helper()
+	return newServedStore(t, true)
+}
+
+// newServedStore is servedStore, with the store left a root (no parent) unless provision is set.
+func newServedStore(t *testing.T, provision bool) (Host, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "state.db")
 	s, err := db.Open(path)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if provision {
+		if _, err := s.ProvisionAsPeer(context.Background(), "build", testParent, false); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
@@ -331,7 +373,8 @@ func TestServeVersionDecisionsGoalAnswer(t *testing.T) {
 	code, r, _ := serveCall(t, h, VerbVersion, "")
 	var v VersionResult
 	resultOf(t, r, &v)
-	if code != 0 || v.Protocol != ProtocolVersion || v.Version != "v-test" || v.Coordinator.Role != db.CoordinatorRoot {
+	if code != 0 || v.Protocol != ProtocolVersion || v.Version != "v-test" ||
+		v.Coordinator != (CoordinatorInfo{Name: "build", Role: db.CoordinatorPeer, ParentID: testParent}) {
 		t.Errorf("version = %+v", v)
 	}
 
@@ -379,23 +422,23 @@ func TestServeVersionDecisionsGoalAnswer(t *testing.T) {
 		return out
 	}
 
-	_, r, _ = serveCall(t, h, VerbGoal, `{"request_id":"goal-1","text":"split the importer"}`)
+	_, r, _ = serveCall(t, h, VerbGoal, withParent(`{"request_id":"goal-1","text":"split the importer"}`))
 	var g GoalResult
 	resultOf(t, r, &g)
-	_, r, _ = serveCall(t, h, VerbGoal, `{"request_id":"goal-1","text":"something else"}`)
+	_, r, _ = serveCall(t, h, VerbGoal, withParent(`{"request_id":"goal-1","text":"something else"}`))
 	var g2 GoalResult
 	resultOf(t, r, &g2)
 	if g.Replayed || !g2.Replayed || g2.EventID != g.EventID {
 		t.Errorf("goal then repeat = %+v, %+v", g, g2)
 	}
 
-	_, r, _ = serveCall(t, h, VerbAnswer, `{"request_id":"ans-1","escalation_id":`+itoa(first.ID)+`,"text":"the first"}`)
+	_, r, _ = serveCall(t, h, VerbAnswer, withParent(`{"request_id":"ans-1","escalation_id":`+itoa(first.ID)+`,"text":"the first"}`))
 	var a AnswerResult
 	resultOf(t, r, &a)
 	if a.EscalationID != first.ID || a.Status != db.EscalationAnswered || a.AnsweredBy != db.ActorParent || a.TaskID != "t1" || a.Replayed {
 		t.Errorf("answer = %+v", a)
 	}
-	_, r, _ = serveCall(t, h, VerbAnswer, `{"request_id":"ans-1","escalation_id":`+itoa(first.ID)+`,"text":"changed my mind"}`)
+	_, r, _ = serveCall(t, h, VerbAnswer, withParent(`{"request_id":"ans-1","escalation_id":`+itoa(first.ID)+`,"text":"changed my mind"}`))
 	var a2 AnswerResult
 	resultOf(t, r, &a2)
 	if !a2.Replayed || a2.EventID != a.EventID {
@@ -412,15 +455,94 @@ func TestServeVersionDecisionsGoalAnswer(t *testing.T) {
 		}
 	}
 
-	code, r, stderr := serveCall(t, h, VerbAnswer, `{"request_id":"ans-2","escalation_id":`+itoa(first.ID)+`,"text":"again"}`)
+	code, r, stderr := serveCall(t, h, VerbAnswer, withParent(`{"request_id":"ans-2","escalation_id":`+itoa(first.ID)+`,"text":"again"}`))
 	wantRefusal(t, "answer to an answered escalation", code, r, stderr, CodeConflict)
-	code, r, stderr = serveCall(t, h, VerbAnswer, `{"request_id":"ans-3","escalation_id":999,"text":"x"}`)
+	code, r, stderr = serveCall(t, h, VerbAnswer, withParent(`{"request_id":"ans-3","escalation_id":999,"text":"x"}`))
 	wantRefusal(t, "answer to no escalation", code, r, stderr, CodeNotFound)
-	code, r, stderr = serveCall(t, h, VerbGoal, `{"request_id":"ans-1","text":"x"}`)
+	code, r, stderr = serveCall(t, h, VerbGoal, withParent(`{"request_id":"ans-1","text":"x"}`))
 	wantRefusal(t, "goal under an answer's request id", code, r, stderr, CodeConflict)
 }
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }
+
+// TestServeRefusesAnotherParent: task-add, goal and answer name the parent they come from, and a
+// peer refuses one from any coordinator but the parent that provisioned it, before the request
+// ledger is read, so not even a replay of a stored result reaches another parent. A coordinator no
+// parent provisioned refuses all three. Nothing is written either way. The read verbs do not check.
+func TestServeRefusesAnotherParent(t *testing.T) {
+	ctx := context.Background()
+	h, path := servedStore(t)
+	s := reopenStore(t, path)
+	if _, err := s.UpsertProject(ctx, "/repo", "repo"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateTask(ctx, db.Task{ID: "t1", ProjectID: 1}, db.ActorManager); err != nil {
+		t.Fatal(err)
+	}
+	esc, err := s.OpenEscalation(ctx, "t1", db.EscalationQuestion, "which one?")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.AddTask = func(ctx context.Context, store *db.Store, req TaskAdd) (db.TaskAddResult, string, error) {
+		res, err := store.AddTask(ctx, db.TaskAdd{
+			Task: db.Task{ID: req.TaskID, ProjectID: req.ProjectID}, Actor: db.ActorParent,
+			RequestID: req.RequestID, Brief: req.Brief, WriteBrief: func(string) error { return nil },
+		})
+		return res, "", err
+	}
+	// One goal from the parent, so there is a stored result another parent could try to replay.
+	_, r, _ := serveCall(t, h, VerbGoal, withParent(`{"request_id":"goal-1","text":"tidy"}`))
+	var g GoalResult
+	resultOf(t, r, &g)
+
+	events := func() int {
+		evs, err := s.EventsSince(ctx, 0, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(evs)
+	}
+	before := events()
+	mutating := []struct{ label, verb, body string }{
+		{"task-add", VerbTaskAdd, `{"request_id":"add-1","task_id":"p-1","repo":"/repo","brief":"# b"}`},
+		{"goal", VerbGoal, `{"request_id":"goal-2","text":"something else"}`},
+		{"a replayed goal", VerbGoal, `{"request_id":"goal-1","text":"tidy"}`},
+		{"answer", VerbAnswer, `{"request_id":"ans-1","escalation_id":` + itoa(esc.ID) + `,"text":"the first"}`},
+	}
+	for _, c := range mutating {
+		code, r, stderr := serveCall(t, h, c.verb, withParentID(c.body, otherParent))
+		wantRefusal(t, "another parent's "+c.label, code, r, stderr, CodeWrongParent)
+		if r.Error != nil && (!strings.Contains(r.Error.Message, otherParent) || !strings.Contains(r.Error.Message, testParent)) {
+			t.Errorf("another parent's %s: the refusal %q does not name both coordinators", c.label, r.Error.Message)
+		}
+	}
+	if _, ok, _ := s.GetTask(ctx, "p-1"); ok {
+		t.Error("another parent's task-add created a task")
+	}
+	if n := events(); n != before {
+		t.Errorf("another parent's requests appended %d events", n-before)
+	}
+	if e, _, _ := s.GetEscalation(ctx, esc.ID); e.Status != db.EscalationOpen {
+		t.Errorf("another parent's answer changed the escalation: %+v", e)
+	}
+	for _, verb := range []string{VerbVersion, VerbDecisions} {
+		if _, r, _ := serveCall(t, h, verb, ``); !r.OK {
+			t.Errorf("%s is a read and does not check the parent; got %+v", verb, r.Error)
+		}
+	}
+
+	// A root coordinator, which no parent provisioned, has no parent to match.
+	root, rootPath := newServedStore(t, false)
+	rs := reopenStore(t, rootPath)
+	if _, err := rs.UpsertProject(ctx, "/repo", "repo"); err != nil {
+		t.Fatal(err)
+	}
+	root.AddTask = h.AddTask
+	for _, c := range mutating {
+		code, r, stderr := serveCall(t, root, c.verb, withParent(c.body))
+		wantRefusal(t, "a root's "+c.label, code, r, stderr, CodeWrongParent)
+	}
+}
 
 // TestServeTaskAddReplaysBeforeTheLint proves a repeated task-add is answered from the ledger
 // without calling the add (so without linting again), that a request id reused for another task
@@ -445,23 +567,23 @@ func TestServeTaskAddReplaysBeforeTheLint(t *testing.T) {
 		return res, "5 of 5 rules ran: passed\x1b[0m", err
 	}
 	body := `{"request_id":"add-1","task_id":"p-1","repo":"/repo","touches":["a.go"],"brief":"# b"}`
-	_, r, _ := serveCall(t, h, VerbTaskAdd, body)
+	_, r, _ := serveCall(t, h, VerbTaskAdd, withParent(body))
 	var first TaskAddResult
 	resultOf(t, r, &first)
 	if first.TaskID != "p-1" || !first.HasBrief || first.Replayed || first.Lint != `5 of 5 rules ran: passed\x1b[0m` {
 		t.Errorf("task-add = %+v", first)
 	}
-	_, r, _ = serveCall(t, h, VerbTaskAdd, body)
+	_, r, _ = serveCall(t, h, VerbTaskAdd, withParent(body))
 	var again TaskAddResult
 	resultOf(t, r, &again)
 	if !again.Replayed || again.EventID != first.EventID || again.Lint != "" || adds != 1 {
 		t.Errorf("repeat = %+v after %d adds, want a replay with no second add", again, adds)
 	}
-	code, r, stderr := serveCall(t, h, VerbTaskAdd, `{"request_id":"add-1","task_id":"p-2","repo":"/repo","brief":"# b"}`)
+	code, r, stderr := serveCall(t, h, VerbTaskAdd, withParent(`{"request_id":"add-1","task_id":"p-2","repo":"/repo","brief":"# b"}`))
 	wantRefusal(t, "request id reused for another task", code, r, stderr, CodeConflict)
-	code, r, stderr = serveCall(t, h, VerbTaskAdd, `{"request_id":"add-2","task_id":"p-1","repo":"/repo","brief":"# b"}`)
+	code, r, stderr = serveCall(t, h, VerbTaskAdd, withParent(`{"request_id":"add-2","task_id":"p-1","repo":"/repo","brief":"# b"}`))
 	wantRefusal(t, "task id taken", code, r, stderr, CodeConflict)
-	code, r, stderr = serveCall(t, h, VerbTaskAdd, `{"request_id":"add-3","task_id":"p-3","repo":"/elsewhere","brief":"# b"}`)
+	code, r, stderr = serveCall(t, h, VerbTaskAdd, withParent(`{"request_id":"add-3","task_id":"p-3","repo":"/elsewhere","brief":"# b"}`))
 	wantRefusal(t, "unregistered repo", code, r, stderr, CodeNotFound)
 	if adds != 2 {
 		t.Errorf("adds = %d, want 2 (the first, and the taken id the store refused)", adds)

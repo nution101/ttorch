@@ -13,9 +13,11 @@ package peer
 //
 // What the channel can do is the verb list, and the list holds nothing that approves, merges,
 // lands, gates or touches a worker. A verb that changes state takes a request id, and the
-// peer_requests ledger makes a repeat of it return the first result and change nothing. The
-// read verbs open the store read-only (db.OpenReadOnly), so a poll runs no migration and
-// writes no row.
+// peer_requests ledger makes a repeat of it return the first result and change nothing. It also
+// names the parent it comes from, and is refused unless that is the parent the coordinator row
+// records (`ttorch peer init` writes it), so a peer two parents registered by mistake takes work
+// and answers from one of them. The read verbs open the store read-only (db.OpenReadOnly), so a
+// poll runs no migration and writes no row.
 //
 // Every byte of a request is treated as hostile, and so is every string a response carries:
 // task ids a worker chose, repo paths, escalation text that may quote a worker. Each is escaped
@@ -115,6 +117,7 @@ const (
 	CodeBadRequest    = "bad_request"    // a field missing, malformed or out of bounds
 	CodeNotFound      = "not_found"      // no such project or escalation
 	CodeConflict      = "conflict"       // a request id used for another request, a task id taken, an escalation no longer open
+	CodeWrongParent   = "wrong_parent"   // a state-changing request from a coordinator that is not this peer's parent
 	CodeBriefLint     = "brief_lint"     // the brief lint refused the brief, or could not finish
 	CodeUnavailable   = "unavailable"    // no state store, or one behind this binary's schema
 	CodeNoManager     = "no_manager"     // ensure-up with no manager session recorded
@@ -408,10 +411,13 @@ type VersionResult struct {
 	Coordinator CoordinatorInfo `json:"coordinator"`
 }
 
-// CoordinatorInfo is the coordinator row as a parent sees it.
+// CoordinatorInfo is the coordinator row as a parent sees it. ParentID is the coordinator id of
+// the parent that provisioned this one, "" when none has; a parent reads it back after `peer init`
+// to confirm the control key reaches the store init wrote. It is an identifier, not a secret.
 type CoordinatorInfo struct {
-	Name string `json:"name"`
-	Role string `json:"role"`
+	Name     string `json:"name"`
+	Role     string `json:"role"`
+	ParentID string `json:"parent_id"`
 }
 
 func serveVersion(ctx context.Context, h Host, body []byte) (any, error) {
@@ -430,7 +436,7 @@ func serveVersion(ctx context.Context, h Host, body []byte) (any, error) {
 	return VersionResult{
 		Protocol:    ProtocolVersion,
 		Version:     SafeText(h.Version),
-		Coordinator: CoordinatorInfo{Name: SafeText(c.Name), Role: SafeText(c.Role)},
+		Coordinator: CoordinatorInfo{Name: SafeText(c.Name), Role: SafeText(c.Role), ParentID: SafeID(c.ParentID)},
 	}, nil
 }
 
@@ -510,9 +516,11 @@ func serveDecisions(ctx context.Context, h Host, body []byte) (any, error) {
 
 // --- task-add ----------------------------------------------------------------------------
 
-// TaskAddRequest is a briefed backlog task a parent hands the peer. Repo is the repository's
-// path on the peer, as registered there; Touches is its footprint.
+// TaskAddRequest is a briefed backlog task a parent hands the peer. ParentID is the sending
+// coordinator's id; Repo is the repository's path on the peer, as registered there; Touches is
+// its footprint.
 type TaskAddRequest struct {
+	ParentID  string   `json:"parent_id"`
 	RequestID string   `json:"request_id"`
 	TaskID    string   `json:"task_id"`
 	Repo      string   `json:"repo"`
@@ -570,6 +578,9 @@ func serveTaskAdd(ctx context.Context, h Host, body []byte) (any, error) {
 		return nil, err
 	}
 	defer store.Close()
+	if err := checkParent(ctx, store, req.ParentID); err != nil {
+		return nil, err
+	}
 	// A repeat is answered before the lint runs again: the lint reaches the network, and a
 	// retry after a timeout must get the first result even if the remote is down now.
 	stored, ok, err := store.StoredTaskAdd(ctx, req.RequestID)
@@ -605,6 +616,9 @@ func serveTaskAdd(ctx context.Context, h Host, body []byte) (any, error) {
 // checkTaskAdd refuses a task-add request whose fields are missing or out of bounds, before
 // anything is opened.
 func checkTaskAdd(req TaskAddRequest) error {
+	if err := checkParentID(req.ParentID); err != nil {
+		return err
+	}
 	if err := db.ValidRequestID(req.RequestID); err != nil {
 		return Refuse(CodeBadRequest, "%v", err)
 	}
@@ -661,11 +675,40 @@ func storeErr(err error) error {
 	return err
 }
 
+// checkParentID refuses a request that does not name the coordinator it comes from, before
+// anything is opened.
+func checkParentID(id string) error {
+	if err := db.ValidCoordID(id); err != nil {
+		return Refuse(CodeBadRequest, "parent_id: %v", err)
+	}
+	return nil
+}
+
+// checkParent refuses a state-changing request from any coordinator but this peer's parent, as
+// the coordinator row records it (design 5.7). It runs before the request ledger is read, so a
+// result stored for the parent is not replayed to another coordinator. A coordinator no parent
+// has provisioned takes no such request at all. The row is any same-user process's to rewrite,
+// so this keeps two parents from both handing one peer work by accident, and bounds nothing else.
+func checkParent(ctx context.Context, store *db.Store, parentID string) error {
+	c, err := store.GetCoordinator(ctx)
+	if err != nil {
+		return fmt.Errorf("reading the coordinator row: %w", err)
+	}
+	if c.Role != db.CoordinatorPeer || c.ParentID == "" {
+		return Refuse(CodeWrongParent, "this coordinator was not provisioned by a parent, so it takes no work or answers over this channel (ttorch peer add runs ttorch peer init here)")
+	}
+	if c.ParentID != parentID {
+		return Refuse(CodeWrongParent, "the request comes from coordinator %s, and this peer's parent is %s; moving a peer to another parent is ttorch peer adopt --force", SafeID(parentID), SafeID(c.ParentID))
+	}
+	return nil
+}
+
 // --- goal --------------------------------------------------------------------------------
 
 // GoalRequest is plain-language work for the peer's manager, the way the lead talks to a root
 // manager.
 type GoalRequest struct {
+	ParentID  string `json:"parent_id"`
 	RequestID string `json:"request_id"`
 	Text      string `json:"text"`
 }
@@ -681,6 +724,9 @@ func serveGoal(ctx context.Context, h Host, body []byte) (any, error) {
 	if err := decode(body, &req); err != nil {
 		return nil, err
 	}
+	if err := checkParentID(req.ParentID); err != nil {
+		return nil, err
+	}
 	if err := db.ValidRequestID(req.RequestID); err != nil {
 		return nil, Refuse(CodeBadRequest, "%v", err)
 	}
@@ -692,6 +738,9 @@ func serveGoal(ctx context.Context, h Host, body []byte) (any, error) {
 		return nil, err
 	}
 	defer store.Close()
+	if err := checkParent(ctx, store, req.ParentID); err != nil {
+		return nil, err
+	}
 	res, err := store.RecordGoal(ctx, req.RequestID, req.Text)
 	if err != nil {
 		return nil, storeErr(err)
@@ -715,6 +764,7 @@ func checkText(text string) error {
 
 // AnswerRequest answers one open escalation.
 type AnswerRequest struct {
+	ParentID     string `json:"parent_id"`
 	RequestID    string `json:"request_id"`
 	EscalationID int64  `json:"escalation_id"`
 	Text         string `json:"text"`
@@ -738,6 +788,9 @@ func serveAnswer(ctx context.Context, h Host, body []byte) (any, error) {
 	if err := decode(body, &req); err != nil {
 		return nil, err
 	}
+	if err := checkParentID(req.ParentID); err != nil {
+		return nil, err
+	}
 	if err := db.ValidRequestID(req.RequestID); err != nil {
 		return nil, Refuse(CodeBadRequest, "%v", err)
 	}
@@ -752,6 +805,9 @@ func serveAnswer(ctx context.Context, h Host, body []byte) (any, error) {
 		return nil, err
 	}
 	defer store.Close()
+	if err := checkParent(ctx, store, req.ParentID); err != nil {
+		return nil, err
+	}
 	// Recorded as relayed by the parent coordinator: not the lead, whose words these may be but
 	// nothing here can verify, and not the local manager, which never saw them.
 	res, err := store.AnswerEscalation(ctx, req.EscalationID, req.RequestID, req.Text, db.ActorParent)

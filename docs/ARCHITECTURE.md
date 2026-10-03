@@ -1111,7 +1111,11 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   no legacy import, no default-branch seed, no row written, so unlike `ttorch summary` the
   served summary does not sync approval escalations first. `task-add`, `goal` and `answer`
   carry a request id stored in `peer_requests`, so a repeat returns the first result and
-  changes nothing. `task-add` runs the `ttorch task add` core, brief lint included, and writes
+  changes nothing. They also carry the sending coordinator's id, and are refused with
+  `wrong_parent`, before the ledger is read, unless it is the parent the coordinator row records
+  (`ttorch peer init` writes it); a coordinator no parent provisioned refuses all three, and
+  `version` reports the recorded parent. Like the rest of that row, this stops two parents
+  sharing a peer by accident and bounds nothing. `task-add` runs the `ttorch task add` core, brief lint included, and writes
   the brief in the transaction that creates the row. `goal` and `answer` are recorded as the
   parent coordinator's (actor `parent`), never the lead's or the local manager's. `ensure-up`
   restores the manager and workers without a terminal and starts the scheduler, and refuses

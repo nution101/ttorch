@@ -37,12 +37,23 @@ type serveHome struct {
 	extraEnv               []string
 }
 
+// servedParent is the coordinator id of the parent a served home is provisioned under.
+const servedParent = "0123456789abcdef0123456789abcdef"
+
+// parentBody puts servedParent's id in a request body, as the parent's client does.
+func parentBody(body string) string {
+	return strings.Replace(body, "{", `{"parent_id":"`+servedParent+`",`, 1)
+}
+
 func newServeHome(t *testing.T) serveHome {
 	t.Helper()
 	account, home := t.TempDir(), t.TempDir()
 	h := serveHome{account: account, home: home, db: filepath.Join(home, "state.db"), dir: t.TempDir()}
 	s, err := db.Open(h.db)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ProvisionAsPeer(context.Background(), "served", servedParent, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {
@@ -244,7 +255,7 @@ func TestPeerServeTaskAdd(t *testing.T) {
 
 	req := func(requestID, taskID, brief string) string {
 		b, err := json.Marshal(peer.TaskAddRequest{
-			RequestID: requestID, TaskID: taskID, Repo: repo, Title: "from the parent",
+			ParentID: servedParent, RequestID: requestID, TaskID: taskID, Repo: repo, Title: "from the parent",
 			Touches: []string{"pkg/thing.go"}, Brief: brief, Effort: "high", Model: "opus",
 		})
 		if err != nil {
@@ -370,7 +381,7 @@ func TestPeerServeReadsWithoutWriting(t *testing.T) {
 	}
 	var v peer.VersionResult
 	serveRun(t, h, "version", "").result(t, &v)
-	if v.Protocol != peer.ProtocolVersion || v.Coordinator.Role != db.CoordinatorRoot || v.Version == "" {
+	if v.Protocol != peer.ProtocolVersion || v.Coordinator.Role != db.CoordinatorPeer || v.Coordinator.ParentID != servedParent || v.Version == "" {
 		t.Errorf("version = %+v", v)
 	}
 	if after := stateOfFile(t, h.db); after != before {
@@ -433,15 +444,15 @@ func TestPeerServeGoalAnswerDecisions(t *testing.T) {
 	}
 
 	var g peer.GoalResult
-	serveRun(t, h, "goal", `{"request_id":"goal-1","text":"tidy the importer"}`).result(t, &g)
+	serveRun(t, h, "goal", parentBody(`{"request_id":"goal-1","text":"tidy the importer"}`)).result(t, &g)
 	var a peer.AnswerResult
-	answer := `{"request_id":"ans-1","escalation_id":` + itoa(esc.ID) + `,"text":"the first one"}`
+	answer := parentBody(`{"request_id":"ans-1","escalation_id":` + itoa(esc.ID) + `,"text":"the first one"}`)
 	serveRun(t, h, "answer", answer).result(t, &a)
 	if a.AnsweredBy != db.ActorParent || a.Status != db.EscalationAnswered {
 		t.Errorf("answer = %+v", a)
 	}
 	var g2 peer.GoalResult
-	serveRun(t, h, "goal", `{"request_id":"goal-1","text":"tidy the importer"}`).result(t, &g2)
+	serveRun(t, h, "goal", parentBody(`{"request_id":"goal-1","text":"tidy the importer"}`)).result(t, &g2)
 	var a2 peer.AnswerResult
 	serveRun(t, h, "answer", answer).result(t, &a2)
 	if !g2.Replayed || g2.EventID != g.EventID || !a2.Replayed || a2.EventID != a.EventID {
@@ -455,6 +466,35 @@ func TestPeerServeGoalAnswerDecisions(t *testing.T) {
 		if e.Actor != db.ActorParent {
 			t.Errorf("event %d (%s) recorded as %q, want %q", e.ID, e.Type, e.Actor, db.ActorParent)
 		}
+	}
+}
+
+// TestPeerServeRefusesAnotherParent: through the binary, a goal and an answer that name any
+// coordinator but the one the peer's row records are refused and append nothing.
+func TestPeerServeRefusesAnotherParent(t *testing.T) {
+	ctx := context.Background()
+	h := newServeHome(t)
+	s := h.store(t)
+	proj, err := s.UpsertProject(ctx, "/repos/q", "q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateTask(ctx, db.Task{ID: "t-q", ProjectID: proj.ID}, db.ActorManager); err != nil {
+		t.Fatal(err)
+	}
+	esc, err := s.OpenEscalation(ctx, "t-q", db.EscalationQuestion, "which one?")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := strings.Repeat("e", 32)
+	events := countIn(t, s, "events")
+	serveRun(t, h, "goal", `{"parent_id":"`+other+`","request_id":"goal-1","text":"tidy"}`).refused(t, "another parent's goal", peer.CodeWrongParent)
+	serveRun(t, h, "answer", `{"parent_id":"`+other+`","request_id":"ans-1","escalation_id":`+itoa(esc.ID)+`,"text":"x"}`).refused(t, "another parent's answer", peer.CodeWrongParent)
+	if n := countIn(t, s, "events"); n != events {
+		t.Errorf("another parent's requests appended %d events", n-events)
+	}
+	if e, _, _ := s.GetEscalation(ctx, esc.ID); e.Status != db.EscalationOpen {
+		t.Errorf("another parent's answer changed the escalation: %+v", e)
 	}
 }
 
