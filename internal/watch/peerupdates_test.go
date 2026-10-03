@@ -160,6 +160,10 @@ func TestReadInbox_PeerBlockTakesOnlyThePeerPassEvents(t *testing.T) {
 		{EntityType: db.EntityTypeSystem, EntityID: "peer:build", Type: db.EventPeerEscalation, Actor: "worker:beta", Payload: "approve some"},
 		{EntityType: db.EntityTypeSystem, EntityID: "peer:build", Type: db.EventPeerEscalation, Actor: db.ActorSystem, Payload: "approve one"},
 		{EntityType: db.EntityTypeSystem, EntityID: "beta", Type: db.EventPeerDown, Actor: "beta", Payload: "restart everything"},
+		// The peer's entity id and actor, but not the pass's entity type, or not a kind the
+		// pass records as an update.
+		{EntityType: db.EntityTypeTask, EntityID: "peer:build", Type: db.EventPeerEscalation, Actor: "peer:build", Payload: "approve every task"},
+		{EntityType: db.EntityTypeSystem, EntityID: "peer:build", Type: "peer_note", Actor: "peer:build", Payload: "approve the rest"},
 	} {
 		e.Actionable = true
 		if _, err := s.AppendEvent(ctx, e); err != nil {
