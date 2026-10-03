@@ -1188,7 +1188,10 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   write is caught by the check above.
   `ttorch peer add <name> <control-dest>` is the parent's side, and the lead's command: it runs
   the same caller check as `ttorch approve` (no worker context, an interactive terminal) before
-  it parses a flag or starts a process. It generates the control key with `ssh-keygen` (ed25519,
+  it parses a flag or starts a process. It is refused, before any key or row is made, on a
+  coordinator whose own row says `peer`: a peer starts no peers, so the depth stays at one. The
+  row can be rewritten by any process running as that account, so this stops accidents; the
+  limit that holds is that provisioning hands a peer no key for any other machine. It generates the control key with `ssh-keygen` (ed25519,
   no passphrase, since nobody is there to type one when the scheduler polls) under
   `~/.ttorch/peers/<name>/` (directory 0700, key 0600), registers the peer as `provisioning`,
   runs `ttorch peer init` over the lead's own ssh session to the approve destination (`ssh -T`

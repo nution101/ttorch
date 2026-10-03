@@ -42,7 +42,7 @@ func peerKeyDir(name string) string { return filepath.Join(paths.Default().Home,
 // cmdPeerProvision is `ttorch peer add` and, with adopt, `ttorch peer adopt --force`.
 //
 // It refuses a worker context and a stdin that is not a terminal first, before it parses a flag,
-// opens the store or starts a process. Then:
+// opens the store or starts a process, and then a coordinator that is itself a peer. Then:
 //
 //  1. It finds or makes the control key under <ttorch home>/peers/<name>/ (directory 0700,
 //     private key 0600), with ssh-keygen, an ed25519 key with no passphrase, since nobody is there
@@ -113,6 +113,14 @@ func cmdPeerProvision(args []string, adopt bool, stdin *os.File) error {
 	self, err := store.GetCoordinator(ctx)
 	if err != nil {
 		return err
+	}
+	// Depth one (design 3.3): a peer starts no peers. Its manager's escalations reach the lead
+	// through its parent, and a peer below it would need every hop to relay them, and the
+	// approvals back. Any process running as this account can rewrite the row, so the check
+	// stops accidents; what keeps a peer from reaching further is that provisioning gives it no
+	// key for any other machine.
+	if self.Role == db.CoordinatorPeer {
+		return fmt.Errorf("peer %s: this coordinator is a peer (%s, provisioned by %s), and a peer starts no peers of its own; run ttorch peer %s on the root coordinator instead", verb, peer.SafeID(self.Name), peer.SafeID(self.ParentID), verb)
 	}
 	if cur, ok, err := store.GetPeer(ctx, name); err != nil {
 		return err

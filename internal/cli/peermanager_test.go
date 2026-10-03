@@ -134,3 +134,41 @@ func TestPeerServeEnsureUpChecksTheParent(t *testing.T) {
 		t.Errorf("windows after ensure-up = %q, want the manager's", w)
 	}
 }
+
+// TestPeerAddRefusesOnAPeer: a peer starts no peers of its own (design 3.3), so peer add and peer
+// adopt on a coordinator whose row says peer are refused before anything happens: no control key
+// is generated, no peer is registered, and ssh never runs. It is the same command, from the same
+// terminal, that provisions a peer from a root.
+func TestPeerAddRefusesOnAPeer(t *testing.T) {
+	ctx := context.Background()
+	f := newPeerFixture(t)
+	s, err := db.Open(filepath.Join(f.parentHome, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ProvisionAsPeer(ctx, "mid", strings.Repeat("a", 32), false); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, args := range [][]string{
+		{"peer", "add", "build", "ttorch@build-host"},
+		{"peer", "adopt", "build", "ttorch@build-host", "--force"},
+	} {
+		r := f.run(t, nil, args...)
+		if r.code == 0 || !strings.Contains(r.stderr, "this coordinator is a peer") {
+			t.Errorf("%v on a peer: exit %d, stderr %q; want it refused because this coordinator is a peer", args, r.code, r.stderr)
+		}
+	}
+	if calls := f.calls(t); len(calls) != 0 {
+		t.Errorf("a refused add ran ssh %d time(s): %+v", len(calls), calls)
+	}
+	if _, err := os.Lstat(filepath.Join(f.parentHome, "peers")); !os.IsNotExist(err) {
+		t.Errorf("a refused add made a control key directory (%v)", err)
+	}
+	if peers, err := f.parentStore(t).ListPeers(ctx); err != nil || len(peers) != 0 {
+		t.Errorf("a refused add registered %d peer(s) (%v)", len(peers), err)
+	}
+}
