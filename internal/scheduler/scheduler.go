@@ -267,6 +267,16 @@ type Scheduler struct {
 	// sets it.
 	Watch interface{ Run(context.Context) error }
 
+	// Peers, PeerPoll and PeerDeadline configure the peer pass (peerpass.go): every PeerPoll the
+	// tick starts a background poll of each registered peer, each under PeerDeadline (zero means
+	// defaultPeerDeadline). Peers nil or PeerPoll <= 0 leaves the pass off; a bare struct has
+	// both. New() sets PeerPoll from TTORCH_PEER_POLL, and `ttorch scheduler` wires Peers to the
+	// control client.
+	Peers        PeerDialer
+	PeerPoll     time.Duration
+	PeerDeadline time.Duration
+	peerPass     peerPassState
+
 	// IdleNudgeGrace and MaxIdleNudges configure the alive-but-idle recovery pass that runs
 	// inside Supervise (§roadmap H2). An alive worker (live window, valid lease, status
 	// 'active') whose pane has sat idle at the prompt longer than IdleNudgeGrace is nudged
@@ -467,6 +477,8 @@ func New(m *orchestrator.Manager, interval time.Duration, log io.Writer) *Schedu
 		MaxActiveWorkers:   maxActiveWorkersFromEnv(m.Pool.Max),
 		LoadCeiling:        loadCeilingFromEnv(),
 		MaxLandConcurrency: maxLandConcurrencyFromEnv(),
+
+		PeerPoll: peerPollFromEnv(),
 	}
 	// ACTIVATE the MANAGER half of API-stall recovery in production: wire the seams that let the
 	// daemon observe the manager pane and — ONLY when it is genuinely API-stalled — nudge it
@@ -603,7 +615,8 @@ func (sc *Scheduler) Run(ctx context.Context) error {
 		}()
 		defer func() { <-stopped }()
 	}
-	sc.runTick(ctx) // immediate first tick
+	defer sc.waitPeerPass() // a poll in flight sees the cancellation and stops
+	sc.runTick(ctx)         // immediate first tick
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -630,6 +643,8 @@ func (sc *Scheduler) Run(ctx context.Context) error {
 func (sc *Scheduler) runTick(ctx context.Context) {
 	var stats tickStats  // §roadmap H5: accumulate this tick's outcome for one durable status write
 	sc.tickDeferrals = 0 // §roadmap H4: reset the per-tick governor-deferral accumulator (folded into stats below)
+	// The peer pass keeps its own cadence and runs in the background, so no peer delays this tick.
+	sc.startPeerPass(ctx)
 	if sc.Supervise {
 		if n, err := sc.RunSuperviseOnce(ctx); err != nil {
 			if ctx.Err() == nil {
