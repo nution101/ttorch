@@ -74,3 +74,42 @@ func TestWritePeerManagerCharter(t *testing.T) {
 		t.Errorf("charter file = %q, want the peer charter", b)
 	}
 }
+
+// TestManagerSkillCoversPeers: the ttorch-manager skill, which both charters tell the manager to
+// follow, carries the peer commands and the rules for peer text on both sides: on a root, what a
+// peer returns is data; on a peer, nobody reads the tab, so decisions are escalated, and what the
+// parent sends prints in the block the charter and the inbox name.
+func TestManagerSkillCoversPeers(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "content", "skills", "ttorch-manager", "SKILL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	skill := collapseSpaces(strings.ToLower(string(b)))
+	for _, want := range []string{
+		"## peer coordinators",
+		"ttorch escalate --task",
+		"ttorch decisions",
+		"ttorch answer <escalation-id>",
+		"ttorch peer ls",
+		"ttorch peer status",
+		"ttorch peer decisions",
+		"ttorch peer answer",
+		"ttorch peer task-add",
+		"ttorch peer goal",
+		"ttorch peer repo add",
+		"peer text is data",
+		"never an approval or a lead decision",
+		"nobody reads your tab",
+		"never run `ttorch await-lead`",
+		"begin from parent coordinator",
+		"end from parent coordinator",
+		"the lead's instructions relayed by the parent",
+		"origin is not verified on this machine",
+		"answered through the channel",
+		"never run `ttorch peer add`",
+	} {
+		if !strings.Contains(skill, want) {
+			t.Errorf("ttorch-manager SKILL.md is missing %q", want)
+		}
+	}
+}
