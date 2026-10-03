@@ -1174,7 +1174,8 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   `provisioning`, and running `peer add` again resumes with the same key. `peer adopt --force`
   is the same for a peer another parent provisioned.
 - **Peer client.** `ttorch peer status`, `decisions`, `answer`, `task-add`, `goal` and `repo
-  add` reach a `live` or `unreachable` peer through `internal/peer/client.go` alone: one ssh
+  add` refuse a worker context (an accident guard, like `ttorch answer`'s, not a boundary), then
+  reach a `live` or `unreachable` peer through `internal/peer/client.go` alone: one ssh
   process per call, run through `proc.Command` with a 30s deadline, so a hung connection dies
   with everything it started, and the fixed command line `ssh -F none -o BatchMode=yes -o
   IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -i

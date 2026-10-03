@@ -33,7 +33,9 @@ import (
 // against accidents and injected commands, and is not a boundary: the lead's ssh keys can reach
 // the peer whatever ttorch refuses. The other commands use a peer already provisioned, the way a
 // manager uses its worker pool, and talk to it only through the control key, which reaches only
-// the control channel's verbs.
+// the control channel's verbs. Every one that sends the peer anything (status, decisions, answer,
+// task-add, goal, repo add) refuses a worker context first (refuseWorkerContext); ls reads only
+// this coordinator's store.
 
 // Seams. A test points peerSSH at a stand-in for ssh; the timeouts bound one control call and
 // one init session.
@@ -305,6 +307,17 @@ func controlKey(ctx context.Context, name, coordID string) (key, pub string, err
 	return key, strings.TrimSpace(string(b)), nil
 }
 
+// refuseWorkerContext is the accident guard every command that sends a peer anything runs first,
+// the one `ttorch answer` and `ttorch escalate` have: a worker that runs it from its own shell, by
+// mistake or because text it read told it to, is stopped before ssh runs. Like those, it is not a
+// boundary: a process running as the lead can unset $TTORCH_TASK_ID and leave its worktree.
+func refuseWorkerContext(what string) error {
+	if signal := workerContextSignal(); signal != "" {
+		return fmt.Errorf("refusing to %s from inside a worker context (%s): a peer takes its work and answers from the manager. Run it from the manager's shell, outside the worktree", what, signal)
+	}
+	return nil
+}
+
 // usablePeer opens the store and finds name, which must be live or unreachable: a peer still
 // provisioning has no key the channel admits yet, and a retired one has none at all. The client
 // reaches it with the control key only.
@@ -407,6 +420,9 @@ func cmdPeerLs(args []string) error {
 // cmdPeerStatus reads the peer's summary over the control channel and prints it, caching it on
 // the peer's row for display. Every string in it came from the peer and was escaped on arrival.
 func cmdPeerStatus(args []string) error {
+	if err := refuseWorkerContext("read a peer's summary"); err != nil {
+		return err
+	}
 	if len(args) < 1 || strings.HasPrefix(args[0], "-") {
 		return errors.New("usage: ttorch peer status <name> [--json]")
 	}
@@ -442,6 +458,9 @@ func cmdPeerStatus(args []string) error {
 // cmdPeerDecisions lists the peer's open escalations above --since. It does not move the cursor
 // the scheduler's poll keeps (escalation_cursor); it only reads.
 func cmdPeerDecisions(args []string) error {
+	if err := refuseWorkerContext("read a peer's escalations"); err != nil {
+		return err
+	}
 	const usage = "usage: ttorch peer decisions <name> [--since <id>] [--json]"
 	if len(args) < 1 || strings.HasPrefix(args[0], "-") {
 		return errors.New(usage)
@@ -501,8 +520,8 @@ const peerAnswerUsage = `usage: ttorch peer answer <name> <escalation-id> -m "<t
 // It wakes the peer's manager with one event and grants nothing. Like `ttorch answer` it refuses a
 // worker context, and a repeat with the same --request-id changes nothing.
 func cmdPeerAnswer(args []string) error {
-	if signal := workerContextSignal(); signal != "" {
-		return fmt.Errorf("refusing to answer a peer's escalation from inside a worker context (%s): answers are the lead's, relayed by the manager. Run it from the manager's shell, outside the worktree", signal)
+	if err := refuseWorkerContext("answer a peer's escalation"); err != nil {
+		return err
 	}
 	if len(args) < 2 || strings.HasPrefix(args[0], "-") {
 		return errors.New(peerAnswerUsage)
@@ -568,6 +587,9 @@ func retryHint(err error, requestID string) error {
 // a restart it knows what it asked for; a refusal from the peer drops the record, since the peer
 // acted on nothing. The brief lint runs on the peer, against the peer's checkout.
 func cmdPeerTaskAdd(args []string) error {
+	if err := refuseWorkerContext("hand a peer a task"); err != nil {
+		return err
+	}
 	const usage = `usage: ttorch peer task-add <name> <task-id> --repo <path on the peer> (--brief-file <f> | --brief "...") [--title "..."] [--touches "a,b"] [--effort <level>] [--model <m>] [--request-id <id>]`
 	if len(args) < 2 || strings.HasPrefix(args[0], "-") || strings.HasPrefix(args[1], "-") {
 		return errors.New(usage)
@@ -636,6 +658,9 @@ func cmdPeerTaskAdd(args []string) error {
 // cmdPeerGoal hands the peer's manager plain-language work, the way the lead talks to a root
 // manager. It is recorded as a delegation, with the sha256 of the text.
 func cmdPeerGoal(args []string) error {
+	if err := refuseWorkerContext("hand a peer a goal"); err != nil {
+		return err
+	}
 	const usage = `usage: ttorch peer goal <name> -m "<text>" [--request-id <id>]`
 	if len(args) < 1 || strings.HasPrefix(args[0], "-") {
 		return errors.New(usage)
@@ -709,6 +734,9 @@ func delegate(name string, d db.Delegation, requestID string, call func(ctx cont
 // cmdPeerRepoAdd records that the peer owns a repository, after the peer's summary confirms it
 // has a project at that path. One repository belongs to one coordinator (db.AddPeerRepo).
 func cmdPeerRepoAdd(args []string) error {
+	if err := refuseWorkerContext("record a peer's repository"); err != nil {
+		return err
+	}
 	const usage = "usage: ttorch peer repo add <name> <path on the peer> --origin <url>"
 	if len(args) < 2 || strings.HasPrefix(args[0], "-") || strings.HasPrefix(args[1], "-") {
 		return errors.New(usage)

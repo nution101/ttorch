@@ -828,3 +828,39 @@ func TestPeerCommandsNeedAUsablePeer(t *testing.T) {
 		t.Errorf("ssh ran %d time(s) for peers that cannot be called", n)
 	}
 }
+
+// TestPeerCommandsRefuseAWorkerContext: every command that sends a peer anything refuses a
+// worker context before it runs ssh, the accident guard `ttorch answer` and `ttorch escalate`
+// have. A worker told by text it read to hand another machine work, or to read it, is stopped
+// here; one set on getting past it can, as everywhere on one machine.
+func TestPeerCommandsRefuseAWorkerContext(t *testing.T) {
+	f := newPeerFixture(t)
+	f.add(t, "build")
+	brief := filepath.Join(t.TempDir(), "brief.md")
+	if err := os.WriteFile(brief, []byte(cleanBrief), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.extraEnv = append(f.extraEnv, "TTORCH_TASK_ID=t1")
+	for _, args := range [][]string{
+		{"peer", "status", "build"},
+		{"peer", "decisions", "build"},
+		{"peer", "answer", "build", "1", "-m", "yes"},
+		{"peer", "task-add", "build", "p-1", "--repo", "/srv/app", "--brief-file", brief},
+		{"peer", "goal", "build", "-m", "tidy the importer"},
+		{"peer", "repo", "add", "build", "/srv/app", "--origin", "git@example.com:org/app.git"},
+	} {
+		t.Run(args[1], func(t *testing.T) {
+			before := len(f.calls(t))
+			r := f.run(t, nil, args...)
+			if r.code == 0 || !strings.Contains(r.stderr, "worker context") {
+				t.Errorf("%v from a worker context: exit %d, stderr %q", args, r.code, r.stderr)
+			}
+			if n := len(f.calls(t)); n != before {
+				t.Errorf("%v from a worker context ran ssh", args)
+			}
+		})
+	}
+	if ds, _ := f.parentStore(t).ListDelegations(context.Background(), "build"); len(ds) != 0 {
+		t.Errorf("a refused command recorded a delegation: %+v", ds)
+	}
+}
