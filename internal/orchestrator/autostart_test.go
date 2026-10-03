@@ -1,6 +1,9 @@
 package orchestrator
 
 import (
+	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/nution101/ttorch/internal/paths"
@@ -73,6 +76,59 @@ func TestAutoStartScheduler(t *testing.T) {
 	m.autoStartScheduler()
 	if launched != 0 {
 		t.Fatalf("auto-start must not start a second daemon while the singleton is held, launched=%d", launched)
+	}
+}
+
+// TestStartSchedulerReportsWhatItDid covers the exported start the peer control channel's
+// ensure-up calls. It decides as autoStartScheduler does, and names the outcome, including the
+// one the auto-start passes over in silence: no installed binary to launch.
+func TestStartSchedulerReportsWhatItDid(t *testing.T) {
+	t.Setenv("TTORCH_HOME", t.TempDir())
+	m := &Manager{P: paths.Default()}
+	orig := schedulerDaemonLauncher
+	defer func() { schedulerDaemonLauncher = orig }()
+	launched := 0
+	var launchErr error
+	schedulerDaemonLauncher = func(p paths.Paths) error { launched++; return launchErr }
+
+	check := func(label, want string, wantLaunches int) {
+		t.Helper()
+		launched = 0
+		got, err := m.StartScheduler()
+		if err != nil {
+			t.Fatalf("%s: %v", label, err)
+		}
+		if got != want || launched != wantLaunches {
+			t.Errorf("%s: StartScheduler = %q with %d launches, want %q with %d", label, got, launched, want, wantLaunches)
+		}
+	}
+
+	t.Setenv("TTORCH_SCHEDULER_AUTOSTART", "")
+	check("no installed binary", SchedulerNotInstalled, 0)
+
+	if err := os.MkdirAll(filepath.Dir(m.P.Binary()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(m.P.Binary(), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	check("installed, nothing running", SchedulerStarted, 1)
+
+	t.Setenv("TTORCH_SCHEDULER_AUTOSTART", "off")
+	check("switched off", SchedulerDisabled, 0)
+
+	t.Setenv("TTORCH_SCHEDULER_AUTOSTART", "1")
+	lock, acquired, err := singleton.Acquire(m.P.SchedulerPIDFile())
+	if err != nil || !acquired {
+		t.Fatalf("setup: pre-acquire the singleton: acquired=%v err=%v", acquired, err)
+	}
+	check("a daemon holds the lock", SchedulerAlreadyRunning, 0)
+	singleton.Release(lock)
+
+	launchErr = errors.New("fork failed")
+	launched = 0
+	if got, err := m.StartScheduler(); err == nil || got != "" || launched != 1 {
+		t.Errorf("a failed launch = %q, %v after %d launches; want the error", got, err, launched)
 	}
 }
 

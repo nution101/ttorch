@@ -58,6 +58,37 @@ func (m *Manager) autoStartScheduler() {
 	}
 }
 
+// What StartScheduler did.
+const (
+	SchedulerStarted        = "started"         // the daemon was launched
+	SchedulerAlreadyRunning = "already_running" // a daemon holds the singleton lock
+	SchedulerDisabled       = "disabled"        // TTORCH_SCHEDULER_AUTOSTART is falsey
+	SchedulerNotInstalled   = "not_installed"   // no installed binary (paths.Binary) to launch
+)
+
+// StartScheduler is autoStartScheduler for a caller with no terminal to print to that needs the
+// outcome: the peer control channel's ensure-up, which restores a peer after a reboot and
+// reports back to its parent. It honours the same off-switch and singleton lock and launches
+// through the same launcher, and it names which of those applied. It also names the case the
+// auto-start passes over in silence, an installed binary that does not exist, because a peer
+// that never gets a scheduler is a peer nobody is driving. "started" means the launch
+// succeeded; the daemon re-checks the lock itself.
+func (m *Manager) StartScheduler() (string, error) {
+	if !schedulerAutoStartEnabled() {
+		return SchedulerDisabled, nil
+	}
+	if singleton.Held(m.P.SchedulerPIDFile()) {
+		return SchedulerAlreadyRunning, nil
+	}
+	if _, err := os.Stat(m.P.Binary()); err != nil {
+		return SchedulerNotInstalled, nil
+	}
+	if err := schedulerDaemonLauncher(m.P); err != nil {
+		return "", fmt.Errorf("starting the scheduler daemon: %w", err)
+	}
+	return SchedulerStarted, nil
+}
+
 // schedulerAutoStartEnabled reports whether StartManager should auto-start the scheduler daemon.
 // It DEFAULTS ON and is disabled only by an explicit falsey TTORCH_SCHEDULER_AUTOSTART
 // (0/false/no/off) — the documented off-switch for falling back to manual dispatch/land.
