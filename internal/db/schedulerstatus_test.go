@@ -104,8 +104,8 @@ func TestMigration0006SchedulerStatus(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t) // Open() already migrated to the latest
 
-	if v, err := s.schemaVersion(ctx); err != nil || v != 11 {
-		t.Fatalf("fresh DB version = %d err=%v, want 11", v, err)
+	if v, err := s.schemaVersion(ctx); err != nil || v != 12 {
+		t.Fatalf("fresh DB version = %d err=%v, want 12", v, err)
 	}
 	if !tableExists(t, s, "scheduler_status") {
 		t.Fatal("scheduler_status missing after up")
@@ -133,8 +133,8 @@ func TestMigration0006SchedulerStatus(t *testing.T) {
 	if err := s.Migrate(ctx); err != nil {
 		t.Fatalf("re-Migrate: %v", err)
 	}
-	if v, err := s.schemaVersion(ctx); err != nil || v != 11 {
-		t.Fatalf("after re-up: version=%d err=%v, want 11", v, err)
+	if v, err := s.schemaVersion(ctx); err != nil || v != 12 {
+		t.Fatalf("after re-up: version=%d err=%v, want 12", v, err)
 	}
 	if _, err := s.RecordSchedulerTick(ctx, SchedulerTick{At: time.Now()}); err != nil {
 		t.Errorf("scheduler_status unusable after re-up: %v", err)
