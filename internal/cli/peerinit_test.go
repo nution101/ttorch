@@ -195,8 +195,7 @@ func TestPeerInitProvisions(t *testing.T) {
 		t.Errorf("peer.env PATH = %q, want the default first", conf["PATH"])
 	}
 	for _, d := range filepath.SplitList(os.Getenv("PATH")) {
-		fi, err := os.Stat(d)
-		if filepath.IsAbs(d) && err == nil && fi.IsDir() && fi.Mode().Perm()&0o022 == 0 && !strings.Contains(conf["PATH"], d) {
+		if filepath.IsAbs(d) && peer.TrustedDir(d, os.Getuid()) == nil && !strings.Contains(conf["PATH"], d) {
 			t.Errorf("peer.env PATH %q lacks the session's %s", conf["PATH"], d)
 		}
 	}
@@ -328,6 +327,7 @@ func TestPeerInitRefusesBeforeWriting(t *testing.T) {
 // TestInitPath: a new peer.env's PATH is the channel's default, then the session's directories,
 // minus any that are relative, missing, already listed, or writable by someone else.
 func TestInitPath(t *testing.T) {
+	uid := os.Getuid()
 	u := peerUser{home: t.TempDir(), name: "p", ttorchHome: t.TempDir()}
 	mk := func(mode os.FileMode) string {
 		d := t.TempDir()
@@ -336,12 +336,35 @@ func TestInitPath(t *testing.T) {
 		}
 		return d
 	}
+	// sub makes a 0755 directory inside parent.
+	sub := func(parent string) string {
+		d := filepath.Join(parent, "bin")
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
 	tools, shared, group := mk(0o755), mk(0o777), mk(0o775)
+	// A private directory inside a world-writable one: whoever can write the parent can rename
+	// it away and put their own in its place. Inside a sticky one (/tmp) they cannot.
+	underShared, underSticky := sub(mk(0o777)), sub(mk(os.ModeSticky|0o777))
+	// A symlink to a good directory is as good as the directory its link lives in.
+	goodLink, badLink := filepath.Join(mk(0o755), "link"), filepath.Join(mk(0o777), "link")
+	for _, l := range []string{goodLink, badLink} {
+		if err := os.Symlink(tools, l); err != nil {
+			t.Fatal(err)
+		}
+	}
 	session := strings.Join([]string{
 		filepath.Join(t.TempDir(), "absent"), shared, "relative/bin", tools, group, tools, "/usr/bin",
+		underShared, underSticky, goodLink, badLink,
 	}, string(os.PathListSeparator))
-	want := defaultPeerPath(u) + string(os.PathListSeparator) + tools
-	if got := initPath(u, session); got != want {
+	want := strings.Join([]string{defaultPeerPath(u), tools, underSticky, goodLink}, string(os.PathListSeparator))
+	if got := initPath(u, session, uid); got != want {
 		t.Errorf("initPath =\n%s\nwant\n%s", got, want)
+	}
+	// Directories this account owns are someone else's to the account init writes for.
+	if got := initPath(u, tools, uid+1); got != defaultPeerPath(u) {
+		t.Errorf("initPath for another account = %s; want only the default", got)
 	}
 }

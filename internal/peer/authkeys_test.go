@@ -127,6 +127,106 @@ func TestServeBinary(t *testing.T) {
 	refused("in a world-writable directory", loose, uid, "writable")
 	dir := t.TempDir()
 	refused("a directory", dir, uid, "regular file")
+
+	// Every directory above the binary counts: one others can write could have the binary's own
+	// directory renamed away and replaced. A sticky one (/tmp) cannot, except as the binary's
+	// own directory, which must be writable by no one else at all.
+	nested := func(mode os.FileMode) string {
+		t.Helper()
+		parent := filepath.Join(t.TempDir(), "parent")
+		if err := os.Mkdir(parent, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(parent, mode); err != nil {
+			t.Fatal(err)
+		}
+		bin := filepath.Join(parent, "bin")
+		if err := os.Mkdir(bin, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(bin, "ttorch")
+		if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	refused("under a world-writable directory", nested(0o777), uid, "parent is writable")
+	refused("under a group-writable directory", nested(0o770), uid, "parent is writable")
+	if _, err := resolveServeBinary(nested(os.ModeSticky|0o777), uid); err != nil {
+		t.Errorf("under a sticky world-writable directory: %v", err)
+	}
+	sticky := mk(t, "ttorch", 0o755)
+	if err := os.Chmod(filepath.Dir(sticky), os.ModeSticky|0o777); err != nil {
+		t.Fatal(err)
+	}
+	refused("in a sticky world-writable directory", sticky, uid, "writable")
+}
+
+// TestTrustedDir: a directory, and every directory on the way to it, must be owned by the
+// account or root and writable by no one else, except that a sticky ancestor may be. A symlink
+// on the way is followed one hop at a time, so the directory holding each link is checked, and
+// so is ".." as the kernel resolves it, from the directory the link led to.
+func TestTrustedDir(t *testing.T) {
+	uid := os.Getuid()
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mkdir := func(path string, mode os.FileMode) string {
+		t.Helper()
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	good := mkdir(filepath.Join(base, "good"), 0o755)
+	open := mkdir(filepath.Join(base, "open"), 0o777)
+	sticky := mkdir(filepath.Join(base, "sticky"), os.ModeSticky|0o777)
+	underOpen := mkdir(filepath.Join(open, "bin"), 0o755)
+	underSticky := mkdir(filepath.Join(sticky, "bin"), 0o755)
+	inGood := mkdir(filepath.Join(good, "bin"), 0o755)
+	linkInOpen := filepath.Join(open, "link")
+	linkInGood := filepath.Join(good, "link")
+	for _, l := range []string{linkInOpen, linkInGood} {
+		if err := os.Symlink(inGood, l); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// good/up -> open/bin, so good/up/.. is open, as the kernel sees it, not good.
+	up := filepath.Join(good, "up")
+	if err := os.Symlink(underOpen, up); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(good, "file")
+	if err := os.WriteFile(file, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, ok := range []string{good, inGood, underSticky, linkInGood, "/"} {
+		if err := TrustedDir(ok, uid); err != nil {
+			t.Errorf("TrustedDir(%s) = %v", ok, err)
+		}
+	}
+	for _, c := range []struct{ label, path, want string }{
+		{"a world-writable directory", open, "writable"},
+		{"a sticky world-writable directory itself", sticky, "writable"},
+		{"under a world-writable directory", underOpen, "writable"},
+		{"a link in a world-writable directory", linkInOpen, "writable"},
+		{"dot-dot after a link into a world-writable directory", up + "/../bin", "writable"},
+		{"a file", file, "not a directory"},
+		{"missing", filepath.Join(good, "absent"), "absent"},
+		{"relative", "good", "absolute"},
+	} {
+		if err := TrustedDir(c.path, uid); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: TrustedDir(%s) = %v, want it to say %q", c.label, c.path, err, c.want)
+		}
+	}
+	if err := TrustedDir(good, uid+1); err == nil || !strings.Contains(err.Error(), "owned by") {
+		t.Errorf("another account's directory: %v", err)
+	}
 }
 
 // TestInstallControlKey appends the line once, creating ~/.ssh and authorized_keys private if

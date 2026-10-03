@@ -148,8 +148,8 @@ func ServeBinary(uid int) (string, error) {
 // command will name: absolute, with every symlink resolved, so self-update replacing the file at
 // that path keeps the line right. It refuses a path a shell would not read as one plain word, and
 // a binary that someone other than its owner could replace: it must be an executable regular
-// file owned by uid or by root, with no group or other write bit, in a directory with the same
-// owners and no group or other write bit.
+// file owned by uid or by root, with no group or other write bit, in a directory that passes
+// TrustedDir, so that no directory on the way to it can be written by anyone else either.
 func resolveServeBinary(exe string, uid int) (string, error) {
 	if !filepath.IsAbs(exe) {
 		return "", fmt.Errorf("the ttorch binary's path %q is not absolute", exe)
@@ -174,15 +174,95 @@ func resolveServeBinary(exe string, uid int) (string, error) {
 	if err := ownedBy(path, fi, uid, true); err != nil {
 		return "", err
 	}
-	dir := filepath.Dir(path)
-	di, err := os.Lstat(dir)
-	if err != nil {
-		return "", err
-	}
-	if err := ownedBy(dir, di, uid, true); err != nil {
+	if err := TrustedDir(filepath.Dir(path), uid); err != nil {
 		return "", err
 	}
 	return path, nil
+}
+
+// maxLinkHops bounds the symlinks TrustedDir follows for one path, as the kernel does.
+const maxLinkHops = 40
+
+// TrustedDir checks that no account but uid and root can change what the directory at path
+// holds. path must be absolute and lead to a directory owned by uid or root that its group and
+// others cannot write, and so must every directory on the way there: whoever can write one of
+// them can rename the next away and put their own in its place. An ancestor that others can
+// write is accepted only with the sticky bit set (/tmp), which keeps them from renaming or
+// removing an entry they do not own; path itself never is. The path is resolved one component at
+// a time, a symlink by reading it and resolving its target from the directory that holds it, and
+// ".." from the directory reached so far, as the kernel does, so the directory holding each link
+// is among those checked.
+func TrustedDir(path string, uid int) error {
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("the directory %q is not absolute", path)
+	}
+	rest := pathComponents(path)
+	cur, hops := "/", 0
+	for {
+		fi, err := os.Lstat(cur)
+		if err != nil {
+			return err
+		}
+		if !fi.IsDir() {
+			return fmt.Errorf("%s is not a directory", cur)
+		}
+		if err := ownedBy(cur, fi, uid, true); err != nil {
+			// A sticky ancestor others can write is fine; its owner still has to be uid or root.
+			if len(rest) == 0 || fi.Mode()&fs.ModeSticky == 0 || !ownerIs(fi, uid) {
+				return err
+			}
+		}
+		if len(rest) == 0 {
+			return nil
+		}
+		next, tail := rest[0], rest[1:]
+		switch next {
+		case ".":
+			rest = tail
+			continue
+		case "..":
+			cur, rest = filepath.Dir(cur), tail
+			continue
+		}
+		child := filepath.Join(cur, next)
+		li, err := os.Lstat(child)
+		if err != nil {
+			return err
+		}
+		if li.Mode()&fs.ModeSymlink == 0 {
+			cur, rest = child, tail
+			continue
+		}
+		if hops++; hops > maxLinkHops {
+			return fmt.Errorf("%s: more than %d symbolic links", path, maxLinkHops)
+		}
+		target, err := os.Readlink(child)
+		if err != nil {
+			return err
+		}
+		if filepath.IsAbs(target) {
+			cur = "/"
+		}
+		rest = append(pathComponents(target), tail...)
+	}
+}
+
+// pathComponents splits a slash-separated path into its non-empty components, keeping "." and
+// "..", which TrustedDir resolves itself.
+func pathComponents(p string) []string {
+	var out []string
+	for _, c := range strings.Split(p, "/") {
+		if c != "" {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// ownerIs reports whether fi is owned by uid or by root.
+func ownerIs(fi fs.FileInfo, uid int) bool {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	return ok && (int(st.Uid) == uid || st.Uid == 0)
 }
 
 // ownedBy reports why fi, the entry at path, is owned by neither uid nor (when rootToo) root, or

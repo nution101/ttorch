@@ -1155,28 +1155,32 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   `peer serve` does, so it writes the store, `peer.env` and `authorized_keys` the channel will
   read whatever `TTORCH_HOME` or `TTORCH_DB` the session has. It records the parent on the
   coordinator row (another parent is refused unless forced) and writes `peer.env` only if there
-  is none. A new one gets the channel's default PATH plus each session directory that exists and
-  that neither its group nor others can write, and the parent's model and effort settings.
+  is none. A new one gets the channel's default PATH plus each session directory that exists, is
+  owned by the account or root, and that no one else can write, nor any directory on the way to
+  it, and the parent's model and effort settings.
   Everything else `peer.env` may hold (the tmux session, the backend, limits, the switches that
   turn a safeguard off) describes one machine, so it is the peer operator's to add. An existing
   `peer.env` is kept, and refused here if the channel would refuse it. Only then does init append
   `command="<absolute path> peer serve --parent <parent>",restrict ssh-ed25519 <key>
   ttorch-peer-control:<parent>` to `~/.ssh/authorized_keys`. The path is the running binary with
   symlinks resolved, and must be a plain word to the shell, owned by the account or root, and
-  writable by no one else, nor
-  its directory. `~/.ssh` and the file are created private if missing, must be private
-  otherwise, and are never written through a symlink (the directory is opened once and the file
-  relative to it, each checked through its descriptor); the file is only appended to, and a key
-  already listed another way is refused. Running it again changes nothing. A forced init (adopt)
-  instead removes every other line that ends in a control key's comment, this key's older lines
-  included, keeping every other line byte for byte: the new contents go to a new 0600 file in
-  the same directory, which is synced and renamed over `authorized_keys` relative to the checked
-  descriptor, after checking the file is still the one read, unchanged (same file, size and
-  modification time). If something wrote it in between, the rewrite is dropped and refused, so
-  that write is not lost. The result names the parent each removed line was for. Each install
-  holds an exclusive `flock` on `~/.ssh` from the read to the write, so two inits at once take
-  turns instead of both appending the line or one renaming away the other's; the lock orders
-  ttorch's installs only, and another program's write is caught by the check above.
+  writable by no one else. So must its directory and every directory above it, except that an
+  ancestor others can write is accepted with the sticky bit (`/tmp`), since that keeps them from
+  renaming the entry below it. Symlinks on the way to a PATH directory are followed one at a
+  time, so the directory holding each link is checked too. `~/.ssh` and the file are created
+  private if missing, must be private otherwise, and are never written through a symlink (the
+  directory is opened once and the file relative to it, each checked through its descriptor);
+  the file is only appended to, and a key already listed another way is refused. Running it
+  again changes nothing. A forced init (adopt) instead removes every other line that ends in a
+  control key's comment, this key's older lines included, keeping every other line byte for
+  byte: the new contents go to a new 0600 file in the same directory, which is synced and
+  renamed over `authorized_keys` relative to the checked descriptor, after checking the file is
+  still the one read, unchanged (same file, size and modification time). If something wrote it
+  in between, the rewrite is dropped and refused, so that write is not lost. The result names
+  the parent each removed line was for. Each install holds an exclusive `flock` on `~/.ssh` from
+  the read to the write, so two inits at once take turns instead of both appending the line or
+  one renaming away the other's; the lock orders ttorch's installs only, and another program's
+  write is caught by the check above.
   `ttorch peer add <name> <control-dest>` is the parent's side, and the lead's command: it runs
   the same caller check as `ttorch approve` (no worker context, an interactive terminal) before
   it parses a flag or starts a process. It generates the control key with `ssh-keygen` (ed25519,

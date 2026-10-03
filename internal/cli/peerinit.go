@@ -91,7 +91,7 @@ func peerInit(ctx context.Context, stdin io.Reader) (peer.InitResult, error) {
 
 	envPath := filepath.Join(u.ttorchHome, peerEnvFile)
 	envState := "kept"
-	fresh := map[string]string{"PATH": initPath(u, os.Getenv("PATH"))}
+	fresh := map[string]string{"PATH": initPath(u, os.Getenv("PATH"), uid)}
 	for k, v := range req.Settings {
 		fresh[k] = v
 	}
@@ -170,10 +170,12 @@ func privateDir(dir string, uid int) error {
 // initPath is the PATH a new peer.env gets: the control channel's default (defaultPeerPath),
 // then each directory of this session's PATH it does not already hold. A claude installed under a
 // version manager or a custom prefix is on the lead's PATH and on none of the defaults. A session
-// directory is kept only if it is an absolute, printable path to an existing directory with no
-// group or other write bit: anyone who can write a PATH directory chooses which tmux, claude and
-// git the fleet runs, and a directory that does not exist yet is one someone else may create.
-func initPath(u peerUser, session string) string {
+// directory is kept only if it is an absolute, printable path to an existing directory that
+// peer.TrustedDir accepts for uid, the account peer.env is for: owned by it or root, and neither
+// it nor any directory on the way to it writable by anyone else. Anyone who can write a PATH
+// directory, or replace one, chooses which tmux, claude and git the fleet runs, and a directory
+// that does not exist yet is one someone else may create.
+func initPath(u peerUser, session string, uid int) string {
 	dirs := filepath.SplitList(defaultPeerPath(u))
 	seen := map[string]bool{}
 	for _, d := range dirs {
@@ -183,7 +185,7 @@ func initPath(u peerUser, session string) string {
 		if !filepath.IsAbs(d) || seen[d] || !utf8.ValidString(d) || strings.IndexFunc(d, func(r rune) bool { return !unicode.IsGraphic(r) }) >= 0 {
 			continue
 		}
-		if fi, err := os.Stat(d); err != nil || !fi.IsDir() || fi.Mode().Perm()&0o022 != 0 {
+		if peer.TrustedDir(d, uid) != nil {
 			continue
 		}
 		seen[d] = true
