@@ -450,6 +450,7 @@ once if it touches any covered path.
 | `go.work` | 0 | +0 |
 | `go.work.sum` | 0 | +0 |
 | `internal/approval/` | 6 | +0 |
+| `internal/cli/peerinit.go` | 0 | +0 |
 | `internal/cli/peerserve.go` | 0 | +0 |
 | `internal/installer/` | 5 | +1 |
 | `internal/orchestrator/audit.go` | 1 | +0 |
@@ -462,6 +463,7 @@ once if it touches any covered path.
 | `internal/orchestrator/validate.go` | 2 | +0 |
 | `internal/orchestrator/validatecache.go` | 1 | +0 |
 | `internal/orchestrator/workdir.go` | 0 | +0 |
+| `internal/peer/authkeys.go` | 0 | +0 |
 | `internal/peer/serve.go` | 0 | +0 |
 | `internal/projectinit/` | 9 | +3 |
 | `internal/review/` | 7 | +4 |
