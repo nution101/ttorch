@@ -167,6 +167,12 @@ var ttorchSourceFiles = []string{
 	// verb added to it would widen what that key reaches, so the change needs
 	// --allow-gate-change. The rest of internal/peer only reads.
 	"internal/peer/serve.go",
+	// peerserve.go wires those verbs to what they act on (the store, the task add core,
+	// ensure-up's Resume and scheduler start) and builds the environment the channel and
+	// everything ensure-up starts run with. Covering only the verb names would let a change here
+	// make an existing verb reach Approve or MergeLocal, or hand the session's environment back to
+	// the processes ensure-up starts, with no flag. The rest of internal/cli stays uncovered.
+	"internal/cli/peerserve.go",
 	// The gate's own proofs. Without these, the backstop can be deleted in the same merge
 	// as the attack it would catch: TestTtorchRepoIsScopedIn goes red on a .gitattributes
 	// that un-scopes the repo, but a diff that adds the attribute AND deletes the test

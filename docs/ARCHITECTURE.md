@@ -450,6 +450,7 @@ once if it touches any covered path.
 | `go.work` | 0 | +0 |
 | `go.work.sum` | 0 | +0 |
 | `internal/approval/` | 6 | +0 |
+| `internal/cli/peerserve.go` | 0 | +0 |
 | `internal/installer/` | 5 | +1 |
 | `internal/orchestrator/audit.go` | 1 | +0 |
 | `internal/orchestrator/defaultbranch.go` | 0 | +0 |

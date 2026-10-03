@@ -2021,6 +2021,11 @@ func TestMatchesGateConfig(t *testing.T) {
 		// key can do on a peer. The rest of the package only reads.
 		{"the peer control channel", "internal/peer/serve.go", true},
 		{"the peer summary", "internal/peer/summary.go", false},
+		// What each verb reaches (the store, the task add core, ensure-up) and the environment it
+		// runs with are wired here, so a change to what a verb does is covered too. The rest of
+		// internal/cli is not.
+		{"the control channel's wiring", "internal/cli/peerserve.go", true},
+		{"the rest of the cli", "internal/cli/cli.go", false},
 		{"a project-level reviewer definition", ".claude/agents/ttorch-reviewer-security.md", true},
 		{"project-level MCP servers", ".mcp.json", true},
 		{"a nested instruction file", "internal/orchestrator/CLAUDE.md", true},
