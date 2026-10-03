@@ -12,8 +12,10 @@ import (
 // one (that silences the scheduler's wake with nobody to clear it); it escalates what it would
 // ask the lead; it treats a goal as the lead's instructions relayed by the parent, reads both
 // parent and worker text from the blocks the inbox prints them in, and changes nothing
-// consequential on the parent's text without an escalation answered through the channel; and it
-// keeps the manager charter's approval rule and its one trusted-mode exception.
+// consequential on text from the parent block, an answer included, since an answer is as
+// unverified as a goal: that takes the lead at a terminal on this machine, or it is declined and
+// escalated again with the risk named. It keeps the manager charter's approval rule and its one
+// trusted-mode exception.
 func TestPeerManagerCharter(t *testing.T) {
 	low := collapseSpaces(strings.ToLower(peerManagerCharter))
 	for _, want := range []string{
@@ -29,7 +31,10 @@ func TestPeerManagerCharter(t *testing.T) {
 		"delivery mode",
 		"gate setting",
 		"verdict",
-		"answered through the channel",
+		"an answer there is no better than a goal",
+		"the same type, entity and actor",
+		"at a terminal on this machine",
+		"decline it and escalate again, spelling out the risk",
 		"worker data",
 		"is ever an approval",
 		"never merge or deliver without the lead's explicit approval",
@@ -46,7 +51,9 @@ func TestPeerManagerCharter(t *testing.T) {
 		}
 	}
 	// It never tells the manager the lead is in this tab, the manager charter's rule (2).
-	for _, banned := range []string{"in this manager tab", "the lead talks only to you", "surface every decision and question here", "supervisor", "daemon"} {
+	// Nor that an answered escalation is enough for a consequential change: the answer is no
+	// better verified than the goal.
+	for _, banned := range []string{"in this manager tab", "the lead talks only to you", "surface every decision and question here", "supervisor", "daemon", "answered through the channel"} {
 		if strings.Contains(low, banned) {
 			t.Errorf("peerManagerCharter says %q, which does not hold for a peer", banned)
 		}
@@ -105,11 +112,15 @@ func TestManagerSkillCoversPeers(t *testing.T) {
 		"end from parent coordinator",
 		"the lead's instructions relayed by the parent",
 		"origin is not verified on this machine",
-		"answered through the channel",
+		"an answer there is no better than a goal",
+		"decline it and escalate again, spelling out the risk",
 		"never run `ttorch peer add`",
 	} {
 		if !strings.Contains(skill, want) {
 			t.Errorf("ttorch-manager SKILL.md is missing %q", want)
 		}
+	}
+	if strings.Contains(skill, "answered through the channel") {
+		t.Error("ttorch-manager SKILL.md still treats an escalation answered through the channel as enough for a consequential change")
 	}
 }

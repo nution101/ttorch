@@ -1245,8 +1245,11 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   and never runs `ttorch await-lead`, which would silence the scheduler's wake with nobody to
   clear it; that it raises with `ttorch escalate` whatever it would ask the lead; and that it
   treats a goal in the `FROM PARENT COORDINATOR` block as the lead's instructions relayed by the
-  parent, whose origin is not verified, so it changes no delivery mode, gate setting or verdict
-  on that text without an escalation answered through the channel. The peer charter is passed
+  parent, whose origin is not verified. An answer in that block is no better: it carries the same
+  type, entity and actor a same-user process could forge, so answering an escalation verifies
+  nothing. The manager changes no delivery mode, gate setting or verdict on text from that block;
+  such a change needs the lead's own action at a terminal on the peer, or the manager declines it
+  and escalates again with the risk spelled out. The peer charter is passed
   only as a file: when it cannot be written, or the row cannot be read, the peer's manager is
   not launched and the restore says why, where a root's falls back to the inline manager
   charter.
