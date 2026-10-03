@@ -1135,7 +1135,10 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   `TTORCH_VALIDATE_CACHE_DIR` and `TTORCH_CLAUDE_JSON`, nor a task identity or
   `TTORCH_WORKER_TABS`, which is always 0), and PATH falls back to a fixed default. A test reads
   every `TTORCH_*` name in the code and the installed content and fails on one that is neither
-  refused nor listed as a setting peer.env may hold. A malformed `peer.env` refuses every verb.
+  refused nor listed as a setting peer.env may hold. `peer.env` is read only from a regular
+  file the account owns and no one else can write, opened with `O_NOFOLLOW` and checked with
+  `fstat`, in a ttorch home that is not a symlink and has the same owner and mode. A malformed
+  or unsafe `peer.env` refuses every verb.
 
 Migrations, in order: **0001** initial hierarchy + events + manager singleton; **0002**
 durable verdicts; **0003** task leases + the terminal `failed` status; **0004** the

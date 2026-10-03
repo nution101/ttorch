@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -81,7 +82,9 @@ func currentAccount() (peerUser, error) {
 }
 
 // peerEnvFile is the peer's own configuration for the control channel, in the ttorch home. Only
-// a process running as the peer's user writes it; the parent has no verb that can.
+// a process running as the peer's user writes it; the parent has no verb that can. It is read
+// only from a regular file that account owns and no one else can write, in a ttorch home that is
+// not a symlink and has the same owner and mode (readPeerEnv).
 const peerEnvFile = "peer.env"
 
 // maxPeerEnv bounds peer.env. It holds a handful of settings.
@@ -138,7 +141,7 @@ func peerControlEnv() (paths.Paths, error) {
 	if err := ownedDir(u.home, false); err != nil {
 		return paths.Paths{}, fmt.Errorf("home directory %s: %w", u.home, err)
 	}
-	conf, err := readPeerEnv(filepath.Join(u.ttorchHome, peerEnvFile))
+	conf, err := readPeerEnv(u.ttorchHome, os.Getuid())
 	if err != nil {
 		return paths.Paths{}, err
 	}
@@ -177,16 +180,36 @@ func defaultPeerPath(u peerUser) string {
 	}, string(os.PathListSeparator))
 }
 
-// readPeerEnv reads peer.env: KEY=VALUE lines, with blank lines and # comments ignored. A key is
-// PATH or TTORCH_ followed by capitals, digits and underscores, and not one of peerEnvRefused; a
-// value is the rest of the line as written, printable, with no quoting or expansion. A missing
-// file sets nothing. Anything else in it is refused, line named, rather than half-applied.
-func readPeerEnv(path string) (map[string]string, error) {
+// readPeerEnv reads peer.env from the ttorch home: KEY=VALUE lines, with blank lines and #
+// comments ignored. A key is PATH or TTORCH_ followed by capitals, digits and underscores, and not
+// one of peerEnvRefused; a value is the rest of the line as written, printable, with no quoting or
+// expansion. A missing ttorch home or peer.env sets nothing. Anything else in it is refused, line
+// named, rather than half-applied.
+//
+// peer.env sets the PATH and TTORCH_* settings of everything ensure-up starts, so where it comes
+// from matters as much as what it says. The ttorch home must be a directory, not a symlink, owned
+// by uid and writable by no one else, and peer.env a regular file with the same owner and mode
+// (openPeerEnv). A file another account can write, or one a link points somewhere else, is
+// refused rather than read. uid is the account the channel runs as; tests pass another one.
+func readPeerEnv(ttorchHome string, uid int) (map[string]string, error) {
 	out := map[string]string{}
-	b, err := readCapped(path, maxPeerEnv+1)
+	fi, err := os.Lstat(ttorchHome)
 	if os.IsNotExist(err) {
 		return out, nil
 	}
+	if err != nil {
+		return nil, err
+	}
+	if err := privateEntry(ttorchHome, fi, uid, true); err != nil {
+		return nil, err
+	}
+	path := filepath.Join(ttorchHome, peerEnvFile)
+	f, err := openPeerEnv(path, uid)
+	if err != nil || f == nil {
+		return out, err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, maxPeerEnv+1))
 	if err != nil {
 		return nil, err
 	}
@@ -209,6 +232,58 @@ func readPeerEnv(path string) (map[string]string, error) {
 		out[k] = v
 	}
 	return out, nil
+}
+
+// openPeerEnv opens peer.env without following a symlink in its last component, and checks the
+// file it got (fstat, not a second lookup by name): a regular file uid owns that no one else can
+// write. It opens non-blocking, so a fifo is refused rather than waited on. A missing file is
+// (nil, nil).
+func openPeerEnv(path string, uid int) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil, nil
+	case errors.Is(err, syscall.ELOOP):
+		return nil, fmt.Errorf("%s is a symbolic link; peer.env must be a regular file this account owns that no one else can write", path)
+	case err != nil:
+		return nil, err
+	}
+	fi, err := f.Stat()
+	if err == nil {
+		err = privateEntry(path, fi, uid, false)
+	}
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+// privateEntry reports why fi, the entry at path, is not a directory (dir set) or a regular file
+// (dir unset) owned by uid with no group or other write bit. fi comes from Lstat or fstat, so a
+// symlink is seen as one.
+func privateEntry(path string, fi fs.FileInfo, uid int, dir bool) error {
+	kind := "a regular file"
+	if dir {
+		kind = "a directory"
+	}
+	switch {
+	case fi.Mode()&fs.ModeSymlink != 0:
+		return fmt.Errorf("%s is a symbolic link; it must be %s this account owns that no one else can write", path, kind)
+	case dir && !fi.IsDir(), !dir && !fi.Mode().IsRegular():
+		return fmt.Errorf("%s is not %s", path, kind)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("%s: its owner cannot be read", path)
+	}
+	if int(st.Uid) != uid {
+		return fmt.Errorf("%s is owned by uid %d, not by this account (uid %d)", path, st.Uid, uid)
+	}
+	if fi.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("%s is writable by its group or by others (mode %s); it must be writable only by this account", path, fi.Mode().Perm())
+	}
+	return nil
 }
 
 func peerEnvKey(k string) bool {

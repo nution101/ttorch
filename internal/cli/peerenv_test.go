@@ -7,7 +7,11 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
+
+	"github.com/nution101/ttorch/internal/peer"
 )
 
 // peerEnvSettings are the TTORCH_* variables peer.env may set: settings that tune how the fleet
@@ -30,7 +34,8 @@ var peerEnvSettings = []string{
 // TestPeerEnvRefusesEveryPathOverride: peer.env may not move anything ttorch reads or writes.
 // Each path override is refused, the validate cache and claude's config file included.
 func TestPeerEnvRefusesEveryPathOverride(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "peer.env")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "peer.env")
 	for _, k := range []string{
 		"TTORCH_HOME", "TTORCH_DB", "TTORCH_CLAUDE_DIR", "TTORCH_AGENTS_DIR", "TTORCH_BIN_DIR",
 		"TTORCH_VALIDATE_CACHE_DIR", "TTORCH_CLAUDE_JSON",
@@ -38,7 +43,7 @@ func TestPeerEnvRefusesEveryPathOverride(t *testing.T) {
 		if err := os.WriteFile(path, []byte(k+"=/elsewhere\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if got, err := readPeerEnv(path); err == nil {
+		if got, err := readPeerEnv(dir, os.Getuid()); err == nil {
 			t.Errorf("peer.env setting %s was accepted: %v", k, got)
 		}
 	}
@@ -133,5 +138,169 @@ func TestPeerEnvClassifiesEveryVariable(t *testing.T) {
 		if _, ok := found[k]; !ok {
 			t.Errorf("peerEnvRefused lists %s, which nothing reads any more", k)
 		}
+	}
+}
+
+// TestPeerEnvRefusesWhatAnotherAccountCouldWrite: peer.env decides the PATH and the settings of
+// every process the control channel starts, so it is read only from a regular file the account
+// owns that no one else can write, in a ttorch home with the same properties. A symlink is refused
+// at either level (peer.env is opened with O_NOFOLLOW), and so is anything that is not a regular
+// file. A missing ttorch home or peer.env sets nothing.
+func TestPeerEnvRefusesWhatAnotherAccountCouldWrite(t *testing.T) {
+	uid := os.Getuid()
+	other := uid + 1
+	good := func(t *testing.T) (dir, path string) {
+		t.Helper()
+		dir = t.TempDir()
+		if err := os.Chmod(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		path = filepath.Join(dir, peerEnvFile)
+		if err := os.WriteFile(path, []byte("TTORCH_MODEL=opus\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := readPeerEnv(dir, uid); err != nil || got["TTORCH_MODEL"] != "opus" {
+			t.Fatalf("a private peer.env = %v, %v; want it read", got, err)
+		}
+		return dir, path
+	}
+	refused := func(t *testing.T, label, dir string, uid int, want string) {
+		t.Helper()
+		got, err := readPeerEnv(dir, uid)
+		if err == nil {
+			t.Errorf("%s: read %v, want it refused", label, got)
+			return
+		}
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: refused with %q, want it to say %q", label, err, want)
+		}
+	}
+
+	for _, mode := range []os.FileMode{0o620, 0o602, 0o666} {
+		dir, path := good(t)
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+		refused(t, "peer.env mode "+mode.String(), dir, uid, "writable by")
+	}
+
+	dir, path := good(t)
+	target := filepath.Join(t.TempDir(), "elsewhere.env")
+	if err := os.WriteFile(target, []byte("TTORCH_MODEL=opus\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+	refused(t, "peer.env a symlink to a private file", dir, uid, "symbolic link")
+	if err := os.Remove(target); err != nil {
+		t.Fatal(err)
+	}
+	refused(t, "peer.env a dangling symlink", dir, uid, "symbolic link")
+
+	dir, path = good(t)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		refused(t, "peer.env a fifo", dir, uid, "not a regular file")
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("reading a fifo peer.env blocked")
+	}
+
+	dir, path = good(t)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	refused(t, "peer.env a directory", dir, uid, "not a regular file")
+
+	// Another account's file. Making one needs root, so the owner the check expects is moved
+	// instead: openPeerEnv is what readPeerEnv opens peer.env with, after the home has passed.
+	_, path = good(t)
+	if f, err := openPeerEnv(path, other); err == nil {
+		f.Close()
+		t.Error("a peer.env another account owns was opened")
+	} else if !strings.Contains(err.Error(), "owned by") {
+		t.Errorf("a peer.env another account owns: %v, want it to say who owns it", err)
+	}
+
+	// The ttorch home: a symlink, writable by others, or another account's.
+	dir, _ = good(t)
+	link := filepath.Join(t.TempDir(), "ttorch-link")
+	if err := os.Symlink(dir, link); err != nil {
+		t.Fatal(err)
+	}
+	refused(t, "ttorch home a symlink", link, uid, "symbolic link")
+	for _, mode := range []os.FileMode{0o770, 0o707, 0o777} {
+		dir, _ := good(t)
+		if err := os.Chmod(dir, mode); err != nil {
+			t.Fatal(err)
+		}
+		refused(t, "ttorch home mode "+mode.String(), dir, uid, "writable by")
+	}
+	dir, _ = good(t)
+	refused(t, "ttorch home another account's", dir, other, "owned by")
+
+	// Nothing there sets nothing.
+	if got, err := readPeerEnv(filepath.Join(t.TempDir(), "absent"), uid); err != nil || len(got) != 0 {
+		t.Errorf("a missing ttorch home = %v, %v; want nothing set", got, err)
+	}
+	dir, path = good(t)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := readPeerEnv(dir, uid); err != nil || len(got) != 0 {
+		t.Errorf("a missing peer.env = %v, %v; want nothing set", got, err)
+	}
+}
+
+// TestPeerServeRefusesAnUnsafePeerEnv: through the binary, a peer.env that is a symlink or that
+// another account could write refuses every verb as unavailable, before the store is opened.
+func TestPeerServeRefusesAnUnsafePeerEnv(t *testing.T) {
+	h := newServeHome(t)
+	path := filepath.Join(h.home, peerEnvFile)
+	if err := os.Chmod(path, 0o660); err != nil {
+		t.Fatal(err)
+	}
+	s := serveRun(t, h, "version", "")
+	s.refused(t, "a group-writable peer.env", peer.CodeUnavailable)
+	if s.resp.Error != nil && !strings.Contains(s.resp.Error.Message, "writable by") {
+		t.Errorf("the refusal %q does not say why", s.resp.Error.Message)
+	}
+
+	h = newServeHome(t)
+	path = filepath.Join(h.home, peerEnvFile)
+	target := filepath.Join(t.TempDir(), "peer.env")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+	serveRun(t, h, "summary", "").refused(t, "a symlinked peer.env", peer.CodeUnavailable)
+	serveRun(t, h, "goal", parentBody(`{"request_id":"g1","text":"x"}`)).refused(t, "a symlinked peer.env", peer.CodeUnavailable)
+	if evs := managerEventsIn(t, h.store(t)); len(evs) != 0 {
+		t.Errorf("a refused goal appended %d events", len(evs))
 	}
 }

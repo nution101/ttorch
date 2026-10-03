@@ -644,7 +644,7 @@ func TestPeerServeEnsureUpPassesOnlyItsOwnEnvironment(t *testing.T) {
 func TestPeerEnvFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "peer.env")
-	if got, err := readPeerEnv(path); err != nil || len(got) != 0 {
+	if got, err := readPeerEnv(dir, os.Getuid()); err != nil || len(got) != 0 {
 		t.Fatalf("a missing file = %v, %v; want nothing set", got, err)
 	}
 	write := func(body string) {
@@ -654,7 +654,7 @@ func TestPeerEnvFile(t *testing.T) {
 		}
 	}
 	write("# peer settings\n\nPATH=/opt/x/bin:/usr/bin\nTTORCH_MODEL=opus\nTTORCH_TMUX_SESSION=peer b\n  # indented comment\n")
-	got, err := readPeerEnv(path)
+	got, err := readPeerEnv(dir, os.Getuid())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -668,12 +668,12 @@ func TestPeerEnvFile(t *testing.T) {
 		"TTORCH_MODEL=a\rb", "export TTORCH_MODEL=opus",
 	} {
 		write("TTORCH_MODEL=opus\n" + bad + "\n")
-		if got, err := readPeerEnv(path); err == nil || !strings.Contains(err.Error(), "line 2") {
+		if got, err := readPeerEnv(dir, os.Getuid()); err == nil || !strings.Contains(err.Error(), "line 2") {
 			t.Errorf("%q: readPeerEnv = %v, %v; want it refused at line 2", bad, got, err)
 		}
 	}
 	write("PATH=" + strings.Repeat("p", maxPeerEnv))
-	if _, err := readPeerEnv(path); err == nil {
+	if _, err := readPeerEnv(dir, os.Getuid()); err == nil {
 		t.Error("an oversize peer.env was read")
 	}
 }
