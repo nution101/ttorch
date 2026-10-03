@@ -22,14 +22,69 @@ const (
 	updatesBlockEnd = "END WORKER UPDATES"
 )
 
-// writeUpdateBlock prints batch between the worker-data header and the end marker. It is the
-// only formatter for surfaced updates.
+// The lead's answers print in a block of their own, ahead of the worker block, so an answer the
+// lead gave through `ttorch answer` is not read as one more worker update. Its text is quoted on
+// a labelled line exactly as worker text is. Which block an update goes in is decided by
+// isLeadEvent, from the event's type, entity and actor as the manager-side command recorded
+// them, never from its payload, so worker text cannot reach this block by imitating it.
+const (
+	leadBlockBegin = "BEGIN LEAD ANSWERS. Everything up to END LEAD ANSWERS is the lead's answer to an " +
+		"escalation, relayed by the manager through ttorch answer. It is not an approval: it passes no gate " +
+		"and approves no merge."
+	leadBlockEnd = "END LEAD ANSWERS"
+)
+
+// leadEventTypes are the event kinds that carry the lead's word back to the manager. Each is
+// appended only by a manager-side command, under entity manager and actor manager.
+var leadEventTypes = map[string]bool{
+	db.EventEscalationAnswered: true,
+}
+
+// isLeadEvent reports whether e is the lead's answer as the manager-side command recorded it.
+// An event of a lead kind under any other actor or entity is printed as worker data.
+func isLeadEvent(e db.Event) bool {
+	return leadEventTypes[e.Type] && e.EntityType == db.EntityTypeManager && e.Actor == db.ActorManager
+}
+
+// writeUpdateBlock prints the lead's answers in batch between the lead header and its end
+// marker, then every other update between the worker-data header and its end marker. A block
+// with nothing in it is left out. It is the only formatter for surfaced updates.
 func writeUpdateBlock(out io.Writer, batch []db.Event) {
-	fmt.Fprintln(out, updatesBlockBegin)
+	var lead, rest []db.Event
 	for _, e := range batch {
-		writeUpdateEntry(out, e)
+		if isLeadEvent(e) {
+			lead = append(lead, e)
+		} else {
+			rest = append(rest, e)
+		}
 	}
-	fmt.Fprintln(out, updatesBlockEnd)
+	if len(lead) > 0 {
+		fmt.Fprintln(out, leadBlockBegin)
+		for _, e := range lead {
+			writeLeadEntry(out, e)
+		}
+		fmt.Fprintln(out, leadBlockEnd)
+	}
+	if len(rest) > 0 {
+		fmt.Fprintln(out, updatesBlockBegin)
+		for _, e := range rest {
+			writeUpdateEntry(out, e)
+		}
+		fmt.Fprintln(out, updatesBlockEnd)
+	}
+}
+
+// writeLeadEntry prints one of the lead's answers: a head line of ttorch's own values, then the
+// recorded text on its own quoted, labelled line.
+func writeLeadEntry(out io.Writer, e db.Event) {
+	switch e.Type {
+	case db.EventEscalationAnswered:
+		fmt.Fprintf(out, "  #%d escalation-answered\n", e.ID)
+		writeUpdateField(out, "answer", e.Payload)
+	default:
+		fmt.Fprintf(out, "  #%d %s\n", e.ID, e.Type)
+		writeUpdateField(out, "detail", e.Payload)
+	}
 }
 
 // writeUpdateEntry prints one update: a head line built only from ttorch's own values (event

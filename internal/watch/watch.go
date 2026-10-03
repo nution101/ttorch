@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -657,13 +658,18 @@ func (w *Watcher) setLiveness(ctx context.Context, t db.Task, paneHash string, s
 // blocked → active → done surfaces a single → done line, never a stale → blocked
 // alongside it. agent_exited is deduplicated on its own key, so it neither displaces nor
 // is displaced by the entity's other events: like the liveness gate, it must not mask
-// them. The result is ordered by id ascending for a stable batch.
+// them. Each of the lead's answers is its own decision, so it is keyed on its own id: two
+// answers in one batch both surface, and an answer and the watchdog's re-poke, which share the
+// manager entity, never hide each other. The result is ordered by id ascending for a stable batch.
 func dedupeByEntity(rows []db.Event) []db.Event {
 	best := make(map[string]db.Event, len(rows))
 	for _, e := range rows {
 		key := e.EntityID
-		if e.Type == db.EventAgentExited {
+		switch {
+		case e.Type == db.EventAgentExited:
 			key += "\x00" + db.EventAgentExited
+		case isLeadEvent(e):
+			key += "\x00lead\x00" + strconv.FormatInt(e.ID, 10)
 		}
 		if cur, ok := best[key]; !ok || e.ID > cur.ID {
 			best[key] = e
