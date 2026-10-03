@@ -1119,6 +1119,15 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   gates or reaches a worker, and `internal/peer/serve.go` is in the covered set, so adding one
   is a gate change. A worker context is refused; like the escalation commands' refusal, that
   guards against accidents and is not a boundary.
+  Before anything else, `peer serve` replaces its environment, because the ssh session's is
+  the client's to shape (whatever the peer's `AcceptEnv` admits) and ensure-up hands it to the
+  tmux server and the scheduler daemon. HOME and USER come from the user database, the store is
+  always `<home>/.ttorch`, LANG is fixed, no `LC_*`, `GIT_*`, `SSH_*` or other session variable
+  survives, SHELL is kept only if `/etc/shells` lists it and TMPDIR only if the account owns it
+  and no one else can write it. PATH and the `TTORCH_*` settings come from the peer's own
+  `~/.ttorch/peer.env` (`KEY=VALUE` lines; it may not set `TTORCH_HOME`, `TTORCH_DB`, the other
+  path overrides, a task identity or `TTORCH_WORKER_TABS`, which is always 0), and PATH falls
+  back to a fixed default. A malformed `peer.env` refuses every verb.
 
 Migrations, in order: **0001** initial hierarchy + events + manager singleton; **0002**
 durable verdicts; **0003** task leases + the terminal `failed` status; **0004** the

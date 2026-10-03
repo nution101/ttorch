@@ -10,8 +10,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nution101/ttorch/internal/db"
 	"github.com/nution101/ttorch/internal/paths"
@@ -24,16 +26,21 @@ import (
 // is the function cmd/ttorch's main calls, so what runs is the CLI's own dispatch with its own
 // environment, working directory and file descriptors.
 
-// serveHome is one machine's ttorch home for the served process.
+// serveHome is one peer account for the served process. account is the user's home directory
+// and home the ttorch home, which the served process takes from peerAccount (set from
+// testPeerHomeEnv and testPeerTtorchEnv in TestMain), never from the session's environment.
+// peer.env in the ttorch home is the peer's own configuration. In production the ttorch home is
+// <account>/.ttorch; here it is a separate temp dir, because the store's test guard refuses
+// anything under $HOME/.ttorch and the served process sets HOME to the account.
 type serveHome struct {
-	home, db, dir string
-	extraEnv      []string
+	account, home, db, dir string
+	extraEnv               []string
 }
 
 func newServeHome(t *testing.T) serveHome {
 	t.Helper()
-	home := t.TempDir()
-	h := serveHome{home: home, db: filepath.Join(home, "state.db"), dir: t.TempDir()}
+	account, home := t.TempDir(), t.TempDir()
+	h := serveHome{account: account, home: home, db: filepath.Join(home, "state.db"), dir: t.TempDir()}
 	s, err := db.Open(h.db)
 	if err != nil {
 		t.Fatal(err)
@@ -41,7 +48,22 @@ func newServeHome(t *testing.T) serveHome {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
+	h.writePeerEnv(t,
+		"PATH="+os.Getenv("PATH"),
+		// A session name of its own, so the summary's window checks never read a real fleet.
+		"TTORCH_TMUX_SESSION=ttorch-serve-test-"+filepath.Base(account),
+		"TTORCH_SCHEDULER_AUTOSTART=0",
+	)
 	return h
+}
+
+// writePeerEnv replaces the peer's own configuration file with lines.
+func (h serveHome) writePeerEnv(t *testing.T, lines ...string) {
+	t.Helper()
+	body := "# written by the test\n\n" + strings.Join(lines, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(h.home, "peer.env"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func (h serveHome) store(t *testing.T) *db.Store {
@@ -64,16 +86,14 @@ func serveRun(t *testing.T, h serveHome, command, body string, args ...string) s
 	t.Helper()
 	cmd := exec.Command(os.Args[0], append([]string{"peer", "serve"}, args...)...)
 	cmd.Dir = h.dir
+	// HOME and PATH are what sshd would set; the served process replaces both (see
+	// peerControlEnv), so the test's own values must not be what makes it work.
 	cmd.Env = append([]string{
 		runMainEnv + "=1",
+		testPeerHomeEnv + "=" + h.account,
+		testPeerTtorchEnv + "=" + h.home,
 		"SSH_ORIGINAL_COMMAND=" + command,
-		"TTORCH_HOME=" + h.home,
-		"TTORCH_DB=" + h.db,
-		"TTORCH_WORKER_TABS=0",
-		"TTORCH_SCHEDULER_AUTOSTART=0",
-		// A session name of its own, so the summary's window checks never read a real fleet.
-		"TTORCH_TMUX_SESSION=ttorch-serve-test-" + filepath.Base(h.home),
-		"HOME=" + h.home,
+		"HOME=" + h.account,
 		"PATH=" + os.Getenv("PATH"),
 	}, h.extraEnv...)
 	cmd.Stdin = strings.NewReader(body)
@@ -443,4 +463,263 @@ func TestPeerServeGoalAnswerDecisions(t *testing.T) {
 func TestPeerServeEnsureUpNeedsAManager(t *testing.T) {
 	h := newServeHome(t)
 	serveRun(t, h, "ensure-up", "").refused(t, "ensure-up with no manager", peer.CodeNoManager)
+}
+
+// envDump reads a file `env` wrote: one KEY=VALUE per line.
+func envDump(t *testing.T, path string) map[string]string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]string{}
+	for _, line := range strings.Split(string(b), "\n") {
+		if k, v, ok := strings.Cut(line, "="); ok {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// TestPeerServeEnsureUpPassesOnlyItsOwnEnvironment runs ensure-up from a session whose
+// environment carries what an sshd AcceptEnv could let a client send: locale variables, ttorch
+// path overrides, git variables, ssh session variables, a shell and a temp dir of its choosing.
+// ensure-up starts tmux (the server every restored window and worker inherits from) and the
+// scheduler daemon. A fake tmux on the peer's PATH and a fake installed ttorch record the
+// environment each was started with, and neither may see any of it. The store and paths come
+// from the account's home, so a session TTORCH_HOME or TTORCH_DB steers nothing.
+func TestPeerServeEnsureUpPassesOnlyItsOwnEnvironment(t *testing.T) {
+	ctx := context.Background()
+	h := newServeHome(t)
+	dumps := t.TempDir()
+
+	fakeBin := t.TempDir()
+	tmuxScript := "#!/bin/sh\nenv > \"" + dumps + "/tmux.$$.env\"\n" +
+		"case \"$1\" in\n-V) echo 'tmux 3.5a' ;;\nhas-session) exit 1 ;;\nesac\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(fakeBin, "tmux"), []byte(tmuxScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// StartScheduler forks the installed binary, paths.Binary under the ttorch home.
+	if err := os.MkdirAll(filepath.Join(h.home, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	daemon := "#!/bin/sh\nenv > \"" + dumps + "/scheduler.env.tmp\" && mv \"" + dumps + "/scheduler.env.tmp\" \"" + dumps + "/scheduler.env\"\n"
+	if err := os.WriteFile(filepath.Join(h.home, "bin", "ttorch"), []byte(daemon), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	session := "ttorch-serve-env-" + filepath.Base(h.account)
+	peerPath := fakeBin + ":/usr/bin:/bin"
+	h.writePeerEnv(t, "PATH="+peerPath, "TTORCH_TMUX_SESSION="+session, "TTORCH_MODEL=opus")
+	if err := h.store(t).SetManager(ctx, db.Manager{Dir: h.dir, SessionID: "sid-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The decoy is a second, complete ttorch home with no manager recorded: if the session's
+	// TTORCH_HOME or TTORCH_DB were honoured, ensure-up would read it and refuse.
+	decoy := newServeHome(t)
+	evilShell := filepath.Join(dumps, "evil-shell")
+	if err := os.WriteFile(evilShell, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hostile := map[string]string{
+		"LC_ALL":            "hostile-lc-all",
+		"LC_CTYPE":          "hostile-lc-ctype",
+		"LANG":              "hostile-lang",
+		"TTORCH_HOME":       decoy.home,
+		"TTORCH_DB":         decoy.db,
+		"TTORCH_MODEL":      "hostile-model",
+		"TTORCH_BACKEND":    "hostile-backend",
+		"GIT_DIR":           filepath.Join(dumps, "hostile-git"),
+		"GIT_CONFIG_GLOBAL": filepath.Join(dumps, "hostile-gitconfig"),
+		"SSH_CONNECTION":    "198.51.100.7 50000 192.0.2.1 22",
+		"SSH_CLIENT":        "198.51.100.7 50000 22",
+		"SHELL":             evilShell,
+		"TMPDIR":            "/tmp",
+		"LD_PRELOAD":        filepath.Join(dumps, "hostile.so"),
+		"HOSTILE_MARKER":    "1",
+	}
+	for k, v := range hostile {
+		h.extraEnv = append(h.extraEnv, k+"="+v)
+	}
+
+	s := serveRun(t, h, "ensure-up", "")
+	var res peer.EnsureUpResult
+	s.result(t, &res)
+	if res.Scheduler != "started" {
+		t.Fatalf("ensure-up = %+v, want the scheduler started", res)
+	}
+	schedEnv := filepath.Join(dumps, "scheduler.env")
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(schedEnv); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the scheduler daemon never recorded its environment")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	started := map[string]map[string]string{"scheduler daemon": envDump(t, schedEnv)}
+	tmuxDumps, err := filepath.Glob(filepath.Join(dumps, "tmux.*.env"))
+	if err != nil || len(tmuxDumps) == 0 {
+		t.Fatalf("tmux was never started (%v)", err)
+	}
+	for _, d := range tmuxDumps {
+		started["tmux "+filepath.Base(d)] = envDump(t, d)
+	}
+	for who, env := range started {
+		for k, v := range hostile {
+			if got, ok := env[k]; ok && (got == v || k == "HOSTILE_MARKER" || strings.HasPrefix(k, "GIT_") || strings.HasPrefix(k, "SSH_") || strings.HasPrefix(k, "LC_") || k == "LD_PRELOAD") {
+				t.Errorf("%s was started with the session's %s=%q", who, k, got)
+			}
+		}
+		want := map[string]string{
+			"HOME":                h.account,
+			"PATH":                peerPath,
+			"LANG":                peerLang,
+			"TTORCH_TMUX_SESSION": session,
+			"TTORCH_MODEL":        "opus",
+			"TTORCH_WORKER_TABS":  "0",
+		}
+		for k, v := range want {
+			if env[k] != v {
+				t.Errorf("%s: %s = %q, want %q", who, k, env[k], v)
+			}
+		}
+		if sh := env["SHELL"]; sh == evilShell || !strings.HasPrefix(sh, "/") {
+			t.Errorf("%s: SHELL = %q, want a shell listed in /etc/shells", who, sh)
+		}
+	}
+	// The launch command typed into the restored manager window reached the account's store:
+	// the decoy has no manager, and ensure-up would have refused on it.
+	if _, ok, _ := decoy.store(t).GetManager(ctx); ok {
+		t.Fatal("setup: the decoy has a manager")
+	}
+}
+
+// TestPeerEnvFile covers what the peer's own configuration may set: PATH and TTORCH_* settings,
+// as written, and never the store's location, a worker's identity, or a non-printing value.
+// Anything it refuses is refused whole, with the line named.
+func TestPeerEnvFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "peer.env")
+	if got, err := readPeerEnv(path); err != nil || len(got) != 0 {
+		t.Fatalf("a missing file = %v, %v; want nothing set", got, err)
+	}
+	write := func(body string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("# peer settings\n\nPATH=/opt/x/bin:/usr/bin\nTTORCH_MODEL=opus\nTTORCH_TMUX_SESSION=peer b\n  # indented comment\n")
+	got, err := readPeerEnv(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := map[string]string{"PATH": "/opt/x/bin:/usr/bin", "TTORCH_MODEL": "opus", "TTORCH_TMUX_SESSION": "peer b"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("readPeerEnv = %v, want %v", got, want)
+	}
+	for _, bad := range []string{
+		"TTORCH_HOME=/elsewhere", "TTORCH_DB=/elsewhere/state.db", "TTORCH_TASK_ID=t1",
+		"TTORCH_WORKER_TABS=1", "TTORCH_CLAUDE_DIR=/x", "LC_ALL=C", "LD_PRELOAD=/x.so",
+		"GIT_DIR=/x", "ttorch_model=opus", "TTORCH_=x", "TTORCH_MODEL", "TTORCH_MODEL=a\x1bb",
+		"TTORCH_MODEL=a\rb", "export TTORCH_MODEL=opus",
+	} {
+		write("TTORCH_MODEL=opus\n" + bad + "\n")
+		if got, err := readPeerEnv(path); err == nil || !strings.Contains(err.Error(), "line 2") {
+			t.Errorf("%q: readPeerEnv = %v, %v; want it refused at line 2", bad, got, err)
+		}
+	}
+	write("PATH=" + strings.Repeat("p", maxPeerEnv))
+	if _, err := readPeerEnv(path); err == nil {
+		t.Error("an oversize peer.env was read")
+	}
+}
+
+// TestPeerControlEnvKeepsOnlyWhatItVouchesFor runs peerControlEnv in this process (restoring the
+// environment after) and checks the two session values it can keep are kept only when safe: a
+// TMPDIR this account owns that no one else can write, and a SHELL /etc/shells lists.
+func TestPeerControlEnvKeepsOnlyWhatItVouchesFor(t *testing.T) {
+	saved := os.Environ()
+	t.Cleanup(func() {
+		os.Clearenv()
+		for _, kv := range saved {
+			if k, v, ok := strings.Cut(kv, "="); ok {
+				_ = os.Setenv(k, v)
+			}
+		}
+	})
+	account, ttorchHome := t.TempDir(), t.TempDir()
+	orig := peerAccount
+	t.Cleanup(func() { peerAccount = orig })
+	peerAccount = func() (peerUser, error) { return peerUser{home: account, name: "p", ttorchHome: ttorchHome}, nil }
+
+	private := t.TempDir()
+	if err := os.Chmod(private, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	open := t.TempDir()
+	if err := os.Chmod(open, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	var listed string
+	if b, err := os.ReadFile("/etc/shells"); err == nil {
+		for _, l := range strings.Split(string(b), "\n") {
+			if l = strings.TrimSpace(l); strings.HasPrefix(l, "/") {
+				listed = l
+				break
+			}
+		}
+	}
+	cases := []struct {
+		label, shell, tmpdir, wantShell, wantTmp string
+	}{
+		{"private tmpdir, listed shell", listed, private, listed, private},
+		{"world-writable tmpdir", listed, open, listed, ""},
+		{"root's /tmp", listed, "/tmp", listed, ""},
+		{"relative tmpdir", listed, "tmp", listed, ""},
+		{"unlisted shell", "/tmp/evil-shell", private, "/bin/sh", private},
+		{"relative shell", "sh", "", "/bin/sh", ""},
+	}
+	for _, c := range cases {
+		if c.shell == "" && listed == "" {
+			continue
+		}
+		os.Clearenv()
+		_ = os.Setenv("SHELL", c.shell)
+		_ = os.Setenv("TMPDIR", c.tmpdir)
+		_ = os.Setenv("TTORCH_HOME", "/elsewhere")
+		_ = os.Setenv("LC_ALL", "hostile")
+		p, err := peerControlEnv()
+		if err != nil {
+			t.Fatalf("%s: %v", c.label, err)
+		}
+		if p.Home != ttorchHome || p.StateDB() != filepath.Join(ttorchHome, "state.db") {
+			t.Errorf("%s: paths = %+v, want the account's ttorch home", c.label, p)
+		}
+		if got := os.Getenv("SHELL"); got != c.wantShell {
+			t.Errorf("%s: SHELL = %q, want %q", c.label, got, c.wantShell)
+		}
+		if got := os.Getenv("TMPDIR"); got != c.wantTmp {
+			t.Errorf("%s: TMPDIR = %q, want %q", c.label, got, c.wantTmp)
+		}
+		for _, k := range []string{"TTORCH_HOME", "LC_ALL"} {
+			if v, ok := os.LookupEnv(k); ok {
+				t.Errorf("%s: %s=%q survived", c.label, k, v)
+			}
+		}
+	}
+
+	// A home that is not this account's directory is refused, and the session is gone anyway.
+	peerAccount = func() (peerUser, error) { return peerUser{home: "/", name: "p", ttorchHome: ttorchHome}, nil }
+	os.Clearenv()
+	_ = os.Setenv("HOSTILE_MARKER", "1")
+	if _, err := peerControlEnv(); err == nil && os.Getuid() != 0 {
+		t.Error("a home owned by another account was accepted")
+	}
+	if _, ok := os.LookupEnv("HOSTILE_MARKER"); ok {
+		t.Error("a refused environment kept the session's variables")
+	}
 }

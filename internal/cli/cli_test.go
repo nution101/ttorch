@@ -23,6 +23,14 @@ func TestMain(m *testing.M) {
 	// runMainEnv set, and it runs Main as cmd/ttorch's main does, with the environment the test
 	// gave it.
 	if os.Getenv(runMainEnv) == "1" {
+		// The peer control channel takes the account's home from the user database, never from
+		// the environment. A served test process gets a temp one through this seam instead.
+		if home := os.Getenv(testPeerHomeEnv); home != "" {
+			ttorchHome := os.Getenv(testPeerTtorchEnv)
+			peerAccount = func() (peerUser, error) {
+				return peerUser{home: home, name: "peer-test", ttorchHome: ttorchHome}, nil
+			}
+		}
 		os.Exit(Main(os.Args[1:]))
 	}
 	os.Setenv("TTORCH_WORKER_TABS", "off")
@@ -44,7 +52,13 @@ func TestMain(m *testing.M) {
 }
 
 // runMainEnv, set to 1, makes the test binary run Main on its arguments instead of the tests.
-const runMainEnv = "TTORCH_CLI_TEST_RUN_MAIN"
+// testPeerHomeEnv and testPeerTtorchEnv then name the account home and ttorch home a served
+// `ttorch peer serve` uses.
+const (
+	runMainEnv        = "TTORCH_CLI_TEST_RUN_MAIN"
+	testPeerHomeEnv   = "TTORCH_CLI_TEST_PEER_HOME"
+	testPeerTtorchEnv = "TTORCH_CLI_TEST_PEER_TTORCH"
+)
 
 // nasty is a message body packed with the characters a shell would re-interpret:
 // command substitution (backticks and $(...)), variable expansion, both quote

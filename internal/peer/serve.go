@@ -155,6 +155,10 @@ type Host struct {
 	Version string
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
+	// Unavailable, when set, is the answer to every verb: the host could not be prepared (its
+	// environment or account could not be established), so nothing is opened or started. A
+	// command that names no verb is still refused as such.
+	Unavailable error
 }
 
 func (h Host) now() time.Time {
@@ -217,6 +221,9 @@ func serve(ctx context.Context, command string, stdin io.Reader, workerSignal st
 	// the verb list, not who runs it.
 	if workerSignal != "" {
 		return nil, v.name, Refuse(CodeWorkerContext, "the control channel is an ssh forced command and does not run inside a worker context (%s)", workerSignal)
+	}
+	if h.Unavailable != nil {
+		return nil, v.name, h.Unavailable
 	}
 	body, err := readBody(stdin)
 	if err != nil {
