@@ -298,20 +298,27 @@ func CheckPrivate(path string, fi fs.FileInfo, uid int, dir bool) error {
 	return ownedBy(path, fi, uid, false)
 }
 
+// afterPrivateDirMade, when set, runs once OpenPrivateDir has made a missing directory, before
+// it is opened: a test's way to swap the path at that point. It is nil outside tests.
+var afterPrivateDirMade func(dir string)
+
 // OpenPrivateDir opens dir without following a symlink in its last component, and checks the
 // directory it got, through the descriptor (fstat), with CheckPrivate: a directory uid owns with no
-// group or other write bit. With create set, a missing dir is first made 0700; without it, a
-// missing dir is (nil, nil). Files in it are then opened with OpenAt, relative to the descriptor,
-// so a rename of dir or of its parents after the check cannot point a read or a write somewhere
-// the check never saw.
+// group or other write bit. With create set, a missing dir is first made, and set to 0700 through
+// the descriptor once it is open (fchmod), so the mode never lands on whatever the path names by
+// then; without it, a missing dir is (nil, nil). Files in it are then opened with OpenAt,
+// relative to the descriptor, so a rename of dir or of its parents after the check cannot point a
+// read or a write somewhere the check never saw.
 func OpenPrivateDir(dir string, uid int, create bool) (*os.File, error) {
 	if !filepath.IsAbs(dir) {
 		return nil, fmt.Errorf("the directory %q is not absolute", dir)
 	}
+	made := false
 	if create {
 		if err := os.Mkdir(dir, 0o700); err == nil {
-			if err := os.Chmod(dir, 0o700); err != nil {
-				return nil, err
+			made = true
+			if afterPrivateDirMade != nil {
+				afterPrivateDirMade(dir)
 			}
 		} else if !errors.Is(err, fs.ErrExist) {
 			return nil, err
@@ -332,7 +339,15 @@ func OpenPrivateDir(dir string, uid int, create bool) (*os.File, error) {
 		return nil, &fs.PathError{Op: "open", Path: dir, Err: err}
 	}
 	f := os.NewFile(uintptr(fd), dir)
-	fi, err := f.Stat()
+	// The umask may have taken bits from the mkdir. Only a directory this call made is changed,
+	// and only through its descriptor; the check below still decides.
+	if made {
+		err = f.Chmod(0o700)
+	}
+	var fi fs.FileInfo
+	if err == nil {
+		fi, err = f.Stat()
+	}
 	if err == nil {
 		err = CheckPrivate(dir, fi, uid, true)
 	}

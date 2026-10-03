@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -691,5 +692,48 @@ func TestLockDirWaitsThenGivesUp(t *testing.T) {
 	first.Close()
 	if err := lockDir(second, time.Second); err != nil {
 		t.Errorf("the lock once the first holder closed its directory: %v", err)
+	}
+}
+
+// TestOpenPrivateDirSetsTheModeThroughTheHandle: a directory OpenPrivateDir makes gets its mode
+// through the descriptor it checked, never by path. If the path is swapped for a symlink between
+// the mkdir and the open, the open refuses it and the link's target keeps its mode; and a umask
+// that strips the owner's write bit still leaves the new directory 0700. (One that strips the
+// owner's read bit makes the directory unopenable, and OpenPrivateDir refuses it.)
+func TestOpenPrivateDirSetsTheModeThroughTheHandle(t *testing.T) {
+	uid := os.Getuid()
+	base := t.TempDir()
+	target := filepath.Join(base, "target")
+	if err := os.WriteFile(target, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(base, "dir")
+	afterPrivateDirMade = func(made string) {
+		if err := os.Remove(made); err != nil {
+			t.Error(err)
+		}
+		if err := os.Symlink(target, made); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { afterPrivateDirMade = nil })
+	if d, err := OpenPrivateDir(dir, uid, true); err == nil {
+		d.Close()
+		t.Error("opened a directory that became a symlink")
+	}
+	if fi, err := os.Stat(target); err != nil || fi.Mode().Perm() != 0o644 {
+		t.Errorf("the symlink's target is now %v (%v); its mode was changed through the path", fi.Mode(), err)
+	}
+	afterPrivateDirMade = nil
+
+	old := syscall.Umask(0o222)
+	d, err := OpenPrivateDir(filepath.Join(base, "masked"), uid, true)
+	syscall.Umask(old)
+	if err != nil {
+		t.Fatalf("OpenPrivateDir under umask 0222: %v", err)
+	}
+	defer d.Close()
+	if fi, err := d.Stat(); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Errorf("a directory made under umask 0222 is %v (%v), want 0700", fi.Mode(), err)
 	}
 }
