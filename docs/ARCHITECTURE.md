@@ -1171,7 +1171,10 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   the same directory, which is synced and renamed over `authorized_keys` relative to the checked
   descriptor, after checking the file is still the one read, unchanged (same file, size and
   modification time). If something wrote it in between, the rewrite is dropped and refused, so
-  that write is not lost. The result names the parent each removed line was for.
+  that write is not lost. The result names the parent each removed line was for. Each install
+  holds an exclusive `flock` on `~/.ssh` from the read to the write, so two inits at once take
+  turns instead of both appending the line or one renaming away the other's; the lock orders
+  ttorch's installs only, and another program's write is caught by the check above.
   `ttorch peer add <name> <control-dest>` is the parent's side, and the lead's command: it runs
   the same caller check as `ttorch approve` (no worker context, an interactive terminal) before
   it parses a flag or starts a process. It generates the control key with `ssh-keygen` (ed25519,

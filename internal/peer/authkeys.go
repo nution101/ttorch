@@ -301,6 +301,12 @@ var afterAuthorizedKeysRead func()
 // checked. sshd's StrictModes refuses a looser file anyway, and a file someone else can write
 // could admit any key.
 //
+// The whole read-decide-write runs under an exclusive flock on the directory (lockDir), so two
+// inits at once, from the same parent retrying or from two parents, take turns: without it both
+// could read the file without the line and both append it, or a forced init could rename away
+// the other's line. The lock only orders ttorch's own installs; another program writing the file
+// meanwhile is caught by the check before a rewrite, not by the lock.
+//
 // Without replace the file is appended to, never rewritten, and a last line without a newline
 // gets one first, so no existing entry is touched. If the file already holds line, nothing is
 // written. If it lists the same key any other way (without the forced command, say), that is
@@ -329,6 +335,9 @@ func installControlKey(sshDir, line, blob string, uid int, replace bool) (Instal
 		return InstallResult{}, err
 	}
 	defer dir.Close()
+	if err := lockDir(dir, authorizedKeysLockWait); err != nil {
+		return InstallResult{}, err
+	}
 	path := filepath.Join(sshDir, "authorized_keys")
 	out := InstallResult{Path: path}
 	f, err := OpenAt(dir, "authorized_keys", os.O_RDWR|os.O_CREATE|os.O_APPEND|syscall.O_NONBLOCK, 0o600)
@@ -412,6 +421,29 @@ func installControlKey(sshDir, line, blob string, uid int, replace bool) (Instal
 	}
 	out.Added = true
 	return out, nil
+}
+
+// authorizedKeysLockWait bounds how long an install waits for another to finish with the file.
+// An install takes milliseconds; the wait only has to outlast one that is running.
+const authorizedKeysLockWait = 30 * time.Second
+
+// lockDir takes an exclusive flock on the open directory dir, waiting at most wait for another
+// holder to let go. The lock is the open file's, so closing dir releases it.
+func lockDir(dir *os.File, wait time.Duration) error {
+	deadline := time.Now().Add(wait)
+	for {
+		err := unix.Flock(int(dir.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EINTR) {
+			return &fs.PathError{Op: "flock", Path: dir.Name(), Err: err}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%s is still locked by another ttorch peer init after %s; run it again once that one finishes", dir.Name(), wait)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // removedParent is what a removed line's comment says about the parent it was for: the

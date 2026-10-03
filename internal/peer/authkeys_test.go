@@ -8,7 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // wireString is one SSH wire-format string: a big-endian length and the bytes.
@@ -513,4 +515,81 @@ func TestInstallControlKeyReplacing(t *testing.T) {
 		t.Errorf("the change made during the rewrite was lost: %q", b)
 	}
 	onlyKeys(t, sshDir)
+}
+
+// TestInstallControlKeyIsSerialized: two installs at once take turns. The first is held after it
+// has read the file; the second must not read it until the first has written, or both would see
+// the key absent and append it twice.
+func TestInstallControlKeyIsSerialized(t *testing.T) {
+	uid := os.Getuid()
+	_, blob := testControlKey(t)
+	line := AuthorizedKeyLine("/home/ttorch/.ttorch/bin/ttorch", blob, testParent)
+	sshDir := filepath.Join(t.TempDir(), ".ssh")
+	if err := os.Mkdir(sshDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var reads atomic.Int32
+	firstRead, release := make(chan struct{}), make(chan struct{})
+	afterAuthorizedKeysRead = func() {
+		if reads.Add(1) == 1 {
+			close(firstRead)
+			<-release
+		}
+	}
+	t.Cleanup(func() { afterAuthorizedKeysRead = nil })
+
+	type outcome struct {
+		res InstallResult
+		err error
+	}
+	first, second := make(chan outcome, 1), make(chan outcome, 1)
+	go func() {
+		res, err := installControlKey(sshDir, line, blob, uid, false)
+		first <- outcome{res, err}
+	}()
+	<-firstRead
+	go func() {
+		res, err := installControlKey(sshDir, line, blob, uid, false)
+		second <- outcome{res, err}
+	}()
+	select {
+	case o := <-second:
+		t.Errorf("the second install finished while the first held the file: %+v, %v", o.res, o.err)
+		close(release)
+		<-first
+	case <-time.After(300 * time.Millisecond):
+		close(release)
+		a, b := <-first, <-second
+		if a.err != nil || b.err != nil || !a.res.Added || b.res.Added {
+			t.Errorf("installs = %+v, %v and %+v, %v; want the first added and the second to find it", a.res, a.err, b.res, b.err)
+		}
+	}
+	if b, _ := os.ReadFile(filepath.Join(sshDir, "authorized_keys")); string(b) != line+"\n" {
+		t.Errorf("authorized_keys = %q; want the line once", b)
+	}
+}
+
+// TestLockDirWaitsThenGivesUp: a second holder waits for the first, and gives up with a named
+// error once its wait runs out; closing the first's directory lets it in.
+func TestLockDirWaitsThenGivesUp(t *testing.T) {
+	dir := t.TempDir()
+	open := func() *os.File {
+		d, err := OpenPrivateDir(dir, os.Getuid(), false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	first, second := open(), open()
+	defer second.Close()
+	if err := lockDir(first, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := lockDir(second, 100*time.Millisecond); err == nil || !strings.Contains(err.Error(), "still locked") {
+		t.Errorf("a second lock while the first is held: %v", err)
+	}
+	first.Close()
+	if err := lockDir(second, time.Second); err != nil {
+		t.Errorf("the lock once the first holder closed its directory: %v", err)
+	}
 }
