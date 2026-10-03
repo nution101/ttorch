@@ -1217,7 +1217,9 @@ the claim/reclaim primitives re-read a row under the write lock and a single win
   `internal/peer/init.go` (the init session's command line and envelope),
   `internal/cli/peerinit.go` and `internal/peer/authkeys.go`.
 - **Peer client.** `ttorch peer status`, `decisions`, `answer`, `task-add`, `goal` and `repo
-  add` refuse a worker context (an accident guard, like `ttorch answer`'s, not a boundary), then
+  add` refuse a worker context (an accident guard, like `ttorch answer`'s, not a boundary), and
+  refuse on a coordinator whose own row says `peer`, before ssh runs or a delegation is recorded,
+  so a peer never uses a control key it still holds for another machine. Then they
   reach a `live` or `unreachable` peer through `internal/peer/client.go` alone: one ssh
   process per call, run through `proc.Command` with a 30s deadline, so a hung connection dies
   with everything it started, and the fixed command line `ssh -F none -o BatchMode=yes -o

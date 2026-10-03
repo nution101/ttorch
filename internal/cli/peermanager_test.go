@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -378,4 +379,49 @@ func TestPeerAddRefusesARootWithPeers(t *testing.T) {
 	line, _ := newControlKey(t)
 	r := initRun(t, f.peer, initBody(t, peer.InitRequest{Name: "build", ParentID: servedParent, ControlKey: line, Force: true}))
 	r.refused(t, "init of a root with a live peer", peer.CodeConflict)
+}
+
+// TestPeerClientRefusesOnAPeer: a peer sends nothing to a peer. If a coordinator's row says peer
+// while it still has a live peer registered (a same-user process rewrote the row, or it predates
+// the init check), every command that reaches a peer is refused before ssh runs and before a
+// delegation is recorded, so the control key it holds is never used. peer ls, which reads only
+// this coordinator's store, still answers.
+func TestPeerClientRefusesOnAPeer(t *testing.T) {
+	ctx := context.Background()
+	f := newPeerFixture(t)
+	f.add(t, "build")
+	sent := len(f.calls(t))
+	raw, err := sql.Open("sqlite", filepath.Join(f.parentHome, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `UPDATE coordinator SET role = 'peer', name = 'mid', parent_id = ? WHERE id = 1`, strings.Repeat("c", 32)); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, args := range [][]string{
+		{"peer", "status", "build"},
+		{"peer", "decisions", "build"},
+		{"peer", "answer", "build", "1", "-m", "use sqlite"},
+		{"peer", "task-add", "build", "p-1", "--repo", "/repos/q", "--brief", "# do it"},
+		{"peer", "goal", "build", "-m", "split the importer"},
+		{"peer", "repo", "add", "build", "/repos/q", "--origin", "https://example.invalid/q.git"},
+	} {
+		r := f.run(t, nil, args...)
+		if r.code == 0 || !strings.Contains(r.stderr, "this coordinator is a peer") {
+			t.Errorf("%v on a peer: exit %d, stderr %q; want it refused because this coordinator is a peer", args[1:], r.code, r.stderr)
+		}
+	}
+	if calls := f.calls(t); len(calls) != sent {
+		t.Errorf("refused commands ran ssh %d time(s): %+v", len(calls)-sent, calls[sent:])
+	}
+	if ds, err := f.parentStore(t).ListDelegations(ctx, "build"); err != nil || len(ds) != 0 {
+		t.Errorf("refused commands recorded delegations: %+v (%v)", ds, err)
+	}
+	if r := f.run(t, nil, "peer", "ls"); r.code != 0 || !strings.Contains(r.stdout, "build") {
+		t.Errorf("peer ls on a peer: exit %d, stdout %q, stderr %q", r.code, r.stdout, r.stderr)
+	}
 }

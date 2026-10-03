@@ -98,12 +98,26 @@ func refuseWorkerContext(what string) error {
 // usablePeer opens the store and finds name, which must be live or unreachable: a peer still
 // provisioning has no key the channel admits yet, and a retired one has none at all. The client
 // reaches it with the control key only.
+//
+// It is the one way every command that sends a peer anything gets a client, so it is also where
+// depth one is enforced on this side: a coordinator whose row says peer reaches no peer, even one
+// still registered here, before ssh runs or a delegation is recorded. Init refuses to make a
+// coordinator with peers a peer (db.ProvisionAsPeer), so this catches a row a same-user process
+// or an older binary left behind.
 func usablePeer(ctx context.Context, name string) (*db.Store, db.Peer, peer.Client, error) {
 	if err := db.ValidPeerName(name); err != nil {
 		return nil, db.Peer{}, peer.Client{}, err
 	}
 	store, err := peerStore()
 	if err != nil {
+		return nil, db.Peer{}, peer.Client{}, err
+	}
+	self, err := store.GetCoordinator(ctx)
+	if err == nil && self.Role == db.CoordinatorPeer {
+		err = fmt.Errorf("this coordinator is a peer (%s, provisioned by %s), and a peer sends nothing to a peer of its own; retire %s here (ttorch peer retire %s) and reach it from a root", peer.SafeID(self.Name), peer.SafeID(self.ParentID), name, name)
+	}
+	if err != nil {
+		store.Close()
 		return nil, db.Peer{}, peer.Client{}, err
 	}
 	p, ok, err := store.GetPeer(ctx, name)
