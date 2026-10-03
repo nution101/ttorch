@@ -8,11 +8,13 @@ import (
 	"go/token"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1935,12 +1937,17 @@ func TestGateLaneRunsTheEvidencePackages(t *testing.T) {
 	}
 	recipe := strings.Split(string(m[1]), "\n")
 	// Generating GATE_TESTS proves nothing if the recipe stops reading it. A recipe
-	// changed to a different -run value leaves the derivation green while the lane runs
-	// something else, which is the same vacuous-pass shape one level out.
-	if !strings.Contains(string(m[1]), "-run $(GATE_TESTS) ./internal/orchestrator/") {
-		t.Errorf("test-gate must run ./internal/orchestrator/ under -run $(GATE_TESTS); "+
+	// changed to a different selector leaves the derivation green while the lane runs
+	// something else, which is the same vacuous-pass shape one level out. The recipe hands
+	// GATE_TESTS to orch_shards, which runs ORCH_PKG; TestGateTestsShardsRunEveryProofOnce
+	// runs the recipe and shows what that does with it.
+	if !strings.Contains(string(m[1]), "$(call orch_shards,$(GATE_TESTS),") {
+		t.Errorf("test-gate must run ./internal/orchestrator/ through $(call orch_shards,$(GATE_TESTS),...); "+
 			"GATE_TESTS is generated and checked, so a recipe that does not use it runs "+
 			"an unchecked selection. Recipe:\n%s", m[1])
+	}
+	if !regexp.MustCompile(`(?m)^ORCH_PKG\s*:=\s*\./internal/orchestrator/$`).Match(mk) {
+		t.Error("ORCH_PKG must be ./internal/orchestrator/, the package GATE_TESTS is generated from")
 	}
 	for _, ip := range guardClosure(t).packages {
 		pkg := "./" + ip[strings.Index(ip, "internal/"):] + "/"
@@ -1960,6 +1967,197 @@ func TestGateLaneRunsTheEvidencePackages(t *testing.T) {
 			t.Errorf("the guard reads the repository through %s, so that package holds part "+
 				"of the evidence the gate rests on, but `make test-gate` does not run it. "+
 				"Its proofs execute in neither lane that gates a merge.", pkg)
+		}
+	}
+}
+
+// TestGateTestsShardsRunEveryProofOnce runs the real test-gate, test-fast and test recipes with
+// a stand-in for go on PATH, and checks what orch_shards does with them.
+//
+// test-gate used to be one `go test -run $(GATE_TESTS)`, and test-fast one `go test -short
+// ./...`. Both now list the orchestrator tests they select and deal them into ORCH_SHARDS
+// processes, and run the lane's other packages in one more process alongside: every other
+// package for test-fast and test, ./internal/worktree/ for test-gate. A shell
+// loop that drops a name, or that exits 0 having run nothing, would leave proofs unrun with
+// the lane green. Reading the recipe cannot see either, so this executes it: each listed test
+// must reach exactly one shard, the -list must get the lane's selector and flags, the other
+// packages must all run once and without the orchestrator, and a list that matches nothing, a
+// list that does not build, a package list that fails, or one failing process must each fail
+// make for its own reason.
+func TestGateTestsShardsRunEveryProofOnce(t *testing.T) {
+	mk := filepath.Join(repoRootForGateConfig(t), "Makefile")
+	if _, err := exec.LookPath("make"); err != nil {
+		t.Fatal("make is not on PATH, and make is what runs the gate's lanes: ", err)
+	}
+	// The stand-in answers `go list` of a pattern with $FAKE_PKGS and exit $FAKE_GOLIST_RC (the
+	// orchestrator package itself always lists), `go test -list`
+	// with $FAKE_LIST (exit $FAKE_LIST_RC), and records every other go test as tab-separated
+	// "run", -run value, packages and flags, failing one whose -run or packages name $FAKE_FAIL.
+	bin := t.TempDir()
+	script := `#!/bin/sh
+log="$FAKE_LOG"
+if [ "$1" = list ]; then
+  echo "golist $*" >> "$log"
+  case "$2" in
+    ./internal/orchestrator/) echo example/internal/orchestrator; exit 0 ;;
+    ./internal/worktree/) echo example/internal/worktree; exit "${FAKE_GOLIST_RC:-0}" ;;
+    *) printf '%s\n' $FAKE_PKGS; exit "${FAKE_GOLIST_RC:-0}" ;;
+  esac
+fi
+for a in "$@"; do
+  if [ "$a" = "-list" ]; then
+    echo "list $*" >> "$log"
+    [ -n "$FAKE_LIST" ] && printf '%s\n' $FAKE_LIST
+    echo "ok  	fake	0.001s"
+    exit "${FAKE_LIST_RC:-0}"
+  fi
+done
+run= pkgs= flags= prev=
+shift
+for a in "$@"; do
+  case "$prev" in
+    -run) run="$a" ;;
+    -timeout) ;;
+    *) case "$a" in -run|-timeout) ;; -*) flags="$flags $a" ;; *) pkgs="$pkgs $a" ;; esac ;;
+  esac
+  prev="$a"
+done
+printf 'run\t%s\t%s\t%s\n' "$run" "${pkgs# }" "${flags# }" >> "$log"
+if [ -n "$FAKE_FAIL" ]; then
+  case "$run $pkgs" in *"$FAKE_FAIL"*) echo "--- FAIL: $FAKE_FAIL"; exit 1 ;; esac
+fi
+echo "ok  	${pkgs# }	0.001s"
+`
+	if err := os.WriteFile(filepath.Join(bin, "go"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	names := []string{"TestA", "TestB", "TestC", "TestD", "TestE", "TestF", "TestG"}
+	selector := "'^(TestA|TestB|TestC|TestD|TestE|TestF|TestG)$$'"
+	pkgs := "example example/internal/orchestrator example/b"
+	type env struct{ list, listRC, golistRC, fail string }
+	runMake := func(target, shards string, e env) (string, []string, error) {
+		t.Helper()
+		log := filepath.Join(t.TempDir(), "calls")
+		cmd := exec.Command("make", "-f", mk, target, "GATE_TESTS="+selector, "ORCH_SHARDS="+shards, "TESTFLAGS=")
+		cmd.Dir = t.TempDir()
+		cmd.Env = []string{
+			"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"),
+			"HOME=" + os.Getenv("HOME"), "TMPDIR=" + os.TempDir(), "FAKE_LOG=" + log,
+			"FAKE_PKGS=" + pkgs, "FAKE_LIST=" + e.list, "FAKE_LIST_RC=" + e.listRC,
+			"FAKE_GOLIST_RC=" + e.golistRC, "FAKE_FAIL=" + e.fail,
+		}
+		out, err := cmd.CombinedOutput()
+		b, _ := os.ReadFile(log)
+		return string(out), strings.Split(strings.TrimRight(string(b), "\n"), "\n"), err
+	}
+	green := env{list: strings.Join(names, " "), listRC: "0", golistRC: "0"}
+
+	for _, lane := range []struct {
+		target, wantList, flags, others string
+	}{
+		{"test-gate", "list test -list ^(TestA|TestB|TestC|TestD|TestE|TestF|TestG)$ ./internal/orchestrator/", "", "example/internal/worktree"},
+		{"test-fast", "list test -short -list . ./internal/orchestrator/", "-short", "example example/b"},
+		{"test", "list test -list . ./internal/orchestrator/", "", "example example/b"},
+	} {
+		for _, shards := range []string{"1", "3", "4", "9"} {
+			out, calls, err := runMake(lane.target, shards, green)
+			if err != nil {
+				t.Fatalf("%s ORCH_SHARDS=%s: a green run failed: %v\n%s", lane.target, shards, err, out)
+			}
+			seen := map[string]int{}
+			var lists, orchRuns, otherRuns int
+			for _, c := range calls {
+				switch {
+				case strings.HasPrefix(c, "golist "):
+					continue
+				case strings.HasPrefix(c, "list "):
+					lists++
+					if c != lane.wantList {
+						t.Errorf("%s ORCH_SHARDS=%s: the list call is %q, want %q", lane.target, shards, c, lane.wantList)
+					}
+					continue
+				}
+				f := strings.Split(c, "\t")
+				if len(f) != 4 || f[0] != "run" {
+					t.Fatalf("%s ORCH_SHARDS=%s: unexpected call %q", lane.target, shards, c)
+				}
+				run, pk, flags := f[1], f[2], f[3]
+				switch {
+				case pk == "./internal/orchestrator/":
+					orchRuns++
+					if flags != lane.flags {
+						t.Errorf("%s: a shard ran with flags %q, want %q", lane.target, flags, lane.flags)
+					}
+					if !strings.HasPrefix(run, "^(") || !strings.HasSuffix(run, ")$") {
+						t.Fatalf("%s ORCH_SHARDS=%s: a shard's -run is not anchored: %q", lane.target, shards, run)
+					}
+					for _, n := range strings.Split(strings.TrimSuffix(strings.TrimPrefix(run, "^("), ")$"), "|") {
+						seen[n]++
+					}
+				case pk == lane.others && run == "":
+					otherRuns++
+					if flags != lane.flags {
+						t.Errorf("%s: the other packages ran with flags %q, want %q", lane.target, flags, lane.flags)
+					}
+				default:
+					t.Fatalf("%s ORCH_SHARDS=%s: unexpected call %q", lane.target, shards, c)
+				}
+			}
+			if lists != 1 {
+				t.Errorf("%s ORCH_SHARDS=%s: %d list calls, want 1", lane.target, shards, lists)
+			}
+			want := len(names)
+			if n, _ := strconv.Atoi(shards); n < want {
+				want = n
+			}
+			if orchRuns != want {
+				t.Errorf("%s ORCH_SHARDS=%s: %d shard processes ran, want %d", lane.target, shards, orchRuns, want)
+			}
+			for _, n := range names {
+				if seen[n] != 1 {
+					t.Errorf("%s ORCH_SHARDS=%s: %s ran in %d shards, want exactly 1", lane.target, shards, n, seen[n])
+				}
+			}
+			if len(seen) != len(names) {
+				t.Errorf("%s ORCH_SHARDS=%s: the shards ran %v, which is not the listed set %v", lane.target, shards, seen, names)
+			}
+			if otherRuns != 1 {
+				t.Errorf("%s ORCH_SHARDS=%s: %s ran %d times, want once and unfiltered", lane.target, shards, lane.others, otherRuns)
+			}
+		}
+	}
+
+	// Each way a lane could go green having run nothing, or having hidden a failure. Each must
+	// fail for its own reason, named in the output: make failing on some other step would pass
+	// a bare exit-code check while the guard it is meant to show is gone.
+	for _, tc := range []struct {
+		name, target string
+		e            env
+		want         string
+	}{
+		{"a selector that matches nothing", "test-gate", env{"", "0", "0", ""}, "orch_shards: the selector matches no test in ./internal/orchestrator/"},
+		{"a list that does not build", "test-gate", env{"", "1", "0", ""}, "ok  \tfake"},
+		{"a list that builds and still exits nonzero", "test-gate", env{green.list, "1", "0", ""}, "ok  \tfake"},
+		{"one failing shard", "test-gate", env{green.list, "0", "0", "TestE"}, "--- FAIL: TestE"},
+		{"a package list that fails", "test-fast", env{green.list, "0", "1", ""}, ""},
+		{"a failing other package", "test-fast", env{green.list, "0", "0", "example/b"}, "--- FAIL: example/b"},
+		{"a failing evidence package", "test-gate", env{green.list, "0", "0", "example/internal/worktree"}, "--- FAIL: example/internal/worktree"},
+		{"an evidence package list that fails", "test-gate", env{green.list, "0", "1", ""}, ""},
+		{"one failing shard in the fast lane", "test-fast", env{green.list, "0", "0", "TestC"}, "--- FAIL: TestC"},
+	} {
+		out, calls, err := runMake(tc.target, "4", tc.e)
+		if err == nil {
+			t.Errorf("%s: make %s succeeded, want a failure\n%s", tc.name, tc.target, out)
+		}
+		if !strings.Contains(out, tc.want) {
+			t.Errorf("%s: the output must contain %q, got:\n%s", tc.name, tc.want, out)
+		}
+		if tc.e.fail == "" {
+			for _, c := range calls {
+				if strings.HasPrefix(c, "run\t") {
+					t.Errorf("%s: no test may run once the listing fails, got %q", tc.name, c)
+				}
+			}
 		}
 	}
 }
