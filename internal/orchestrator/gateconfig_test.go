@@ -2017,6 +2017,10 @@ func TestMatchesGateConfig(t *testing.T) {
 		{"a vendored dependency", "vendor/example.com/dep/d.go", true},
 		{"the module file", "go.mod", true},
 		{"the module checksums", "go.sum", true},
+		// The peer control channel's verb list: a verb added there widens what a parent's
+		// key can do on a peer. The rest of the package only reads.
+		{"the peer control channel", "internal/peer/serve.go", true},
+		{"the peer summary", "internal/peer/summary.go", false},
 		{"a project-level reviewer definition", ".claude/agents/ttorch-reviewer-security.md", true},
 		{"project-level MCP servers", ".mcp.json", true},
 		{"a nested instruction file", "internal/orchestrator/CLAUDE.md", true},

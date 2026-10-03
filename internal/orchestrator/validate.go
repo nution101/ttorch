@@ -162,6 +162,11 @@ var ttorchSourceFiles = []string{
 	// landscratch.go makes the commit a clone task's land validates and merges, by rebasing the
 	// clone's imported head in a scratch worktree of the project.
 	"internal/orchestrator/landscratch.go",
+	// serve.go holds the peer control channel's verb list: everything a parent coordinator's
+	// forced-command key can do on a peer. It has no approve, merge, land or gate verb, and a
+	// verb added to it would widen what that key reaches, so the change needs
+	// --allow-gate-change. The rest of internal/peer only reads.
+	"internal/peer/serve.go",
 	// The gate's own proofs. Without these, the backstop can be deleted in the same merge
 	// as the attack it would catch: TestTtorchRepoIsScopedIn goes red on a .gitattributes
 	// that un-scopes the repo, but a diff that adds the attribute AND deletes the test

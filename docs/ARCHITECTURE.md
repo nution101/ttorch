@@ -461,6 +461,7 @@ once if it touches any covered path.
 | `internal/orchestrator/validate.go` | 2 | +0 |
 | `internal/orchestrator/validatecache.go` | 1 | +0 |
 | `internal/orchestrator/workdir.go` | 0 | +0 |
+| `internal/peer/serve.go` | 0 | +0 |
 | `internal/projectinit/` | 9 | +3 |
 | `internal/review/` | 7 | +4 |
 | `internal/skills/` | 3 | +0 |
