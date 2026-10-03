@@ -681,30 +681,38 @@ func TestRegisterPeerStartsThePollOver(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			// Open both episodes: an escalation never raised at or below the cursor, and an id
+			// the poll refuses.
+			if _, err := s.RecordPeerPoll(ctx, "build", openPoll(false, esc{1, "a1", "one"}, esc{2, "a2", "two"}, esc{7, "a7", "seven"}, esc{0, "a0", "zero"})); err != nil {
+				t.Fatal(err)
+			}
 			if _, err := s.RecordPeerFailure(ctx, "build", "x", "p", unreachableAfter); err != nil {
 				t.Fatal(err)
 			}
 			c.prepare(t, s)
-			if p := mustPeer(t, s, "build"); p.EscalationCursor != 7 || p.DownAttempts == 0 || p.ConsecutiveFailures == 0 {
+			if p := mustPeer(t, s, "build"); p.EscalationCursor != 7 || p.DownAttempts == 0 || p.ConsecutiveFailures == 0 ||
+				!p.CursorResetOpen || !p.BadIDsOpen {
 				t.Fatalf("before registering again: %+v", p)
 			}
 			if _, err := s.RegisterPeer(ctx, testPeer("build"), c.replace); err != nil {
 				t.Fatal(err)
 			}
 			p := mustPeer(t, s, "build")
-			if p.EscalationCursor != 0 || p.ConsecutiveFailures != 0 || p.DownAttempts != 0 || p.Status != PeerProvisioning {
-				t.Errorf("after registering again: cursor %d, failures %d, down %d, status %s; want all zero and provisioning",
-					p.EscalationCursor, p.ConsecutiveFailures, p.DownAttempts, p.Status)
+			if p.EscalationCursor != 0 || p.ConsecutiveFailures != 0 || p.DownAttempts != 0 || p.Status != PeerProvisioning ||
+				p.CursorResetOpen || p.BadIDsOpen {
+				t.Errorf("after registering again: cursor %d, failures %d, down %d, status %s, reset open %t, bad ids open %t; want all zero, provisioning and no episode open",
+					p.EscalationCursor, p.ConsecutiveFailures, p.DownAttempts, p.Status, p.CursorResetOpen, p.BadIDsOpen)
 			}
 			// Once live again, an escalation a new store numbers 1 is raised, and so is one the
 			// old store still has open: the registration starts the record of what was raised
-			// over too. Neither is a regression.
+			// over too. Neither is a regression. An id it refuses opens a new episode and raises
+			// its own protocol error.
 			if err := s.MarkPeerLive(ctx, "build", 1, "v2"); err != nil {
 				t.Fatal(err)
 			}
-			res, err := s.RecordPeerPoll(ctx, "build", openPoll(true, esc{1, "b1", "new one"}, esc{7, "a7", "seven"}))
-			if err != nil || len(res.Raised) != 2 || res.CursorReset {
-				t.Errorf("after registering again: %+v, %v; want both raised and no reset", res, err)
+			res, err := s.RecordPeerPoll(ctx, "build", openPoll(true, esc{1, "b1", "new one"}, esc{7, "a7", "seven"}, esc{0, "b0", "zero"}))
+			if err != nil || len(res.Raised) != 2 || res.CursorReset || res.ProtocolEventID == 0 {
+				t.Errorf("after registering again: %+v, %v; want both raised, no reset and a protocol error", res, err)
 			}
 		})
 	}
