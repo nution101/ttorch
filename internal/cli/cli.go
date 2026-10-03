@@ -1728,6 +1728,10 @@ func cmdScheduler(args []string) error {
 	sch.Land = *land
 	sch.Supervise = *supervise
 	sch.Gate = *gate
+	// The loop polls this coordinator's registered peers every TTORCH_PEER_POLL through their
+	// control keys (peerpoll.go); with none registered the pass reads one empty list. --once
+	// runs no peer pass.
+	sch.Peers = dialPeer
 	var watchDaemon *watch.Daemon
 	if *watchLoop {
 		watchDaemon = watch.NewDaemon(m.Store, m.P, m.Backend, m.Session, os.Stdout)
