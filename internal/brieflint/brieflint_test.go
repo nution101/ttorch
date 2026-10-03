@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1386,12 +1387,24 @@ func TestTextRulesStopWhenTheBudgetIsSpent(t *testing.T) {
 // that factor is about 4x and quadratic about 16x. Each size keeps the best of several
 // interleaved runs, because noise only ever adds time, and interleaving spreads a burst of
 // contention across both sizes instead of landing on one.
+//
+// The time is CPU time, not wall clock. On the wall clock the gate's validate failed this test
+// twice running beside the parallel test shards on the build host, at 8.13x for rule 4 and
+// then 8.66x for rule 3, with every rule linear. Time a run spends waiting for a CPU is not
+// work the rule did. Beside three `make test-fast` loops on that host, eight wall-clock runs
+// put rule 3 anywhere from 3.93x to 13.21x and failed two; eight CPU-time runs alongside
+// them stayed between 3.88x and 4.58x on every rule. A quadratic is work, so it shows in CPU
+// time as it does on the wall: restoring the per-question rescan a8ac3d8 removed measures
+// 15.4x. And a case that does come out past the limit is measured once more from scratch,
+// and fails only if that is past it too: contention comes and goes, while the defect this
+// guards against grows about 15x on every measurement.
 func TestEveryTextRuleIsLinearInTheBrief(t *testing.T) {
 	repo, _ := fixture(t)
 	const (
 		factor    = 4   // the larger brief repeats its unit this many times more
 		maxGrowth = 8.0 // linear is about 4x over that factor, quadratic about 16x
 		runs      = 5
+		attempts  = 2 // measurements a case gets before an excess growth fails it
 	)
 	cases := []struct {
 		name string
@@ -1417,9 +1430,9 @@ func TestEveryTextRuleIsLinearInTheBrief(t *testing.T) {
 		timed := func(n int) time.Duration {
 			brief := "Base is origin/main in this repository.\n\n" + strings.Repeat(tc.unit, n) + "\n"
 			runtime.GC()
-			start := time.Now()
+			start := cpuTime(t)
 			r := Lint(brief, opt)
-			elapsed := time.Since(start)
+			elapsed := cpuTime(t) - start
 			for _, f := range findingsFor(r, tc.rule) {
 				if strings.Contains(f.Detail, "the run budget expired") {
 					expired = true
@@ -1428,22 +1441,49 @@ func TestEveryTextRuleIsLinearInTheBrief(t *testing.T) {
 			return elapsed
 		}
 		timed(tc.n / factor) // warm-up, not measured
-		small, large := time.Duration(math.MaxInt64), time.Duration(math.MaxInt64)
-		for i := 0; i < runs && !expired; i++ {
-			small = min(small, timed(tc.n/factor))
-			large = min(large, timed(tc.n))
+		var small, large time.Duration
+		var growth float64
+		for a := 1; a <= attempts && !expired; a++ {
+			small, large = time.Duration(math.MaxInt64), time.Duration(math.MaxInt64)
+			for i := 0; i < runs && !expired; i++ {
+				small = min(small, timed(tc.n/factor))
+				large = min(large, timed(tc.n))
+			}
+			growth = float64(large) / float64(small)
+			t.Logf("%s, measurement %d: %d units %s CPU, %d units %s CPU, growth %.2fx", tc.name, a, tc.n/factor, small, tc.n, large, growth)
+			if growth <= maxGrowth {
+				break
+			}
 		}
 		if expired {
 			t.Errorf("%s: a healthy run takes a small fraction of a %s budget, and this one spent all of it; the quadratic is back (%s)", tc.name, opt.Budget, tc.was)
 			continue
 		}
-		growth := float64(large) / float64(small)
-		t.Logf("%s: %d units %s, %d units %s, growth %.2fx", tc.name, tc.n/factor, small, tc.n, large, growth)
 		if growth > maxGrowth {
-			t.Errorf("%s: time grew %.1fx for a %dx larger brief (%s to %s), past the %.0fx limit; linear is about %dx, so the quadratic is back (%s)",
-				tc.name, growth, factor, small, large, maxGrowth, factor, tc.was)
+			t.Errorf("%s: CPU time grew %.1fx for a %dx larger brief (%s to %s) on each of %d measurements, past the %.0fx limit; linear is about %dx, so the quadratic is back (%s)",
+				tc.name, growth, factor, small, large, attempts, maxGrowth, factor, tc.was)
 		}
 	}
+}
+
+// cpuTime is the CPU time this process, and every child it has waited for, has used so far.
+// The children count because rule 2 does its checking through git. Nothing in this package
+// calls t.Parallel, so between two readings the CPU this process used went to the call being
+// timed, the runtime's work on its behalf included.
+func cpuTime(t *testing.T) time.Duration {
+	t.Helper()
+	var self, children syscall.Rusage
+	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &self); err != nil {
+		t.Fatalf("getrusage: %v", err)
+	}
+	if err := syscall.Getrusage(syscall.RUSAGE_CHILDREN, &children); err != nil {
+		t.Fatalf("getrusage: %v", err)
+	}
+	var total int64
+	for _, tv := range []syscall.Timeval{self.Utime, self.Stime, children.Utime, children.Stime} {
+		total += tv.Nano()
+	}
+	return time.Duration(total)
 }
 
 // A brief is untrusted input, so what a finding prints from it is bounded. A 60 KB token
