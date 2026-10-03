@@ -33,35 +33,51 @@ TEST_GATE_TIMEOUT ?= 10m
 ORCH_SHARDS ?= 4
 ORCH_PKG    := ./internal/orchestrator/
 
+# ORCH_SHARDS can come from the environment, and .ttorch/validate.sh inherits the environment of
+# whatever runs the gate. A count the loop below cannot use must stop make rather than start no
+# shard and pass, so orch_shards accepts exactly one of these words and nothing else: not 0, not
+# a negative, not "4 -o 1", not "04".
+ORCH_SHARD_COUNTS := 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32
+orch_shards_check = $(if $(and $(filter 1,$(words $(ORCH_SHARDS))),$(filter $(ORCH_SHARD_COUNTS),$(ORCH_SHARDS))),,$(error ORCH_SHARDS must be a whole number from 1 to 32, got "$(ORCH_SHARDS)"))
+
 # $(call orch_shards,SELECTOR,TIMEOUT,FLAGS,OTHERS) runs the ORCH_PKG tests that SELECTOR
-# matches, dealt round-robin into ORCH_SHARDS go test processes that run at once. FLAGS goes to
-# every go test it starts (test-fast passes -short). If OTHERS is a package pattern, every
-# package it names except ORCH_PKG runs in one more go test alongside the shards. It fails if
-# any of them fails. `go test -list` names the tests, so each one runs in exactly one shard.
-# It fails closed: a list that does not build, or a selector that matches nothing, is an
-# error, never a green run of nothing. Each process's output is printed whole once all have
-# finished.
+# matches, dealt round-robin into ORCH_SHARDS go test processes that run at once (fewer when
+# there are fewer tests than shards, so no shard is empty). FLAGS goes to every go test it
+# starts (test-fast passes -short). If OTHERS is a package pattern, every package it names
+# except ORCH_PKG runs in one more go test alongside the shards. It fails if any of them fails.
+# Each process's output is printed whole once all have finished.
+#
+# It fails closed, before any test starts: on a bad ORCH_SHARDS, a list that does not build, a
+# selector that matches nothing, a `go list` that fails, or shard lists that are not exactly
+# the listed tests, each once and none empty. After dispatch it checks that one process started
+# per shard list. No step's status passes through a pipe, where sh would drop it.
 define orch_shards
-	@set -e; dir=$$(mktemp -d); trap 'rm -rf "$$dir"' EXIT; pids=; others=; \
+	@$(orch_shards_check)set -e; dir=$$(mktemp -d); trap 'rm -rf "$$dir"' EXIT; pids=; others=; \
 	go test $(3) -list $(1) $(ORCH_PKG) > "$$dir/list" 2>&1 || { cat "$$dir/list"; exit 1; }; \
 	grep -E '^(Test|Fuzz|Example)' "$$dir/list" > "$$dir/names" || true; \
-	total=$$(wc -l < "$$dir/names" | tr -d ' '); \
+	total=$$(awk 'END { print NR }' "$$dir/names"); \
 	if [ "$$total" -eq 0 ]; then echo "orch_shards: the selector matches no test in $(ORCH_PKG)" >&2; exit 1; fi; \
+	n=$(ORCH_SHARDS); if [ "$$n" -gt "$$total" ]; then n=$$total; fi; \
+	awk -v n="$$n" '{ i = (NR - 1) % n; s[i] = (i in s) ? s[i] "|" $$0 : $$0 } END { for (i = 0; i < n; i++) print s[i] }' "$$dir/names" > "$$dir/shards"; \
+	lists=$$(awk 'END { print NR }' "$$dir/shards"); empty=$$(awk '$$0 == "" { c++ } END { print c + 0 }' "$$dir/shards"); \
+	tr '|' '\n' < "$$dir/shards" > "$$dir/dealt"; sort "$$dir/dealt" > "$$dir/dealt.sorted"; sort "$$dir/names" > "$$dir/names.sorted"; \
+	if [ "$$lists" -ne "$$n" ] || [ "$$empty" -ne 0 ] || ! cmp -s "$$dir/dealt.sorted" "$$dir/names.sorted"; then \
+	  echo "orch_shards: the $$total listed tests were not dealt into $$n non-empty shard lists, each test once ($$lists lists, $$empty empty)" >&2; exit 1; \
+	fi; \
 	if [ -n "$(4)" ]; then \
 	  orch=$$(go list $(ORCH_PKG)); all=$$(go list $(4)); \
 	  others=$$(printf '%s\n' $$all | grep -vxF "$$orch" || true); \
 	fi; \
-	echo "$(ORCH_PKG): $$total tests in $(ORCH_SHARDS) shards"; \
+	echo "$(ORCH_PKG): $$total tests in $$n shards"; \
 	if [ -n "$$others" ]; then \
-	  go test $(3) $(TESTFLAGS) -timeout $(2) $$others > "$$dir/others" 2>&1 & pids="$$!"; \
+	  go test $(3) $(TESTFLAGS) -timeout $(2) $$others < /dev/null > "$$dir/others" 2>&1 & pids="$$!"; \
 	fi; \
-	i=0; while [ "$$i" -lt $(ORCH_SHARDS) ]; do \
-	  sel=$$(awk -v n=$(ORCH_SHARDS) -v i=$$i 'NR % n == i' "$$dir/names" | paste -sd '|' -); \
-	  if [ -n "$$sel" ]; then \
-	    go test $(3) $(TESTFLAGS) -timeout $(2) -run "^($$sel)\$$" $(ORCH_PKG) > "$$dir/shard$$i" 2>&1 & pids="$$pids $$!"; \
-	  fi; i=$$((i + 1)); \
-	done; \
-	rc=0; for p in $$pids; do wait "$$p" || rc=1; done; \
+	i=0; while IFS= read -r sel; do \
+	  go test $(3) $(TESTFLAGS) -timeout $(2) -run "^($$sel)\$$" $(ORCH_PKG) < /dev/null > "$$dir/shard$$i" 2>&1 & pids="$$pids $$!"; \
+	  i=$$((i + 1)); \
+	done < "$$dir/shards"; \
+	rc=0; if [ "$$i" -ne "$$n" ]; then echo "orch_shards: started $$i shard processes, want $$n" >&2; rc=1; fi; \
+	for p in $$pids; do wait "$$p" || rc=1; done; \
 	for f in "$$dir/others" "$$dir"/shard*; do if [ -f "$$f" ]; then cat "$$f"; fi; done; exit $$rc
 endef
 

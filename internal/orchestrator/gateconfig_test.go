@@ -2034,8 +2034,32 @@ echo "ok  	${pkgs# }	0.001s"
 	names := []string{"TestA", "TestB", "TestC", "TestD", "TestE", "TestF", "TestG"}
 	selector := "'^(TestA|TestB|TestC|TestD|TestE|TestF|TestG)$$'"
 	pkgs := "example example/internal/orchestrator example/b"
+	// A stand-in for awk passes every call through to the real one, except the one that deals
+	// the names into shard lists (the only call given -v n=), which $FAKE_AWK can make fail,
+	// print nothing, drop the last shard list, rename a test, or end without a final newline
+	// (which `read` drops, though every count taken before dispatch still adds up).
+	realAwk, err := exec.LookPath("awk")
+	if err != nil {
+		t.Fatal("awk is not on PATH, and the lane's recipe needs it: ", err)
+	}
+	awkScript := `#!/bin/sh
+case " $* " in *" -v n="*) dealing=1 ;; esac
+if [ -n "$dealing" ]; then
+  case "$FAKE_AWK" in
+    fail) exit 1 ;;
+    empty) exit 0 ;;
+    short) '` + realAwk + `' "$@" | sed '$d'; exit 0 ;;
+    rename) '` + realAwk + `' "$@" | sed 's/TestA/TestZ/'; exit 0 ;;
+    nonl) printf '%s' "$('` + realAwk + `' "$@")"; exit 0 ;;
+  esac
+fi
+exec '` + realAwk + `' "$@"
+`
+	if err := os.WriteFile(filepath.Join(bin, "awk"), []byte(awkScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	type env struct{ list, listRC, golistRC, fail string }
-	runMake := func(target, shards string, e env) (string, []string, error) {
+	runMakeWith := func(target, shards, awkMode string, e env) (string, []string, error) {
 		t.Helper()
 		log := filepath.Join(t.TempDir(), "calls")
 		cmd := exec.Command("make", "-f", mk, target, "GATE_TESTS="+selector, "ORCH_SHARDS="+shards, "TESTFLAGS=")
@@ -2044,11 +2068,15 @@ echo "ok  	${pkgs# }	0.001s"
 			"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"),
 			"HOME=" + os.Getenv("HOME"), "TMPDIR=" + os.TempDir(), "FAKE_LOG=" + log,
 			"FAKE_PKGS=" + pkgs, "FAKE_LIST=" + e.list, "FAKE_LIST_RC=" + e.listRC,
-			"FAKE_GOLIST_RC=" + e.golistRC, "FAKE_FAIL=" + e.fail,
+			"FAKE_GOLIST_RC=" + e.golistRC, "FAKE_FAIL=" + e.fail, "FAKE_AWK=" + awkMode,
 		}
 		out, err := cmd.CombinedOutput()
 		b, _ := os.ReadFile(log)
 		return string(out), strings.Split(strings.TrimRight(string(b), "\n"), "\n"), err
+	}
+	runMake := func(target, shards string, e env) (string, []string, error) {
+		t.Helper()
+		return runMakeWith(target, shards, "", e)
 	}
 	green := env{list: strings.Join(names, " "), listRC: "0", golistRC: "0"}
 
@@ -2159,6 +2187,49 @@ echo "ok  	${pkgs# }	0.001s"
 				}
 			}
 		}
+	}
+
+	// ORCH_SHARDS can come from the environment the gate inherits. Every count the shard loop
+	// cannot use must stop make before anything runs: 0 and -1 made the loop start no shard,
+	// "abc" made its [ ] test error out of the loop, and "4 -o 1" looped forever. Each lane
+	// takes the same check.
+	for _, target := range []string{"test-gate", "test-fast", "test"} {
+		for _, shards := range []string{"0", "-1", "abc", "4 -o 1", "", "33", "04", "%", "4'"} {
+			out, calls, err := runMake(target, shards, green)
+			if err == nil {
+				t.Errorf("ORCH_SHARDS=%q: make %s succeeded, want a failure\n%s", shards, target, out)
+			}
+			if !strings.Contains(out, "ORCH_SHARDS must be a whole number from 1 to 32") {
+				t.Errorf("ORCH_SHARDS=%q: make %s must name the bad count, got:\n%s", shards, target, out)
+			}
+			if len(calls) != 1 || calls[0] != "" {
+				t.Errorf("ORCH_SHARDS=%q: make %s ran %q, want nothing run", shards, target, calls)
+			}
+		}
+	}
+
+	// Shard lists that are not the listed tests, each once and none empty, must stop make before
+	// any test starts, whatever the step that dealt them returned.
+	for _, mode := range []string{"fail", "empty", "short", "rename"} {
+		out, calls, err := runMakeWith("test-gate", "4", mode, green)
+		if err == nil {
+			t.Errorf("awk %s: make test-gate succeeded, want a failure\n%s", mode, out)
+		}
+		for _, c := range calls {
+			if strings.HasPrefix(c, "run\t") {
+				t.Errorf("awk %s: no test may run when the shard lists are wrong, got %q", mode, c)
+			}
+		}
+		if mode != "fail" && !strings.Contains(out, "orch_shards: the 7 listed tests were not dealt into 4 non-empty shard lists, each test once") {
+			t.Errorf("awk %s: make must say the shard lists are wrong, got:\n%s", mode, out)
+		}
+	}
+	// A shard list the dispatch loop never reads gets past every check made before it, so the
+	// count of processes started is checked after.
+	if out, _, err := runMakeWith("test-gate", "4", "nonl", green); err == nil {
+		t.Errorf("awk nonl: make test-gate succeeded, want a failure\n%s", out)
+	} else if !strings.Contains(out, "orch_shards: started 3 shard processes, want 4") {
+		t.Errorf("awk nonl: make must say a shard did not start, got:\n%s", out)
 	}
 }
 
